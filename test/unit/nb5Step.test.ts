@@ -358,9 +358,9 @@ const LATE_NONE: LateCommit = { committed: false, old: OLD, why: WHY };
 const DELETE_TAIL = '`smdb graveyard list` reads the data of the bot behind the web panel it asks: once that bot runs on the main database, look there for a new entry of this server with the reason webui-operator-delete, and repeat the delete if there is none.';
 const DELETE_A = `can't confirm whether this server's data was deleted on the main database: ${OLD} confirmed the delete only after this process stopped writing there (${WHY}). ${DELETE_TAIL}`;
 const DELETE_B = `can't confirm whether this server's data was deleted: the database did not confirm the commit, and this process stopped writing to ${OLD} while it waited (${WHY}). ${DELETE_TAIL}`;
-const RESTORE_TAIL = "Once the bot runs on the main database, check whether the server's data is back, and repeat the restore if it is not.";
-const restoreA = (g: string) => `can't confirm whether server ${g} was restored on the main database: ${OLD} confirmed the restore only after this process stopped writing there (${WHY}). ${RESTORE_TAIL}`;
-const restoreB = (g: string) => `can't confirm whether server ${g} was restored: the database did not confirm the commit, and this process stopped writing to ${OLD} while it waited (${WHY}). ${RESTORE_TAIL}`;
+const restoreTail = (g: string) => `Once the bot runs on the main database, run: smdb graveyard restore ${g} 5 --replace. It is safe whether or not this restore reached that database: it copies entry 5 in and moves whatever the server holds into a new entry, so nothing is lost; if that database lists no entry 5, the restore answers "no graveyard entry for this guild" and changes nothing.`;
+const restoreA = (g: string) => `can't confirm whether server ${g} was restored on the main database: ${OLD} confirmed the restore only after this process stopped writing there (${WHY}). ${restoreTail(g)}`;
+const restoreB = (g: string) => `can't confirm whether server ${g} was restored: the database did not confirm the commit, and this process stopped writing to ${OLD} while it waited (${WHY}). ${restoreTail(g)}`;
 
 class ScriptedStore extends EpochStore {
   restoreImpl: () => Promise<RestoreOutcome> = async () => ({ ok: false, reason: 'no-entry' });
@@ -443,7 +443,7 @@ describe('test 6: the operator\'s answer to a retire or a restore answered after
     ws.markForResave(OLD);
     expect(ws.resaveGuilds()).toEqual([]);
     const hydrations = store.hydrationsSent;
-    wire.answer!({ ok: true, moved: 1, retiredAt: 5, reason: 'r' });
+    wire.answer!({ ok: true, copied: 1, retiredAt: 5, reason: 'r', usedAt: 1000 });
     await reply;
     expect(store.hydrationsSent).toBeGreaterThan(hydrations);
     expect(ws.resaveGuilds()).toEqual([]);
@@ -496,8 +496,8 @@ describe('test 6: the operator\'s answer to a retire or a restore answered after
   });
 
   it.each([
-    ['live-rows', { ok: false, reason: 'live-rows', retiredAt: 5 } as const, RESTORE_TEXTS.live(5)],
-    ['refused', { ok: false, reason: 'refused', detail: 'D', code: '57014' } as const, RESTORE_TEXTS.refused('D', '57014')],
+    ['live-rows', { ok: false, reason: 'live-rows', retiredAt: 5 } as const, (g: string) => RESTORE_TEXTS.live(g, 5)],
+    ['refused', { ok: false, reason: 'refused', detail: 'D', code: '57014' } as const, () => RESTORE_TEXTS.refused('D', '57014')],
   ])("R3-C1: a latch during the restore's ROLLBACK, answered '%s', reopens the set flagged, and the move re-saves its documents on the target", async (_name, answer, text) => {
     const { store, ws } = setup();
     const g = freshGuild();
@@ -512,7 +512,9 @@ describe('test 6: the operator\'s answer to a retire or a restore answered after
     store.latched = true;
     ws.markForResave(OLD);
     wire.answer!(answer);
-    expect(await reply).toEqual({ ok: false, code: answer.reason === 'live-rows' ? 'invalid' : 'backend-unavailable', error: text });
+    expect(await reply).toEqual(answer.reason === 'live-rows'
+      ? { ok: false, code: 'invalid', refusal: 'live-data', retiredAt: 5, error: text(g) }
+      : { ok: false, code: 'backend-unavailable', error: text(g) });
     expect(ws.stateOf(g)).toBe('ready');
     expect(ws.resaveGuilds()).toEqual([g]);
     for (const name of ['a.json', 'b.json']) store.docs.delete(`${g}|m/${name}`);

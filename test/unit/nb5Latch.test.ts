@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { FenceToken, GuildFlushBatch } from '../../src/bot/internalSetup/utils/dataBackends/backend';
 import { ANSWER_BOUND_MS, PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
 import { flushBoundMs } from '../../src/bot/internalSetup/utils/storableData';
+import { isGraveInsert, isMove } from '../helpers/nb11ScriptedPg';
 
 // NB5 section 8 test 6 and the rulings that amend it (C, D, G to K): the latch, the hold and the data-pool lease at
 // the backend, over a fake pool that replaces the backend's whole pool (K3). Its clients record every statement with
@@ -30,11 +31,8 @@ const sysError = (code: string) => Object.assign(new Error(`connect ${code} 10.0
 const isFence = (s: string) => /^INSERT INTO smdb_data\.guild_ownership AS o\b/.test(s);
 const isOwnerRead = (s: string) => /^SELECT node_id, claim FROM smdb_data\.guild_ownership/.test(s);
 const isShardRead = (s: string) => /^SELECT claim::text AS claim, holder_name/.test(s);
-const isDocInsert = (s: string) => /^INSERT INTO smdb_data\.guild_data_graveyard/.test(s) && s.includes("'doc'");
-const isAppendInsert = (s: string) => /^INSERT INTO smdb_data\.guild_data_graveyard/.test(s) && s.includes("'append'");
 const isLive = (s: string) => /AS present$/.test(s) && /guild_append WHERE guild_id = \$1\) AS present/.test(s);
 const isBatch = (s: string) => /max\(retired_at\)/i.test(s) && !/^WITH/.test(s) && !/^INSERT/.test(s);
-const isMove = (s: string) => /^WITH moved AS/.test(s);
 const isUpsert = (s: string) => /^INSERT INTO smdb_data\.guild_data \(/.test(s);
 const isCopy = (s: string) => /^WITH batch AS/.test(s) && s.includes('guild_data_graveyard');
 const isMark = (s: string) => /^SELECT claim, last_flush/.test(s);
@@ -167,21 +165,21 @@ const restoreScript = (override: (sql: string) => Reply | null = () => null): Sc
   if (isBatch(sql)) return { rows: [{ retired_at: '5' }], rowCount: 1 };
   if (/^SELECT 1 FROM smdb_data\.guild_data_graveyard/.test(sql)) return { rows: [{ '?column?': 1 }], rowCount: 1 };
   if (isLive(sql)) return { rows: [{ present: false }], rowCount: 1 };
-  if (isMove(sql)) return { rows: [{ taken: '3', put: '3', reason: 'webui-operator-delete' }], rowCount: 1 };
+  if (isMove(sql)) return { rows: [{ taken: '3', put: '3', reason: 'webui-operator-delete', used_at: '1000' }], rowCount: 1 };
   return undefined;
 };
 
-/** Happy answers of a retire whose two graveyard inserts move docs and appends rows. */
+/** Happy answers of a retire whose move-out moves docs and appends rows into batch RETIRED_AT. */
 const retireScript = (docs: number, appends: number, override: (sql: string) => Reply | null = () => null): Script => sql => {
   const own = override(sql);
   if (own !== null) return own;
   if (isFence(sql)) return { rows: [], rowCount: 1 };
-  if (isDocInsert(sql)) return { rows: [], rowCount: docs };
-  if (isAppendInsert(sql)) return { rows: [], rowCount: appends };
+  if (isGraveInsert(sql)) return { rows: [{ at: String(RETIRED_AT), docs: String(docs), streams: String(appends), put: String(docs + appends) }], rowCount: 1 };
   return undefined;
 };
 
-const retiredAtOf = (sent: Sent[]) => Number(sent.find(s => isDocInsert(s.sql))?.values?.[1]);
+const RETIRED_AT = 1700000000777;
+const retiredAtOf = (_sent: Sent[]) => RETIRED_AT;
 const restore = (b: PostgresBackend, deadline: bigint, retiredAt: number | null = 5) => b.restoreGuild('1', retiredAt, token, () => null, deadline);
 
 describe('after the latch every operation is refused with no connection (test 6, G12)', () => {

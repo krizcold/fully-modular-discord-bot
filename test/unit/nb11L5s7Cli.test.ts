@@ -31,7 +31,12 @@ afterEach(() => {
 
 function fakeClient(res: CliResponse) {
   const calls: Array<{ method: string; path: string; opts: unknown }> = [];
-  const client = { request: async (method: string, path: string, opts: unknown) => { calls.push({ method, path, opts }); return res; } } as unknown as Client;
+  const client = {
+    request: async (method: string, path: string, opts: unknown) => {
+      calls.push({ method, path, opts });
+      return method === 'GET' ? { status: 200, ok: true, body: { success: true, entries: [] } } : res;
+    },
+  } as unknown as Client;
   return { client, calls };
 }
 
@@ -48,7 +53,10 @@ describe('the restore verb', () => {
   it('sends a multi-digit retiredAt as a number in a POST to the restore route', async () => {
     const { client, calls } = fakeClient({ status: 200, ok: true, body: { success: true, retiredAt: 5000, reason: 'r' } });
     await run(client, [G, '5000']);
-    expect(calls).toEqual([{ method: 'POST', path: '/api/data/graveyard/restore', opts: { body: { guildId: G, retiredAt: 5000 } } }]);
+    expect(calls).toEqual([
+      { method: 'GET', path: `/api/data/graveyard?guildId=${G}`, opts: { timeoutMs: 10_000 } },
+      { method: 'POST', path: '/api/data/graveyard/restore', opts: { body: { guildId: G, retiredAt: 5000 }, timeoutMs: 100_000 } },
+    ]);
     expect(exits).toEqual([EXIT_OK]);
     expect(stderr.join('')).not.toContain(WHOLE_MS);
   });
@@ -62,10 +70,10 @@ describe('the restore verb', () => {
   });
 
   it('prints no restored line for a refusal that carries a retiredAt', async () => {
-    const { client } = fakeClient({ status: 409, ok: false, body: { success: false, retiredAt: 5000, error: 'live guild data exists' } });
+    const { client } = fakeClient({ status: 409, ok: false, body: { success: false, refusal: 'live-data', retiredAt: 5000, error: `server ${G} has data saved since entry 5000 was deleted; nothing was restored. To put entry 5000 in place and move the current data to the graveyard as a new entry, run: smdb graveyard restore ${G} 5000 --replace` } });
     await run(client, [G]);
     expect(stdout.join('')).not.toContain('restored server');
-    expect(stderr.join('')).toContain('live guild data exists');
+    expect(stderr.join('')).toContain(`server ${G} has data saved since entry 5000 was deleted; nothing was restored. To put entry 5000 in place and move the current data to the graveyard as a new entry, run: smdb graveyard restore ${G} 5000 --replace`);
     expect(exits).toEqual([EXIT_ERR]);
   });
 
@@ -77,7 +85,7 @@ describe('the restore verb', () => {
     expect(stdout.join('')).toBe('');
   });
 
-  it('an answer with no reason and no moved count prints an empty reason and no rows line', async () => {
+  it('an answer with no reason and no copied count prints an empty reason and no rows line', async () => {
     const { client } = fakeClient({ status: 200, ok: true, body: { success: true, retiredAt: 5000 } });
     await run(client, [G]);
     expect(stdout.join('')).toBe(`restored server ${G} from the entry deleted at ${new Date(5000).toISOString()} (retiredAt 5000, reason )\n`);

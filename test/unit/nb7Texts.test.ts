@@ -1,12 +1,26 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { sendHopReply } from '../../src/webui/routes/config';
-import { createGraveyardRoutes, RESTORE_MINUTE } from '../../src/webui/routes/graveyard';
-import { RESTORE_TEXTS } from '../../src/bot/internalSetup/utils/dataManager';
+import { createGraveyardRoutes } from '../../src/webui/routes/graveyard';
+import { RESTORE_TEXTS, restoreNoAnswerEnding } from '../../src/bot/internalSetup/utils/dataManager';
 import { REQUEST_INSERT_SQL, REQUEST_POLL_SQL, SETTLE_UPDATE_SQL } from '../../src/bot/internalSetup/utils/dataBackends/guildRequestSql';
 import { endGuildRequests, NB7_TEXTS, OP_WORDS, remoteNoAnswerText, remoteRestoreNoAnswerCause } from '../../src/webui/utils/guildRequests';
 import { call, startApp } from '../helpers/configRig';
 import { BOT_DOWN, fakeBot, GUILD, isInsert, nb7Rig, resetNb7, type Rig } from '../helpers/nb7Rig';
+
+// The restore route reads the guild's newest entry through the reader before it sends (NB14 decision 13); the rig
+// scripts the request database only, so the reader answers that this guild has no entry.
+vi.mock('../../src/webui/utils/webuiDataReader', async orig => {
+  const actual = await orig<typeof import('../../src/webui/utils/webuiDataReader')>();
+  let reader: ReturnType<typeof actual.getWebuiDataReader> | null = null;
+  return {
+    ...actual,
+    getWebuiDataReader: () => {
+      reader ??= Object.assign(Object.create(actual.getWebuiDataReader()), { listGuildGraveyard: async () => [] });
+      return reader!;
+    },
+  };
+});
 
 // NB7 decision 9 and 11: the answers of the request route, as sendHopReply and the graveyard route give them.
 
@@ -92,7 +106,7 @@ describe('the graveyard restore through the request route', () => {
   }
 
   it('ok: the restore\'s answer', async () => {
-    expect(await restoreWith({ ok: true, retiredAt: 5, reason: 'r', moved: 2 })).toEqual({ status: 200, body: { success: true, retiredAt: 5, reason: 'r', moved: 2, servedBy: 'BRAVO' } });
+    expect(await restoreWith({ ok: true, retiredAt: 5, reason: 'r', copied: 2 })).toEqual({ status: 200, body: { success: true, retiredAt: 5, reason: 'r', copied: 2, servedBy: 'BRAVO' } });
   });
 
   it('a refusal: the restore\'s own text with the prefix', async () => {
@@ -164,7 +178,7 @@ describe('the graveyard restore through the request route', () => {
     }
     expect(rig.statements.filter(isInsert)).toHaveLength(1);
     expect(out.status).toBe(503);
-    expect(out.body).toEqual({ success: false, error: `can't confirm whether server ${GUILD} was restored: ${remoteRestoreNoAnswerCause(cause, 'BRAVO')}. ${RESTORE_MINUTE}`, servedBy: 'BRAVO' });
+    expect(out.body).toEqual({ success: false, error: `can't confirm whether server ${GUILD} was restored: ${remoteRestoreNoAnswerCause(cause, 'BRAVO')}. ${restoreNoAnswerEnding(GUILD, undefined, undefined, false)}`, servedBy: 'BRAVO' });
     expect(out.body.error).toMatch(/BRAVO/);
     expect(out.body.error).not.toMatch(/nothing was/);
     expect(out.body.error).not.toMatch(/the bot did not answer within 50 s/);

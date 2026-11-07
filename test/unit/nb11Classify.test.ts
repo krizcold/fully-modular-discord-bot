@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { FenceToken } from '../../src/bot/internalSetup/utils/dataBackends/backend';
 import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
-import { type Answer, batchExistsAnswer, isBatch, isBatchExists, isBegin, isFenced, isGraveInsert, isLive, isMove, isOwnerInsert, isOwnerRead, scriptedPg } from '../helpers/nb11ScriptedPg';
+import { type Answer, batchExistsAnswer, isBatch, isBatchExists, isBegin, isFenced, isGraveInsert, isLive, isLock, isMove, isOwnerInsert, isOwnerRead, scriptedPg } from '../helpers/nb11ScriptedPg';
 
 // NB11 tests 3 (wip-redesign/sheets/NB11.md, decisions 5 to 10 and 20): the restore's and the retire's transactions
 // over a scripted client that keeps pg's single active query. After a statement that timed out, a statement queued
@@ -48,7 +48,7 @@ function happy(override: (sql: string) => Answer | null = () => null) {
     if (isBatch(sql)) return { rows: [{ retired_at: '5' }], rowCount: 1 };
     if (isBatchExists(sql)) return batchExistsAnswer(sql, true);
     if (isLive(sql)) return { rows: [{ present: false }], rowCount: 1 };
-    if (isMove(sql)) return { rows: [{ taken: '3', put: '3', reason: 'webui-operator-delete' }], rowCount: 1 };
+    if (isMove(sql)) return { rows: [{ taken: '3', put: '3', reason: 'webui-operator-delete', used_at: '1000' }], rowCount: 1 };
     return undefined;
   };
 }
@@ -164,13 +164,13 @@ describe('restore: a decided answer near the deadline keeps its answer', () => {
     expect(releases).toEqual([true]);
   });
 
-  it('taken other than put with 0.5 s left: refused, no ROLLBACK', async () => {
+  it('taken other than put with 0.5 s left: incomplete, no ROLLBACK', async () => {
     const { backend, statements } = scripted(happy(sql => {
       if (!isMove(sql)) return null;
       vi.advanceTimersByTime(39.5 * SECOND);
-      return { rows: [{ taken: '3', put: '2', reason: 'r' }], rowCount: 1 };
+      return { rows: [{ taken: '3', put: '2', reason: 'r', used_at: '1000' }], rowCount: 1 };
     }));
-    expect(await restore(backend, monoIn(40 * SECOND))).toMatchObject({ ok: false, reason: 'refused', detail: 'the batch holds 1 row(s) of an unknown kind' });
+    expect(await restore(backend, monoIn(40 * SECOND))).toMatchObject({ ok: false, reason: 'incomplete', step: 'copy-in', taken: 3, put: 2 });
     expect(statements()).not.toContain('ROLLBACK');
   });
 
@@ -310,18 +310,20 @@ describe('restore: the claim', () => {
 });
 
 describe('restore: the statements', () => {
-  it('runs the fenced update, the batch choice, the live check and one move whose source is the DELETE', async () => {
+  it('runs the shared lock, the fenced update, the batch choice, the live check and one copy-in that stamps the batch', async () => {
     const { backend, statements } = scripted(happy());
-    expect(await restore(backend, monoIn(40 * SECOND))).toEqual({ ok: true, moved: 3, retiredAt: 5, reason: 'webui-operator-delete' });
+    expect(await restore(backend, monoIn(40 * SECOND))).toEqual({ ok: true, copied: 3, retiredAt: 5, reason: 'webui-operator-delete', usedAt: 1000 });
     const sent = statements();
     expect(sent[0]).toBe('BEGIN');
-    expect(isFenced(sent[1])).toBe(true);
-    expect(isBatch(sent[2])).toBe(true);
-    expect(isLive(sent[3])).toBe(true);
-    expect(isMove(sent[4])).toBe(true);
-    expect(sent[4]).toMatch(/DELETE FROM smdb_data\.guild_data_graveyard[\s\S]*RETURNING/);
-    expect(sent[4]).not.toMatch(/ON CONFLICT/);
-    expect(sent[5]).toBe('COMMIT');
+    expect(isLock(sent[1])).toBe(true);
+    expect(isFenced(sent[2])).toBe(true);
+    expect(isBatch(sent[3])).toBe(true);
+    expect(isLive(sent[4])).toBe(true);
+    expect(isMove(sent[5])).toBe(true);
+    expect(sent[5]).not.toMatch(/DELETE FROM smdb_data\.guild_data_graveyard/);
+    expect(sent[5]).toMatch(/^WITH src AS \(\s*UPDATE smdb_data\.guild_data_graveyard\s+SET used_at/);
+    expect(sent[5]).not.toMatch(/ON CONFLICT/);
+    expect(sent[6]).toBe('COMMIT');
     expect(sent.some(s => /SET retired_at = NULL/.test(s) && !isFenced(s))).toBe(false);
   });
 
@@ -330,11 +332,11 @@ describe('restore: the statements', () => {
     expect(await restore(backend, monoIn(40 * SECOND), 9)).toMatchObject({ ok: true, retiredAt: 9 });
     const sent = statements();
     expect(sent.filter(isBatch)).toEqual([]);
-    expect(sent.slice(0, 2).map(s => s === 'BEGIN' || isFenced(s))).toEqual([true, true]);
-    expect(isBatchExists(sent[2])).toBe(true);
-    expect(isLive(sent[3])).toBe(true);
-    expect(isMove(sent[4])).toBe(true);
-    expect(sent[5]).toBe('COMMIT');
+    expect(sent.slice(0, 3).map(s => s === 'BEGIN' || isLock(s) || isFenced(s))).toEqual([true, true, true]);
+    expect(isBatchExists(sent[3])).toBe(true);
+    expect(isLive(sent[4])).toBe(true);
+    expect(isMove(sent[5])).toBe(true);
+    expect(sent[6]).toBe('COMMIT');
   });
 
   it('a given retiredAt that names no batch, with live rows present, answers no-entry with a ROLLBACK, no live check and no COMMIT', async () => {
@@ -360,15 +362,15 @@ describe('restore: the statements', () => {
   });
 
   it('taken 0 answers no-entry with a ROLLBACK and no COMMIT', async () => {
-    const { backend, statements } = scripted(happy(sql => (isMove(sql) ? { rows: [{ taken: '0', put: '0', reason: null }], rowCount: 1 } : null)));
+    const { backend, statements } = scripted(happy(sql => (isMove(sql) ? { rows: [{ taken: '0', put: '0', reason: null, used_at: null }], rowCount: 1 } : null)));
     expect(await restore(backend, monoIn(40 * SECOND))).toMatchObject({ ok: false, reason: 'no-entry' });
     expect(statements()).toContain('ROLLBACK');
     expect(statements()).not.toContain('COMMIT');
   });
 
-  it('taken 3 and put 2 answers refused with a ROLLBACK', async () => {
-    const { backend, statements } = scripted(happy(sql => (isMove(sql) ? { rows: [{ taken: '3', put: '2', reason: 'r' }], rowCount: 1 } : null)));
-    expect(await restore(backend, monoIn(40 * SECOND))).toMatchObject({ ok: false, reason: 'refused' });
+  it('taken 3 and put 2 answers incomplete with a ROLLBACK', async () => {
+    const { backend, statements } = scripted(happy(sql => (isMove(sql) ? { rows: [{ taken: '3', put: '2', reason: 'r', used_at: '1000' }], rowCount: 1 } : null)));
+    expect(await restore(backend, monoIn(40 * SECOND))).toEqual({ ok: false, reason: 'incomplete', step: 'copy-in', taken: 3, put: 2 });
     expect(statements()).toContain('ROLLBACK');
     expect(statements()).not.toContain('COMMIT');
   });

@@ -222,7 +222,7 @@ describe('the floors with exactly the floor left (frozen monotonic clock)', () =
 
   it('a restore with exactly the commit floor (2 s) left sends COMMIT and restores', async () => {
     const { backend, statements, sent } = rig(happy());
-    expect(await backend.restoreGuild('1', null, token, () => null, exactly(2000))).toMatchObject({ ok: true, moved: 3, retiredAt: 5 });
+    expect(await backend.restoreGuild('1', null, token, () => null, exactly(2000))).toMatchObject({ ok: true, copied: 3, retiredAt: 5 });
     expect(statements()).toContain('COMMIT');
     expect(sent.find(s => s.sql === 'COMMIT')?.timeout).toBe(2000);
   });

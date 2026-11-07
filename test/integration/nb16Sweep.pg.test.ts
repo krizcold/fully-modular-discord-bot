@@ -104,6 +104,7 @@ const EXTRAS: Record<string, Extras> = {
   'claim_clock.last_gap_ms retype': TO_NUMERIC,
   'guild_append.seq retype': TO_NUMERIC,
   'guild_data_graveyard.retired_at retype': TO_NUMERIC,
+  'guild_data_graveyard.used_at retype': TO_NUMERIC,
   'guild_ownership.claim retype': TO_NUMERIC,
   'shard_claims.claim retype': TO_NUMERIC,
   'shard_claims.ttl_ms retype': TO_NUMERIC,

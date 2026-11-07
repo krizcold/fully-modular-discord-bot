@@ -6,7 +6,7 @@ import * as fs from 'fs';
 import { dataPath } from '../../../utils/dataRoot';
 import { ProcessLock, parseHolder, realSeams, type LockHolder, type LockSeams, type TakeResult } from './processLock';
 import { cancelQueued, queuedFilePaths, queuedFileWrites, fileFlushOnTheWire } from './dataBackends/fileBackend';
-import { closeSharedWritesLost, forgetSharedFileKnowledge, isSharedPath, reopenSharedWrites } from './dataManager';
+import { closeSharedWritesLost, forgetSharedFileKnowledge, isSharedPath, reopenSharedWrites, useWriterLockCheck } from './dataManager';
 
 export type WriterRole = 'bot' | 'webui' | 'import';
 
@@ -104,6 +104,7 @@ export function takeWriterLock(): TakeResult {
     deposedBy = null;
     readErrorLogged = null;
     reopenSharedWrites();
+    useWriterLockCheck(() => checkWriterLock().kind === 'deposed');
     forgetSharedFileKnowledge();
     startCheck();
   }

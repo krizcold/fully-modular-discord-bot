@@ -1,6 +1,11 @@
 // API helper for same-origin requests. Auth is handled at the deployment boundary
 // (a gateway when managed, or the localhost bind when standalone), not by a URL param.
 
+// A non-2xx answer: the Error carries the status and the parsed body, for callers that decide on a field.
+function httpError(res, json) {
+  return Object.assign(new Error(json.error || json.message || `HTTP ${res.status}`), { status: res.status, body: json });
+}
+
 const api = {
   async get(endpoint) {
     const res = await fetch(`/api${endpoint}`);
@@ -18,7 +23,7 @@ const api = {
     }
 
     if (!res.ok) {
-      throw new Error(json.error || json.message || `HTTP ${res.status}`);
+      throw httpError(res, json);
     }
     return json;
   },
@@ -42,7 +47,7 @@ const api = {
     }
 
     if (!res.ok) {
-      throw new Error(json.error || json.message || `HTTP ${res.status}`);
+      throw httpError(res, json);
     }
     return json;
   },
@@ -64,7 +69,7 @@ const api = {
     }
 
     if (!res.ok) {
-      throw new Error(json.error || json.message || `HTTP ${res.status}`);
+      throw httpError(res, json);
     }
     return json;
   },
@@ -84,7 +89,7 @@ const api = {
     }
 
     if (!res.ok) {
-      throw new Error(json.error || json.message || `HTTP ${res.status}`);
+      throw httpError(res, json);
     }
     return json;
   }

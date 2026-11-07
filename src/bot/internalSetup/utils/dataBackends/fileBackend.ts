@@ -1112,8 +1112,8 @@ export function dropPendingForGuild(guildId: string): void {
 }
 
 /**
- * Rename /data/{guildId} under _graveyard and write a .graveyard.json reason
- * marker inside. The facade drains and drops pending state first.
+ * Rename /data/{guildId} under _graveyard, named by nextGraveyardName, and write its .graveyard.json reason note
+ * inside. The facade drains and drops pending state first.
  */
 export async function graveyardGuildDir(guildId: string, reason: string, writerLost: () => boolean = () => false, stopBeforeTry: () => boolean = () => false): Promise<boolean> {
   try {
@@ -1130,7 +1130,7 @@ async function moveGuildDirToGraveyard(guildId: string, reason: string, writerLo
   while ([...flushing].some(p => p === src || p.startsWith(src + path.sep)) && performance.now() < deadline) await delay(5);
   const graveyardRoot = path.join(BASE_DATA_DIR, GRAVEYARD_DIR);
   await fs.promises.mkdir(graveyardRoot, { recursive: true });
-  const dest = path.join(graveyardRoot, `${guildId}-${Date.now()}`);
+  const dest = path.join(graveyardRoot, `${guildId}-${nextGraveyardName(guildId)}`);
 
   for (let attempt = 0; ; attempt++) {
     if (writerLost()) {
@@ -1152,9 +1152,8 @@ async function moveGuildDirToGraveyard(guildId: string, reason: string, writerLo
     }
   }
 
-  const marker = { guildId, reason, ts: Date.now() };
   try {
-    await fs.promises.writeFile(path.join(dest, '.graveyard.json'), JSON.stringify(marker, null, 2), 'utf-8');
+    await writeGraveyardNote(dest, { guildId, reason, ts: Date.now() });
   } catch (error) {
     console.warn(`[DataManager] Failed to write graveyard marker for ${guildId}:`, error);
   }
@@ -1168,30 +1167,35 @@ export interface FileGraveyardEntry {
   reason: string;
 }
 
-/** Enumerate _graveyard entries ({guildId}-{ms} dirs), newest first. */
-export async function listGraveyardEntries(): Promise<FileGraveyardEntry[]> {
+const ENTRY_NAME = /^(\d+)-(\d+)$/;
+const RESTORE_FOLDER = /^\.(copy|restore)-(\d+)-(\d+)-(\d+)$/;
+
+/** Enumerate _graveyard entries ({guildId}-{ms} dirs), newest first; with a guild, only that guild's. */
+export async function listGraveyardEntries(guildId?: string): Promise<FileGraveyardEntry[]> {
   const graveyardRoot = path.join(BASE_DATA_DIR, GRAVEYARD_DIR);
   let entries: fs.Dirent[];
   try {
     entries = await fs.promises.readdir(graveyardRoot, { withFileTypes: true });
-  } catch {
-    return []; // no graveyard yet
+  } catch (error) {
+    if (errnoOf(error) === 'ENOENT') return [];
+    throw error;
   }
   const out: FileGraveyardEntry[] = [];
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     const dashIdx = entry.name.lastIndexOf('-');
     if (dashIdx <= 0) continue;
-    const guildId = entry.name.slice(0, dashIdx);
+    const owner = entry.name.slice(0, dashIdx);
     const retiredAt = Number(entry.name.slice(dashIdx + 1));
-    if (!/^\d+$/.test(guildId) || !Number.isFinite(retiredAt)) continue;
+    if (!/^\d+$/.test(owner) || !Number.isFinite(retiredAt)) continue;
+    if (guildId !== undefined && owner !== guildId) continue;
     let reason = '';
     try {
-      const raw = await fs.promises.readFile(path.join(graveyardRoot, entry.name, '.graveyard.json'), 'utf-8');
+      const raw = await fs.promises.readFile(path.join(graveyardRoot, entry.name, NOTE_FILE), 'utf-8');
       const marker = JSON.parse(raw) as { reason?: unknown };
       if (typeof marker?.reason === 'string') reason = marker.reason;
     } catch { /* marker is best-effort */ }
-    out.push({ guildId, retiredAt, reason });
+    out.push({ guildId: owner, retiredAt, reason });
   }
   out.sort((a, b) => b.retiredAt - a.retiredAt);
   return out;
@@ -1200,26 +1204,215 @@ export async function listGraveyardEntries(): Promise<FileGraveyardEntry[]> {
 const NOTE_FILE = '.graveyard.json';
 const SWEEP_PREFIX = '.sweep-';
 
+/**
+ * The number the guild's next graveyard folder {guildId}-{n} takes: the later of now and one above every number the
+ * guild's entries and restore folders hold (a restore folder's number stays reserved while it exists).
+ */
+export function nextGraveyardName(guildId: string): number {
+  let newest = 0;
+  let names: string[] = [];
+  try {
+    names = fs.readdirSync(path.join(BASE_DATA_DIR, GRAVEYARD_DIR));
+  } catch { /* no graveyard yet */ }
+  for (const name of names) {
+    const entry = ENTRY_NAME.exec(name);
+    if (entry && entry[1] === guildId) newest = Math.max(newest, Number(entry[2]));
+    const folder = RESTORE_FOLDER.exec(name);
+    if (folder && folder[2] === guildId) newest = Math.max(newest, Number(folder[4]));
+  }
+  return Math.max(Date.now(), newest + 1);
+}
+
+export interface GraveyardNote {
+  guildId: string;
+  reason: string;
+  ts: number;
+  usedAt?: number;
+  [field: string]: unknown;
+}
+
+/**
+ * Writes a graveyard note whole into an existing entry folder: a 'wx' temp file inside it (no folder is made, so a
+ * missing folder rejects with ENOENT), fsynced, renamed over .graveyard.json with atomicReplace's retry.
+ */
+export async function writeGraveyardNote(entryDir: string, note: GraveyardNote): Promise<void> {
+  const target = path.join(entryDir, NOTE_FILE);
+  const tmp = tmpNameFor(target);
+  const fh = await fs.promises.open(tmp, 'wx');
+  try {
+    try {
+      await fh.writeFile(JSON.stringify(note, null, 2), 'utf-8');
+      await fh.sync();
+    } finally {
+      await fh.close();
+    }
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await fs.promises.rename(tmp, target);
+        break;
+      } catch (error) {
+        if (attempt >= 9 || errnoOf(error) === 'ENOENT') throw error;
+        await delay(25 * (attempt + 1));
+      }
+    }
+  } catch (error) {
+    await fs.promises.unlink(tmp).catch(() => undefined);
+    throw error;
+  }
+  if (!IS_WINDOWS) {
+    try {
+      const dh = await fs.promises.open(entryDir, 'r');
+      try { await dh.sync(); } finally { await dh.close(); }
+    } catch { /* directory fsync is best-effort */ }
+  }
+}
+
+/** writeGraveyardNote with sync calls only, for the boot: one rename try. */
+export function writeGraveyardNoteSync(entryDir: string, note: GraveyardNote): void {
+  const target = path.join(entryDir, NOTE_FILE);
+  const tmp = tmpNameFor(target);
+  const fd = fs.openSync(tmp, 'wx');
+  try {
+    try {
+      fs.writeSync(fd, JSON.stringify(note, null, 2));
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.renameSync(tmp, target);
+  } catch (error) {
+    try { fs.unlinkSync(tmp); } catch { /* the temp file is swept as an orphan */ }
+    throw error;
+  }
+  if (!IS_WINDOWS) {
+    try {
+      const fd2 = fs.openSync(entryDir, 'r');
+      try { fs.fsyncSync(fd2); } finally { fs.closeSync(fd2); }
+    } catch { /* directory fsync is best-effort */ }
+  }
+}
+
+/** fsyncDataDirs with sync calls only, best effort, for the boot. */
+export function fsyncDataDirsSync(): void {
+  if (IS_WINDOWS) return;
+  for (const dir of [BASE_DATA_DIR, path.join(BASE_DATA_DIR, GRAVEYARD_DIR)]) {
+    try {
+      const fd = fs.openSync(dir, 'r');
+      try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    } catch { /* best effort */ }
+  }
+}
+
+/**
+ * Decision 10's rule for a restore's own folder: a .copy- folder is dropped; a .restore-<g>-<x>-<n> folder is finished
+ * when _graveyard/<g>-<n> exists and /data/<g> does not, and dropped otherwise. null: not a restore folder.
+ */
+function restoreFolderRule(name: string): { guildId: string; x: number; n: number; action: 'drop' | 'finish' } | null {
+  const m = RESTORE_FOLDER.exec(name);
+  if (!m) return null;
+  const [, kind, guildId, x, n] = m;
+  const finish = kind === 'restore'
+    && fs.existsSync(path.join(BASE_DATA_DIR, GRAVEYARD_DIR, `${guildId}-${n}`))
+    && !fs.existsSync(path.join(BASE_DATA_DIR, guildId));
+  return { guildId, x: Number(x), n: Number(n), action: finish ? 'finish' : 'drop' };
+}
+
+const droppedName = (guildId: string, x: number, n: number) => `${SWEEP_PREFIX}restore-${guildId}-${x}-${n}`;
+
+/**
+ * The boot: ends every restore folder a stopped process left, with sync calls only. A replace whose live folder had
+ * moved to its entry is finished (the copy renamed into place, the entry's note written); every other copy is renamed
+ * to a .sweep- name, which the boot's sweep removes.
+ */
+export function recoverGraveyardRestores(): void {
+  const graveyardRoot = path.join(BASE_DATA_DIR, GRAVEYARD_DIR);
+  let names: string[];
+  try {
+    names = fs.readdirSync(graveyardRoot);
+  } catch {
+    return; // no graveyard yet
+  }
+  for (const name of names) {
+    let rule: ReturnType<typeof restoreFolderRule>;
+    try {
+      rule = restoreFolderRule(name);
+    } catch (error) {
+      console.error(`[DataManager] Cannot check graveyard folder ${name} at boot (tried again at the next sweep or boot):`, error);
+      continue;
+    }
+    if (!rule) continue;
+    const { guildId, x, n } = rule;
+    if (rule.action === 'drop') {
+      try {
+        fs.renameSync(path.join(graveyardRoot, name), path.join(graveyardRoot, droppedName(guildId, x, n)));
+      } catch (error) {
+        console.error(`[DataManager] Cannot drop graveyard folder ${name} at boot (tried again at the next sweep or boot):`, error);
+      }
+      continue;
+    }
+    try {
+      fs.renameSync(path.join(graveyardRoot, name), path.join(BASE_DATA_DIR, guildId));
+    } catch (error) {
+      console.error(`[DataManager] Cannot finish the replace of guild ${guildId}'s data with entry ${x} at boot (tried again at the next boot):`, error);
+      continue;
+    } finally {
+      dropGuildView(guildId);
+    }
+    const entryDir = path.join(graveyardRoot, `${guildId}-${n}`);
+    if (!fs.existsSync(path.join(entryDir, NOTE_FILE))) {
+      try {
+        writeGraveyardNoteSync(entryDir, { guildId, reason: `replaced-by-restore-${x}`, ts: Date.now() });
+      } catch (error) {
+        console.error(`[DataManager] Graveyard entry ${guildId}-${n} holds guild ${guildId}'s data from before the replace; its note could not be written (${errnoOf(error)}), so it is listed with an empty reason`);
+      }
+    }
+    fsyncDataDirsSync();
+    console.log(`[DataManager] Finished the replace of guild ${guildId}'s data with entry ${x}; its data from before is entry ${n}`);
+  }
+}
+
 export type FileRestoreOutcome =
-  | { ok: true; retiredAt: number; reason: string; moveUnconfirmed?: string }
+  | { ok: true; retiredAt: number; reason: string; usedAt: number; replaced?: { retiredAt: number; reason?: string } | null; moveUnconfirmed?: string }
   | { ok: false; why: 'no-entry' }
   | { ok: false; why: 'live'; retiredAt: number }
   | { ok: false; why: 'stopped'; stop: RestoreStop }
   | { ok: false; why: 'writer-lost' }
-  | { ok: false; why: 'note' | 'rename'; code: string; step?: 'read' };
+  | { ok: false; why: 'failing'; file: string; code: string }
+  | { ok: false; why: 'unflushed' }
+  | { ok: false; why: 'stamp' | 'copy' | 'copy-sync' | 'move' | 'put'; x: number; code: string }
+  | { ok: false; why: 'copy-deadline'; x: number; copied: number }
+  | { ok: false; why: 'undone'; x: number; r: number; code: string; syncCode?: string }
+  | { ok: false; why: 'undone-taken'; x: number; r: number; code: string; syncCode?: string }
+  | { ok: false; why: 'half'; x: number; r: number; code: string; undoCode: string }
+  | { ok: false; why: 'half-taken'; x: number; r: number; code: string };
 
 export interface FileRestoreHooks {
-  /** The maintenance gate, the exit drain or the deadline, read after the lookup and before each rename try. */
-  stop: () => RestoreStop | null;
+  /** The maintenance gate, the exit drain, or the deadline less floorMs (0 when absent). */
+  stop: (floorMs?: number) => RestoreStop | null;
+  /** The cached flag: another process took the data files (read up to the copy). */
   writerLost: () => boolean;
-  /** Set once the rename into place returned. */
-  progress: { renamed: boolean };
+  /** The lock file itself read again (the check before the renames, each try, the undo, K6). */
+  writerTaken: () => boolean;
+  replace: boolean;
+  /** Opens a rename section: from K4's start to its end; the drain waits for every open one. Answers its end. */
+  enterSection: () => () => void;
+  /** renamed: the copy's rename into place returned; moved: K4's rename of the live folder returned. */
+  progress: { renamed: boolean; moved: { r: number; x: number } | null };
+}
+
+/** The copy's floor: K4 and K5 need the last 5 s of the restore's time. */
+const COPY_FLOOR_MS = 5000;
+
+class CopyRefusal extends Error {
+  constructor(readonly outcome: FileRestoreOutcome) {
+    super('restore copy refused');
+  }
 }
 
 /**
- * Renames a _graveyard entry back to /data/{guildId} (the given retiredAt, else the newest). Refused while the guild
- * folder exists or an op under it is queued or on the wire. The note leaves the entry first, so a crash never leaves
- * it in a live folder; every refusal after its removal writes it back, except when the entry is gone.
+ * Puts a copy of a _graveyard entry in place as /data/{guildId} (the given retiredAt, else the newest) and keeps the
+ * entry, stamping its note with usedAt. A plain restore is refused while the guild folder exists or an op under it
+ * is queued or on the wire; a replace first moves the live folder to a new entry. Decision 9's K steps.
  */
 export async function restoreGuildDirFromGraveyard(guildId: string, retiredAt: number | undefined, hooks: FileRestoreHooks): Promise<FileRestoreOutcome> {
   try {
@@ -1229,103 +1422,337 @@ export async function restoreGuildDirFromGraveyard(guildId: string, retiredAt: n
   }
 }
 
-async function restoreGuildDir(guildId: string, retiredAt: number | undefined, hooks: FileRestoreHooks): Promise<FileRestoreOutcome> {
-  const graveyardRoot = path.join(BASE_DATA_DIR, GRAVEYARD_DIR);
-  let entry: { name: string; retiredAt: number } | null = null;
-  if (retiredAt !== undefined) {
-    const name = `${guildId}-${retiredAt}`;
-    if (fs.existsSync(path.join(graveyardRoot, name))) entry = { name, retiredAt };
-  } else {
-    const newest = (await listGraveyardEntries()).find(e => e.guildId === guildId);
-    if (newest) entry = { name: `${guildId}-${newest.retiredAt}`, retiredAt: newest.retiredAt };
-  }
-  if (!entry) return { ok: false, why: 'no-entry' };
-  if (guildDirExists(guildId) || guildHasQueuedOps(guildId)) return { ok: false, why: 'live', retiredAt: entry.retiredAt };
-  const early = hooks.stop();
-  if (early) return { ok: false, why: 'stopped', stop: early };
+function writerLostAnswer(guildId: string): FileRestoreOutcome {
+  console.error(`[DataManager] Cannot restore guild ${guildId} from the graveyard: another process took the data files`);
+  return { ok: false, why: 'writer-lost' };
+}
 
-  const entryPath = path.join(graveyardRoot, entry.name);
-  const notePath = path.join(entryPath, NOTE_FILE);
-  let note: string | null = null;
-  try {
-    note = await fs.promises.readFile(notePath, 'utf-8');
-  } catch (error) {
-    if (errnoOf(error) !== 'ENOENT') {
-      console.error(`[DataManager] Cannot restore guild ${guildId}: the note of graveyard entry ${entry.name} could not be read:`, error);
-      return { ok: false, why: 'note', code: errnoOf(error), step: 'read' };
-    }
-  }
-  let reason = '';
-  try {
-    const parsed = note === null ? null : (JSON.parse(note) as { reason?: unknown } | null);
-    if (typeof parsed?.reason === 'string') reason = parsed.reason;
-  } catch { /* an unreadable note gives no reason */ }
-  const beforeUnlink = hooks.stop();
-  if (beforeUnlink) return { ok: false, why: 'stopped', stop: beforeUnlink };
-  if (hooks.writerLost()) {
-    console.error(`[DataManager] Cannot restore guild ${guildId} from the graveyard: another process took the data files`);
-    return { ok: false, why: 'writer-lost' };
-  }
-  try {
-    await fs.promises.unlink(notePath);
-  } catch (error) {
-    if (errnoOf(error) !== 'ENOENT') {
-      console.error(`[DataManager] Cannot restore guild ${guildId}: the note of graveyard entry ${entry.name} could not be removed:`, error);
-      return { ok: false, why: 'note', code: errnoOf(error) };
-    }
-  }
-  const putNoteBack = async () => {
-    if (note === null) return;
-    try {
-      await fs.promises.writeFile(notePath, note, 'utf-8');
-    } catch (error) {
-      console.warn(`[DataManager] Failed to write back the note of graveyard entry ${entry!.name}:`, error);
-    }
-  };
-
-  const dest = path.join(BASE_DATA_DIR, guildId);
+/** Renames from to to with the retire's retry; before each try, refuse may answer a refusal. */
+async function renameWithRetry(from: string, to: string, refuse: () => FileRestoreOutcome | null, after: () => void, final: (code: string) => boolean = () => false): Promise<{ ok: true } | { ok: false; refused: FileRestoreOutcome } | { ok: false; code: string; error: unknown }> {
   for (let attempt = 0; ; attempt++) {
-    const stop = hooks.stop();
-    if (stop) {
-      await putNoteBack();
-      return { ok: false, why: 'stopped', stop };
-    }
-    if (hooks.writerLost()) {
-      console.error(`[DataManager] Cannot restore guild ${guildId} from the graveyard: another process took the data files`);
-      await putNoteBack();
-      return { ok: false, why: 'writer-lost' };
-    }
+    const refused = refuse();
+    if (refused) return { ok: false, refused };
     try {
-      await fs.promises.rename(entryPath, dest);
-      dropGuildView(guildId);
-      break;
+      await fs.promises.rename(from, to);
+      after();
+      return { ok: true };
     } catch (error) {
-      dropGuildView(guildId);
-      const code = errnoOf(error);
-      if (code === 'ENOENT') return { ok: false, why: 'no-entry' };
-      if (attempt >= 9) {
-        console.error(`[DataManager] Failed to move graveyard entry ${entry.name} back:`, error);
-        await putNoteBack();
-        return { ok: false, why: 'rename', code };
-      }
+      after();
+      if (attempt >= 9 || final(errnoOf(error))) return { ok: false, code: errnoOf(error), error };
       await delay(25 * (attempt + 1));
     }
+  }
+}
+
+/** A drop: the copy renamed to its .sweep- name inside the step; its removal runs after the answer. */
+async function dropCopy(folder: string, guildId: string, x: number, n: number): Promise<void> {
+  const graveyardRoot = path.join(BASE_DATA_DIR, GRAVEYARD_DIR);
+  const aside = path.join(graveyardRoot, droppedName(guildId, x, n));
+  const moved = await renameWithRetry(folder, aside, () => null, () => undefined, code => code === 'ENOENT');
+  if (!moved.ok) {
+    if ('code' in moved && moved.code === 'ENOENT') console.warn(`[DataManager] The restore's copy ${path.basename(folder)} was already removed; nothing to drop`);
+    else if ('error' in moved) console.error(`[DataManager] Cannot drop the restore's copy ${path.basename(folder)} (dropped at the next sweep or boot):`, moved.error);
+    return;
+  }
+  setImmediate(() => {
+    fs.promises.rm(aside, { recursive: true, force: true }).catch(error => {
+      console.warn(`[DataManager] Failed to remove dropped restore copy ${path.basename(aside)} (removed at the next sweep):`, error);
+    });
+  });
+}
+
+async function restoreGuildDir(guildId: string, retiredAt: number | undefined, hooks: FileRestoreHooks): Promise<FileRestoreOutcome> {
+  const graveyardRoot = path.join(BASE_DATA_DIR, GRAVEYARD_DIR);
+  const early = (floor = 0): FileRestoreOutcome | null => {
+    const stop = hooks.stop(floor);
+    if (stop) return { ok: false, why: 'stopped', stop };
+    return hooks.writerLost() ? writerLostAnswer(guildId) : null;
+  };
+
+  // K1: what was accepted before the gate closed is on disk and moves with the folder; an op still queued refuses.
+  if (hooks.replace) {
+    await flushGuild(guildId);
+    if (guildHasQueuedOps(guildId)) {
+      const failing = guildFailingWrite(guildId);
+      console.error(`[DataManager] Cannot replace guild ${guildId}'s data: ${failing ? `${failing.file} keeps failing to save (${failing.code})` : 'a write of it is not saved yet'}; nothing was restored`);
+      return failing ? { ok: false, why: 'failing', file: failing.file, code: failing.code } : { ok: false, why: 'unflushed' };
+    }
+    const k1 = early();
+    if (k1) return k1;
+  }
+
+  // K2: the lookup, the live check, the number, then the stamp of X's note.
+  let x: number | null = null;
+  if (retiredAt !== undefined) {
+    if (fs.existsSync(path.join(graveyardRoot, `${guildId}-${retiredAt}`))) x = retiredAt;
+  } else {
+    const newest = (await listGraveyardEntries(guildId))[0];
+    if (newest) x = newest.retiredAt;
+  }
+  if (x === null) return { ok: false, why: 'no-entry' };
+  const liveNow = guildDirExists(guildId);
+  if (!hooks.replace && (liveNow || guildHasQueuedOps(guildId))) return { ok: false, why: 'live', retiredAt: x };
+  const moving = hooks.replace && liveNow;
+  const n = nextGraveyardName(guildId);
+  const k2 = early();
+  if (k2) return k2;
+
+  const entryPath = path.join(graveyardRoot, `${guildId}-${x}`);
+  const notePath = path.join(entryPath, NOTE_FILE);
+  let fields: GraveyardNote = { guildId, reason: '', ts: x };
+  try {
+    const raw = await fs.promises.readFile(notePath, 'utf-8');
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) fields = parsed as GraveyardNote;
+    } catch { /* a note that does not parse gives a fresh one */ }
+  } catch (error) {
+    if (errnoOf(error) !== 'ENOENT') {
+      console.error(`[DataManager] Cannot restore guild ${guildId}: the note of graveyard entry ${guildId}-${x} could not be read:`, error);
+      return { ok: false, why: 'stamp', x, code: errnoOf(error) };
+    }
+  }
+  const reason = typeof fields.reason === 'string' ? fields.reason : '';
+  const usedAt = Date.now();
+  try {
+    await writeGraveyardNote(entryPath, { ...fields, usedAt });
+  } catch (error) {
+    if (errnoOf(error) === 'ENOENT') return { ok: false, why: 'no-entry' };
+    console.error(`[DataManager] Cannot restore guild ${guildId}: graveyard entry ${guildId}-${x} could not be marked as restored:`, error);
+    return { ok: false, why: 'stamp', x, code: errnoOf(error) };
+  }
+
+  // K3: the copy, every file fsynced, renamed to its .restore- name; the gates are read before each entry.
+  const copyPath = path.join(graveyardRoot, `.copy-${guildId}-${x}-${n}`);
+  const restorePath = path.join(graveyardRoot, `.restore-${guildId}-${x}-${n}`);
+  let copied = 0;
+  const copyCheck = () => {
+    const refused = early(COPY_FLOOR_MS);
+    if (!refused) return;
+    if (!refused.ok && refused.why === 'stopped' && refused.stop === 'out-of-time') throw new CopyRefusal({ ok: false, why: 'copy-deadline', x: x!, copied });
+    throw new CopyRefusal(refused);
+  };
+  let copyAt = copyPath;
+  const failCopy = async (outcome: FileRestoreOutcome): Promise<FileRestoreOutcome> => {
+    await dropCopy(copyAt, guildId, x!, n);
+    return outcome;
+  };
+  try {
+    await fs.promises.cp(entryPath, copyPath, {
+      recursive: true,
+      filter: async (src: string) => {
+        copyCheck();
+        if (path.resolve(src) === path.resolve(entryPath)) return true;
+        const name = path.basename(src);
+        if (name.endsWith('.tmp') || (name === NOTE_FILE && path.resolve(path.dirname(src)) === path.resolve(entryPath))) return false;
+        if ((await fs.promises.lstat(src)).isFile()) copied++;
+        return true;
+      },
+    });
+    await syncCopy(copyPath, copyCheck);
+    copyCheck();
+    await fs.promises.rename(copyPath, restorePath);
+    copyAt = restorePath;
+  } catch (error) {
+    if (error instanceof CopyRefusal) return fs.existsSync(copyPath) || fs.existsSync(restorePath) ? failCopy(error.outcome) : error.outcome;
+    const code = errnoOf(error);
+    if (code !== 'ENOENT') console.error(`[DataManager] Cannot restore guild ${guildId}: graveyard entry ${guildId}-${x} could not be copied:`, error);
+    if (!fs.existsSync(copyPath) && !fs.existsSync(restorePath)) return code === 'ENOENT' ? { ok: false, why: 'no-entry' } : { ok: false, why: 'copy', x, code };
+    return failCopy(code === 'ENOENT' ? { ok: false, why: 'no-entry' } : { ok: false, why: 'copy', x, code });
+  }
+  const copySync = await fsyncDataDirs();
+  if (copySync.failed) {
+    console.error(`[DataManager] Cannot restore guild ${guildId}: the disk did not confirm the sync of ${copySync.dir} (${copySync.code}) after the copy of entry ${guildId}-${x}`);
+    return failCopy({ ok: false, why: 'copy-sync', x, code: copySync.code });
+  }
+
+  // The check before the renames, one synchronous run: the gates, the copy's deadline, the lock file and X.
+  const stop = hooks.stop(COPY_FLOOR_MS);
+  if (stop) return failCopy(stop === 'out-of-time' ? { ok: false, why: 'copy-deadline', x, copied } : { ok: false, why: 'stopped', stop });
+  if (hooks.writerTaken()) return failCopy(writerLostAnswer(guildId));
+  if (!fs.existsSync(entryPath)) return failCopy({ ok: false, why: 'no-entry' });
+  if (!moving) return putPlainCopy(guildId, x, n, reason, usedAt, restorePath, hooks, failCopy);
+
+  const endSection = hooks.enterSection();
+  try {
+    return await replaceInSection(guildId, x, n, reason, usedAt, restorePath, hooks);
+  } finally {
+    endSection();
+  }
+}
+
+/** fsyncs every copied file (opened 'r+': Windows needs write access) and, on POSIX, every folder, best effort. */
+async function syncCopy(dir: string, check: () => void): Promise<void> {
+  for (const entry of await fs.promises.readdir(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      await syncCopy(full, check);
+      continue;
+    }
+    check();
+    const fh = await fs.promises.open(full, 'r+');
+    try {
+      await fh.sync();
+    } finally {
+      await fh.close();
+    }
+  }
+  if (IS_WINDOWS) return;
+  check();
+  try {
+    const dh = await fs.promises.open(dir, 'r');
+    try { await dh.sync(); } finally { await dh.close(); }
+  } catch { /* directory fsync is best-effort */ }
+}
+
+/** K5 of a plain restore: the gates and the lock file read before each try; a refusal or a failure drops the copy. */
+async function putPlainCopy(guildId: string, x: number, n: number, reason: string, usedAt: number, restorePath: string, hooks: FileRestoreHooks, fail: (outcome: FileRestoreOutcome) => Promise<FileRestoreOutcome>): Promise<FileRestoreOutcome> {
+  const live = path.join(BASE_DATA_DIR, guildId);
+  const put = await renameWithRetry(restorePath, live, () => {
+    const stop = hooks.stop();
+    if (stop) return { ok: false, why: 'stopped', stop };
+    return hooks.writerTaken() ? writerLostAnswer(guildId) : null;
+  }, () => dropGuildView(guildId));
+  if (!put.ok) {
+    if ('refused' in put) return fail(put.refused);
+    console.error(`[DataManager] Cannot restore guild ${guildId}: the copy of graveyard entry ${guildId}-${x} could not be put in place:`, put.error);
+    return fail({ ok: false, why: 'put', x, code: put.code });
   }
   hooks.progress.renamed = true;
   const synced = await fsyncDataDirs();
   if (synced.failed) {
     forgetGuildDurableFiles(guildId);
-    console.error(`[DataManager] Guild ${guildId} restored from graveyard entry ${entry.name}, but the disk did not confirm the sync of ${synced.dir} (${synced.code}), so a power cut can put the folder back in the graveyard`);
+    console.error(`[DataManager] Guild ${guildId} restored from graveyard entry ${guildId}-${x}, but the disk did not confirm the sync of ${synced.dir} (${synced.code}), so a power cut can put the folder back in the graveyard`);
   } else {
-    console.warn(`[DataManager] Guild ${guildId} restored from graveyard entry ${entry.name}`);
+    console.warn(`[DataManager] Guild ${guildId} restored from graveyard entry ${guildId}-${x}`);
   }
-  return { ok: true, retiredAt: entry.retiredAt, reason, ...(synced.failed ? { moveUnconfirmed: synced.code } : {}) };
+  return { ok: true, retiredAt: x, reason, usedAt, ...(hooks.replace ? { replaced: null } : {}), ...(synced.failed ? { moveUnconfirmed: synced.code } : {}) };
+}
+
+/** K4 to K6 of a replace, inside its rename section. After K4's rename nothing reads the gates or the deadline. */
+async function replaceInSection(guildId: string, x: number, n: number, reason: string, usedAt: number, restorePath: string, hooks: FileRestoreHooks): Promise<FileRestoreOutcome> {
+  const graveyardRoot = path.join(BASE_DATA_DIR, GRAVEYARD_DIR);
+  const live = path.join(BASE_DATA_DIR, guildId);
+  const rPath = path.join(graveyardRoot, `${guildId}-${n}`);
+
+  // K4: the live folder becomes entry R.
+  const moved = await renameWithRetry(live, rPath, () => {
+    const stop = hooks.stop();
+    if (stop) return { ok: false, why: 'stopped', stop };
+    return hooks.writerTaken() ? writerLostAnswer(guildId) : null;
+  }, () => dropGuildView(guildId));
+  if (!moved.ok) {
+    await dropCopy(restorePath, guildId, x, n);
+    if ('refused' in moved) return moved.refused;
+    console.error(`[DataManager] Cannot replace guild ${guildId}'s data: its folder could not be moved to the graveyard:`, moved.error);
+    return { ok: false, why: 'move', x, code: moved.code };
+  }
+  hooks.progress.moved = { r: n, x };
+  let unconfirmed: string | null = null;
+  const k4Sync = await fsyncDataDirs();
+  if (k4Sync.failed) unconfirmed = k4Sync.code;
+
+  // K5: the copy into place, with no read; on failure the undo.
+  let putCode: string | null = null;
+  try {
+    const put = await renameWithRetry(restorePath, live, () => null, () => dropGuildView(guildId));
+    if (!put.ok) {
+      putCode = 'code' in put ? put.code : 'EIO';
+      console.error(`[DataManager] The copy of graveyard entry ${guildId}-${x} could not be put in place for guild ${guildId}:`, 'error' in put ? put.error : put);
+    }
+  } catch (error) {
+    putCode = errnoOf(error);
+    console.error(`[DataManager] The copy of graveyard entry ${guildId}-${x} could not be put in place for guild ${guildId}:`, error);
+  }
+  if (putCode !== null) return undoReplace(guildId, x, n, putCode, restorePath, hooks);
+  hooks.progress.renamed = true;
+
+  // K6: R's note, unless another process took the data files.
+  let noteWritten = false;
+  if (hooks.writerTaken()) {
+    console.error(`[DataManager] Graveyard entry ${guildId}-${n} holds guild ${guildId}'s data from before the replace; its note was not written: another process took the data files`);
+  } else {
+    try {
+      await writeGraveyardNote(rPath, { guildId, reason: `replaced-by-restore-${x}`, ts: Date.now() });
+      noteWritten = true;
+    } catch (error) {
+      console.error(`[DataManager] Graveyard entry ${guildId}-${n} holds guild ${guildId}'s data from before the replace; its note could not be written, so it is listed with an empty reason:`, error);
+    }
+  }
+  const k6Sync = await fsyncDataDirs();
+  if (k6Sync.failed && unconfirmed === null) unconfirmed = k6Sync.code;
+  if (unconfirmed !== null) {
+    forgetGuildDurableFiles(guildId);
+    console.error(`[DataManager] Guild ${guildId}'s data was replaced with a copy of graveyard entry ${guildId}-${x}, but the disk did not confirm a folder sync (${unconfirmed}), so a power cut can undo the replace`);
+  } else {
+    console.warn(`[DataManager] Guild ${guildId}'s data was replaced with a copy of graveyard entry ${guildId}-${x}; its data from before is entry ${guildId}-${n}`);
+  }
+  return {
+    ok: true, retiredAt: x, reason, usedAt,
+    replaced: noteWritten ? { retiredAt: n, reason: `replaced-by-restore-${x}` } : { retiredAt: n },
+    ...(unconfirmed === null ? {} : { moveUnconfirmed: unconfirmed }),
+  };
+}
+
+/** The undo: entry R renamed back with fs.renameSync, the lock file read before each try and right after the rename. */
+async function undoReplace(guildId: string, x: number, n: number, code: string, restorePath: string, hooks: FileRestoreHooks): Promise<FileRestoreOutcome> {
+  const live = path.join(BASE_DATA_DIR, guildId);
+  const rPath = path.join(BASE_DATA_DIR, GRAVEYARD_DIR, `${guildId}-${n}`);
+  for (let attempt = 0; ; attempt++) {
+    if (hooks.writerTaken()) {
+      console.error(`[DataManager] Guild ${guildId}: another process took the data files after the server's data moved to graveyard entry ${guildId}-${n}; the copy of entry ${x} stays under _graveyard/.restore-${guildId}-${x}-${n} for the next bot start to finish or drop`);
+      return { ok: false, why: 'half-taken', x, r: n, code };
+    }
+    let takenAfter: boolean;
+    try {
+      fs.renameSync(rPath, live);
+      takenAfter = hooks.writerTaken();
+    } catch (error) {
+      dropGuildView(guildId);
+      if (attempt >= 9) {
+        console.error(`[DataManager] Guild ${guildId}: its data could not be moved back from graveyard entry ${guildId}-${n}; entries ${n} and ${x} are both listed:`, error);
+        await dropCopy(restorePath, guildId, x, n);
+        return { ok: false, why: 'half', x, r: n, code, undoCode: errnoOf(error) };
+      }
+      await delay(25 * (attempt + 1));
+      continue;
+    }
+    dropGuildView(guildId);
+    const synced = await fsyncDataDirs();
+    const syncCode = synced.failed ? { syncCode: synced.code } : {};
+    if (takenAfter) {
+      console.error(`[DataManager] Guild ${guildId}: the server's data moved back from graveyard entry ${guildId}-${n} while another process took the data files; a save of that process may have replaced one of its files`);
+      return { ok: false, why: 'undone-taken', x, r: n, code, ...syncCode };
+    }
+    await dropCopy(restorePath, guildId, x, n);
+    return { ok: false, why: 'undone', x, r: n, code, ...syncCode };
+  }
+}
+
+/** A note's numeric usedAt, or null when it has none; throws a code when the note cannot be read or parsed. */
+function noteUsedAt(entryDir: string): number | null {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(path.join(entryDir, NOTE_FILE), 'utf-8');
+  } catch (error) {
+    if (errnoOf(error) === 'ENOENT') return null;
+    throw new Error(errnoOf(error));
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error('parse');
+  }
+  const usedAt = (parsed as { usedAt?: unknown } | null)?.usedAt;
+  return typeof usedAt === 'number' && Number.isFinite(usedAt) ? usedAt : null;
 }
 
 /**
- * Delete graveyard entries older than the TTL (default 14 days). An expired entry is renamed out of the listed names
- * (.sweep-<name>) before anything in it is removed, so a failed removal never leaves a partial entry a restore finds;
- * every .sweep- folder is removed at the next run. skip: a guild whose restore runs keeps its entries.
+ * Removes graveyard entries whose delete and newest restore are both older than the TTL (default 14 days). Each name
+ * is decided and renamed in one synchronous run: an expired entry to .sweep-<name>, a restore folder that decision
+ * 10's rule drops to its .sweep- name; then every .sweep- folder is removed. skip: a guild whose restore runs keeps
+ * its entries and folders.
  */
 export async function sweepGraveyard(skip: (guildId: string) => boolean = () => false): Promise<void> {
   const graveyardRoot = path.join(BASE_DATA_DIR, GRAVEYARD_DIR);
@@ -1338,38 +1765,62 @@ export async function sweepGraveyard(skip: (guildId: string) => boolean = () => 
   const ttlDays = Number(process.env.GRAVEYARD_TTL_DAYS);
   const ttlMs = (Number.isFinite(ttlDays) && ttlDays > 0 ? ttlDays : 14) * 24 * 60 * 60 * 1000;
   const cutoff = Date.now() - ttlMs;
-  const remove = async (name: string) => {
+  const toRemove: Array<{ aside: string; entry: string | null }> = [];
+  const renameAside = (name: string, aside: string, what: string): boolean => {
     try {
-      await fs.promises.rm(path.join(graveyardRoot, name), { recursive: true, force: true });
+      fs.renameSync(path.join(graveyardRoot, name), path.join(graveyardRoot, aside));
       return true;
     } catch (error) {
-      console.warn(`[DataManager] Failed to remove swept graveyard folder ${name} (removed at the next sweep):`, error);
+      console.warn(`[DataManager] Failed to sweep graveyard ${what} ${name} (tried again at the next sweep):`, error);
       return false;
     }
   };
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
-    if (entry.name.startsWith(SWEEP_PREFIX)) {
-      await remove(entry.name);
+    const name = entry.name;
+    if (name.startsWith(SWEEP_PREFIX)) {
+      toRemove.push({ aside: name, entry: null });
       continue;
     }
-    const full = path.join(graveyardRoot, entry.name);
-    // Timestamp is the trailing -{ms} suffix; fall back to mtime if absent.
-    const dashIdx = entry.name.lastIndexOf('-');
-    let ts = dashIdx >= 0 ? Number(entry.name.slice(dashIdx + 1)) : NaN;
+    if (name.startsWith('.')) {
+      const m = RESTORE_FOLDER.exec(name);
+      if (!m || skip(m[2])) continue;
+      let rule: ReturnType<typeof restoreFolderRule>;
+      try {
+        rule = restoreFolderRule(name);
+      } catch {
+        continue;
+      }
+      if (!rule || rule.action !== 'drop') continue;
+      const aside = droppedName(rule.guildId, rule.x, rule.n);
+      if (renameAside(name, aside, 'folder')) toRemove.push({ aside, entry: null });
+      continue;
+    }
+    const dashIdx = name.lastIndexOf('-');
+    let ts = dashIdx >= 0 ? Number(name.slice(dashIdx + 1)) : NaN;
     if (!Number.isFinite(ts)) {
-      try { ts = (await fs.promises.stat(full)).mtimeMs; } catch { continue; }
+      try { ts = fs.statSync(path.join(graveyardRoot, name)).mtimeMs; } catch { continue; }
     }
     if (ts >= cutoff) continue;
-    if (dashIdx > 0 && skip(entry.name.slice(0, dashIdx))) continue;
-    const aside = `${SWEEP_PREFIX}${entry.name}`;
+    if (dashIdx > 0 && skip(name.slice(0, dashIdx))) continue;
+    let usedAt: number | null;
     try {
-      await fs.promises.rename(full, path.join(graveyardRoot, aside));
+      usedAt = noteUsedAt(path.join(graveyardRoot, name));
     } catch (error) {
-      console.warn(`[DataManager] Failed to sweep graveyard entry ${entry.name} (tried again at the next sweep):`, error);
+      console.warn(`[DataManager] Graveyard entry ${name} kept: its note could not be read (${(error as Error).message})`);
       continue;
     }
-    if (await remove(aside)) console.log(`[DataManager] Swept expired graveyard entry: ${entry.name}`);
+    if (usedAt !== null && usedAt >= cutoff) continue;
+    const aside = `${SWEEP_PREFIX}${name}`;
+    if (renameAside(name, aside, 'entry')) toRemove.push({ aside, entry: name });
+  }
+  for (const { aside, entry } of toRemove) {
+    try {
+      await fs.promises.rm(path.join(graveyardRoot, aside), { recursive: true, force: true });
+      if (entry) console.log(`[DataManager] Swept expired graveyard entry: ${entry}`);
+    } catch (error) {
+      console.warn(`[DataManager] Failed to remove swept graveyard folder ${aside} (removed at the next sweep):`, error);
+    }
   }
 }
 

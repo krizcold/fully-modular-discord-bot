@@ -12,6 +12,7 @@ import { flagStr, flagInt } from './args';
 import { waitForEvent, pollUntil } from './waiter';
 import { DATA_ROOT } from '../utils/dataRoot';
 import { bundleRefusal, importBundle, readBundle, writeBundle } from '../bot/internalSetup/utils/dataInterchange';
+import { restoreNoAnswerEnding } from '../bot/internalSetup/utils/dataManager';
 
 interface Ctx {
   client: Client;
@@ -20,7 +21,37 @@ interface Ctx {
 }
 
 const DEFAULT_WAIT_MS = 120_000;
-const RESTORE_MINUTE = "Within a minute, if it was restored, the server's data is back and its entry is gone from `smdb graveyard list`; if not, the entry is still listed, unless it had passed the graveyard's keep time and the graveyard sweep removed it, data and all. The list reads the data of the bot behind the web panel it asks; if the main database was replaced meanwhile, check once that bot runs on the new main.";
+const RESTORE_LIST_MS = 10_000;
+/** The route answers a restore by its plan's deadline, 90 s after the plan starts; 10 s cover the rest. */
+const RESTORE_POST_MS = 100_000;
+
+/** A restore's ok lines on stdout, then its warning on stderr. */
+function printRestored(guildId: string, b: unknown): void {
+  const answer = b as {
+    success?: unknown; retiredAt?: unknown; reason?: unknown; copied?: unknown; keptUntil?: unknown; warning?: unknown;
+    replaced?: { retiredAt?: unknown; moved?: unknown; reason?: unknown } | null;
+  };
+  if (answer?.success !== true || typeof answer.retiredAt !== 'number') return;
+  const x = answer.retiredAt;
+  const iso = (ms: number) => new Date(ms).toISOString();
+  const kept = typeof answer.keptUntil === 'number' ? answer.keptUntil : null;
+  const copied = typeof answer.copied === 'number' ? `; ${answer.copied} row(s) copied` : '';
+  const until = kept === null ? '' : `; entry ${x} stays in the graveyard until ${iso(kept)}`;
+  process.stdout.write(`restored server ${guildId} from the entry deleted at ${iso(x)} (retiredAt ${x}, reason ${String(answer.reason ?? '')})${copied}${until}\n`);
+  const replaced = answer.replaced;
+  if (replaced === null) {
+    process.stdout.write('the server had no data, so nothing was moved to the graveyard\n');
+  } else if (replaced && typeof replaced.retiredAt === 'number') {
+    const r = replaced.retiredAt;
+    const reason = typeof replaced.reason === 'string' ? `reason ${replaced.reason}` : 'listed with an empty reason: its note could not be written; see the bot log';
+    const rows = typeof replaced.moved === 'number' ? `, ${replaced.moved} row(s)` : '';
+    process.stdout.write(`the data it replaced is entry ${r} (deleted at ${iso(r)}, ${reason}${rows}); to put it back, run: smdb graveyard restore ${guildId} ${r} --replace\n`);
+  }
+  if (kept !== null) {
+    process.stdout.write(`A module that kept this server's data in memory from before the restore may save it again over the restored data; until ${iso(kept)}, run: smdb graveyard restore ${guildId} ${x} --replace to put the restored version back (what the module saved moves to a new entry).\n`);
+  }
+  if (typeof answer.warning === 'string') process.stderr.write(`smdb: warning: ${answer.warning}\n`);
+}
 
 function need(ctx: Ctx, idx: number, label: string): string {
   const v = ctx.args[idx];
@@ -199,27 +230,40 @@ const HANDLERS: Record<string, Handler> = {
     ),
   'graveyard restore': async (c) => {
     const guildId = need(c, 0, 'guildId');
+    if (!/^\d+$/.test(guildId)) fail('Invalid guild ID format', EXIT_USAGE);
     const raw = flagStr(c.flags, 'retired-at') ?? c.args[1];
     const body: Record<string, unknown> = { guildId };
+    let retiredAt: number | undefined;
     if (raw !== undefined) {
-      const retiredAt = /^\d+$/.test(raw) ? Number(raw) : NaN;
+      retiredAt = /^\d+$/.test(raw) ? Number(raw) : NaN;
       if (!Number.isSafeInteger(retiredAt)) fail('retiredAt must be a whole number of milliseconds', EXIT_USAGE);
       body.retiredAt = retiredAt;
     }
+    if (c.flags.replace !== undefined && c.flags.replace !== true) fail('replace must be true or false', EXIT_USAGE);
+    const replace = c.flags.replace === true;
+    if (replace) body.replace = true;
+    // N, the guild's newest entry before the request: the cut answer names what a replace would add after it.
+    let n: number | undefined;
+    try {
+      const list = await c.client.request('GET', `/api/data/graveyard${qs({ guildId })}`, { timeoutMs: RESTORE_LIST_MS });
+      const listed = list.body as { success?: unknown; entries?: Array<{ guildId?: unknown; retiredAt?: unknown }>; error?: unknown } | null;
+      if (!list.ok || listed?.success !== true || !Array.isArray(listed.entries)) {
+        throw new Error(typeof listed?.error === 'string' ? listed.error : `HTTP ${list.status}`);
+      }
+      for (const entry of listed.entries) {
+        if (entry.guildId === guildId && typeof entry.retiredAt === 'number' && (n === undefined || entry.retiredAt > n)) n = entry.retiredAt;
+      }
+    } catch (error) {
+      fail(`the graveyard list could not be read (${error instanceof Error ? error.message : String(error)}); nothing was restored; try again in a moment`, EXIT_ERR);
+    }
     let res: CliResponse;
     try {
-      res = await c.client.request('POST', '/api/data/graveyard/restore', { body });
+      res = await c.client.request('POST', '/api/data/graveyard/restore', { body, timeoutMs: RESTORE_POST_MS });
     } catch {
       // No whole answer: the restore may have run.
-      fail(`can't confirm whether server ${guildId} was restored: the web UI did not answer. ${RESTORE_MINUTE}`, EXIT_ERR);
+      fail(`can't confirm whether server ${guildId} was restored: the web UI did not answer. ${restoreNoAnswerEnding(guildId, retiredAt ?? n, n, replace)}`, EXIT_ERR);
     }
-    emit(res, c.flags, (b) => {
-      const answer = b as { success?: unknown; retiredAt?: unknown; reason?: unknown; moved?: unknown };
-      if (answer?.success !== true || typeof answer.retiredAt !== 'number') return;
-      process.stdout.write(`restored server ${guildId} from the entry deleted at ${new Date(answer.retiredAt).toISOString()} (retiredAt ${answer.retiredAt}, reason ${String(answer.reason ?? '')})\n`);
-      if (typeof answer.moved === 'number') process.stdout.write(`${answer.moved} row(s) moved\n`);
-      if (typeof (answer as { warning?: unknown }).warning === 'string') process.stderr.write(`smdb: warning: ${(answer as { warning: string }).warning}\n`);
-    });
+    emit(res, c.flags, (b) => printRestored(guildId, b));
   },
 
   // --- misc + cross-cutting ---

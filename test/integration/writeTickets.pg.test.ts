@@ -204,7 +204,7 @@ describe('the claim fence on a real Postgres', () => {
       expect((await other.hydrateGuild(guildId, tokenOf(2, 'node-b'))).ok).toBe(true);
       expect(await other.flushGuild(guildId, batchOf('{"from":"b"}'), tokenOf(2, 'node-b'))).toEqual({ ok: true });
       expect(await other.listGuilds()).toContain(guildId);
-      await other.sweepGraveyard(Date.now() + 86_400_000);
+      await other.sweepGraveyard(-86_400_000);
       expect(await ownerRow(guildId)).toEqual({ node_id: 'node-b', claim: '2' });
       expect(await backend.flushGuild(guildId, batchOf('{"from":"a"}'), tokenOf(1))).toMatchObject({ ok: false, reason: 'deposed' });
       expect(await stored(guildId, 'x.json')).toBe('{"from":"b"}');

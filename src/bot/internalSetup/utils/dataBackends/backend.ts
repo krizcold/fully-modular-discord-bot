@@ -83,15 +83,25 @@ export type RetireOutcome =
   | { ok: true; moved: number; retiredAt: number }
   | { ok: false; reason: 'unknown'; retiredAt: number; moved: number; afterLatch?: true; late?: LateCommit }
   | { ok: false; reason: 'latched' | 'held'; detail: string }
-  | { ok: false; reason: 'deposed' | 'unavailable' | 'out-of-time' | 'refused' | 'no-claim'; detail?: string; timedOut?: boolean };
+  | { ok: false; reason: 'deposed' | 'unavailable' | 'out-of-time' | 'refused' | 'no-claim' | 'incomplete'; detail?: string; timedOut?: boolean };
 
+/** The batch a replace's move-out made of the server's rows: null when the server had no rows, so no batch exists. */
+export type ReplacedBatch = { retiredAt: number; moved: number; reason: string } | null;
+
+/**
+ * A restore copies batch retiredAt into the live rows and keeps it; usedAt is the stamp the copy-in wrote on it.
+ * replaced is set only for a replace. 'changed': rows of the guild were live after the move-out. 'incomplete': a
+ * statement put fewer rows than it took. 'unknown' carries replaced when the move-out had answered.
+ */
 export type RestoreOutcome =
-  | { ok: true; moved: number; retiredAt: number; reason: string }
+  | { ok: true; copied: number; retiredAt: number; reason: string; usedAt: number; replaced?: ReplacedBatch }
   | { ok: false; reason: 'deposed'; currentOwner?: GuildOwner }
+  | { ok: false; reason: 'changed' }
+  | { ok: false; reason: 'incomplete'; step: 'move-out' | 'copy-in'; taken: number; put: number }
   | { ok: false; reason: 'refused'; detail: string; code?: string }
   | { ok: false; reason: 'live-rows'; retiredAt: number }
   | { ok: false; reason: 'latched' | 'held'; detail: string }
-  | { ok: false; reason: 'no-entry' | 'schema-mismatch' | 'not-provisioned' | 'no-claim' | 'maintenance' | 'node-stopping' | 'out-of-time' | 'unavailable' | 'unknown'; detail?: string; retiredAt?: number; timedOut?: boolean; afterLatch?: true; late?: LateCommit };
+  | { ok: false; reason: 'no-entry' | 'schema-mismatch' | 'not-provisioned' | 'no-claim' | 'maintenance' | 'node-stopping' | 'out-of-time' | 'unavailable' | 'unknown'; detail?: string; retiredAt?: number; timedOut?: boolean; afterLatch?: true; late?: LateCommit; replaced?: ReplacedBatch };
 
 export interface DataBackend {
   readonly kind: 'file' | 'postgres';
@@ -118,8 +128,11 @@ export interface DataBackend {
   resolveFlush(guildId: string, flushId: string, sentClaim: number, token: FenceToken): Promise<FlushFate>;
   /** deadline: a process.hrtime.bigint() reading; no statement is sent past it. */
   retireGuild(guildId: string, reason: string, token: FenceToken, deadline?: bigint | null): Promise<RetireOutcome>;
-  /** retiredAt null: the guild's newest batch. beforeCommit is read after the move, just before COMMIT. */
-  restoreGuild(guildId: string, retiredAt: number | null, token: FenceToken, beforeCommit: () => RestoreStop | null, deadline: bigint): Promise<RestoreOutcome>;
+  /**
+   * retiredAt null: the guild's newest batch. beforeCommit is read after the copy-in, just before COMMIT. replace: the
+   * guild's live rows move to a new batch first, in the same transaction.
+   */
+  restoreGuild(guildId: string, retiredAt: number | null, token: FenceToken, beforeCommit: () => RestoreStop | null, deadline: bigint, replace?: boolean): Promise<RestoreOutcome>;
   loadDoc(guildId: string, key: DocKey): Promise<string | null>;
   /** Catalog-wide listing; tooling/webui only (the sync facade answers the owned set). */
   listGuilds(): Promise<string[]>;

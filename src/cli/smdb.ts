@@ -31,7 +31,7 @@ Usage:     usage global | usage guilds | usage guild <guildId>
 Fleet:     fleet state
 Data:      bundle export <guildId> <file> | bundle import <file>
            data migrate --to postgres|file   (bot stopped; exits 0 only when the migration is done)
-           graveyard list | graveyard restore <guildId> [retiredAt | --retired-at MS]
+           graveyard list | graveyard restore <guildId> [retiredAt | --retired-at MS] [--replace]
 Raw:       api <METHOD> <path> [--body JSON] | events [--filter PREFIX] [--timeout S]
            wait --get <path> --until <expr> [--interval MS] [--timeout S] | health
 

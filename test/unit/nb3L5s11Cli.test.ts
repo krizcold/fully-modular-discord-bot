@@ -40,6 +40,8 @@ function fakeClient(body: unknown = { success: true }) {
   const client = {
     request: async (method: string, path: string, opts?: unknown) => {
       calls.push({ method, path, opts });
+      // The restore verb's read of the guild's entries before its POST: these rows hold none.
+      if (method === 'GET' && path.startsWith('/api/data/graveyard?guildId=')) return { status: 200, ok: true, body: { success: true, entries: [] } };
       return { status: 200, ok: true, body };
     },
     openWs: (cb: (msg: { type: string; data: unknown }) => void) => {
@@ -113,25 +115,25 @@ describe('graveyard restore', () => {
   const restoreCall = (r: { calls: Call[] }) => r.calls.map(c => [c.method, c.path, c.opts]);
 
   it('without a retiredAt sends only the guild id', async () => {
-    const r = await run(['graveyard', 'restore', 'g1']);
+    const r = await run(['graveyard', 'restore', '111']);
     expect(r.code).toBe(0);
-    expect(restoreCall(r)).toEqual([['POST', '/api/data/graveyard/restore', { body: { guildId: 'g1' } }]]);
+    expect(restoreCall(r)).toEqual([['GET', `/api/data/graveyard?guildId=111`, { timeoutMs: 10_000 }], ['POST', '/api/data/graveyard/restore', { body: { guildId: '111' }, timeoutMs: 100_000 }]]);
   });
 
   it('takes the retiredAt from the second argument', async () => {
-    const r = await run(['graveyard', 'restore', 'g1', '1700']);
+    const r = await run(['graveyard', 'restore', '111', '1700']);
     expect(r.code).toBe(0);
-    expect(restoreCall(r)).toEqual([['POST', '/api/data/graveyard/restore', { body: { guildId: 'g1', retiredAt: 1700 } }]]);
+    expect(restoreCall(r)).toEqual([['GET', `/api/data/graveyard?guildId=111`, { timeoutMs: 10_000 }], ['POST', '/api/data/graveyard/restore', { body: { guildId: '111', retiredAt: 1700 }, timeoutMs: 100_000 }]]);
   });
 
   it('takes the retiredAt from --retired-at alone', async () => {
-    const r = await run(['graveyard', 'restore', 'g1'], { json: true, 'retired-at': '42' });
+    const r = await run(['graveyard', 'restore', '111'], { json: true, 'retired-at': '42' });
     expect(r.code).toBe(0);
-    expect(restoreCall(r)).toEqual([['POST', '/api/data/graveyard/restore', { body: { guildId: 'g1', retiredAt: 42 } }]]);
+    expect(restoreCall(r)).toEqual([['GET', `/api/data/graveyard?guildId=111`, { timeoutMs: 10_000 }], ['POST', '/api/data/graveyard/restore', { body: { guildId: '111', retiredAt: 42 }, timeoutMs: 100_000 }]]);
   });
 
   it('refuses a retiredAt that is not a number and sends nothing', async () => {
-    const r = await run(['graveyard', 'restore', 'g1', 'abc']);
+    const r = await run(['graveyard', 'restore', '111', 'abc']);
     expect(r.code).toBe(2);
     expect(r.stderr).toBe('smdb: retiredAt must be a whole number of milliseconds\n');
     expect(r.calls).toEqual([]);

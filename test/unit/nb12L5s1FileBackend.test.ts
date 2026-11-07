@@ -205,7 +205,7 @@ describe('when the bot drops its view of a guild', () => {
     vi.spyOn(console, 'warn').mockImplementation((...args: unknown[]) => {
       if (String(args[0]).includes(`Guild ${g} restored from graveyard entry`)) seen = guildKeyStored(g, 'x.json');
     });
-    expect(await restoreGuildDirFromGraveyard(g, undefined, { stop: () => null, writerLost: () => false, progress: { renamed: false } }))
+    expect(await restoreGuildDirFromGraveyard(g, undefined, { stop: () => null, writerLost: () => false, writerTaken: () => false, replace: false, enterSection: () => () => undefined, progress: { renamed: false, moved: null } }))
       .toMatchObject({ ok: true, reason: 'test' });
     expect(seen).toBe(false);
     expect(guildKeyStored(g, 'r.json')).toBe(true);

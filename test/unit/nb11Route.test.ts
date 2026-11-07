@@ -31,10 +31,10 @@ import { answering, exitChild, freshWriterLock, quiet, resetForks, sentTo, start
 // web UI's wait and stamp for a restore and a delete, and the delete's texts through config.ts.
 
 const G = '123456789012345678';
-const MINUTE = "Within a minute, if it was restored, the server's data is back and its entry is gone from `smdb graveyard list`; if not, the entry is still listed, unless it had passed the graveyard's keep time and the graveyard sweep removed it, data and all. The list reads the data of the bot behind the web panel it asks; if the main database was replaced meanwhile, check once that bot runs on the new main.";
+const MINUTE = `The outcome is fixed within a minute. The entry it restored, if any, stays listed either way, unless it had passed the graveyard's keep time (GRAVEYARD_TTL_DAYS, 14 days by default) and the graveyard sweep removed it, data and all. Running smdb graveyard restore ${G} <its retiredAt> --replace is then safe: it copies that entry in and moves whatever the server holds into a new entry, so nothing is lost. The list reads the data of the bot behind the web panel it asks; if the main database was replaced meanwhile, check once that bot runs on the new main.`;
 const DELETE_MINUTE = "Within a minute, `smdb graveyard list` lists a new entry for this server if it was deleted (on a database, an entry with the reason webui-operator-delete); if no such entry is listed by then, it was not. The list reads the data of the bot behind the web panel it asks; if the main database was replaced meanwhile, check once that bot runs on the new main.";
-const liveText = (r: number) => `live guild data exists; nothing was restored. To restore entry ${r}, delete this server's data, then restore with retiredAt ${r} before the bot saves anything new for the server; data it saves in between blocks the restore again. While the server's members are active, remove the bot from the server first and add it back after the restore.`;
-const unknownText = (r: number) => `can't confirm whether server ${G} was restored: the database did not confirm the commit. Within a minute, if it was restored, the server's data is back and entry ${r} is gone from \`smdb graveyard list\`; if not, the entry is still listed, unless it had passed the graveyard's keep time (GRAVEYARD_TTL_DAYS, 14 days by default) and the graveyard sweep removed it, data and all. The list reads the data of the bot behind the web panel it asks; if the main database was replaced meanwhile, check once that bot runs on the new main.`;
+const liveText = (r: number) => `server ${G} has data saved since entry ${r} was deleted; nothing was restored. To put entry ${r} in place and move the current data to the graveyard as a new entry, run: smdb graveyard restore ${G} ${r} --replace`;
+const unknownText = (r: number) => `can't confirm whether server ${G} was restored: the database did not confirm the commit; the outcome is fixed within a minute. Entry ${r} stays listed either way, unless it had passed the graveyard's keep time (GRAVEYARD_TTL_DAYS, 14 days by default) and the graveyard sweep removed it, data and all. Running smdb graveyard restore ${G} ${r} --replace is then safe: it copies entry ${r} in and moves whatever the server holds into a new entry, so nothing is lost. The list reads the data of the bot behind the web panel it asks; if the main database was replaced meanwhile, check once that bot runs on the new main.`;
 const WHOLE_MS = 'retiredAt must be a whole number of milliseconds';
 
 beforeEach(async () => {
@@ -56,8 +56,8 @@ function graveyardApp(reply: (req: any) => unknown) {
 
 describe('the restore route', () => {
   it.each([
-    ['ok', { ok: true, retiredAt: 5, reason: 'webui-operator-delete', moved: 3 }, 200, { success: true, retiredAt: 5, reason: 'webui-operator-delete', moved: 3 }],
-    ['live data', { ok: false, code: 'invalid', error: liveText(5) }, 409, { success: false, error: liveText(5) }],
+    ['ok', { ok: true, retiredAt: 5, reason: 'webui-operator-delete', copied: 3 }, 200, { success: true, retiredAt: 5, reason: 'webui-operator-delete', copied: 3 }],
+    ['live data', { ok: false, code: 'invalid', refusal: 'live-data', retiredAt: 5, error: liveText(5) }, 409, { success: false, refusal: 'live-data', retiredAt: 5, error: liveText(5) }],
     ['not loaded', { ok: false, code: 'backend-unavailable', error: "this server's data is not loaded in this bot process; nothing was restored; try again in a moment" }, 503, { success: false, error: "this server's data is not loaded in this bot process; nothing was restored; try again in a moment" }],
     ['unknown', { ok: false, code: 'backend-unavailable', error: unknownText(5) }, 503, { success: false, error: unknownText(5) }],
     ['deposed', { ok: false, code: 'not-owner', error: "another bot process now serves this server's data; nothing was restored" }, 503, { success: false, error: "another bot process now serves this server's data; nothing was restored" }],
@@ -145,7 +145,12 @@ describe('the CLI verb', () => {
   });
 
   it('a cut answer prints the can\'t confirm text and exits with the failure code', async () => {
-    const { client, close } = await server((_req, res) => {
+    const { client, close } = await server((req, res) => {
+      if (req.method === 'GET') {
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ success: true, entries: [] }));
+        return;
+      }
       res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': '100' });
       res.write('{"success":');
       setTimeout(() => res.socket?.destroy(), 10);
@@ -159,10 +164,14 @@ describe('the CLI verb', () => {
     }
   });
 
-  it('an ok answer prints the restored entry and the rows moved', async () => {
-    const { client, close } = await server((_req, res) => {
+  it('an ok answer prints the restored entry and the rows copied', async () => {
+    const { client, close } = await server((req, res) => {
       res.setHeader('Content-Type', 'application/json');
-      res.end(JSON.stringify({ success: true, retiredAt: 5000, reason: 'webui-operator-delete', moved: 3 }));
+      if (req.method === 'GET') {
+        res.end(JSON.stringify({ success: true, entries: [{ guildId: G, retiredAt: 5000, reason: 'webui-operator-delete', rows: 3, backend: 'postgres' }] }));
+        return;
+      }
+      res.end(JSON.stringify({ success: true, retiredAt: 5000, reason: 'webui-operator-delete', keptUntil: 6000, copied: 3 }));
     });
     const tty = process.stdout.isTTY;
     (process.stdout as any).isTTY = true;
@@ -170,7 +179,7 @@ describe('the CLI verb', () => {
       await dispatch(client, ['graveyard', 'restore', G], {}).catch(() => undefined);
       expect(exits).toEqual([0]);
       expect(stdout.join('')).toContain(`restored server ${G} from the entry deleted at ${new Date(5000).toISOString()} (retiredAt 5000, reason webui-operator-delete)`);
-      expect(stdout.join('')).toContain('3 row(s) moved');
+      expect(stdout.join('')).toContain('; 3 row(s) copied; entry 5000 stays in the graveyard until');
     } finally {
       (process.stdout as any).isTTY = tty;
       await close();

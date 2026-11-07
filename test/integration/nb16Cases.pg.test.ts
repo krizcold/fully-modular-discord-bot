@@ -86,7 +86,7 @@ describe('decision 5: no version row, relations present', () => {
       'CREATE SCHEMA smdb_data',
       `CREATE TABLE smdb_data.guild_data_graveyard (
         guild_id text NOT NULL, module text NOT NULL, filename text NOT NULL,
-        kind text NOT NULL CHECK (kind IN ('doc','append')), doc text NOT NULL, retired_at bigint NOT NULL, reason text,
+        kind text NOT NULL CHECK (kind IN ('doc','append')), doc text NOT NULL, retired_at bigint NOT NULL, reason text, used_at bigint,
         PRIMARY KEY (guild_id, retired_at, module, filename))`,
       'CREATE INDEX IF NOT EXISTS guild_graveyard_ttl_idx ON smdb_data.guild_data_graveyard (retired_at)'));
     expect(run.verdict).toEqual({
@@ -703,7 +703,7 @@ describe("item 7: the BUILD.md row's own case through the full boot path", () =>
       'CREATE SCHEMA smdb_data',
       `CREATE TABLE smdb_data.guild_data_graveyard (
         guild_id text NOT NULL, module text NOT NULL, filename text NOT NULL,
-        kind text NOT NULL CHECK (kind IN ('doc','append')), doc text NOT NULL, retired_at bigint NOT NULL, reason text,
+        kind text NOT NULL CHECK (kind IN ('doc','append')), doc text NOT NULL, retired_at bigint NOT NULL, reason text, used_at bigint,
         PRIMARY KEY (guild_id, retired_at, module, filename))`,
       'CREATE INDEX IF NOT EXISTS guild_graveyard_ttl_idx ON smdb_data.guild_data_graveyard (retired_at)');
     wipeRoot();

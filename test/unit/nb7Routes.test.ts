@@ -10,6 +10,20 @@ import { dataPath } from '../../src/utils/dataRoot';
 import { BACKUPS, FakeChild, backupNames, botFor, call, put, readJson, resetData, startApp } from '../helpers/configRig';
 import { GUILD, heldRow, isInsert, nb7Rig, resetNb7, type Rig } from '../helpers/nb7Rig';
 
+// The restore route reads the guild's newest graveyard entry through the reader before it sends (NB14 decision 13); the
+// rig scripts the request database only, so the reader answers that this guild has no entry.
+vi.mock('../../src/webui/utils/webuiDataReader', async orig => {
+  const actual = await orig<typeof import('../../src/webui/utils/webuiDataReader')>();
+  let reader: ReturnType<typeof actual.getWebuiDataReader> | null = null;
+  return {
+    ...actual,
+    getWebuiDataReader: () => {
+      reader ??= Object.assign(Object.create(actual.getWebuiDataReader()), { listGuildGraveyard: async () => [] });
+      return reader!;
+    },
+  };
+});
+
 // NB7 test 10: the five config write routes and the graveyard restore plan a Postgres guild's change (decision 3)
 // after their own checks, inside the target's lock for update, restore and data/update, read and back up what the
 // database holds when another machine runs the guild, and send the change as one request row. A guild this machine

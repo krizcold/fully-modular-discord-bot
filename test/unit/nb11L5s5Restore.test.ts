@@ -34,7 +34,8 @@ const deferred = <T = void>() => {
 };
 const same = (a: unknown, b: unknown) => path.resolve(String(a)) === path.resolve(String(b));
 const event = (g: string) => [{ guildId: g }];
-const liveText = (r: number) => `live guild data exists; nothing was restored. To restore entry ${r}, delete this server's data, then restore with retiredAt ${r} before the bot saves anything new for the server; data it saves in between blocks the restore again. While the server's members are active, remove the bot from the server first and add it back after the restore.`;
+const liveText = (g: string, r: number) => `server ${g} has data saved since entry ${r} was deleted; nothing was restored. To put entry ${r} in place and move the current data to the graveyard as a new entry, run: smdb graveyard restore ${g} ${r} --replace`;
+const liveReply = (g: string, r: number) => ({ ok: false, code: 'invalid', refusal: 'live-data', retiredAt: r, error: liveText(g, r) });
 
 function bury(g: string, ms: number, files: Record<string, string> = { 'm/a.json': '{"n":5}' }): void {
   const dir = entryDir(g, ms);
@@ -107,7 +108,7 @@ describe('the file graveyard sweep', () => {
     expect(fs.existsSync(entryDir(swept, 1000))).toBe(false);
     expect(fs.readFileSync(path.join(entryDir(held, 1000), 'm', 'a.json'), 'utf8')).toBe('{"h":1}');
     release();
-    expect(await restoring).toEqual({ ok: true, retiredAt: 1000, reason: 'webui-operator-delete' });
+    expect(await restoring).toEqual({ ok: true, retiredAt: 1000, reason: 'webui-operator-delete', keptUntil: expect.any(Number) });
     expect(fs.readFileSync(dataPath(held, 'm', 'a.json'), 'utf8')).toBe('{"h":1}');
   });
 });
@@ -118,7 +119,7 @@ describe('the barrier after a JSON restore', () => {
     bury(g, 1000);
     await flushAll();
     const before = saveMark().stamp;
-    expect(await restoreGuildFromGraveyard(g, 1000)).toEqual({ ok: true, retiredAt: 1000, reason: 'webui-operator-delete' });
+    expect(await restoreGuildFromGraveyard(g, 1000)).toEqual({ ok: true, retiredAt: 1000, reason: 'webui-operator-delete', keptUntil: expect.any(Number) });
     const ledger = openLedger('interaction');
     // The restore took exactly one stamp, its barrier, so the ledger opened at the barrier itself.
     expect(ledger.openedMark.stamp).toBe(before + 1);
@@ -137,7 +138,7 @@ describe('the barrier after a JSON restore', () => {
       await gate.promise;
       return saveDataTracked('g.json', global, { from: g });
     });
-    expect(await restoreGuildFromGraveyard(g, 1000)).toEqual({ ok: true, retiredAt: 1000, reason: 'webui-operator-delete' });
+    expect(await restoreGuildFromGraveyard(g, 1000)).toEqual({ ok: true, retiredAt: 1000, reason: 'webui-operator-delete', keptUntil: expect.any(Number) });
     gate.resolve();
     expect((await running).outcome).toBe('saved');
     await flushAll();
@@ -163,7 +164,7 @@ describe('raw writes under a held guild', () => {
       `[Data] Write of ${dotted} refused: its guild's data is being restored from the graveyard`,
     ]);
     release();
-    expect(await restoring).toEqual({ ok: true, retiredAt: 1000, reason: 'webui-operator-delete' });
+    expect(await restoring).toEqual({ ok: true, retiredAt: 1000, reason: 'webui-operator-delete', keptUntil: expect.any(Number) });
     await flushAll();
     expect(fs.readdirSync(dataPath(g, 'm'))).toEqual(['a.json']);
   });
@@ -205,7 +206,7 @@ describe('events and the restore buffer', () => {
     // A later restore of the guild replays only the events it held.
     fs.mkdirSync(dataPath(g), { recursive: true });
     bury(g, 1000);
-    expect(await restoreGuildFromGraveyard(g)).toEqual({ ok: false, code: 'invalid', error: liveText(1000) });
+    expect(await restoreGuildFromGraveyard(g)).toEqual(liveReply(g, 1000));
     expect(ran).not.toHaveBeenCalled();
   });
 
@@ -219,7 +220,7 @@ describe('events and the restore buffer', () => {
       const restoring = restoreGuildFromGraveyard(g);
       expect(await gateEventDispatch('messageCreate', event(g), () => { ran.push(name); })).toBe(false);
       release();
-      expect(await restoring).toEqual({ ok: false, code: 'invalid', error: liveText(1000) });
+      expect(await restoring).toEqual(liveReply(g, 1000));
       vi.restoreAllMocks();
       warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
       error = vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -238,7 +239,7 @@ describe('events and the restore buffer', () => {
     expect(await gateEventDispatch('messageCreate', event(g), () => { throw boom; })).toBe(false);
     expect(await gateEventDispatch('messageCreate', event(g), () => { ran.push('next'); })).toBe(false);
     release();
-    expect(await restoring).toEqual({ ok: false, code: 'invalid', error: liveText(1000) });
+    expect(await restoring).toEqual(liveReply(g, 1000));
     expect(ran).toEqual(['next']);
     expect(error.mock.calls).toContainEqual([`[Data] Buffered event replay failed for guild ${g}:`, boom]);
   });
@@ -254,24 +255,33 @@ describe('events and the restore buffer', () => {
     const overflow = warnLines().filter(l => l.startsWith(`[Data] Event buffer overflow for guild ${g}`));
     expect(overflow).toEqual([`[Data] Event buffer overflow for guild ${g} (1 drop(s) total); oldest dropped`]);
     release();
-    expect(await restoring).toEqual({ ok: false, code: 'invalid', error: liveText(1000) });
+    expect(await restoring).toEqual(liveReply(g, 1000));
     expect(ran).toEqual(Array.from({ length: 256 }, (_v, i) => i + 3));
   });
 });
 
 describe('the operation deadline', () => {
-  it('a restore and a delete whose deadline is exactly now still run', async () => {
+  it('a restore whose deadline is exactly now is refused before it copies', async () => {
     const r = freshGuild();
     bury(r, 1000);
+    const now = process.hrtime.bigint();
+    vi.spyOn(process.hrtime, 'bigint').mockReturnValue(now);
+    expect(await restoreGuildFromGraveyard(r, 1000, now)).toEqual({ ok: false, code: 'backend-unavailable', error: "entry 1000 could not be copied before the restore's deadline (0 file(s) copied); nothing was restored" });
+    vi.restoreAllMocks();
+    expect(fs.existsSync(dataPath(r))).toBe(false);
+    expect(fs.readFileSync(path.join(entryDir(r, 1000), 'm', 'a.json'), 'utf8')).toBe('{"n":5}');
+    expect(await listed(r)).toEqual([{ guildId: r, retiredAt: 1000, reason: 'webui-operator-delete' }]);
+    expect(fs.readdirSync(dataPath('_graveyard')).filter(n => n.startsWith(`.copy-${r}-`) || n.startsWith(`.restore-${r}-`))).toEqual([]);
+  });
+
+  it('a delete whose deadline is exactly now still runs', async () => {
     const d = freshGuild();
     saveData('a.json', opts(d), { a: 1 });
     await flushAll();
     const now = process.hrtime.bigint();
     vi.spyOn(process.hrtime, 'bigint').mockReturnValue(now);
-    expect(await restoreGuildFromGraveyard(r, 1000, now)).toEqual({ ok: true, retiredAt: 1000, reason: 'webui-operator-delete' });
     expect(await deleteGuildNamespace(d, 'test', 5000, now)).toEqual({ ok: true });
     vi.restoreAllMocks();
-    expect(fs.readFileSync(dataPath(r, 'm', 'a.json'), 'utf8')).toBe('{"n":5}');
     expect(fs.existsSync(dataPath(d))).toBe(false);
     const [entry] = await listed(d);
     expect(JSON.parse(fs.readFileSync(path.join(entryDir(d, entry.retiredAt), 'm', 'a.json'), 'utf8'))).toEqual({ a: 1 });

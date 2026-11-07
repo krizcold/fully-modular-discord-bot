@@ -50,11 +50,11 @@ async function bury(guildId: string, retiredAt: number, docs: Record<string, str
 const liveDocs = async (g: string) => (await direct.query(`SELECT filename, doc FROM smdb_data.guild_data WHERE guild_id = $1 ORDER BY filename`, [g])).rows;
 
 describe('a given batch that does not exist', () => {
-  it('a second restore of the same batch after an ok answers no-entry, and the live docs stay', async () => {
+  it('a second restore of the same batch after an ok is refused as live rows naming it, and the live docs stay', async () => {
     const g = freshGuild();
     await bury(g, 5, { 'a.json': '{"a":1}' });
-    expect(await backend.restoreGuild(g, 5, tokenOf(claim), none, monoIn(40 * SECOND))).toEqual({ ok: true, moved: 1, retiredAt: 5, reason: 'test' });
-    expect(await backend.restoreGuild(g, 5, tokenOf(claim), none, monoIn(40 * SECOND))).toEqual({ ok: false, reason: 'no-entry' });
+    expect(await backend.restoreGuild(g, 5, tokenOf(claim), none, monoIn(40 * SECOND))).toEqual({ ok: true, copied: 1, retiredAt: 5, reason: 'test', usedAt: expect.any(Number) });
+    expect(await backend.restoreGuild(g, 5, tokenOf(claim), none, monoIn(40 * SECOND))).toEqual({ ok: false, reason: 'live-rows', retiredAt: 5 });
     expect(await liveDocs(g)).toEqual([{ filename: 'a.json', doc: '{"a":1}' }]);
   });
 

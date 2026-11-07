@@ -67,10 +67,14 @@ export interface DataWriteReply {
   note?: string;
   /** changed: whether the target or its global twin changed since the read the body was built on. */
   which?: 'target' | 'twin';
-  /** A graveyard restore's entry, its reason and, on a database, the rows it moved. */
+  /** A graveyard restore's entry (on a live-data refusal too), its reason and, on a database, the rows it copied in. */
+  refusal?: 'live-data';
   retiredAt?: number;
   reason?: string;
-  moved?: number;
+  copied?: number;
+  /** A restore's ok: the date its entry stays listed until, and for a replace the entry it made (null: no data moved). */
+  keptUntil?: number;
+  replaced?: { retiredAt: number; moved?: number; reason?: string } | null;
   /** A JSON restore or delete whose folder move the disk did not confirm: the errno of the failed directory fsync. */
   moveUnconfirmed?: string;
 }
@@ -99,7 +103,7 @@ export interface GuildDataWriteRequest {
   /** Ignored for delete-namespace. */
   filename: string;
   op: 'write' | 'delete' | 'delete-namespace' | 'restore-graveyard';
-  /** Raw JSON text, 2-space pretty like the facade writes. For restore-graveyard it carries {retiredAt}. */
+  /** Raw JSON text, 2-space pretty like the facade writes. For restore-graveyard it carries {retiredAt?, replace?}. */
   contentJson?: string;
   /** write: the sha of the stored text the body was built on; compared in the write's own turn. */
   expectSha?: ExpectSha;
@@ -158,6 +162,7 @@ const OPERATOR_FLUSH_MS = 5000;
 const OPERATION_BOUND_NS = 40_000_000_000n;
 const ANSWER_MARGIN_NS = 5_000_000_000n;
 const WHOLE_MS_TEXT = 'retiredAt must be a whole number of milliseconds';
+const REPLACE_TEXT = 'replace must be true or false';
 
 /**
  * A restore's or a delete's deadline on the monotonic clock: the earlier of the web UI's answerByMono less 5 s (40 s
@@ -177,8 +182,8 @@ export async function applyOperatorDataWrite(req: GuildDataWriteRequest): Promis
   return own.threw ? reply : carryWrites(reply, { ...NO_WRITES, tickets: own.ticket ? [own.ticket] : [] });
 }
 
-/** restore-graveyard's retiredAt from its body: undefined for the newest entry, or the reply that refuses it. */
-function retiredAtOf(req: GuildDataWriteRequest): { retiredAt?: number } | DataWriteReply {
+/** restore-graveyard's retiredAt (undefined for the newest entry) and replace from its body, or the reply that refuses them. */
+function restoreArgsOf(req: GuildDataWriteRequest): { retiredAt?: number; replace?: boolean } | DataWriteReply {
   if (req.contentJson === undefined) return {};
   let parsed: unknown;
   try {
@@ -186,10 +191,12 @@ function retiredAtOf(req: GuildDataWriteRequest): { retiredAt?: number } | DataW
   } catch {
     return { ok: false, code: 'invalid', error: 'contentJson is not valid JSON' };
   }
+  const replace = (parsed as { replace?: unknown } | null)?.replace;
+  if (replace !== undefined && typeof replace !== 'boolean') return { ok: false, code: 'invalid', error: REPLACE_TEXT };
   const value = (parsed as { retiredAt?: unknown } | null)?.retiredAt;
-  if (value === undefined) return {};
+  if (value === undefined) return replace === undefined ? {} : { replace };
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) return { ok: false, code: 'invalid', error: WHOLE_MS_TEXT };
-  return { retiredAt: value };
+  return { retiredAt: value, ...(replace === undefined ? {} : { replace }) };
 }
 
 /**
@@ -286,7 +293,7 @@ async function graveyardOp(req: GuildDataWriteRequest, receivedAt: bigint): Prom
     return { ok: false, code: 'invalid', error: text };
   }
   if (monoNow() >= deadline) return { ok: false, code: 'backend-unavailable', error: restore ? RESTORE_TEXTS.outOfTime : DELETE_TEXTS.outOfTime };
-  const parsed: { retiredAt?: number } | DataWriteReply = restore ? retiredAtOf(req) : {};
+  const parsed: { retiredAt?: number; replace?: boolean } | DataWriteReply = restore ? restoreArgsOf(req) : {};
   if ('ok' in parsed) return parsed as DataWriteReply;
   if (!(await awaitGuildDataReady(guildId))) {
     return { ok: false, code: 'backend-unavailable', error: restore ? RESTORE_TEXTS.notLoaded : DELETE_TEXTS.notLoaded };
@@ -295,11 +302,11 @@ async function graveyardOp(req: GuildDataWriteRequest, receivedAt: bigint): Prom
   if (stoppedServing() || getWorkingSet()?.stateOf(guildId) === 'frozen-retained') return { ok: false, code: 'frozen' };
   try {
     if (restore) {
-      const restored = await restoreGuildFromGraveyard(guildId, parsed.retiredAt, deadline);
+      const restored = await restoreGuildFromGraveyard(guildId, parsed.retiredAt, deadline, parsed.replace === true);
       // An evicted set: its read starts now, so the events it holds replay on the restored data; the answer does not wait on it.
       if (resolveDataBackend() === 'postgres' && getWorkingSet() && !getWorkingSet()!.has(guildId)) await awaitGuildDataReady(guildId);
       if (!restored.ok && deposedHolder() && !isUnconfirmedReply(restored)) return { ok: false, code: 'held-elsewhere', error: deposedText(deposedHolder()!) };
-      return restored.ok ? { ok: true, retiredAt: restored.retiredAt, reason: restored.reason, ...(restored.moved === undefined ? {} : { moved: restored.moved }), ...(restored.moveUnconfirmed === undefined ? {} : { moveUnconfirmed: restored.moveUnconfirmed }) } : restored;
+      return restored.ok ? { ok: true, retiredAt: restored.retiredAt, reason: restored.reason, ...(restored.keptUntil === undefined ? {} : { keptUntil: restored.keptUntil }), ...(restored.copied === undefined ? {} : { copied: restored.copied }), ...(restored.replaced === undefined ? {} : { replaced: restored.replaced }), ...(restored.moveUnconfirmed === undefined ? {} : { moveUnconfirmed: restored.moveUnconfirmed }) } : restored;
     }
     const deleted = await deleteGuildNamespace(guildId, 'webui-operator-delete', OPERATOR_FLUSH_MS, deadline);
     if (!deleted.ok && deposedHolder() && !isUnconfirmedReply(deleted)) return { ok: false, code: 'held-elsewhere', error: deposedText(deposedHolder()!) };

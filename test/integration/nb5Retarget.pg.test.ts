@@ -203,7 +203,9 @@ describe("round 5: a guild retired on A after W was given A's rows (NB5-R5-RESAV
     const counted = vi.mocked(console.log).mock.calls.map(c => String(c[0]))
       .filter(line => line.startsWith(`[Data] Guild ${R}: the re-save on ${showEntry(entryW)} moved 41 row(s)`));
     expect(counted).toHaveLength(1);
-    expect(await r.backend.restoreGuild(R, null, P, () => null, deadlineIn(60_000))).toMatchObject({ ok: true, moved: 41 });
+    expect(await r.backend.restoreGuild(R, null, P, () => null, deadlineIn(60_000))).toMatchObject({ ok: true, copied: 41 });
+    const kept = await directW.query(`SELECT count(*)::int AS n, count(used_at)::int AS used FROM smdb_data.guild_data_graveyard WHERE guild_id = $1 AND retired_at::text = $2`, [R, batch[0].batch]);
+    expect(kept.rows[0]).toEqual({ n: 41, used: 41 });
     expect(Object.keys(await liveDocs(directW, R))).toHaveLength(40);
     const lines = await directW.query(`SELECT string_agg(chunk, '' ORDER BY seq) AS text FROM smdb_data.guild_append WHERE guild_id = $1`, [R]);
     expect(lines.rows[0].text).toBe('line-1\nline-2\n');

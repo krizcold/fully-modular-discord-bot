@@ -21,7 +21,7 @@ import { dataPath } from '../../src/utils/dataRoot';
 import { setBackendKind } from '../helpers/backendKind';
 import { FakeStore } from '../helpers/fakeStore';
 import { freshGuild } from '../helpers/gateRig';
-import { batchExistsAnswer, isBatchExists } from '../helpers/nb11ScriptedPg';
+import { batchExistsAnswer, isBatchExists, isGraveInsert, isMove } from '../helpers/nb11ScriptedPg';
 import { LEASED } from '../helpers/readinessRig';
 
 // NB11 fix round 1: the writer-lock override keeps a can't confirm answer (NB11-L1, NB11-run-1), a socket errno is no
@@ -30,7 +30,7 @@ import { LEASED } from '../helpers/readinessRig';
 
 const SECOND = 1000;
 const token: FenceToken = { nodeId: 'node-a', claim: 7, processId: 'process-a', shardId: 0, shardCount: 1 };
-const unknownText = (g: string, r: number) => `can't confirm whether server ${g} was restored: the database did not confirm the commit. Within a minute, if it was restored, the server's data is back and entry ${r} is gone from \`smdb graveyard list\`; if not, the entry is still listed, unless it had passed the graveyard's keep time (GRAVEYARD_TTL_DAYS, 14 days by default) and the graveyard sweep removed it, data and all. The list reads the data of the bot behind the web panel it asks; if the main database was replaced meanwhile, check once that bot runs on the new main.`;
+const unknownText = (g: string, r?: number) => `can't confirm whether server ${g} was restored: the database did not confirm the commit; the outcome is fixed within a minute. ${r === undefined ? `The entry it restored, if any, stays listed either way, unless it had passed the graveyard's keep time (GRAVEYARD_TTL_DAYS, 14 days by default) and the graveyard sweep removed it, data and all. Running smdb graveyard restore ${g} <its retiredAt> --replace is then safe: it copies that entry in and moves whatever the server holds into a new entry, so nothing is lost.` : `Entry ${r} stays listed either way, unless it had passed the graveyard's keep time (GRAVEYARD_TTL_DAYS, 14 days by default) and the graveyard sweep removed it, data and all. Running smdb graveyard restore ${g} ${r} --replace is then safe: it copies entry ${r} in and moves whatever the server holds into a new entry, so nothing is lost.`} The list reads the data of the bot behind the web panel it asks; if the main database was replaced meanwhile, check once that bot runs on the new main.`;
 const DELETE_UNKNOWN = "can't confirm whether this server's data was deleted: the database did not confirm the commit. Within a minute, `smdb graveyard list` lists a new entry for this server with the reason webui-operator-delete if it was deleted; if no such entry is listed by then, it was not. The list reads the data of the bot behind the web panel it asks; if the main database was replaced meanwhile, check once that bot runs on the new main.";
 const DELETE_NO_CLAIM = 'this bot process holds no usable claim on the database; nothing was removed; restart the bot';
 const HOLDER = { role: 'import', pid: 4242 };
@@ -167,7 +167,7 @@ describe('a socket errno is not a SQLSTATE', () => {
         if (/^INSERT INTO smdb_data\.guild_ownership AS o\b/.test(sql)) return Promise.resolve({ rows: [], rowCount: 1 });
         if (isBatchExists(sql)) return Promise.resolve(batchExistsAnswer(sql, true));
         if (/AS present/.test(sql)) return Promise.resolve({ rows: [{ present: false }], rowCount: 1 });
-        if (/^WITH moved AS/.test(sql)) return Promise.resolve({ rows: [{ taken: '1', put: '1', reason: 'r' }], rowCount: 1 });
+        if (isMove(sql)) return Promise.resolve({ rows: [{ taken: '1', put: '1', reason: 'r', used_at: '1000' }], rowCount: 1 });
         return Promise.resolve({ rows: [], rowCount: 0 });
       },
       release: () => {},
@@ -177,7 +177,7 @@ describe('a socket errno is not a SQLSTATE', () => {
   }
 
   it('EPIPE on the move answers unavailable and notes the outage', async () => {
-    const backend = scripted(sql => (/^WITH moved AS/.test(sql) ? epipe() : null));
+    const backend = scripted(sql => (isMove(sql) ? epipe() : null));
     expect(await backend.restoreGuild('1', 5, token, () => null, monoIn(40 * SECOND))).toEqual({ ok: false, reason: 'unavailable', detail: 'write EPIPE' });
     expect(backend.connectionState().state).not.toBe('ready');
   });
@@ -188,12 +188,12 @@ describe('a socket errno is not a SQLSTATE', () => {
   });
 
   it('EPIPE on the retire answers unavailable, not refused', async () => {
-    const backend = scripted(sql => (/^DELETE FROM smdb_data\.guild_data /.test(sql) ? epipe() : null));
+    const backend = scripted(sql => (isGraveInsert(sql) ? epipe() : null));
     expect(await backend.retireGuild('1', 'test', token, monoIn(40 * SECOND))).toEqual({ ok: false, reason: 'unavailable', detail: 'write EPIPE' });
   });
 
   it('a server error with a SQLSTATE still answers refused', async () => {
-    const backend = scripted(sql => (/^WITH moved AS/.test(sql) ? serverError('23505') : null));
+    const backend = scripted(sql => (isMove(sql) ? serverError('23505') : null));
     expect(await backend.restoreGuild('1', 5, token, () => null, monoIn(40 * SECOND))).toEqual({ ok: false, reason: 'refused', detail: 'SQLSTATE 23505: scripted refusal', code: '23505' });
     expect(backend.connectionState().state).toBe('ready');
   });
@@ -218,8 +218,8 @@ describe('the JSON restore before it removes the note', () => {
     const dir = bury(g, 1000);
     const unlink = vi.spyOn(fs.promises, 'unlink');
     const writeFile = vi.spyOn(fs.promises, 'writeFile');
-    const progress = { renamed: false };
-    expect(await restoreGuildDirFromGraveyard(g, 1000, { stop: () => null, writerLost: () => true, progress })).toEqual({ ok: false, why: 'writer-lost' });
+    const progress = { renamed: false, moved: null };
+    expect(await restoreGuildDirFromGraveyard(g, 1000, { stop: () => null, writerLost: () => true, writerTaken: () => false, replace: false, enterSection: () => () => undefined, progress })).toEqual({ ok: false, why: 'writer-lost' });
     expect(unlink).not.toHaveBeenCalled();
     expect(writeFile).not.toHaveBeenCalled();
     expect(fs.existsSync(path.join(dir, '.graveyard.json'))).toBe(true);
@@ -232,7 +232,7 @@ describe('the JSON restore before it removes the note', () => {
     const unlink = vi.spyOn(fs.promises, 'unlink');
     let reads = 0;
     const stop = () => (++reads > 1 ? 'maintenance' as const : null);
-    expect(await restoreGuildDirFromGraveyard(g, 1000, { stop, writerLost: () => false, progress: { renamed: false } })).toEqual({ ok: false, why: 'stopped', stop: 'maintenance' });
+    expect(await restoreGuildDirFromGraveyard(g, 1000, { stop, writerLost: () => false, writerTaken: () => false, replace: false, enterSection: () => () => undefined, progress: { renamed: false, moved: null } })).toEqual({ ok: false, why: 'stopped', stop: 'maintenance' });
     expect(unlink).not.toHaveBeenCalled();
     expect(fs.existsSync(path.join(dir, '.graveyard.json'))).toBe(true);
     expect(fs.existsSync(dataPath(g))).toBe(false);

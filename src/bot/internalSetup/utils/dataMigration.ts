@@ -291,6 +291,8 @@ export interface SnapGrave {
   guildId: string;
   retiredAt: number;
   reason: string;
+  /** The entry's newest restore (NB14 decision 19): a JSON note's usedAt, a batch's max(used_at). */
+  usedAt?: number;
 }
 
 export interface SnapShadow {
@@ -344,7 +346,7 @@ function compareHashes(expected: Map<string, string>, actual: Map<string, string
 }
 
 function compareGraves(expected: SnapGrave[], actual: SnapGrave[], what: string): void {
-  const key = (g: SnapGrave) => `${g.guildId}-${g.retiredAt}|${g.reason}`;
+  const key = (g: SnapGrave) => `${g.guildId}-${g.retiredAt}|${g.reason}|${g.usedAt ?? ''}`;
   const a = expected.map(key).sort().join('\n');
   const b = actual.map(key).sort().join('\n');
   if (a !== b) throw new Error(`${what} holds other graveyard entries or reasons than the source`);
@@ -507,12 +509,14 @@ export async function readJsonUnit(unit: SourceUnit): Promise<Snapshot> {
   }
   const retiredAt = unit.retiredAt;
   let reason = '';
+  let usedAt: number | undefined;
   const items: SnapItem[] = [];
   await walkFolder(dir, '', snap.leftOut, (rel, bytes, file) => {
     if (rel === '.graveyard.json') {
       try {
-        const note = JSON.parse(bytes.toString('utf8')) as { reason?: unknown };
+        const note = JSON.parse(bytes.toString('utf8')) as { reason?: unknown; usedAt?: unknown };
         if (typeof note?.reason === 'string') reason = note.reason;
+        if (typeof note?.usedAt === 'number' && Number.isSafeInteger(note.usedAt)) usedAt = note.usedAt;
       } catch { /* a note that cannot be parsed gives reason '' */ }
       return;
     }
@@ -523,7 +527,7 @@ export async function readJsonUnit(unit: SourceUnit): Promise<Snapshot> {
     return snap;
   }
   snap.items.push(...items);
-  snap.graves.push({ guildId: unit.guildId, retiredAt, reason });
+  snap.graves.push({ guildId: unit.guildId, retiredAt, reason, ...(usedAt === undefined ? {} : { usedAt }) });
   return snap;
 }
 
@@ -570,7 +574,7 @@ export async function stageSnapshot(snap: Snapshot, staging: string): Promise<vo
   await fs.promises.mkdir(staging, { recursive: true });
   for (const item of snap.items) await writeSynced(stagedPath(staging, item), item.bytes);
   for (const g of snap.graves) {
-    const note = JSON.stringify({ guildId: g.guildId, reason: g.reason, ts: g.retiredAt }, null, 2);
+    const note = JSON.stringify({ guildId: g.guildId, reason: g.reason, ts: g.retiredAt, ...(g.usedAt === undefined ? {} : { usedAt: g.usedAt }) }, null, 2);
     await writeSynced(path.join(staging, '_graveyard', `${g.guildId}-${g.retiredAt}`, '.graveyard.json'), note);
   }
   await syncFolder(staging);
@@ -1009,7 +1013,7 @@ async function schemaPresent(session: PgSession): Promise<boolean> {
 export function snapshotFromPgRows(dataRows: any[], appendRows: any[], graveRows: any[]): Snapshot {
   const snap: Snapshot = { items: [], graves: [], guilds: [], leftOut: [], shadow: [] };
   type Row = { module: string; filename: string; kind: 'doc' | 'append'; text: string };
-  const scopes = new Map<string, { guildId: string; retiredAt?: number; reason?: string; rows: Row[] }>();
+  const scopes = new Map<string, { guildId: string; retiredAt?: number; reason?: string; usedAt?: number; rows: Row[] }>();
   const scopeOf = (guildId: string, retiredAt?: number, reason?: string) => {
     if (!fitsBigint(String(guildId))) throw new Refusal(`The database holds rows of "${guildId}", which is not a guild id; nothing was written`);
     const id = retiredAt === undefined ? guildId : `${guildId}-${retiredAt}`;
@@ -1034,7 +1038,9 @@ export function snapshotFromPgRows(dataRows: any[], appendRows: any[], graveRows
   }
   for (const r of graveRows) {
     const retiredAt = Number(r.retired_at);
-    scopeOf(String(r.guild_id), retiredAt, r.reason).rows.push({ module: r.module, filename: r.filename, kind: r.kind === 'append' ? 'append' : 'doc', text: r.doc });
+    const scope = scopeOf(String(r.guild_id), retiredAt, r.reason);
+    if (r.used_at !== null && r.used_at !== undefined) scope.usedAt = Math.max(scope.usedAt ?? 0, Number(r.used_at));
+    scope.rows.push({ module: r.module, filename: r.filename, kind: r.kind === 'append' ? 'append' : 'doc', text: r.doc });
   }
 
   for (const scope of scopes.values()) {
@@ -1113,7 +1119,7 @@ export function snapshotFromPgRows(dataRows: any[], appendRows: any[], graveRows
       const mine = p.split('/').slice(0, depth).join('/');
       throw new Refusal(`The folders ${collision.entry} and ${mine} of ${where} differ only in letter case; nothing was written`);
     }
-    if (scope.retiredAt !== undefined) snap.graves.push({ guildId: scope.guildId, retiredAt: scope.retiredAt, reason: scope.reason ?? '' });
+    if (scope.retiredAt !== undefined) snap.graves.push({ guildId: scope.guildId, retiredAt: scope.retiredAt, reason: scope.reason ?? '', ...(scope.usedAt === undefined ? {} : { usedAt: scope.usedAt }) });
     else if (scope.rows.length > 0) snap.guilds.push(scope.guildId);
   }
   return snap;
@@ -1141,7 +1147,7 @@ export async function readPgUnit(session: PgSession, unit: SourceUnit): Promise<
   if (unit.retiredAt !== undefined) {
     const text = unit.retiredText ?? String(unit.retiredAt);
     const grave = await session.query(
-      'SELECT guild_id, module, filename, kind, doc, retired_at, reason FROM smdb_data.guild_data_graveyard WHERE guild_id = $1 AND retired_at = $2',
+      'SELECT guild_id, module, filename, kind, doc, retired_at, reason, used_at FROM smdb_data.guild_data_graveyard WHERE guild_id = $1 AND retired_at = $2',
       [unit.guildId, text]);
     if (grave.rows.length === 0) throw new Refusal(`The database lists graveyard entry ${unit.guildId}-${text}, but its read found no rows`);
     return snapshotFromPgRows([], [], grave.rows);
@@ -1252,11 +1258,13 @@ async function writePgItems(session: PgSession, snap: Snapshot): Promise<void> {
     [docs.map(i => i.guildId), docs.map(i => i.module), docs.map(i => i.filename), docs.map(text)]);
   await insertRows(session, 'INSERT INTO smdb_data.guild_append (guild_id, module, filename, chunk) SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[])',
     [streams.map(i => i.guildId), streams.map(i => i.module), streams.map(i => i.filename), streams.map(text)]);
-  const reasonOf = new Map(snap.graves.map(g => [`${g.guildId}-${g.retiredAt}`, g.reason]));
+  const graveOf = new Map(snap.graves.map(g => [`${g.guildId}-${g.retiredAt}`, g]));
+  const usedAtOf = (i: SnapItem) => graveOf.get(`${i.guildId}-${i.retiredAt}`)?.usedAt;
   await insertRows(session,
-    'INSERT INTO smdb_data.guild_data_graveyard (guild_id, module, filename, kind, doc, retired_at, reason) SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::bigint[], $7::text[])',
+    'INSERT INTO smdb_data.guild_data_graveyard (guild_id, module, filename, kind, doc, retired_at, reason, used_at) SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::bigint[], $7::text[], $8::bigint[])',
     [graves.map(i => i.guildId), graves.map(i => i.module), graves.map(i => i.filename), graves.map(i => i.kind), graves.map(text),
-      graves.map(i => String(i.retiredAt)), graves.map(i => reasonOf.get(`${i.guildId}-${i.retiredAt}`) ?? '')]);
+      graves.map(i => String(i.retiredAt)), graves.map(i => graveOf.get(`${i.guildId}-${i.retiredAt}`)?.reason ?? ''),
+      graves.map(i => (usedAtOf(i) === undefined ? null : String(usedAtOf(i))))]);
 }
 
 async function writePgOwners(session: PgSession, guilds: string[], nodeId: string, shardCount: number): Promise<void> {
@@ -1279,12 +1287,14 @@ async function readBackPg(session: PgSession): Promise<{ hashes: Map<string, str
     for (const r of streams.rows) hashes.set(itemId({ kind: 'append', guildId: r.guild_id, module: r.module, filename: r.filename }), r.h);
   }
   const grave = await session.query(
-    `SELECT guild_id, retired_at::text AS retired_at, module, filename, kind, reason, encode(sha256(convert_to(doc, 'UTF8')), 'hex') AS h FROM smdb_data.guild_data_graveyard`);
+    `SELECT guild_id, retired_at::text AS retired_at, module, filename, kind, reason, used_at::text AS used_at, encode(sha256(convert_to(doc, 'UTF8')), 'hex') AS h FROM smdb_data.guild_data_graveyard`);
   const graves = new Map<string, SnapGrave>();
   for (const r of grave.rows) {
     const retiredAt = Number(r.retired_at);
     hashes.set(itemId({ kind: r.kind, guildId: r.guild_id, grave: true, retiredAt, module: r.module, filename: r.filename }), r.h);
-    graves.set(`${r.guild_id}-${retiredAt}`, { guildId: r.guild_id, retiredAt, reason: r.reason });
+    const id = `${r.guild_id}-${retiredAt}`;
+    const usedAt = r.used_at === null || r.used_at === undefined ? graves.get(id)?.usedAt : Math.max(graves.get(id)?.usedAt ?? 0, Number(r.used_at));
+    graves.set(id, { guildId: r.guild_id, retiredAt, reason: r.reason, ...(usedAt === undefined ? {} : { usedAt }) });
   }
   const owners = await session.query('SELECT guild_id FROM smdb_data.guild_ownership');
   return { hashes, graves: [...graves.values()], owners: owners.rows.map(r => String(r.guild_id)) };

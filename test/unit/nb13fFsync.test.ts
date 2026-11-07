@@ -201,8 +201,14 @@ describe.skipIf(process.platform === 'win32')('a move whose directory fsync fail
   ])('%s fails on a restore: the answer names it, a line is logged and the next append runs the chain', async (_name, dir) => {
     const g = freshGuild();
     const p = await start(g);
-    stub.failDirSync(dir, 'EIO');
-    expect(await restoreGuildFromGraveyard(g)).toMatchObject({ ok: true, reason: 'test', moveUnconfirmed: 'EIO' });
+    const first = stub.holdDirSync(dir);
+    const restoring = restoreGuildFromGraveyard(g);
+    await first.reached;
+    const second = stub.holdDirSync(dir, 'EIO');
+    first.release();
+    await second.reached;
+    second.release();
+    expect(await restoring).toMatchObject({ ok: true, reason: 'test', moveUnconfirmed: 'EIO' });
     expect(errors).toHaveLength(1);
     expect(restoredLine(g, dir, 'EIO')(errors[0])).toBe(true);
     stub.dirSyncs.length = 0;
@@ -213,7 +219,7 @@ describe.skipIf(process.platform === 'win32')('a move whose directory fsync fail
     expect(fs.readFileSync(p, 'utf8')).toBe(L(1) + L(2));
   });
 
-  it('B3: a restore whose fsyncs succeed answers as before and the next append skips the chain', async () => {
+  it('B3: a restore whose fsyncs succeed answers as before; the copy is new, so the first append runs the chain and the next skips it', async () => {
     const g = freshGuild();
     const p = await start(g);
     const answer = await restoreGuildFromGraveyard(g);
@@ -225,11 +231,15 @@ describe.skipIf(process.platform === 'win32')('a move whose directory fsync fail
     stub.dirSyncs.length = 0;
     const t = append(p, L(2));
     await flushAll();
-    expect(synced()).toEqual([]);
+    expect(synced()).toEqual(chainOf(p));
     expect(fileTicketState(t)).toBe('landed');
+    stub.dirSyncs.length = 0;
+    append(p, L(3));
+    await flushAll();
+    expect(synced()).toEqual([]);
   });
 
-  it('B4: an unsupported sync (EINVAL) on a restore forgets nothing', async () => {
+  it('B4: an unsupported sync (EINVAL) on a restore forgets nothing: the first append runs the chain, the next skips it', async () => {
     const g = freshGuild();
     const p = await start(g);
     stub.failDirSync(DATA_ROOT, 'EINVAL');
@@ -239,6 +249,10 @@ describe.skipIf(process.platform === 'win32')('a move whose directory fsync fail
     expect(errors).toEqual([]);
     stub.dirSyncs.length = 0;
     append(p, L(2));
+    await flushAll();
+    expect(synced()).toEqual(chainOf(p));
+    stub.dirSyncs.length = 0;
+    append(p, L(3));
     await flushAll();
     expect(synced()).toEqual([]);
   });
@@ -251,8 +265,14 @@ describe.skipIf(process.platform === 'win32')('a move whose directory fsync fail
     append(q, L(1));
     await flushAll();
     const p = await start(g);
-    stub.failDirSync(DATA_ROOT, 'EIO');
-    expect(await restoreGuildFromGraveyard(g)).toMatchObject({ ok: true });
+    const first = stub.holdDirSync(DATA_ROOT);
+    const restoring = restoreGuildFromGraveyard(g);
+    await first.reached;
+    const second = stub.holdDirSync(DATA_ROOT, 'EIO');
+    first.release();
+    await second.reached;
+    second.release();
+    expect(await restoring).toMatchObject({ ok: true });
     stub.dirSyncs.length = 0;
     append(q, L(2));
     await flushAll();
@@ -307,8 +327,14 @@ describe.skipIf(process.platform === 'win32')('the operator restore and delete a
   it('C1: a failed fsync names its errno in the restore and the delete answers', async () => {
     const g = freshGuild();
     bury(g, 2000);
-    stub.failDirSync(DATA_ROOT, 'EIO');
-    expect(await applyOperatorDataWrite(restoreReq(g))).toStrictEqual({ ok: true, retiredAt: 2000, reason: 'webui-operator-delete', moveUnconfirmed: 'EIO' });
+    const first = stub.holdDirSync(DATA_ROOT);
+    const restoring = applyOperatorDataWrite(restoreReq(g));
+    await first.reached;
+    const second = stub.holdDirSync(DATA_ROOT, 'EIO');
+    first.release();
+    await second.reached;
+    second.release();
+    expect(await restoring).toStrictEqual({ ok: true, retiredAt: 2000, reason: 'webui-operator-delete', keptUntil: expect.any(Number), moveUnconfirmed: 'EIO' });
     stub.failDirSync(DATA_ROOT, 'ENOSPC');
     expect(await applyOperatorDataWrite(deleteReq(g))).toStrictEqual({ ok: true, moveUnconfirmed: 'ENOSPC' });
   });
@@ -316,7 +342,7 @@ describe.skipIf(process.platform === 'win32')('the operator restore and delete a
   it('C2: fsyncs that succeed answer as before, with no new key', async () => {
     const g = freshGuild();
     bury(g, 2000);
-    expect(await applyOperatorDataWrite(restoreReq(g))).toStrictEqual({ ok: true, retiredAt: 2000, reason: 'webui-operator-delete' });
+    expect(await applyOperatorDataWrite(restoreReq(g))).toStrictEqual({ ok: true, retiredAt: 2000, reason: 'webui-operator-delete', keptUntil: expect.any(Number) });
     expect(await applyOperatorDataWrite(deleteReq(g))).toStrictEqual({ ok: true });
   });
 });

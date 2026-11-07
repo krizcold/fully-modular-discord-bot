@@ -133,7 +133,7 @@ describe('ruling H: operator data writes', () => {
       const stop = (args[3] as () => string | null)();
       if (stop) return { ok: false, reason: stop as 'maintenance' };
       committed = true;
-      return { ok: true, moved: 1, retiredAt: 5, reason: 'r' };
+      return { ok: true, copied: 1, retiredAt: 5, reason: 'r', usedAt: 1000 };
     };
     setGuildDataBackend(store);
     await expect(restoreGuildFromGraveyard(guildId)).rejects.toMatchObject({ causeKey: 'maintenance' });

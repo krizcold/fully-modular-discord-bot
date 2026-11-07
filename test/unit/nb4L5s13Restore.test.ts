@@ -24,7 +24,7 @@ describe('an operator restore', () => {
     const { guildId } = await storeGuild();
     const ws = getWorkingSet()!;
     ws.freeze(guildId);
-    const restoreGuild = vi.fn(async () => ({ ok: true, moved: 1 }));
+    const restoreGuild = vi.fn(async () => ({ ok: true, copied: 1 }));
     backendWith(restoreGuild);
     expect(await restoreGuildFromGraveyard(guildId, 5)).toEqual({ ok: false, code: 'frozen' });
     expect(restoreGuild).not.toHaveBeenCalled();
@@ -34,8 +34,8 @@ describe('an operator restore', () => {
   it('that lands drops the served set, so the next access reads the restored rows', async () => {
     const { guildId } = await storeGuild();
     const ws = getWorkingSet()!;
-    backendWith(async () => ({ ok: true, moved: 3, retiredAt: 5, reason: 'r' }));
-    expect(await restoreGuildFromGraveyard(guildId, 5)).toEqual({ ok: true, moved: 3, retiredAt: 5, reason: 'r' });
+    backendWith(async () => ({ ok: true, copied: 3, retiredAt: 5, reason: 'r', usedAt: 1000 }));
+    expect(await restoreGuildFromGraveyard(guildId, 5)).toEqual({ ok: true, copied: 3, retiredAt: 5, reason: 'r', keptUntil: 1000 + 14 * 24 * 60 * 60 * 1000 });
     expect(ws.has(guildId)).toBe(false);
   });
 });

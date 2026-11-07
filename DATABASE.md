@@ -245,10 +245,17 @@ partition the log names as missing may have held data that is not in that databa
 creating it empty.
 The graveyard sweep deletes retired guild data after `GRAVEYARD_TTL_DAYS` (14 by default); it keeps
 each guild's ownership row, which stops an older bot process from writing over a newer one.
-A restore moves one deleted server's data back in one transaction, only while that server has no data in the
-database, fenced by its claim like any save; on JSON it renames the entry back into `/data`. The entry leaves the
-graveyard in the same step. The file sweep renames an expired entry to `.sweep-<name>` before it removes it, and
-removes leftover `.sweep-` folders at each run.
+A restore copies the chosen batch into the live tables in one transaction, fenced by its claim like any save, and
+keeps the batch; a plain restore runs only while the server has no data in the database, and a replace first moves the
+server's rows into a new batch in the same transaction. Every new batch is named by the later of the database's clock
+and the server's newest batch plus 1, and the sweep reads the same clock. A restore stamps the batch's `used_at`, and
+the sweep removes a batch only when both `retired_at` and `used_at` are past the keep time; a restore and the sweep
+exclude each other by an advisory lock, and a sweep that finds a restore running skips that run. On JSON a restore
+records `usedAt` in the entry's note, copies the entry to a hidden folder, syncs it, and renames it into place; a
+replace renames the live folder into the graveyard in between and puts it back if the copy cannot be put in place, and
+a boot after a crash in between finishes the replace. The file sweep renames an expired entry to `.sweep-<name>` before
+it removes it, removes leftover `.sweep-` folders at each run, and keeps an entry whose note it cannot read and logs
+`Graveyard entry <name> kept`.
 Each save also writes its own id on the guild's ownership row. When the answer to a save is lost (the connection
 drops after the commit was sent, or no answer comes within 40 seconds), the bot reads that row, after any unfinished
 save of the guild has ended, to learn whether the save was stored before it sends anything again, so no appended line

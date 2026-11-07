@@ -37,7 +37,7 @@ afterEach(() => {
 
 const backendServing = (serves: boolean) => {
   const sweeps: number[] = [];
-  const backend = { servesData: () => serves, sweepGraveyard: async (cutoffMs: number) => { sweeps.push(cutoffMs); return 1; } };
+  const backend = { servesData: () => serves, sweepGraveyard: async (ttlMs: number) => { sweeps.push(ttlMs); return 1; } };
   return { backend: backend as never, sweeps };
 };
 
@@ -45,9 +45,15 @@ describe('the graveyard sweep', () => {
   it('deletes graveyard rows past the cutoff on its own pool and never a guild_ownership row', async () => {
     const sent: string[] = [];
     const real = new PostgresBackend(fixedDatabase('postgres://nobody@127.0.0.1:9/none'));
-    const client = { query: async (config: { text: string }) => { sent.push(config.text); return { rows: [], rowCount: 3 }; }, release: () => undefined };
+    const client = {
+      query: async (config: { text: string }) => {
+        sent.push(config.text);
+        return /pg_try_advisory_xact_lock/.test(config.text) ? { rows: [{ locked: true }], rowCount: 1 } : { rows: [], rowCount: 3 };
+      },
+      release: () => undefined,
+    };
     (real as unknown as { pool: unknown }).pool = { connect: async () => client, end: async () => undefined };
-    const swept = await real.sweepGraveyard(Date.now());
+    const swept = await real.sweepGraveyard(14 * 24 * 60 * 60 * 1000);
     await real.stop();
     expect(swept).toBe(3);
     expect(sent.some(sql => sql.includes('guild_data_graveyard'))).toBe(true);

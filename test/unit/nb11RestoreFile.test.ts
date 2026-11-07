@@ -47,7 +47,8 @@ const NODE_STOPPING = '[Data] This process is stopping; nothing was restored';
 const OUT_OF_TIME = 'the restore ran out of its 40 s before it could commit; nothing was restored; try again in a moment';
 const DELETE_FLUSH = "the server's unsaved changes are not confirmed saved yet; nothing was removed; try again in a moment";
 const DELETE_OUT_OF_TIME = 'the delete ran out of its 40 s before it could commit; nothing was removed; try again in a moment';
-const liveText = (r: number) => `live guild data exists; nothing was restored. To restore entry ${r}, delete this server's data, then restore with retiredAt ${r} before the bot saves anything new for the server; data it saves in between blocks the restore again. While the server's members are active, remove the bot from the server first and add it back after the restore.`;
+const liveText = (g: string, r: number) => `server ${g} has data saved since entry ${r} was deleted; nothing was restored. To put entry ${r} in place and move the current data to the graveyard as a new entry, run: smdb graveyard restore ${g} ${r} --replace`;
+const liveReply = (g: string, r: number) => ({ ok: false, code: 'invalid', refusal: 'live-data', retiredAt: r, error: liveText(g, r) });
 const failingText = (file: string, code: string) => `a file of this server keeps failing to save (${file}: ${code}); nothing was removed; free disk space or fix the file's permissions, then try again`;
 
 let guilds = 800_000_000_000_000_000n;
@@ -94,16 +95,22 @@ function holdLookup(): () => void {
   }) as any);
   return () => lookup.resolve();
 }
-/** Holds the unlink of g's entry note at ms until the returned release is called; the unlink then runs. */
-function holdUnlink(g: string, ms: number): () => void {
+/** Holds the open of the stamp's temp file in g's entry at ms until the returned release is called; reached resolves once it waits. */
+function holdStamp(g: string, ms: number): { release: () => void; reached: Promise<void> } {
   const gate = deferred();
-  const unlink = fs.promises.unlink.bind(fs.promises);
-  vi.spyOn(fs.promises, 'unlink').mockImplementation((async (p: any) => {
-    if (same(p, path.join(entryDir(g, ms), '.graveyard.json'))) await gate.promise;
-    return unlink(p);
+  const reached = deferred();
+  const open = fs.promises.open.bind(fs.promises);
+  vi.spyOn(fs.promises, 'open').mockImplementation((async (p: any, ...rest: any[]) => {
+    if (same(path.dirname(String(p)), entryDir(g, ms)) && String(p).endsWith('.tmp')) {
+      reached.resolve();
+      await gate.promise;
+    }
+    return (open as any)(p, ...rest);
   }) as any);
-  return () => gate.resolve();
+  return { release: () => gate.resolve(), reached: reached.promise };
 }
+/** The rename of g's copy into place. */
+const isPut = (g: string) => (from: unknown, to: unknown) => path.basename(String(from)).startsWith(`.restore-${g}-`) && same(to, dataPath(g));
 const event = (g: string) => [{ guildId: g }];
 let warn: ReturnType<typeof vi.spyOn>;
 
@@ -127,7 +134,7 @@ describe('writes and events during a restore', () => {
     bury(g, 1000, { 'm/a.json': '{"n":5}', 'm/b.json': '{"b":1}' });
     const restoring = restoreGuildFromGraveyard(g, 1000);
     expect(saveDataTracked('x.json', opts(g), { v: 1 })).toEqual({ outcome: 'refused', cause: 'not-ready' });
-    expect(await restoring).toEqual({ ok: true, retiredAt: 1000, reason: 'webui-operator-delete' });
+    expect(await restoring).toEqual({ ok: true, retiredAt: 1000, reason: 'webui-operator-delete', keptUntil: expect.any(Number) });
     expect(fs.readFileSync(dataPath(g, 'm', 'a.json'), 'utf8')).toBe('{"n":5}');
     expect(fs.readFileSync(dataPath(g, 'm', 'b.json'), 'utf8')).toBe('{"b":1}');
     expect(fs.existsSync(dataPath(g, '.graveyard.json'))).toBe(false);
@@ -177,7 +184,7 @@ describe('writes and events during a restore', () => {
     for (let i = 0; i < 257; i++) expect(await gateEventDispatch('messageCreate', event(g), () => { ran.push(i); })).toBe(false);
     expect(warn.mock.calls.some((c: unknown[]) => String(c[0]).includes(`Event buffer overflow for guild ${g}`))).toBe(true);
     lookup.resolve();
-    expect(await restoring).toEqual({ ok: false, code: 'invalid', error: liveText(1000) });
+    expect(await restoring).toEqual(liveReply(g, 1000));
     expect(ran).toEqual(Array.from({ length: 256 }, (_v, i) => i + 1));
   });
 
@@ -185,7 +192,7 @@ describe('writes and events during a restore', () => {
     const g = freshGuild();
     bury(g, 1000);
     enqueueWrite(dataPath(g, 'm', 'q.json'), '{"q":1}');
-    expect(await restoreGuildFromGraveyard(g, 1000)).toEqual({ ok: false, code: 'invalid', error: liveText(1000) });
+    expect(await restoreGuildFromGraveyard(g, 1000)).toEqual(liveReply(g, 1000));
     expect(await listed(g)).toHaveLength(1);
     await flushAll();
 
@@ -208,7 +215,7 @@ describe('writes and events during a restore', () => {
       if (dropped) dropPendingForGuild(h2);
       expect(guildHasQueuedOps(h2)).toBe(true);
       expect(fs.existsSync(dataPath(h2))).toBe(false);
-      expect(await restoreGuildFromGraveyard(h2, 1000)).toEqual({ ok: false, code: 'invalid', error: liveText(1000) });
+      expect(await restoreGuildFromGraveyard(h2, 1000)).toEqual(liveReply(h2, 1000));
       expect(await listed(h2)).toEqual([{ guildId: h2, retiredAt: 1000, reason: 'webui-operator-delete' }]);
       wire.resolve();
       await vi.waitFor(() => expect(guildHasQueuedOps(h2)).toBe(false));
@@ -220,65 +227,77 @@ describe('writes and events during a restore', () => {
   });
 });
 
-describe('the note and the rename', () => {
-  it('the note leaves first: a rename that keeps failing writes it back; a crash after the unlink lists the entry with no reason', async () => {
+describe('the stamp and the rename', () => {
+  it('a rename of the copy that keeps failing keeps the entry with its note; a step that stops there lists it with its reason', async () => {
     const g = freshGuild();
     bury(g, 1000);
     const rename = fs.promises.rename.bind(fs.promises);
     let tries = 0;
     vi.spyOn(fs.promises, 'rename').mockImplementation((async (from: any, to: any) => {
-      if (same(from, entryDir(g, 1000))) {
+      if (isPut(g)(from, to)) {
         tries++;
         throw errno('EPERM');
       }
       return rename(from, to);
     }) as any);
-    expect(await restoreGuildFromGraveyard(g, 1000)).toEqual({ ok: false, code: 'io-error', error: 'the graveyard entry could not be moved back (EPERM); nothing was restored; try again in a moment' });
+    expect(await restoreGuildFromGraveyard(g, 1000)).toEqual({ ok: false, code: 'io-error', error: 'the copy of entry 1000 could not be put in place (EPERM); nothing was restored; try again in a moment' });
     expect(tries).toBe(10);
-    expect(fs.readFileSync(path.join(entryDir(g, 1000), '.graveyard.json'), 'utf8')).toBe(JSON.stringify({ guildId: g, reason: 'webui-operator-delete', ts: 1000 }, null, 2));
+    expect(JSON.parse(fs.readFileSync(path.join(entryDir(g, 1000), '.graveyard.json'), 'utf8'))).toEqual({ guildId: g, reason: 'webui-operator-delete', ts: 1000, usedAt: expect.any(Number) });
     expect(await listed(g)).toEqual([{ guildId: g, retiredAt: 1000, reason: 'webui-operator-delete' }]);
     expect(fs.existsSync(dataPath(g))).toBe(false);
     vi.restoreAllMocks();
 
     const c = freshGuild();
     bury(c, 2000);
-    vi.spyOn(fs.promises, 'rename').mockImplementation((() => new Promise(() => {})) as any);
+    const reached = deferred();
+    vi.spyOn(fs.promises, 'rename').mockImplementation((async (from: any, to: any) => {
+      if (isPut(c)(from, to)) {
+        reached.resolve();
+        await new Promise(() => {});
+      }
+      return rename(from, to);
+    }) as any);
     void restoreGuildFromGraveyard(c, 2000);
-    await vi.waitFor(() => expect(fs.existsSync(path.join(entryDir(c, 2000), '.graveyard.json'))).toBe(false));
-    expect(await listed(c)).toEqual([{ guildId: c, retiredAt: 2000, reason: '' }]);
+    await reached.promise;
+    expect(await listed(c)).toEqual([{ guildId: c, retiredAt: 2000, reason: 'webui-operator-delete' }]);
   });
 
-  it('the rename is retried; ENOENT answers no entry', async () => {
+  it('the rename is retried; ENOENT at the stamp answers no entry', async () => {
     const g = freshGuild();
     bury(g, 1000, { 'm/a.json': '{"n":5}' }, 'test-reason');
     const rename = fs.promises.rename.bind(fs.promises);
     let fails = 2;
     let tries = 0;
     vi.spyOn(fs.promises, 'rename').mockImplementation((async (from: any, to: any) => {
-      if (same(from, entryDir(g, 1000))) {
+      if (isPut(g)(from, to)) {
         tries++;
         if (fails-- > 0) throw errno('EPERM');
       }
       return rename(from, to);
     }) as any);
-    expect(await restoreGuildFromGraveyard(g, 1000)).toEqual({ ok: true, retiredAt: 1000, reason: 'test-reason' });
+    expect(await restoreGuildFromGraveyard(g, 1000)).toEqual({ ok: true, retiredAt: 1000, reason: 'test-reason', keptUntil: expect.any(Number) });
     expect(tries).toBe(3);
     expect(fs.readFileSync(dataPath(g, 'm', 'a.json'), 'utf8')).toBe('{"n":5}');
     vi.restoreAllMocks();
 
     const e = freshGuild();
     bury(e, 1000);
+    const before = fs.readFileSync(path.join(entryDir(e, 1000), '.graveyard.json'), 'utf8');
     let enoent = 0;
     vi.spyOn(fs.promises, 'rename').mockImplementation((async () => { enoent++; throw errno('ENOENT'); }) as any);
     expect(await restoreGuildFromGraveyard(e, 1000)).toEqual({ ok: false, code: 'invalid', error: NO_ENTRY });
     expect(enoent).toBe(1);
-    expect(fs.existsSync(path.join(entryDir(e, 1000), '.graveyard.json'))).toBe(false);
+    expect(fs.readFileSync(path.join(entryDir(e, 1000), '.graveyard.json'), 'utf8')).toBe(before);
   });
 
-  it('a note that cannot be removed refuses the restore', async () => {
+  it('a stamp that cannot be written refuses the restore', async () => {
     const g = freshGuild();
     bury(g, 1000);
-    vi.spyOn(fs.promises, 'unlink').mockImplementation((async () => { throw errno('EPERM'); }) as any);
+    const open = fs.promises.open.bind(fs.promises);
+    vi.spyOn(fs.promises, 'open').mockImplementation((async (p: any, ...rest: any[]) => {
+      if (same(path.dirname(String(p)), entryDir(g, 1000)) && String(p).endsWith('.tmp')) throw errno('EPERM');
+      return (open as any)(p, ...rest);
+    }) as any);
     const lookup = deferred();
     const readdir = fs.promises.readdir.bind(fs.promises);
     vi.spyOn(fs.promises, 'readdir').mockImplementation((async (...args: any[]) => {
@@ -289,13 +308,12 @@ describe('the note and the rename', () => {
     const ran = vi.fn();
     expect(await gateEventDispatch('messageCreate', event(g), ran)).toBe(false);
     lookup.resolve();
-    expect(await restoring).toEqual({ ok: false, code: 'io-error', error: "the graveyard entry's note could not be removed (EPERM); nothing was restored; try again in a moment" });
+    expect(await restoring).toEqual({ ok: false, code: 'io-error', error: 'entry 1000 could not be marked as restored (EPERM); nothing was restored; try again in a moment' });
     expect(await listed(g)).toEqual([{ guildId: g, retiredAt: 1000, reason: 'webui-operator-delete' }]);
     expect(fs.existsSync(dataPath(g))).toBe(false);
     expect(guildDataOpOf(g)).toBeUndefined();
     expect(ran).toHaveBeenCalledTimes(1);
   });
-
   it('a throw in the lookup answers the error text and replays the queue', async () => {
     const g = freshGuild();
     bury(g, 1000);
@@ -364,8 +382,18 @@ describe('the file sweep', () => {
   });
 });
 
-describe('maintenance, exit and the deadline during the lookup or the unlink', () => {
-  it('the gate closed during the lookup refuses; closed during the unlink writes the note back', async () => {
+describe('maintenance, exit and the deadline during the lookup or the stamp', () => {
+  /** Runs after each stamp temp file of g's entry at ms is opened. */
+  function afterStampOpen(g: string, ms: number, then: () => Promise<void> | void): void {
+    const open = fs.promises.open.bind(fs.promises);
+    vi.spyOn(fs.promises, 'open').mockImplementation((async (p: any, ...rest: any[]) => {
+      const fh = await (open as any)(p, ...rest);
+      if (same(path.dirname(String(p)), entryDir(g, ms)) && String(p).endsWith('.tmp')) await then();
+      return fh;
+    }) as any);
+  }
+
+  it('the gate closed during the lookup refuses; closed during the stamp refuses at the copy and keeps the entry', async () => {
     const g = freshGuild();
     bury(g, 1000);
     const lookup = deferred();
@@ -382,11 +410,7 @@ describe('maintenance, exit and the deadline during the lookup or the unlink', (
     expect(fs.existsSync(dataPath(g))).toBe(false);
     setMaintenanceGate(null);
 
-    const unlink = fs.promises.unlink.bind(fs.promises);
-    vi.spyOn(fs.promises, 'unlink').mockImplementation((async (p: any) => {
-      await unlink(p);
-      setMaintenanceGate({ cause: 'hook', message: 'down' });
-    }) as any);
+    afterStampOpen(g, 1000, () => setMaintenanceGate({ cause: 'hook', message: 'down' }));
     expect(await restoreGuildFromGraveyard(g, 1000).catch(e => e.causeKey)).toBe('maintenance');
     expect(await listed(g)).toEqual([{ guildId: g, retiredAt: 1000, reason: 'webui-operator-delete' }]);
     expect(fs.existsSync(dataPath(g))).toBe(false);
@@ -404,15 +428,11 @@ describe('maintenance, exit and the deadline during the lookup or the unlink', (
     expect(guildDataOpOf(g)).toBeUndefined();
   });
 
-  it('the deadline passing during the unlink refuses with the note written back', async () => {
+  it('a deadline that leaves the copy less than 5 s refuses at the copy and keeps the entry', async () => {
     const g = freshGuild();
     bury(g, 1000);
-    const unlink = fs.promises.unlink.bind(fs.promises);
-    vi.spyOn(fs.promises, 'unlink').mockImplementation((async (p: any) => {
-      await unlink(p);
-      await tick(80);
-    }) as any);
-    expect(await restoreGuildFromGraveyard(g, 1000, monoIn(50))).toEqual({ ok: false, code: 'backend-unavailable', error: OUT_OF_TIME });
+    afterStampOpen(g, 1000, () => tick(80));
+    expect(await restoreGuildFromGraveyard(g, 1000, monoIn(50))).toEqual({ ok: false, code: 'backend-unavailable', error: "entry 1000 could not be copied before the restore's deadline (0 file(s) copied); nothing was restored" });
     expect(await listed(g)).toEqual([{ guildId: g, retiredAt: 1000, reason: 'webui-operator-delete' }]);
     expect(fs.existsSync(dataPath(g))).toBe(false);
   });
@@ -425,10 +445,10 @@ describe('restore and delete on JSON', () => {
     await flushAll();
     bury(g, 1000);
     const note = deferred();
-    const writeFile = fs.promises.writeFile.bind(fs.promises);
-    vi.spyOn(fs.promises, 'writeFile').mockImplementation((async (p: any, ...rest: any[]) => {
-      if (String(p).endsWith('.graveyard.json')) await note.promise;
-      return (writeFile as any)(p, ...rest);
+    const open = fs.promises.open.bind(fs.promises);
+    vi.spyOn(fs.promises, 'open').mockImplementation((async (p: any, ...rest: any[]) => {
+      if (path.basename(String(p)).startsWith('.graveyard.json.')) await note.promise;
+      return (open as any)(p, ...rest);
     }) as any);
     const deleting = deleteGuildNamespace(g, 'test', 5000);
     await vi.waitFor(() => expect(fs.existsSync(dataPath(g))).toBe(false));
@@ -586,7 +606,7 @@ describe('the barrier on JSON (decision 17)', () => {
     bury(g, 1000);
     const gate = deferred();
     const running = olderRun(g, gate.promise);
-    expect(await restoreGuildFromGraveyard(g, 1000)).toEqual({ ok: true, retiredAt: 1000, reason: 'webui-operator-delete' });
+    expect(await restoreGuildFromGraveyard(g, 1000)).toEqual({ ok: true, retiredAt: 1000, reason: 'webui-operator-delete', keptUntil: expect.any(Number) });
     warn.mockClear();
     gate.resolve();
     const r = await running;
@@ -594,12 +614,12 @@ describe('the barrier on JSON (decision 17)', () => {
     expect(r.save).toEqual({ outcome: 'refused', cause: 'not-ready' });
     expect(r.update).toEqual({ outcome: 'refused', cause: 'not-ready' });
     expect(r.del).toEqual({ outcome: 'refused', cause: 'not-ready' });
-    expect(r.append.outcome).toBe('appended');
+    expect(r.append).toEqual({ outcome: 'refused', cause: 'not-ready' });
     const lines = warn.mock.calls.map((c: unknown[]) => String(c[0]));
-    for (const what of ['Write', 'Update', 'Delete']) expect(lines).toContain(`[Data] ${what} for guild ${g} refused: ${BARRIER_LINE}`);
+    for (const what of ['Write', 'Update', 'Delete', 'Append']) expect(lines).toContain(`[Data] ${what} for guild ${g} refused: ${BARRIER_LINE}`);
     await flushAll();
     expect(fs.readFileSync(dataPath(g, 'm', 'a.json'), 'utf8')).toBe('{"n":5}');
-    expect(fs.readFileSync(dataPath(g, 'm', 'l.jsonl'), 'utf8')).toBe('x\n');
+    expect(fs.existsSync(dataPath(g, 'm', 'l.jsonl'))).toBe(false);
     const later = runInLedger(openLedger('interaction'), 'm', () => saveDataTracked('a.json', opts(g), { n: 6 }));
     expect(later.outcome).toBe('saved');
     await flushAll();
@@ -607,21 +627,21 @@ describe('the barrier on JSON (decision 17)', () => {
   });
 
   it.each([
-    ['a live folder', (g: string) => { fs.mkdirSync(dataPath(g), { recursive: true }); }, { ok: false, code: 'invalid', error: liveText(1000) }],
+    ['a live folder', (g: string) => { fs.mkdirSync(dataPath(g), { recursive: true }); }, (g: string) => liveReply(g, 1000)],
     ['a rename that keeps failing', (g: string) => {
       const rename = fs.promises.rename.bind(fs.promises);
       vi.spyOn(fs.promises, 'rename').mockImplementation((async (from: any, to: any) => {
-        if (same(from, entryDir(g, 1000))) throw errno('EPERM');
+        if (path.basename(String(from)).startsWith(`.restore-${g}-`) && same(to, dataPath(g))) throw errno('EPERM');
         return rename(from, to);
       }) as any);
-    }, { ok: false, code: 'io-error', error: 'the graveyard entry could not be moved back (EPERM); nothing was restored; try again in a moment' }],
+    }, () => ({ ok: false, code: 'io-error', error: 'the copy of entry 1000 could not be put in place (EPERM); nothing was restored; try again in a moment' })],
   ] as const)('a JSON restore refused before the rename (%s) takes no barrier: the older run saves', async (_name, prepare, answer) => {
     const g = freshGuild();
     bury(g, 1000);
     prepare(g);
     const gate = deferred();
     const running = olderRun(g, gate.promise);
-    expect(await restoreGuildFromGraveyard(g, 1000)).toEqual(answer);
+    expect(await restoreGuildFromGraveyard(g, 1000)).toEqual(answer(g));
     vi.restoreAllMocks();
     gate.resolve();
     const r = await running;
@@ -664,7 +684,7 @@ describe('raw writes under a held guild (decision 1)', () => {
     expect(guildHasQueuedOps(g)).toBe(false);
     expect(fs.existsSync(dataPath(g))).toBe(false);
     release();
-    expect(await restoring).toEqual({ ok: true, retiredAt: 1000, reason: 'webui-operator-delete' });
+    expect(await restoring).toEqual({ ok: true, retiredAt: 1000, reason: 'webui-operator-delete', keptUntil: expect.any(Number) });
     await flushAll();
     expect(fs.readdirSync(dataPath(g, 'm'))).toEqual(['a.json']);
     expect(fs.readFileSync(dataPath(g, 'm', 'a.json'), 'utf8')).toBe('{"n":5}');
@@ -716,9 +736,12 @@ describe.skipIf(process.platform === 'win32')('the directories are fsynced befor
     const once = new Map([[path.resolve(dataPath()), 1], [path.resolve(dataPath('_graveyard')), 1]]);
     const g = freshGuild();
     bury(g, 1000);
+    const d = freshGuild();
+    saveData('a.json', opts(d), { a: 1 });
+    await flushAll();
     const runs: [string, () => Promise<unknown>, unknown][] = [
-      ['restore', () => restoreGuildFromGraveyard(g, 1000), { ok: true, retiredAt: 1000, reason: 'webui-operator-delete', moveUnconfirmed: 'EIO' }],
-      ['delete', () => deleteGuildNamespace(g, 'test', 5000), { ok: true, moveUnconfirmed: 'EIO' }],
+      ['restore', () => restoreGuildFromGraveyard(g, 1000), { ok: false, code: 'io-error', error: 'the disk did not confirm the copy of entry 1000 (EIO); nothing was restored; check the disk, then try again' }],
+      ['delete', () => deleteGuildNamespace(d, 'test', 5000), { ok: true, moveUnconfirmed: 'EIO' }],
     ];
     for (const [, run, expected] of runs) {
       synced.clear();
@@ -742,11 +765,11 @@ describe.skipIf(process.platform === 'win32')('the directories are fsynced befor
 describe('the state x exit table (JSON cells)', () => {
   it.each([
     ['J1 no entry', (_g: string) => {}, NO_ENTRY],
-    ['J1 a live folder', (g: string) => { bury(g, 1000); fs.mkdirSync(dataPath(g), { recursive: true }); }, liveText(1000)],
+    ['J1 a live folder', (g: string) => { bury(g, 1000); fs.mkdirSync(dataPath(g), { recursive: true }); }, null],
   ] as const)('%s', async (_name, prepare, error) => {
     const g = freshGuild();
     prepare(g);
-    expect(await restoreGuildFromGraveyard(g, 1000)).toEqual({ ok: false, code: 'invalid', error });
+    expect(await restoreGuildFromGraveyard(g, 1000)).toEqual(error === null ? liveReply(g, 1000) : { ok: false, code: 'invalid', error });
     expect(guildDataOpOf(g)).toBeUndefined();
     if (error !== NO_ENTRY) {
       expect(await listed(g)).toEqual([{ guildId: g, retiredAt: 1000, reason: 'webui-operator-delete' }]);
@@ -777,31 +800,31 @@ describe('the state x exit table (JSON cells)', () => {
     expect(await restoreGuildFromGraveyard(g)).toEqual({ ok: false, code: 'invalid', error: ALREADY });
     expect(await deleteGuildNamespace(g, 'test', 5000)).toEqual({ ok: false, code: 'invalid', error: RESTORE_RUNNING });
     release();
-    expect(await restoring).toEqual({ ok: true, retiredAt: 1000, reason: 'webui-operator-delete' });
+    expect(await restoring).toEqual({ ok: true, retiredAt: 1000, reason: 'webui-operator-delete', keptUntil: expect.any(Number) });
     expect(fs.readFileSync(dataPath(g, 'm', 'a.json'), 'utf8')).toBe('{"n":5}');
-    expect(await listed(g)).toEqual([]);
+    expect(await listed(g)).toEqual([{ guildId: g, retiredAt: 1000, reason: 'webui-operator-delete' }]);
   });
 
-  it('J2 delete of G: a delete while the note is being removed is refused; the restore completes without the note', async () => {
+  it('K2 delete of G: a delete during the stamp is refused; the restore completes without the note', async () => {
     const g = freshGuild();
     bury(g, 1000);
-    const release = holdUnlink(g, 1000);
+    const stamp = holdStamp(g, 1000);
     const restoring = restoreGuildFromGraveyard(g, 1000);
-    await vi.waitFor(() => expect(vi.mocked(fs.promises.unlink)).toHaveBeenCalled());
+    await stamp.reached;
     expect(await deleteGuildNamespace(g, 'test', 5000)).toEqual({ ok: false, code: 'invalid', error: RESTORE_RUNNING });
-    release();
+    stamp.release();
     expect(await restoring).toMatchObject({ ok: true, retiredAt: 1000 });
     expect(fs.readdirSync(dataPath(g)).sort()).toEqual(['m']);
     expect(fs.readFileSync(dataPath(g, 'm', 'a.json'), 'utf8')).toBe('{"n":5}');
   });
 
-  it('J3 maintenance read before a rename try: refused, the note written back, nothing moved', async () => {
+  it('K5 maintenance read before a rename try: refused, nothing moved', async () => {
     const g = freshGuild();
     bury(g, 1000);
     const rename = fs.promises.rename.bind(fs.promises);
     let tries = 0;
     vi.spyOn(fs.promises, 'rename').mockImplementation((async (from: any, to: any) => {
-      if (!same(from, entryDir(g, 1000))) return rename(from, to);
+      if (!isPut(g)(from, to)) return rename(from, to);
       tries += 1;
       setMaintenanceGate({ cause: 'hook', message: 'down' });
       throw errno('EPERM');
@@ -812,52 +835,59 @@ describe('the state x exit table (JSON cells)', () => {
     await expectEntryKept(g, 1000);
   });
 
-  it('J3 the deadline read before a rename try: out-of-time, the note written back, nothing moved', async () => {
+  it('K5 the deadline read before a rename try: out-of-time, nothing moved', async () => {
     const g = freshGuild();
     bury(g, 1000);
+    const realBig = process.hrtime.bigint;
+    let offset = 0n;
+    vi.spyOn(process.hrtime, 'bigint').mockImplementation(() => realBig() + offset);
     const rename = fs.promises.rename.bind(fs.promises);
     let tries = 0;
     vi.spyOn(fs.promises, 'rename').mockImplementation((async (from: any, to: any) => {
-      if (!same(from, entryDir(g, 1000))) return rename(from, to);
+      if (!isPut(g)(from, to)) return rename(from, to);
       tries += 1;
-      await tick(80);
+      offset += 41_000_000_000n;
       throw errno('EPERM');
     }) as any);
-    expect(await restoreGuildFromGraveyard(g, 1000, monoIn(50))).toEqual({ ok: false, code: 'backend-unavailable', error: OUT_OF_TIME });
+    expect(await restoreGuildFromGraveyard(g, 1000)).toEqual({ ok: false, code: 'backend-unavailable', error: OUT_OF_TIME });
     expect(tries).toBe(1);
     await expectEntryKept(g, 1000);
   });
 
-  it('J3 delete of G: a delete during the rename is refused; the restore completes', async () => {
+  it('K5 delete of G: a delete during the rename is refused; the restore completes', async () => {
     const g = freshGuild();
     bury(g, 1000);
     const gate = deferred();
+    const reached = deferred();
     const rename = fs.promises.rename.bind(fs.promises);
     vi.spyOn(fs.promises, 'rename').mockImplementation((async (from: any, to: any) => {
-      if (same(from, entryDir(g, 1000))) await gate.promise;
+      if (isPut(g)(from, to)) {
+        reached.resolve();
+        await gate.promise;
+      }
       return rename(from, to);
     }) as any);
     const restoring = restoreGuildFromGraveyard(g, 1000);
-    await vi.waitFor(() => expect(vi.mocked(fs.promises.rename)).toHaveBeenCalled());
+    await reached.promise;
     expect(await deleteGuildNamespace(g, 'test', 5000)).toEqual({ ok: false, code: 'invalid', error: RESTORE_RUNNING });
     gate.resolve();
     expect(await restoring).toMatchObject({ ok: true });
     expect(fs.readFileSync(dataPath(g, 'm', 'a.json'), 'utf8')).toBe('{"n":5}');
   });
 
-  it('J4 then a restore again: no entry, or live data naming the older entry', async () => {
+  it('K6 then a restore again: live data naming the entry, which stays listed', async () => {
     const g = freshGuild();
     bury(g, 1000);
     expect(await restoreGuildFromGraveyard(g, 1000)).toMatchObject({ ok: true });
-    expect(await restoreGuildFromGraveyard(g, 1000)).toEqual({ ok: false, code: 'invalid', error: NO_ENTRY });
+    expect(await restoreGuildFromGraveyard(g, 1000)).toEqual(liveReply(g, 1000));
     bury(g, 500, { 'm/old.json': '{"o":1}' });
-    expect(await restoreGuildFromGraveyard(g)).toEqual({ ok: false, code: 'invalid', error: liveText(500) });
+    expect(await restoreGuildFromGraveyard(g)).toEqual(liveReply(g, 1000));
     expect(fs.readFileSync(dataPath(g, 'm', 'a.json'), 'utf8')).toBe('{"n":5}');
     expect(fs.existsSync(dataPath(g, 'm', 'old.json'))).toBe(false);
-    expect(await listed(g)).toEqual([{ guildId: g, retiredAt: 500, reason: 'webui-operator-delete' }]);
+    expect(await listed(g)).toEqual([{ guildId: g, retiredAt: 1000, reason: 'webui-operator-delete' }, { guildId: g, retiredAt: 500, reason: 'webui-operator-delete' }]);
   });
 
-  it('J4 then a delete: runs as any delete and moves the restored files back to the graveyard', async () => {
+  it('K6 then a delete: runs as any delete and moves the restored files to a new graveyard entry', async () => {
     const g = freshGuild();
     bury(g, 1000);
     expect(await restoreGuildFromGraveyard(g, 1000)).toMatchObject({ ok: true });
@@ -871,20 +901,20 @@ describe('the state x exit table (JSON cells)', () => {
 
 // Last: the exit drain closes the facade for the rest of this file.
 describe('the exit', () => {
-  it('the exit drain during the lookup or the unlink refuses node-stopping; the note is written back and nothing moved', async () => {
+  it('the exit drain during the lookup or the stamp refuses node-stopping; nothing moved', async () => {
     const a = freshGuild();
     const b = freshGuild();
     bury(a, 1000);
     bury(b, 1000);
+    const stamp = holdStamp(b, 1000);
     const releaseLookup = holdLookup();
-    const releaseUnlink = holdUnlink(b, 1000);
+    const duringStamp = restoreGuildFromGraveyard(b, 1000).catch(e => e);
+    await stamp.reached;
     const duringLookup = restoreGuildFromGraveyard(a).catch(e => e);
-    const duringUnlink = restoreGuildFromGraveyard(b, 1000).catch(e => e);
-    await vi.waitFor(() => expect(vi.mocked(fs.promises.unlink)).toHaveBeenCalled());
     await drainForExit(200);
     releaseLookup();
-    releaseUnlink();
-    for (const thrown of [await duringLookup, await duringUnlink]) {
+    stamp.release();
+    for (const thrown of [await duringLookup, await duringStamp]) {
       expect(thrown.causeKey).toBe('node-stopping');
       expect(thrown.message).toBe(NODE_STOPPING);
     }

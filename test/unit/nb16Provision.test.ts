@@ -136,7 +136,7 @@ function colRow(rel: string, name: string, type: string, notNull: boolean, extra
 const CURRENT = [{ value: JSON.stringify({ v: pg.SCHEMA_VERSION }) }];
 
 /** The frozen schema statements without its seed row, as the fresh path and the scratch send them. */
-const frozenSchema = () => [...FROZEN_V6_DDL, ...frozenPartitions(true)].filter(s => !s.startsWith('INSERT')).map(s => s.trim());
+const frozenSchema = () => [...FROZEN_V7_DDL, ...frozenPartitions(true)].filter(s => !s.startsWith('INSERT')).map(s => s.trim());
 
 const SEQ_PARAMS = { seq_increment: '1', seq_min: '1', seq_max: '9223372036854775807', seq_cache: '1', seq_cycle: false };
 const PLAIN_TABLES = ['meta', 'guild_ownership', 'shard_claims', 'claim_clock', 'shard_nodes', 'guild_data_graveyard', 'guild_requests'];
@@ -442,7 +442,7 @@ describe('a fresh database', () => {
     const tail = sent.slice(sent.indexOf('RELEASE SAVEPOINT shape'));
     expect(tail.length).toBe(7);
     expect(FOUND.test(tail[1])).toBe(true);
-    expect(tail[2]).toBe(FROZEN_V6_DDL.find(s => s.startsWith('INSERT'))!.trim());
+    expect(tail[2]).toBe(FROZEN_V7_DDL.find(s => s.startsWith('INSERT'))!.trim());
     expect(tail[3]).toMatch(/^INSERT INTO smdb_data\.meta \(key, value\) VALUES \('schema_version', \$1\) ON CONFLICT \(key\) DO NOTHING$/);
     expect(VERSION.test(tail[4])).toBe(true);
     expect(tail[5]).toMatch(/^INSERT INTO smdb_data\.meta \(key, value\) VALUES \('store_id'/);
@@ -584,7 +584,7 @@ describe('a throw at any statement of the check', () => {
 });
 
 // The schema of SCHEMA_VERSION 6, frozen. A change here means the DDL changed.
-const FROZEN_V6_DDL = [
+const FROZEN_V7_DDL = [
   `CREATE SCHEMA IF NOT EXISTS smdb_data`,
   `CREATE TABLE IF NOT EXISTS smdb_data.meta (
     key        text PRIMARY KEY,
@@ -668,6 +668,7 @@ const FROZEN_V6_DDL = [
     doc        text NOT NULL,
     retired_at bigint NOT NULL,
     reason     text NOT NULL,
+    used_at    bigint,
     PRIMARY KEY (guild_id, retired_at, module, filename)
   )`,
   `CREATE INDEX IF NOT EXISTS guild_graveyard_ttl_idx ON smdb_data.guild_data_graveyard (retired_at)`,
@@ -707,16 +708,16 @@ function frozenPartitions(ifNotExists: boolean): string[] {
 
 const BUMP = 'the DDL changed: bump SCHEMA_VERSION (the boot refuses a stored schema that differs) and update this copy';
 
-describe('the schema of SCHEMA_VERSION 6 (guard)', () => {
+describe('the schema of SCHEMA_VERSION 7 (guard)', () => {
   it("provision()'s 83 statements are today's, text for text", () => {
-    expect(pg.SCHEMA_VERSION, BUMP).toBe(6);
-    expect([...pg.provisionDdl('smdb_data'), ...pg.partitionDdl('smdb_data', true)], BUMP).toEqual([...FROZEN_V6_DDL, ...frozenPartitions(true)]);
+    expect(pg.SCHEMA_VERSION, BUMP).toBe(7);
+    expect([...pg.provisionDdl('smdb_data'), ...pg.partitionDdl('smdb_data', true)], BUMP).toEqual([...FROZEN_V7_DDL, ...frozenPartitions(true)]);
   });
 
   it("provisionStoreInTransaction's statements are today's, text for text", async () => {
     const sent: string[] = [];
     await pg.provisionStoreInTransaction({ query: async (text: string) => { sent.push(text); return { rows: [] }; } });
-    expect(sent.slice(0, -2), BUMP).toEqual(['CREATE SCHEMA smdb_data', ...FROZEN_V6_DDL.slice(1), ...frozenPartitions(false)]);
+    expect(sent.slice(0, -2), BUMP).toEqual(['CREATE SCHEMA smdb_data', ...FROZEN_V7_DDL.slice(1), ...frozenPartitions(false)]);
   });
 
   it('the DDL rendered for another schema names no smdb_data', () => {

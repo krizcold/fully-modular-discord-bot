@@ -20,8 +20,8 @@ import { LEASED } from '../helpers/readinessRig';
 
 const DELETE_FAILED = 'guild data delete failed; nothing was removed';
 const DELETE_ALREADY = "a delete of this server's data is already running; nothing was removed";
-const unknownTail = "is gone from `smdb graveyard list`; if not, the entry is still listed, unless it had passed the graveyard's keep time (GRAVEYARD_TTL_DAYS, 14 days by default) and the graveyard sweep removed it, data and all. The list reads the data of the bot behind the web panel it asks; if the main database was replaced meanwhile, check once that bot runs on the new main.";
-const unknownHead = (g: string) => `can't confirm whether server ${g} was restored: the database did not confirm the commit. Within a minute, if it was restored, the server's data is back and`;
+const unknownText = (g: string, r?: number) => `can't confirm whether server ${g} was restored: the database did not confirm the commit; the outcome is fixed within a minute. ${r === undefined ? `The entry it restored, if any, stays listed either way, unless it had passed the graveyard's keep time (GRAVEYARD_TTL_DAYS, 14 days by default) and the graveyard sweep removed it, data and all. Running smdb graveyard restore ${g} <its retiredAt> --replace is then safe: it copies that entry in and moves whatever the server holds into a new entry, so nothing is lost.` : `Entry ${r} stays listed either way, unless it had passed the graveyard's keep time (GRAVEYARD_TTL_DAYS, 14 days by default) and the graveyard sweep removed it, data and all. Running smdb graveyard restore ${g} ${r} --replace is then safe: it copies entry ${r} in and moves whatever the server holds into a new entry, so nothing is lost.`} The list reads the data of the bot behind the web panel it asks; if the main database was replaced meanwhile, check once that bot runs on the new main.`;
+
 
 class Scripted extends FakeStore {
   restoreImpl: (() => Promise<RestoreOutcome>) | null = null;
@@ -88,7 +88,7 @@ describe('a restore the database did not confirm', () => {
     const g = await readyGuild(ws);
     store.restoreImpl = async () => ({ ok: false, reason: 'unknown' });
     const reply = await restoreGuildFromGraveyard(g);
-    expect(reply).toEqual({ ok: false, code: 'backend-unavailable', error: `${unknownHead(g)} its entry ${unknownTail}` });
+    expect(reply).toEqual({ ok: false, code: 'backend-unavailable', error: unknownText(g) });
     expect(lines(error)).toContain(`[DataManager] Can't confirm whether guild ${g} was restored: the database did not confirm the commit`);
   });
 
@@ -97,7 +97,7 @@ describe('a restore the database did not confirm', () => {
     const g = await readyGuild(ws);
     store.restoreImpl = async () => ({ ok: false, reason: 'unknown', retiredAt: 9 });
     const reply = await restoreGuildFromGraveyard(g);
-    expect(reply).toEqual({ ok: false, code: 'backend-unavailable', error: `${unknownHead(g)} entry 9 ${unknownTail}` });
+    expect(reply).toEqual({ ok: false, code: 'backend-unavailable', error: unknownText(g, 9) });
     expect(lines(error)).toContain(`[DataManager] Can't confirm whether guild ${g} was restored from graveyard batch 9: the database did not confirm the commit`);
   });
 });

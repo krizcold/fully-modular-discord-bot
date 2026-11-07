@@ -248,7 +248,7 @@ describe('an operator delete or restore asks the serving gate after its last awa
     let stopped = false;
     setStoppedServingHook(() => stopped);
     const { guildId } = await storeGuild();
-    const restoreGuild = vi.fn(async () => ({ ok: true, moved: 1, retiredAt: 5, reason: 'r' }));
+    const restoreGuild = vi.fn(async () => ({ ok: true, copied: 1, retiredAt: 5, reason: 'r', usedAt: 1000 }));
     setGuildDataBackend(Object.assign(Object.create(PostgresBackend.prototype), { restoreGuild }));
     const ws = getWorkingSet()!;
     vi.spyOn(ws, 'flushGuildNow').mockImplementation(async () => { stopped = true; return 'ok' as never; });
@@ -265,10 +265,10 @@ describe('an operator delete or restore asks the serving gate after its last awa
         ws.freeze(guildId);
         expect(ws.stateOf(guildId)).toBe('restoring');
         expect(ws.dirtyGuildIds()).not.toContain(guildId);
-        return { ok: true, moved: 1, retiredAt: 5, reason: 'r' };
+        return { ok: true, copied: 1, retiredAt: 5, reason: 'r', usedAt: 1000 };
       },
     }));
-    expect(await restoreGuildFromGraveyard(guildId, 5)).toEqual({ ok: true, moved: 1, retiredAt: 5, reason: 'r' });
+    expect(await restoreGuildFromGraveyard(guildId, 5)).toEqual({ ok: true, copied: 1, retiredAt: 5, reason: 'r', keptUntil: 1000 + 14 * 24 * 60 * 60 * 1000 });
     expect(ws.has(guildId)).toBe(false);
   });
 });

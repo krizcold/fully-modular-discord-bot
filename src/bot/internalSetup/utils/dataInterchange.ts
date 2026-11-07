@@ -9,6 +9,7 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import { DATA_ROOT } from '../../../utils/dataRoot';
 import { flushGuild } from './dataManager';
+import { nextGraveyardName, writeGraveyardNote } from './dataBackends/fileBackend';
 import { checkWriterLock, configureWriterLock, deposedHolder, holderWords, releaseWriterLock, takeWriterLock, writerLockDepth, writerLockPath } from './writerLock';
 import type { TakeResult } from './processLock';
 import { MIGRATION_FILE, readDataFacts } from './dataBackends/recognitionGuard';
@@ -491,7 +492,7 @@ async function importBundleHeld(filePath: string): Promise<BundleImportResult> {
     if (live) {
       const graveyardRoot = path.join(DATA_ROOT, '_graveyard');
       await fs.promises.mkdir(graveyardRoot, { recursive: true });
-      const dest = path.join(graveyardRoot, `${guildId}-${Date.now()}`);
+      const dest = path.join(graveyardRoot, `${guildId}-${nextGraveyardName(guildId)}`);
       refuseIfDeposed();
       await fs.promises.rename(liveDir, dest);
       swapping = true;
@@ -506,8 +507,7 @@ async function importBundleHeld(filePath: string): Promise<BundleImportResult> {
         }
         throw new Error(`[DataInterchange] Swap failed; the old guild dir was put back: ${error instanceof Error ? error.message : String(error)}`);
       }
-      await fs.promises.writeFile(path.join(dest, '.graveyard.json'), JSON.stringify({ guildId, reason: 'replaced by bundle import', ts: Date.now() }, null, 2), 'utf-8')
-        .catch(() => undefined);
+      await writeGraveyardNote(dest, { guildId, reason: 'replaced by bundle import', ts: Date.now() }).catch(() => undefined);
     } else {
       refuseIfDeposed();
       swapping = true;

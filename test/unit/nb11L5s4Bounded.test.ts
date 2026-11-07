@@ -13,7 +13,7 @@ const token: FenceToken = { nodeId: 'node-a', claim: 7, processId: 'process-a', 
 
 type Doc = { guild: string; module: string; filename: string; doc: string };
 type Chunk = { guild: string; module: string; filename: string; seq: number; chunk: string };
-type Grave = { guild: string; module: string; filename: string; kind: 'doc' | 'append'; doc: string; retiredAt: number; reason: string };
+type Grave = { guild: string; module: string; filename: string; kind: 'doc' | 'append'; doc: string; retiredAt: number; reason: string; usedAt?: number };
 type Owner = { nodeId: string; claim: number; retired: boolean };
 type Tables = { data: Doc[]; append: Chunk[]; grave: Grave[]; owners: Map<string, Owner> };
 type Result = { rows: Record<string, unknown>[]; rowCount: number | null };
@@ -74,7 +74,10 @@ function rig(opts: { foreignOwner?: { nodeId: string; claim: number }; hook?: (s
       const owner = db.owners.get(g);
       return owner ? { rows: [{ node_id: owner.nodeId, claim: String(owner.claim) }], rowCount: 1 } : { rows: [], rowCount: 0 };
     }
-    if (/^INSERT INTO smdb_data\.guild_data_graveyard/.test(sql) && /string_agg/.test(sql)) {
+    if (/pg_advisory_xact_lock_shared/.test(sql)) return { rows: [{}], rowCount: 1 };
+    if (/^WITH r AS/.test(sql)) {
+      const mine = db.grave.filter(r => r.guild === g).map(r => r.retiredAt);
+      const at = Math.max(Date.now(), ...mine.map(x => x + 1));
       const groups = new Map<string, Chunk[]>();
       for (const c of db.append.filter(r => r.guild === g)) {
         const k = `${c.module}|${c.filename}`;
@@ -82,24 +85,13 @@ function rig(opts: { foreignOwner?: { nodeId: string; claim: number }; hook?: (s
       }
       for (const list of groups.values()) {
         const doc = list.sort((x, y) => x.seq - y.seq).map(c => c.chunk).join('');
-        db.grave.push({ guild: g, module: list[0].module, filename: list[0].filename, kind: 'append', doc, retiredAt: Number(b), reason: values[2] as string });
+        db.grave.push({ guild: g, module: list[0].module, filename: list[0].filename, kind: 'append', doc, retiredAt: at, reason: b as string });
       }
-      return { rows: [], rowCount: groups.size };
-    }
-    if (/^INSERT INTO smdb_data\.guild_data_graveyard/.test(sql)) {
-      const rows = db.data.filter(r => r.guild === g);
-      for (const r of rows) db.grave.push({ ...r, kind: 'doc', retiredAt: Number(b), reason: values[2] as string });
-      return { rows: [], rowCount: rows.length };
-    }
-    if (sql === 'DELETE FROM smdb_data.guild_data WHERE guild_id = $1') {
-      const before = db.data.length;
+      const docs = db.data.filter(r => r.guild === g);
+      for (const r of docs) db.grave.push({ ...r, kind: 'doc', retiredAt: at, reason: b as string });
       db.data = db.data.filter(r => r.guild !== g);
-      return { rows: [], rowCount: before - db.data.length };
-    }
-    if (sql === 'DELETE FROM smdb_data.guild_append WHERE guild_id = $1') {
-      const before = db.append.length;
       db.append = db.append.filter(r => r.guild !== g);
-      return { rows: [], rowCount: before - db.append.length };
+      return { rows: [{ at: String(at), docs: String(docs.length), streams: String(groups.size), put: String(docs.length + groups.size) }], rowCount: 1 };
     }
     if (sql === 'UPDATE smdb_data.guild_ownership SET retired_at = now() WHERE guild_id = $1') {
       const owner = db.owners.get(g);
@@ -118,16 +110,16 @@ function rig(opts: { foreignOwner?: { nodeId: string; claim: number }; hook?: (s
       const present = db.data.some(r => r.guild === g) || db.append.some(r => r.guild === g);
       return { rows: [{ present }], rowCount: 1 };
     }
-    if (/^WITH moved AS/.test(sql)) {
+    if (/^WITH src AS/.test(sql)) {
       const moved = db.grave.filter(r => r.guild === g && r.retiredAt === Number(b));
-      db.grave = db.grave.filter(r => !moved.includes(r));
       let seq = 1000;
       for (const r of moved) {
+        r.usedAt = 1000;
         if (r.kind === 'doc') db.data.push({ guild: r.guild, module: r.module, filename: r.filename, doc: r.doc });
         else db.append.push({ guild: r.guild, module: r.module, filename: r.filename, seq: seq++, chunk: r.doc });
       }
       const reasons = moved.map(r => r.reason).sort();
-      return { rows: [{ taken: String(moved.length), put: String(moved.length), reason: reasons.length ? reasons[0] : null }], rowCount: 1 };
+      return { rows: [{ taken: String(moved.length), put: String(moved.length), reason: reasons.length ? reasons[0] : null, used_at: moved.length ? '1000' : null }], rowCount: 1 };
     }
     throw new Error(`[Test] Unscripted statement: ${sql}`);
   };
@@ -257,10 +249,10 @@ describe('restoreGuild on Postgres', () => {
       seedGrave(t, 2_000, 'webui-operator-delete', { 'a.json': '{"a":1}', 'b.json': '{"b":2}' });
     });
     const outcome = await r.backend.restoreGuild(G, null, token, never, deadlineIn(40_000));
-    expect(outcome).toEqual({ ok: true, moved: 2, retiredAt: 2_000, reason: 'webui-operator-delete' });
+    expect(outcome).toEqual({ ok: true, copied: 2, retiredAt: 2_000, reason: 'webui-operator-delete', usedAt: 1000 });
     expect(r.tables().data.map(x => [x.filename, x.doc]).sort()).toEqual([['a.json', '{"a":1}'], ['b.json', '{"b":2}']]);
-    expect(r.tables().grave.map(x => x.retiredAt)).toEqual([1_000]);
-    expect(log).toHaveBeenCalledWith(`[PostgresBackend] Guild ${G} restored from graveyard batch 2000; 2 row(s) moved back`);
+    expect(r.tables().grave.map(x => [x.retiredAt, x.usedAt])).toEqual([[1_000, undefined], [2_000, 1000], [2_000, 1000]]);
+    expect(log).toHaveBeenCalledWith(`[PostgresBackend] Guild ${G} restored from graveyard batch 2000; 2 row(s) copied in`);
     expect(r.releases).toEqual([{ destroy: undefined, openTransaction: false }]);
   });
 
@@ -271,9 +263,9 @@ describe('restoreGuild on Postgres', () => {
       seedGrave(t, 2_000, 'newer', { 'a.json': '{"a":1}' });
     });
     const outcome = await r.backend.restoreGuild(G, 1_000, token, never, deadlineIn(40_000));
-    expect(outcome).toEqual({ ok: true, moved: 1, retiredAt: 1_000, reason: 'older' });
+    expect(outcome).toEqual({ ok: true, copied: 1, retiredAt: 1_000, reason: 'older', usedAt: 1000 });
     expect(r.tables().data.map(x => x.filename)).toEqual(['old.json']);
-    expect(r.tables().grave.map(x => x.retiredAt)).toEqual([2_000]);
+    expect(r.tables().grave.map(x => [x.retiredAt, x.usedAt])).toEqual([[1_000, 1000], [2_000, undefined]]);
   });
 
   it('a deposed restore names the current owner and rolls back before pooling the client', async () => {
@@ -312,12 +304,12 @@ describe('restoreGuild on Postgres', () => {
   });
 
   it('with exactly 2 s left before COMMIT it still commits the restore', async () => {
-    const r = rig({ hook: sql => { if (sql.startsWith('WITH moved AS')) advance(3_000); } });
+    const r = rig({ hook: sql => { if (sql.startsWith('WITH src AS')) advance(3_000); } });
     r.seed(t => seedGrave(t, 2_000, 'webui-operator-delete', { 'a.json': '{"a":1}' }));
     const outcome = await r.backend.restoreGuild(G, null, token, never, deadlineIn(5_000));
-    expect(outcome).toEqual({ ok: true, moved: 1, retiredAt: 2_000, reason: 'webui-operator-delete' });
+    expect(outcome).toEqual({ ok: true, copied: 1, retiredAt: 2_000, reason: 'webui-operator-delete', usedAt: 1000 });
     expect(r.tables().data.map(x => x.filename)).toEqual(['a.json']);
-    expect(r.tables().grave).toEqual([]);
+    expect(r.tables().grave.map(x => [x.retiredAt, x.usedAt])).toEqual([[2_000, 1000]]);
   });
 
   it('out of time before BEGIN is sent: nothing is sent and the untouched client goes back to the pool for reuse', async () => {
@@ -339,7 +331,7 @@ describe('restoreGuild on Postgres', () => {
   });
 
   it('a statement the database refused is an answer and starts no hold', async () => {
-    const r = rig({ hook: sql => (sql.startsWith('WITH moved AS') ? pgError('23505', 'duplicate key value violates unique constraint') : undefined) });
+    const r = rig({ hook: sql => (sql.startsWith('WITH src AS') ? pgError('23505', 'duplicate key value violates unique constraint') : undefined) });
     r.seed(t => seedGrave(t, 2_000, 'webui-operator-delete', { 'a.json': '{"a":1}' }));
     const outcome = await r.backend.restoreGuild(G, null, token, never, deadlineIn(40_000));
     expect(outcome).toMatchObject({ ok: false, reason: 'refused', code: '23505' });

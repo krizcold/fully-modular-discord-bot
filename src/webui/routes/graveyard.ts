@@ -5,7 +5,7 @@
 import { Router, Request, Response } from 'express';
 import { BotManager, ROUTE_TEXT } from '../botManager';
 import { resolveDataBackend } from '../../utils/envLoader';
-import { listGraveyardEntries } from '../../bot/internalSetup/utils/dataManager';
+import { listGraveyardEntries, restoreNoAnswerEnding } from '../../bot/internalSetup/utils/dataManager';
 import { readFileMarker, recognitionRefusal } from '../../bot/internalSetup/utils/dataBackends/recognitionGuard';
 import { getWebuiDataReader, isDataBackendUnreachable } from '../utils/webuiDataReader';
 import { hopFailure } from './hopFailure';
@@ -17,7 +17,8 @@ const NO_ANSWER_CAUSE: Record<string, string> = {
   failed: 'the request could not be handed to the bot',
 };
 
-export const RESTORE_MINUTE = "Within a minute, if it was restored, the server's data is back and its entry is gone from `smdb graveyard list`; if not, the entry is still listed, unless it had passed the graveyard's keep time and the graveyard sweep removed it, data and all. The list reads the data of the bot behind the web panel it asks; if the main database was replaced meanwhile, check once that bot runs on the new main.";
+const REPLACE_TEXT = 'replace must be true or false';
+const N_READ_BOUND_MS = 5000;
 
 /** The warning of a restore or a delete whose folder move the disk did not confirm. */
 export function moveUnconfirmedText(code: string, what: 'restore' | 'delete'): string {
@@ -48,6 +49,36 @@ interface GraveyardEntry {
   backend: 'file' | 'postgres';
 }
 
+/**
+ * One guild's entries, newest first, by the full listing's store rule: the JSON entries while files are the live store,
+ * the database's batches when the deployment routes postgres, both when both hold.
+ */
+async function guildGraveyardEntries(guildId: string, boundMs?: number): Promise<GraveyardEntry[]> {
+  const live = readFileMarker()?.live ?? resolveDataBackend();
+  const entries: GraveyardEntry[] = live === 'file' ? (await listGraveyardEntries(guildId)).map(e => ({ ...e, backend: 'file' as const })) : [];
+  if (resolveDataBackend() === 'postgres') {
+    for (const batch of await getWebuiDataReader().listGuildGraveyard(guildId, boundMs)) entries.push({ ...batch, backend: 'postgres' });
+  }
+  return entries.sort((a, b) => b.retiredAt - a.retiredAt);
+}
+
+/** The newest retiredAt among the guild's entries (undefined: none), or the read's error after at most 5 s. */
+async function newestEntry(guildId: string): Promise<{ n: number | undefined } | { error: string }> {
+  let timer: NodeJS.Timeout | undefined;
+  const late = new Promise<{ error: string }>(resolve => {
+    timer = setTimeout(() => resolve({ error: `no answer within ${N_READ_BOUND_MS / 1000} s` }), N_READ_BOUND_MS);
+  });
+  const read = guildGraveyardEntries(guildId, N_READ_BOUND_MS).then(
+    entries => ({ n: entries.length > 0 ? entries[0].retiredAt : undefined }),
+    error => ({ error: error instanceof Error ? error.message : String(error) }),
+  );
+  try {
+    return await Promise.race([read, late]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export function createGraveyardRoutes(botManager: BotManager): Router {
   const router = Router();
 
@@ -55,12 +86,30 @@ export function createGraveyardRoutes(botManager: BotManager): Router {
    * GET /api/data/graveyard
    * All restorable entries: the _graveyard dirs when files are the live
    * store, and the tombstone batches when the deployment routes postgres.
+   * ?guildId= lists that guild's entries only, through its own bounded read.
    */
   router.get('/', async (req: Request, res: Response) => {
     try {
       const refusal = recognitionRefusal();
       if (refusal) {
         res.status(503).json({ success: false, error: `The graveyard is not served: ${refusal}.` });
+        return;
+      }
+      const guildId = req.query?.guildId;
+      if (guildId !== undefined) {
+        if (typeof guildId !== 'string' || !/^\d+$/.test(guildId)) {
+          res.status(400).json({ success: false, error: 'Invalid guild ID format' });
+          return;
+        }
+        let entries: GraveyardEntry[];
+        try {
+          entries = await guildGraveyardEntries(guildId);
+        } catch (error) {
+          if (!isDataBackendUnreachable(error)) throw error;
+          res.status(503).json({ success: false, error: 'Data backend unreachable; retry shortly' });
+          return;
+        }
+        res.json({ success: true, entries });
         return;
       }
       // A move to Postgres leaves /data/_graveyard in place; it is listed only while files are the live store.
@@ -85,18 +134,22 @@ export function createGraveyardRoutes(botManager: BotManager): Router {
   });
 
   /**
-   * POST /api/data/graveyard/restore {guildId, retiredAt?}
+   * POST /api/data/graveyard/restore {guildId, retiredAt?, replace?}
    * Applied in the bot process; refusals (live data exists, no entry) map to 409.
    */
   router.post('/restore', async (req: Request, res: Response) => {
     try {
-      const { guildId, retiredAt } = (req.body || {}) as { guildId?: unknown; retiredAt?: unknown };
+      const { guildId, retiredAt, replace } = (req.body || {}) as { guildId?: unknown; retiredAt?: unknown; replace?: unknown };
       if (typeof guildId !== 'string' || !/^\d+$/.test(guildId)) {
         res.status(400).json({ success: false, error: 'Invalid guild ID format' });
         return;
       }
       if (retiredAt !== undefined && (typeof retiredAt !== 'number' || !Number.isSafeInteger(retiredAt) || retiredAt < 0)) {
         res.status(400).json({ success: false, error: 'retiredAt must be a whole number of milliseconds' });
+        return;
+      }
+      if (replace !== undefined && typeof replace !== 'boolean') {
+        res.status(400).json({ success: false, error: REPLACE_TEXT });
         return;
       }
       const refusal = recognitionRefusal();
@@ -109,12 +162,22 @@ export function createGraveyardRoutes(botManager: BotManager): Router {
         res.status(400).json({ success: false, error: plan.reply.error });
         return;
       }
+      // N, for a no-answer text: an entry newer than N can only be one this request made.
+      let n: number | undefined;
+      if (plan.kind !== 'refuse') {
+        const newest = await newestEntry(guildId);
+        if ('error' in newest) {
+          res.status(503).json({ success: false, error: `the graveyard list could not be read (${newest.error}); nothing was restored; try again in a moment` });
+          return;
+        }
+        n = newest.n;
+      }
       const reply = await sendGuildChange(botManager, plan, {
         guildId,
         module: '',
         filename: '',
         op: 'restore-graveyard',
-        contentJson: JSON.stringify({ retiredAt }),
+        contentJson: JSON.stringify({ retiredAt, replace }),
       });
       // NB7 decision 9: another machine's answer is prefixed with its name; the sender's own answers are not.
       const servedBy = reply && typeof reply.servedBy === 'string' ? reply.servedBy : null;
@@ -123,7 +186,8 @@ export function createGraveyardRoutes(botManager: BotManager): Router {
       // No answer from the bot: whatever the code, the restore may have landed.
       if (reply?.noAnswer) {
         const cause = servedBy ? remoteRestoreNoAnswerCause(reply.noAnswer, servedBy) : NO_ANSWER_CAUSE[reply.noAnswer as string] ?? NO_ANSWER_CAUSE.failed;
-        res.status(503).json({ success: false, error: `can't confirm whether server ${guildId} was restored: ${cause}. ${RESTORE_MINUTE}`, ...by });
+        const ending = restoreNoAnswerEnding(guildId, (retiredAt as number | undefined) ?? n, n, replace === true);
+        res.status(503).json({ success: false, error: `can't confirm whether server ${guildId} was restored: ${cause}. ${ending}`, ...by });
         return;
       }
       if (reply?.ok) {
@@ -131,7 +195,9 @@ export function createGraveyardRoutes(botManager: BotManager): Router {
           success: true,
           retiredAt: reply.retiredAt,
           reason: reply.reason,
-          ...(typeof reply.moved === 'number' ? { moved: reply.moved } : {}),
+          ...(typeof reply.keptUntil === 'number' ? { keptUntil: reply.keptUntil } : {}),
+          ...(typeof reply.copied === 'number' ? { copied: reply.copied } : {}),
+          ...(reply.replaced !== undefined ? { replaced: reply.replaced } : {}),
           ...(typeof reply.moveUnconfirmed === 'string' ? { warning: moveUnconfirmedText(reply.moveUnconfirmed, 'restore') } : {}),
           ...by,
         });
@@ -140,7 +206,8 @@ export function createGraveyardRoutes(botManager: BotManager): Router {
       const code = reply?.code;
       const error = reply?.error || 'restore failed';
       if (code === 'invalid') {
-        res.status(409).json({ success: false, error: on(error), ...by });
+        const live = reply.refusal === 'live-data' && typeof reply.retiredAt === 'number' ? { refusal: 'live-data', retiredAt: reply.retiredAt } : {};
+        res.status(409).json({ success: false, ...live, error: on(error), ...by });
         return;
       }
       // The restore's own words: hopFailure's speak of a change.

@@ -13,6 +13,7 @@ import { addressListInUse, parseAddressList, pgConfig, showEntry } from '../../.
 import { readNewestNotice, sendOwnerDm, waitNonce } from '../../../../utils/ownerMessages';
 import { getNodeName } from '../../fleet/nodeName';
 import { initWorkingSet, type WorkingSetManager } from './workingSet';
+import { recoverGraveyardRestores } from './fileBackend';
 import type { DataUnavailableCause } from './workingSet';
 import { initDataReadiness, getDataReadiness, DataReadinessDriver } from './dataReadiness';
 import { evaluateRecognitionGuard, verifyStoreIdentity, readFileMarker, readMarkerStoreId, GuardVerdict } from './recognitionGuard';
@@ -108,6 +109,7 @@ export function initDataBackendLayer(): void {
   }
   if (verdict.live === 'file') {
     bootStatus = { ...bootStatus, mode: 'file', state: 'file' };
+    recoverGraveyardRestores();
     return;
   }
   if (!addressListInUse()) {

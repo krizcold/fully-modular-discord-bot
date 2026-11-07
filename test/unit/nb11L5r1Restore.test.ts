@@ -53,7 +53,7 @@ describe('restoreGuild on Postgres with a batch whose reason is NULL', () => {
         if (/^INSERT INTO smdb_data\.guild_ownership AS o\b/.test(sql)) return { rows: [], rowCount: 1 };
         if (/max\(retired_at\)/.test(sql)) return { rows: [{ retired_at: '2000' }], rowCount: 1 };
         if (/AS present$/.test(sql)) return { rows: [{ present: false }], rowCount: 1 };
-        if (/^WITH moved AS/.test(sql)) return { rows: [{ taken: '1', put: '1', reason: null }], rowCount: 1 };
+        if (/^WITH src AS/.test(sql)) return { rows: [{ taken: '1', put: '1', reason: null, used_at: '1000' }], rowCount: 1 };
         return { rows: [], rowCount: null };
       },
       release: () => {},
@@ -61,7 +61,7 @@ describe('restoreGuild on Postgres with a batch whose reason is NULL', () => {
     (backend.getPool() as unknown as { connect: unknown }).connect = async () => client;
     const g = freshGuild();
     const outcome = await backend.restoreGuild(g, null, token, () => null, process.hrtime.bigint() + 40_000_000_000n);
-    expect(outcome).toStrictEqual({ ok: true, moved: 1, retiredAt: 2000, reason: '' });
+    expect(outcome).toStrictEqual({ ok: true, copied: 1, retiredAt: 2000, reason: '', usedAt: 1000 });
     expect(sent).toContain('COMMIT');
   });
 });

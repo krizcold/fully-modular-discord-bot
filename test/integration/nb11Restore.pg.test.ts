@@ -79,10 +79,10 @@ class Hop {
   }
 }
 
-const LIVE = (r: number) => `live guild data exists; nothing was restored. To restore entry ${r}, delete this server's data, then restore with retiredAt ${r} before the bot saves anything new for the server; data it saves in between blocks the restore again. While the server's members are active, remove the bot from the server first and add it back after the restore.`;
+const LIVE = (g: string, r: number) => `server ${g} has data saved since entry ${r} was deleted; nothing was restored. To put entry ${r} in place and move the current data to the graveyard as a new entry, run: smdb graveyard restore ${g} ${r} --replace`;
 const DELETE_TIMEOUT = 'the database did not finish the delete within its 40 s; nothing was removed; try again in a moment';
 const RESTORE_TIMEOUT = "[Data] The database did not answer or ended the connection (the database did not answer within the restore's 40 s); nothing was restored; try again in a moment";
-const UNKNOWN = (g: string, r: number) => `can't confirm whether server ${g} was restored: the database did not confirm the commit. Within a minute, if it was restored, the server's data is back and entry ${r} is gone from \`smdb graveyard list\`; if not, the entry is still listed, unless it had passed the graveyard's keep time (GRAVEYARD_TTL_DAYS, 14 days by default) and the graveyard sweep removed it, data and all. The list reads the data of the bot behind the web panel it asks; if the main database was replaced meanwhile, check once that bot runs on the new main.`;
+const UNKNOWN = (g: string, r: number) => `can't confirm whether server ${g} was restored: the database did not confirm the commit; the outcome is fixed within a minute. Entry ${r} stays listed either way, unless it had passed the graveyard's keep time (GRAVEYARD_TTL_DAYS, 14 days by default) and the graveyard sweep removed it, data and all. Running smdb graveyard restore ${g} ${r} --replace is then safe: it copies entry ${r} in and moves whatever the server holds into a new entry, so nothing is lost. The list reads the data of the bot behind the web panel it asks; if the main database was replaced meanwhile, check once that bot runs on the new main.`;
 const SECOND = 1000;
 
 let container: StartedPostgreSqlContainer;
@@ -181,7 +181,7 @@ function onStatement(match: RegExp, act: () => void): () => void {
   });
 }
 
-const openTransactions = async () => Number((await rows(`SELECT count(*)::int AS n FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() AND (state LIKE 'idle in transaction%' OR (state = 'active' AND query LIKE 'WITH moved AS%'))`, []))[0].n);
+const openTransactions = async () => Number((await rows(`SELECT count(*)::int AS n FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() AND (state LIKE 'idle in transaction%' OR (state = 'active' AND query LIKE 'WITH src AS%'))`, []))[0].n);
 
 /** The server has ended the restore's transaction: no session is left in it, and no lock holds the guild's batch rows. */
 async function serverEnded(g: string, openBefore: number): Promise<void> {
@@ -233,13 +233,14 @@ describe('the fence', () => {
     const g = freshGuild();
     await direct.query(`INSERT INTO smdb_data.guild_ownership (guild_id, node_id, shard_id, claim, shard_count, retired_at) VALUES ($1, 'node-old', 0, $2, 1, now())`, [g, claim - below]);
     await bury(g, 5, { 'a.json': '{"a":1}' });
-    expect(await backend.restoreGuild(g, null, tokenOf(claim), none, monoIn(40 * SECOND))).toEqual({ ok: true, moved: 1, retiredAt: 5, reason: 'test' });
+    expect(await backend.restoreGuild(g, null, tokenOf(claim), none, monoIn(40 * SECOND))).toEqual({ ok: true, copied: 1, retiredAt: 5, reason: 'test', usedAt: expect.any(Number) });
     const owner = (await rows(`SELECT node_id, claim, retired_at FROM smdb_data.guild_ownership WHERE guild_id = $1`, [g]))[0];
     expect(owner.node_id).toBe('node-a');
     expect(Number(owner.claim)).toBe(claim);
     expect(owner.retired_at).toBeNull();
     expect(await liveDocs(g)).toEqual([{ filename: 'a.json', doc: '{"a":1}' }]);
-    expect(await graveRows(g)).toEqual([]);
+    expect(await graveRows(g)).toEqual([{ filename: 'a.json', retired_at: expect.anything() }]);
+    expect((await rows(`SELECT used_at FROM smdb_data.guild_data_graveyard WHERE guild_id = $1 AND retired_at = 5`, [g]))[0].used_at).not.toBeNull();
   });
 });
 
@@ -276,64 +277,6 @@ describe('the live check and the batch', () => {
   });
 });
 
-describe('the sweep from a second session', () => {
-  it('(a) the sweep\'s DELETE open before the move, then committed: no-entry, nothing restored, the batch gone', async () => {
-    const g = freshGuild();
-    await bury(g, 5, { 'a.json': '{"a":1}' }, { 'l.jsonl': 'x\n' });
-    const sweep = await direct.connect();
-    try {
-      await sweep.query('BEGIN');
-      await sweep.query(`DELETE FROM smdb_data.guild_data_graveyard WHERE guild_id = $1`, [g]);
-      const restoring = backend.restoreGuild(g, null, tokenOf(claim), none, monoIn(40 * SECOND));
-      await sleep(500);
-      await sweep.query('COMMIT');
-      expect(await restoring).toMatchObject({ ok: false, reason: 'no-entry' });
-    } finally {
-      sweep.release();
-    }
-    expect(await liveDocs(g)).toEqual([]);
-    expect(await rows(`SELECT 1 FROM smdb_data.guild_append WHERE guild_id = $1`, [g])).toEqual([]);
-    expect(await graveRows(g)).toEqual([]);
-  }, 60_000);
-
-  it('(b) the same, rolled back: the restore moves every doc and append row', async () => {
-    const g = freshGuild();
-    await bury(g, 5, { 'a.json': '{"a":1}', 'b.json': '{"b":1}' }, { 'l.jsonl': 'x\n' });
-    const sweep = await direct.connect();
-    try {
-      await sweep.query('BEGIN');
-      await sweep.query(`DELETE FROM smdb_data.guild_data_graveyard WHERE guild_id = $1`, [g]);
-      const restoring = backend.restoreGuild(g, null, tokenOf(claim), none, monoIn(40 * SECOND));
-      await sleep(500);
-      await sweep.query('ROLLBACK');
-      expect(await restoring).toEqual({ ok: true, moved: 3, retiredAt: 5, reason: 'test' });
-    } finally {
-      sweep.release();
-    }
-    expect(await liveDocs(g)).toHaveLength(2);
-    expect(await rows(`SELECT chunk FROM smdb_data.guild_append WHERE guild_id = $1`, [g])).toEqual([{ chunk: 'x\n' }]);
-  }, 60_000);
-
-  it('(c) the move first: the sweep waits and deletes none of the batch', async () => {
-    const g = freshGuild();
-    await bury(g, 5, { 'a.json': '{"a":1}' }, { 'l.jsonl': 'x\n' });
-    const sweep = await direct.connect();
-    let swept: Promise<number> | null = null;
-    try {
-      const answer = await backend.restoreGuild(g, null, tokenOf(claim), () => {
-        swept = sweep.query(`DELETE FROM smdb_data.guild_data_graveyard WHERE guild_id = $1`, [g]).then(r => r.rowCount ?? 0);
-        return null;
-      }, monoIn(40 * SECOND));
-      expect(answer).toMatchObject({ ok: true, moved: 2 });
-      expect(await swept).toBe(0);
-    } finally {
-      sweep.release();
-    }
-    expect(await liveDocs(g)).toEqual([{ filename: 'a.json', doc: '{"a":1}' }]);
-    expect(await rows(`SELECT chunk FROM smdb_data.guild_append WHERE guild_id = $1`, [g])).toEqual([{ chunk: 'x\n' }]);
-  }, 60_000);
-});
-
 describe('through the real stack', () => {
   it('a write accepted before the restore is not dropped', async () => {
     const { ws } = await stack();
@@ -341,7 +284,7 @@ describe('through the real stack', () => {
     await bury(g, 5, { 'a.json': '{"old":1}' });
     expect(await ws.hydrate(g, tokenOf(claim))).toBe('ready');
     expect(saveDataTracked('b.json', { guildId: g, category: 'm' }, { b: 1 }).outcome).toBe('saved');
-    expect(await applyOperatorDataWrite(restoreReq(g))).toEqual({ ok: false, code: 'invalid', error: LIVE(5) });
+    expect(await applyOperatorDataWrite(restoreReq(g))).toEqual({ ok: false, code: 'invalid', refusal: 'live-data', retiredAt: 5, error: LIVE(g, 5) });
     expect(await liveDocs(g)).toEqual([{ filename: 'b.json', doc: JSON.stringify({ b: 1 }, null, 2) }]);
     expect(await graveRows(g)).toHaveLength(1);
   }, 60_000);
@@ -351,22 +294,23 @@ describe('through the real stack', () => {
     const g = freshGuild();
     await bury(g, 5, { 'a.json': '{"a":1}' }, { 'l.jsonl': 'one\ntwo\n' });
     expect(await ws.hydrate(g, tokenOf(claim))).toBe('ready');
-    expect(await applyOperatorDataWrite(restoreReq(g))).toEqual({ ok: true, retiredAt: 5, reason: 'test', moved: 2 });
+    expect(await applyOperatorDataWrite(restoreReq(g))).toEqual({ ok: true, retiredAt: 5, reason: 'test', copied: 2, keptUntil: expect.any(Number) });
     for (let i = 0; i < 50 && ws.stateOf(g) !== 'ready'; i++) await sleep(50);
     expect(loadData('a.json', { guildId: g, category: 'm' }, null)).toEqual({ a: 1 });
     expect(await rows(`SELECT chunk FROM smdb_data.guild_append WHERE guild_id = $1 ORDER BY seq`, [g])).toEqual([{ chunk: 'one\ntwo\n' }]);
   }, 60_000);
 
-  it('a second restore of an entry already restored answers no graveyard entry, and the restored docs stay live', async () => {
+  it('a second restore of an entry already restored is refused as live data naming it, and the restored docs stay live', async () => {
     const { ws } = await stack();
     const g = freshGuild();
     await bury(g, 5, { 'a.json': '{"a":1}' });
     expect(await ws.hydrate(g, tokenOf(claim))).toBe('ready');
-    expect(await applyOperatorDataWrite(restoreReq(g, 5))).toEqual({ ok: true, retiredAt: 5, reason: 'test', moved: 1 });
+    expect(await applyOperatorDataWrite(restoreReq(g, 5))).toEqual({ ok: true, retiredAt: 5, reason: 'test', copied: 1, keptUntil: expect.any(Number) });
     for (let i = 0; i < 50 && ws.stateOf(g) !== 'ready'; i++) await sleep(50);
-    expect(await applyOperatorDataWrite(restoreReq(g, 5))).toEqual({ ok: false, code: 'invalid', error: 'no graveyard entry for this guild' });
+    expect(await applyOperatorDataWrite(restoreReq(g, 5))).toEqual({ ok: false, code: 'invalid', refusal: 'live-data', retiredAt: 5, error: LIVE(g, 5) });
     expect(await liveDocs(g)).toEqual([{ filename: 'a.json', doc: '{"a":1}' }]);
-    expect(await graveRows(g)).toEqual([]);
+    expect(await graveRows(g)).toEqual([{ filename: 'a.json', retired_at: expect.anything() }]);
+    expect((await rows(`SELECT used_at FROM smdb_data.guild_data_graveyard WHERE guild_id = $1 AND retired_at = 5`, [g]))[0].used_at).not.toBeNull();
   }, 60_000);
 
   it('a stall before COMMIT answers unavailable by 45 s, reopens the set, and the server rolls back', async () => {
@@ -375,7 +319,7 @@ describe('through the real stack', () => {
     await bury(g, 5, { 'a.json': '{"a":1}' });
     expect(await ws.hydrate(g, tokenOf(claim))).toBe('ready');
     const openBefore = await openTransactions();
-    const undo = onStatement(/^WITH moved AS/, () => hop.stall());
+    const undo = onStatement(/^WITH src AS/, () => hop.stall());
     const sent = process.hrtime.bigint();
     try {
       const reply = await applyOperatorDataWrite(restoreReq(g, undefined, sent));
@@ -448,7 +392,8 @@ describe('through the real stack', () => {
       expect(guildDataOpOf(g)).toBeUndefined();
       expect(await openTransactions()).toBe(openBefore);
       expect(await liveDocs(g)).toEqual([{ filename: 'a.json', doc: '{"a":1}' }]);
-      expect(await graveRows(g)).toEqual([]);
+      expect(await graveRows(g)).toEqual([{ filename: 'a.json', retired_at: expect.anything() }]);
+      expect((await rows(`SELECT used_at FROM smdb_data.guild_data_graveyard WHERE guild_id = $1 AND retired_at = 5`, [g]))[0].used_at).not.toBeNull();
     } finally {
       undo();
       hop.restore();
@@ -462,7 +407,8 @@ describe('through the real stack', () => {
     expect(state).toBe('ready');
     expect(loadData('a.json', { guildId: g, category: 'm' }, null)).toEqual({ a: 1 });
     expect(await liveDocs(g)).toEqual([{ filename: 'a.json', doc: '{"a":1}' }]);
-    expect(await graveRows(g)).toEqual([]);
+    expect(await graveRows(g)).toEqual([{ filename: 'a.json', retired_at: expect.anything() }]);
+    expect((await rows(`SELECT used_at FROM smdb_data.guild_data_graveyard WHERE guild_id = $1 AND retired_at = 5`, [g]))[0].used_at).not.toBeNull();
   }, 180_000);
 });
 

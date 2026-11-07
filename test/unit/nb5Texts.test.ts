@@ -10,13 +10,15 @@ import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('fs', async importOriginal => {
   const real = await importOriginal<any>();
-  const writeFile = vi.fn((file: any, ...rest: any[]) => {
-    if (failGraveyardNote.on && String(file).endsWith('.graveyard.json')) {
-      return Promise.reject(Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' }));
+  // writeGraveyardNote writes the note through the handle of its temp file, .graveyard.json.<pid>.<ms>.<n>.tmp.
+  const open = vi.fn(async (file: any, ...rest: any[]) => {
+    const fh = await real.promises.open(file, ...rest);
+    if (failGraveyardNote.on && /[\\/]\.graveyard\.json\.[^\\/]*$/.test(String(file))) {
+      fh.writeFile = () => Promise.reject(Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' }));
     }
-    return real.promises.writeFile(file, ...rest);
+    return fh;
   });
-  const promises = { ...real.promises, writeFile };
+  const promises = { ...real.promises, open };
   return { ...real, promises, default: { ...real, promises } };
 });
 const failGraveyardNote = vi.hoisted(() => ({ on: false }));
@@ -155,9 +157,9 @@ describe('NB5F: the texts of a marker that cannot be read, the move check and th
 
   it('T8 to T17, the move check and the bootstrap line', () => {
     expect(seen(moveCheckTexts.markerUnknown(why))).toBe(`${why}, so the bot can't confirm which store this machine records`);
-    expect(seen(moveCheckTexts.version('{"v":5}'))).toBe('the database holds schema version {"v":5}, and this bot reads only version 6');
+    expect(seen(moveCheckTexts.version('{"v":5}'))).toBe('the database holds schema version {"v":5}, and this bot reads only version 7');
     expect(seen(moveCheckTexts.empty)).toBe("the database holds no tables in smdb_data, so it holds no copy of this bot's store; a move does not provision a database");
-    expect(seen(moveCheckTexts.noStoreId)).toBe("the database's smdb_data matches this bot's schema (version 6) but smdb_data.meta holds no store_id row, and this machine records no store id, so this bot can't confirm whose store it is; a move writes no store id");
+    expect(seen(moveCheckTexts.noStoreId)).toBe("the database's smdb_data matches this bot's schema (version 7) but smdb_data.meta holds no store_id row, and this machine records no store id, so this bot can't confirm whose store it is; a move writes no store id");
     expect(seen(moveCheckTexts.unreadableStoreId)).toBe("its store id can't be read (the stored value is not a JSON string)");
     expect(seen(moveCheckTexts.otherStore('store-x', 'store-a'))).toBe("the configured database is not the one this deployment's data lives in (store store-x vs recorded store-a)");
     expect(seen(moveCheckTexts.incomplete('SQLSTATE 42501: permission denied for schema smdb_data'))).toBe('the check of its store could not be completed (SQLSTATE 42501: permission denied for schema smdb_data)');
@@ -209,10 +211,11 @@ describe("texts A and B (C7, D5, H8) and G12's refusals", () => {
   const why = 'a:5432/bot was replaced by node-b (generation 2)';
   const old = 'a:5432/bot';
   it('text A and text B for a restore', () => {
-    expect(seen(RESTORE_TEXTS.late('880000000000000001', { committed: true, old, why })))
-      .toBe(`can't confirm whether server 880000000000000001 was restored on the main database: ${old} confirmed the restore only after this process stopped writing there (${why}). Once the bot runs on the main database, check whether the server's data is back, and repeat the restore if it is not.`);
-    expect(seen(RESTORE_TEXTS.late('880000000000000001', { committed: false, old, why })))
-      .toBe(`can't confirm whether server 880000000000000001 was restored: the database did not confirm the commit, and this process stopped writing to ${old} while it waited (${why}). Once the bot runs on the main database, check whether the server's data is back, and repeat the restore if it is not.`);
+    const tail = 'Once the bot runs on the main database, run: smdb graveyard restore 880000000000000001 5 --replace. It is safe whether or not this restore reached that database: it copies entry 5 in and moves whatever the server holds into a new entry, so nothing is lost; if that database lists no entry 5, the restore answers "no graveyard entry for this guild" and changes nothing.';
+    expect(seen(RESTORE_TEXTS.late('880000000000000001', { committed: true, old, why }, 5)))
+      .toBe(`can't confirm whether server 880000000000000001 was restored on the main database: ${old} confirmed the restore only after this process stopped writing there (${why}). ${tail}`);
+    expect(seen(RESTORE_TEXTS.late('880000000000000001', { committed: false, old, why }, 5)))
+      .toBe(`can't confirm whether server 880000000000000001 was restored: the database did not confirm the commit, and this process stopped writing to ${old} while it waited (${why}). ${tail}`);
   });
 
   it('text A and text B for a delete, with H8 sentence', () => {

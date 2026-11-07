@@ -81,9 +81,9 @@ describe('a restore on a JSON bot through the route', () => {
     const g = freshGuild();
     bury(g, 2000);
     const reply = await applyOperatorDataWrite(restoreReq(g));
-    expect(reply).toStrictEqual({ ok: true, retiredAt: 2000, reason: 'webui-operator-delete' });
+    expect(reply).toStrictEqual({ ok: true, retiredAt: 2000, reason: 'webui-operator-delete', keptUntil: expect.any(Number) });
     expect(fs.readFileSync(dataPath(g, 'm', 'a.json'), 'utf8')).toBe('{"n":5}');
-    expect(await listed(g)).toEqual([]);
+    expect(await listed(g)).toEqual([{ guildId: g, retiredAt: 2000, reason: 'webui-operator-delete' }]);
   });
 
   it('is out of time when the clock reads exactly its deadline, and nothing is restored', async () => {

@@ -35,6 +35,9 @@ function ConfigPanel() {
   const latestList = useRef(null);
   const latestLoad = useRef(null);
   const latestBackups = useRef(null);
+  // The selected guild's graveyard entries ("Deleted data"), and the read they came from.
+  const [graveyard, setGraveyard] = useState({ guildId: null, entries: [] });
+  const latestGraveyard = useRef(null);
   // The selection as of the last render, for answers that arrive later.
   const selRef = useRef({});
   selRef.current = { file: selectedFile, ctx: guildContext, type: selectedFileType };
@@ -64,6 +67,30 @@ function ConfigPanel() {
       loadBackups(selectedFile);
     }
   }, [selectedFile, filesStamp]);
+
+  const dataGuildId = selectedFileType === 'data' ? guildIdOf(guildContext) : null;
+  useEffect(() => {
+    if (dataGuildId) loadGraveyard(dataGuildId);
+    else {
+      latestGraveyard.current = null;
+      setGraveyard({ guildId: null, entries: [] });
+    }
+  }, [dataGuildId]);
+
+  async function loadGraveyard(guildId) {
+    const seq = ++seqRef.current;
+    latestGraveyard.current = seq;
+    setGraveyard(g => (g.guildId === guildId ? g : { guildId, entries: [] }));
+    try {
+      const res = await api.get(`/data/graveyard?guildId=${encodeURIComponent(guildId)}`);
+      if (latestGraveyard.current !== seq) return;
+      setGraveyard({ guildId, entries: Array.isArray(res.entries) ? res.entries : [] });
+    } catch (err) {
+      if (latestGraveyard.current !== seq) return;
+      setGraveyard({ guildId, entries: [] });
+      setError(err.message);
+    }
+  }
 
   function clearEditor() {
     latestLoad.current = null;
@@ -393,7 +420,7 @@ function ConfigPanel() {
     const guildId = currentContext?.guildId || null;
     if (!guildId) return;
 
-    if (!confirm(`Delete ALL data for guild ${guildId}? This removes every data file stored for this guild. Deleted data is kept restorable for 14 days (the graveyard) before it is permanently removed.`)) return;
+    if (!confirm(`Delete ALL data for guild ${guildId}? This removes every data file stored for this guild. Deleted data is kept restorable for the graveyard's keep time (14 days by default) before it is permanently removed.`)) return;
 
     try {
       setSaving(true);
@@ -402,7 +429,7 @@ function ConfigPanel() {
         if (res.pending) setSuccess(`Delete accepted: ${res.message}`);
         else if (res.warning) showToast(`All data for this guild was deleted. ${res.warning}`, 'warning', { sticky: true });
         else setSuccess('All data for this guild was deleted');
-        await refreshAfterDelete();
+        await Promise.all([loadGraveyard(guildId), refreshAfterDelete()]);
       } else {
         setError(res.error || 'Failed to delete guild data');
       }
@@ -410,6 +437,49 @@ function ConfigPanel() {
       setError(err.message);
     } finally {
       setSaving(false);
+    }
+  }
+
+  // A plain restore first; the bot's live check under its row lock decides whether the guild has data to replace.
+  async function handleRestoreEntry(guildId, entry) {
+    const date = new Date(entry.retiredAt).toLocaleString();
+    if (!confirm(`Restore the data of guild ${guildId} deleted on ${date}?`)) return;
+    const listed = graveyard.guildId === guildId ? graveyard.entries.map(e => e.retiredAt).filter(ms => typeof ms === 'number') : [];
+    const newest = listed.length > 0 ? Math.max(...listed) : undefined;
+    let replace = false;
+    try {
+      setSaving(true);
+      let step = await postRestore({ guildId, retiredAt: entry.retiredAt });
+      if (step.next === 'confirm-replace') {
+        if (!confirm(`Guild ${guildId} has data saved since that delete. Replace it with the data deleted on ${date}? The current data moves to this list as a new entry, kept for the graveyard's keep time (14 days by default); nothing is merged.`)) {
+          showToast('Nothing was restored', 'info');
+          return;
+        }
+        replace = true;
+        step = await postRestore({ guildId, retiredAt: entry.retiredAt, replace: true });
+      }
+      if (step.next === 'done') {
+        const done = restoreDoneText(entry.retiredAt, step.body);
+        if (step.body.warning) showToast(`${done} ${step.body.warning}`, 'warning', { sticky: true });
+        else setSuccess(done);
+        await Promise.all([loadGraveyard(guildId), refreshAfterDelete()]);
+      } else if (step.next === 'no-answer') {
+        showToast(restoreNoAnswerText(guildId, entry.retiredAt, newest, replace, step.message), 'warning', { sticky: true });
+        await Promise.all([loadGraveyard(guildId), refreshAfterDelete()]);
+      } else if (step.next === 'error') {
+        setError(step.message);
+      }
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function postRestore(body) {
+    try {
+      const res = await api.post('/data/graveyard/restore', body);
+      return { next: restoreNextStep(200, res), body: res, message: res.error };
+    } catch (err) {
+      return { next: restoreNextStep(err.status, err.body), body: err.body, message: err.message };
     }
   }
 
@@ -677,8 +747,39 @@ function ConfigPanel() {
               🗑️ Delete all data for this guild
             </button>
             <div style={{color: '#999', fontSize: '0.85rem', marginTop: '6px'}}>
-              Removes every data file for this guild. Deleted data stays restorable for 14 days.
+              Removes every data file for this guild. Deleted data stays restorable for the graveyard's keep time (14 days by default).
             </div>
+            {graveyard.guildId === currentGuildId && graveyard.entries.length > 0 && (
+              <div style={{marginTop: '15px'}}>
+                <h4 style={{marginBottom: '8px'}}>Deleted data</h4>
+                <div style={{display: 'flex', flexDirection: 'column', gap: '8px'}}>
+                  {graveyard.entries.map(entry => (
+                    <div key={`${entry.backend}-${entry.retiredAt}`} style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      padding: '10px',
+                      background: '#1a1a1a',
+                      borderRadius: '4px',
+                      border: '1px solid #333'
+                    }}>
+                      <div style={{color: '#999', fontSize: '0.85rem'}}>
+                        {new Date(entry.retiredAt).toLocaleString()} • {entry.reason}
+                        {typeof entry.rows === 'number' ? ` • ${entry.rows} row(s)` : ''}
+                      </div>
+                      <button
+                        onClick={() => handleRestoreEntry(currentGuildId, entry)}
+                        className="btn btn-warning"
+                        style={{marginRight: 0}}
+                        disabled={busy}
+                      >
+                        Restore
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         )}
       </div>

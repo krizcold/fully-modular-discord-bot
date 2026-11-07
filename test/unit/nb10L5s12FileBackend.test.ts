@@ -128,7 +128,7 @@ describe('an append and the last byte of its file', () => {
     await new Promise(resolve => setTimeout(resolve, 5));
     expect(await graveyardGuildDir(G, 'second')).toBe(true);
     expect(fs.existsSync(dataPath(G))).toBe(false);
-    expect(await restoreGuildDirFromGraveyard(G, entry.retiredAt, { stop: () => null, writerLost: () => false, progress: { renamed: false } })).toMatchObject({ ok: true, retiredAt: entry.retiredAt });
+    expect(await restoreGuildDirFromGraveyard(G, entry.retiredAt, { stop: () => null, writerLost: () => false, writerTaken: () => false, replace: false, enterSection: () => () => undefined, progress: { renamed: false, moved: null } })).toMatchObject({ ok: true, retiredAt: entry.retiredAt });
     expect(read(p)).toBe('old');
     enqueueAppend(p, 'b\n');
     await flushAll();
@@ -259,10 +259,10 @@ describe('the graveyard moves', () => {
     fs.writeFileSync(dataPath(G, 'a.json'), '{"a":2}');
     expect(await graveyardGuildDir(G, 'nb10')).toBe(true);
     const errors = vi.mocked(console.error);
-    expect(await restoreGuildDirFromGraveyard(G, undefined, { stop: () => null, writerLost: () => true, progress: { renamed: false } })).toEqual({ ok: false, why: 'writer-lost' });
+    expect(await restoreGuildDirFromGraveyard(G, undefined, { stop: () => null, writerLost: () => true, writerTaken: () => false, replace: false, enterSection: () => () => undefined, progress: { renamed: false, moved: null } })).toEqual({ ok: false, why: 'writer-lost' });
     expect(errors).toHaveBeenCalledWith(`[DataManager] Cannot restore guild ${G} from the graveyard: another process took the data files`);
     expect(fs.existsSync(dataPath(G))).toBe(false);
-    expect(await restoreGuildDirFromGraveyard(G, undefined, { stop: () => null, writerLost: () => false, progress: { renamed: false } })).toMatchObject({ ok: true, reason: 'nb10' });
+    expect(await restoreGuildDirFromGraveyard(G, undefined, { stop: () => null, writerLost: () => false, writerTaken: () => false, replace: false, enterSection: () => () => undefined, progress: { renamed: false, moved: null } })).toMatchObject({ ok: true, reason: 'nb10' });
     expect(read(dataPath(G, 'a.json'))).toBe('{"a":2}');
   });
 });

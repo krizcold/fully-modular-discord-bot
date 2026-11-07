@@ -137,7 +137,7 @@ describe('a JSON restore whose note cannot be read', () => {
     expect(await restoreGuildFromGraveyard(g)).toEqual({
       ok: false,
       code: 'io-error',
-      error: `the graveyard entry's note could not be read (${code}); nothing was restored; try again in a moment`,
+      error: `entry 1000 could not be marked as restored (${code}); nothing was restored; try again in a moment`,
     });
     expect(unlink).not.toHaveBeenCalled();
     expect(rename).not.toHaveBeenCalled();
@@ -152,7 +152,7 @@ describe('a JSON restore whose note cannot be read', () => {
     const g = freshGuild();
     bury(g, 2000);
     fs.unlinkSync(path.join(entryDir(g, 2000), '.graveyard.json'));
-    expect(await restoreGuildFromGraveyard(g)).toEqual({ ok: true, retiredAt: 2000, reason: '' });
+    expect(await restoreGuildFromGraveyard(g)).toEqual({ ok: true, retiredAt: 2000, reason: '', keptUntil: expect.any(Number) });
     expect(fs.readFileSync(dataPath(g, 'm', 'a.json'), 'utf8')).toBe('{"n":5}');
   });
 });

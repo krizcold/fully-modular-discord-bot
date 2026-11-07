@@ -47,11 +47,11 @@ describe('graveyard restore with no owner info (NB11)', () => {
     const tokens: any[] = [];
     setBackendKind('postgres');
     const store = new FakeStore();
-    store.restoreGuild = async (...args: unknown[]) => { tokens.push(args[2]); return { ok: true, moved: 0, retiredAt: 5, reason: 'r' }; };
+    store.restoreGuild = async (...args: unknown[]) => { tokens.push(args[2]); return { ok: true, copied: 0, retiredAt: 5, reason: 'r', usedAt: 1000 }; };
     const ws = initWorkingSet(store);
     setGuildDataBackend(store);
     expect(await ws.hydrate('1', { nodeId: 'node-a', claim: 7, processId: 'process-a', shardId: 0, shardCount: 1 })).toBe('ready');
-    expect(await restoreGuildFromGraveyard('1', 5)).toEqual({ ok: true, moved: 0, retiredAt: 5, reason: 'r' });
+    expect(await restoreGuildFromGraveyard('1', 5)).toEqual({ ok: true, copied: 0, retiredAt: 5, reason: 'r', keptUntil: expect.any(Number) });
     expect(tokens).toEqual([{ nodeId: 'node-a', claim: 7, processId: 'process-a', shardId: 0, shardCount: 1 }]);
     expect(await restoreGuildFromGraveyard('2', 5)).toMatchObject({ ok: false, code: 'backend-unavailable' });
     expect(tokens).toHaveLength(1);

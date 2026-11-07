@@ -108,6 +108,29 @@ function hold(holder: any, fn: string, match: (p: string) => boolean) {
   return { release, reached };
 }
 
+/** Holds the write of a file opened at a matching path: the handle's writeFile, through which writeGraveyardNote writes the note. */
+function holdHandleWrite(match: (p: string) => boolean) {
+  const spy = vi.mocked(fs.promises.open) as any;
+  const prev = spy.getMockImplementation() ?? fs.promises.open.bind(fs.promises);
+  let release!: () => void;
+  const released = new Promise<void>(resolve => { release = resolve; });
+  let reach!: () => void;
+  const reached = new Promise<void>(resolve => { reach = resolve; });
+  spy.mockImplementation(async (...args: unknown[]) => {
+    const fh = await prev(...args);
+    if (match(String(args[0]))) {
+      const write = fh.writeFile.bind(fh);
+      fh.writeFile = async (...rest: unknown[]) => {
+        reach();
+        await released;
+        return write(...rest);
+      };
+    }
+    return fh;
+  });
+  return { release, reached };
+}
+
 /** Makes calls of fn whose first argument matches throw code, times times (Infinity until lift). */
 function failing(holder: any, fn: string, code: string, match: (p: string) => boolean, times = Infinity) {
   const spy = vi.mocked(holder[fn]) as any;
@@ -272,7 +295,7 @@ describe('the retire and restore windows, bot process (cache on)', () => {
     expect(dm.loadData('notes/a.json', r.o, null)).toBe(1);
     expect(dm.saveDataTracked('notes/b.json', r.o, 2).outcome).toBe('saved');
     await dm.flushAll();
-    const marker = hold(fs.promises, 'writeFile', p => p.endsWith('.graveyard.json'));
+    const marker = holdHandleWrite(p => path.basename(p).startsWith('.graveyard.json.'));
     const retire = graveyardGuildDir(r.guildId, 'nb12 test');
     await marker.reached;
     expect(fs.existsSync(r.p())).toBe(false);
@@ -303,8 +326,8 @@ describe('the retire and restore windows, bot process (cache on)', () => {
     const r = rig('case-sensitive', true, { 'notes/a.json': '1' });
     expect(dm.loadData('notes/a.json', r.o, null)).toBe(1);
     expect(await graveyardGuildDir(r.guildId, 'nb12 test')).toBe(true);
-    const rename = hold(fs.promises, 'rename', p => path.basename(p).startsWith(`${r.guildId}-`));
-    const restore = restoreGuildDirFromGraveyard(r.guildId, undefined, { stop: () => null, writerLost: () => false, progress: { renamed: false } });
+    const rename = hold(fs.promises, 'rename', p => path.basename(p).startsWith(`.restore-${r.guildId}-`));
+    const restore = restoreGuildDirFromGraveyard(r.guildId, undefined, { stop: () => null, writerLost: () => false, writerTaken: () => false, replace: false, enterSection: () => () => undefined, progress: { renamed: false, moved: null } });
     await rename.reached;
     expect(dm.loadData('notes/a.json', r.o, null)).toBe(null);
     rename.release();

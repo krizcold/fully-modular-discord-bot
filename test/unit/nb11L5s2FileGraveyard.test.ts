@@ -12,8 +12,10 @@ import {
 } from '../../src/bot/internalSetup/utils/dataBackends/fileBackend';
 import { dataPath } from '../../src/utils/dataRoot';
 
+vi.mock('fs', async orig => (await import('../helpers/forwardingFs')).forwardingFs(await orig<any>()));
+
 // NB11 (wip-redesign/sheets/NB11.md): the file restore from the graveyard and the TTL sweep, at the edges the
-// mutation gate found untested: what each refusal answers and logs, the note written back, the rename backoff, and
+// mutation gate found untested: what each refusal answers and logs, the rename backoff, and
 // which folders a sweep removes.
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -38,7 +40,7 @@ function makeDir(name: string): string {
   fs.writeFileSync(path.join(dir, 'm', 'a.json'), '{"n":1}');
   return dir;
 }
-const hooks = (over: Partial<FileRestoreHooks> = {}): FileRestoreHooks => ({ stop: () => null, writerLost: () => false, progress: { renamed: false }, ...over });
+const hooks = (over: Partial<FileRestoreHooks> = {}): FileRestoreHooks => ({ stop: () => null, writerLost: () => false, writerTaken: () => false, replace: false, enterSection: () => () => undefined, progress: { renamed: false, moved: null }, ...over });
 
 let errorSpy: ReturnType<typeof vi.spyOn>;
 let warnSpy: ReturnType<typeof vi.spyOn>;
@@ -76,50 +78,13 @@ describe('restoreGuildDirFromGraveyard refusals', () => {
       return (readFile as any)(p, ...rest);
     }) as any);
     const out = await restoreGuildDirFromGraveyard(g, ms, hooks());
-    expect(out).toEqual({ ok: false, why: 'note', code: 'EIO', step: 'read' });
+    expect(out).toEqual({ ok: false, why: 'stamp', x: ms, code: 'EIO' });
     expect(errorSpy).toHaveBeenCalledWith(`[DataManager] Cannot restore guild ${g}: the note of graveyard entry ${g}-${ms} could not be read:`, failure);
     expect(fs.readFileSync(note, 'utf8')).toBe(NOTE(g, ms));
     expect(fs.existsSync(dataPath(g))).toBe(false);
   });
 
-  it('logs a note that cannot be removed and keeps the entry with its note', async () => {
-    const g = freshGuild();
-    const ms = Date.now();
-    bury(g, ms);
-    const note = path.join(entryDir(g, ms), '.graveyard.json');
-    const unlink = fs.promises.unlink.bind(fs.promises);
-    const failure = errno('EACCES');
-    vi.spyOn(fs.promises, 'unlink').mockImplementation((async (p: any) => {
-      if (same(p, note)) throw failure;
-      return unlink(p);
-    }) as any);
-    const out = await restoreGuildDirFromGraveyard(g, ms, hooks());
-    expect(out).toEqual({ ok: false, why: 'note', code: 'EACCES' });
-    expect(errorSpy).toHaveBeenCalledWith(`[DataManager] Cannot restore guild ${g}: the note of graveyard entry ${g}-${ms} could not be removed:`, failure);
-    expect(fs.readFileSync(note, 'utf8')).toBe(NOTE(g, ms));
-    expect(fs.existsSync(dataPath(g))).toBe(false);
-  });
-
-  it('warns when the note cannot be written back after a stop', async () => {
-    const g = freshGuild();
-    const ms = Date.now();
-    bury(g, ms);
-    const note = path.join(entryDir(g, ms), '.graveyard.json');
-    const writeFile = fs.promises.writeFile.bind(fs.promises);
-    const failure = errno('EROFS');
-    vi.spyOn(fs.promises, 'writeFile').mockImplementation((async (p: any, ...rest: any[]) => {
-      if (same(p, note)) throw failure;
-      return (writeFile as any)(p, ...rest);
-    }) as any);
-    let stops = 0;
-    const out = await restoreGuildDirFromGraveyard(g, ms, hooks({ stop: () => (++stops >= 3 ? 'maintenance' : null) }));
-    expect(out).toEqual({ ok: false, why: 'stopped', stop: 'maintenance' });
-    expect(warnSpy).toHaveBeenCalledWith(`[DataManager] Failed to write back the note of graveyard entry ${g}-${ms}:`, failure);
-    expect(fs.readFileSync(path.join(entryDir(g, ms), 'm', 'a.json'), 'utf8')).toBe('{"n":5}');
-    expect(fs.existsSync(dataPath(g))).toBe(false);
-  });
-
-  it('refuses when the writer is lost after the note left, puts the note back and leaves the entry in place', async () => {
+  it('refuses when the writer is lost after the stamp, keeps the entry with its stamped note and leaves no copy', async () => {
     const g = freshGuild();
     const ms = Date.now();
     bury(g, ms);
@@ -130,12 +95,13 @@ describe('restoreGuildDirFromGraveyard refusals', () => {
     expect(out).toEqual({ ok: false, why: 'writer-lost' });
     expect(errorSpy).toHaveBeenCalledWith(`[DataManager] Cannot restore guild ${g} from the graveyard: another process took the data files`);
     expect(h.progress.renamed).toBe(false);
-    expect(fs.readFileSync(path.join(entryDir(g, ms), '.graveyard.json'), 'utf8')).toBe(NOTE(g, ms));
+    expect(JSON.parse(fs.readFileSync(path.join(entryDir(g, ms), '.graveyard.json'), 'utf8'))).toEqual({ ...JSON.parse(NOTE(g, ms)), usedAt: expect.any(Number) });
     expect(fs.readFileSync(path.join(entryDir(g, ms), 'm', 'a.json'), 'utf8')).toBe('{"n":5}');
     expect(fs.existsSync(dataPath(g))).toBe(false);
+    expect(fs.readdirSync(graveyard()).filter(n => n.startsWith(`.copy-${g}-`) || n.startsWith(`.restore-${g}-`))).toEqual([]);
   });
 
-  it('retries a failing rename ten times with a growing backoff, then logs it and puts the note back', async () => {
+  it('retries a failing rename of the copy ten times with a growing backoff, then logs it and keeps the entry', async () => {
     const g = freshGuild();
     const ms = Date.now();
     bury(g, ms);
@@ -144,7 +110,7 @@ describe('restoreGuildDirFromGraveyard refusals', () => {
     const tries: number[] = [];
     const failure = errno('EPERM');
     vi.spyOn(fs.promises, 'rename').mockImplementation((async (from: any, to: any) => {
-      if (same(from, entryDir(g, ms))) {
+      if (path.basename(String(from)).startsWith(`.restore-${g}-`) && same(to, dataPath(g))) {
         tries.push(Date.now());
         throw failure;
       }
@@ -158,23 +124,24 @@ describe('restoreGuildDirFromGraveyard refusals', () => {
     }
     const out = await pending;
     vi.useRealTimers();
-    expect(out).toEqual({ ok: false, why: 'rename', code: 'EPERM' });
+    expect(out).toEqual({ ok: false, why: 'put', x: ms, code: 'EPERM' });
     expect(tries.slice(1).map((t, i) => t - tries[i])).toEqual([25, 50, 75, 100, 125, 150, 175, 200, 225]);
-    expect(errorSpy).toHaveBeenCalledWith(`[DataManager] Failed to move graveyard entry ${g}-${ms} back:`, failure);
-    expect(fs.readFileSync(path.join(entryDir(g, ms), '.graveyard.json'), 'utf8')).toBe(NOTE(g, ms));
+    expect(errorSpy).toHaveBeenCalledWith(`[DataManager] Cannot restore guild ${g}: the copy of graveyard entry ${g}-${ms} could not be put in place:`, failure);
+    expect(JSON.parse(fs.readFileSync(path.join(entryDir(g, ms), '.graveyard.json'), 'utf8')).reason).toBe('webui-operator-delete');
     expect(fs.existsSync(dataPath(g))).toBe(false);
   });
 
-  it('restores the entry into place and logs the restore', async () => {
+  it('restores a copy of the entry into place, keeps the entry and logs the restore', async () => {
     const g = freshGuild();
     const ms = Date.now();
     bury(g, ms);
     const h = hooks();
     const out = await restoreGuildDirFromGraveyard(g, ms, h);
-    expect(out).toEqual({ ok: true, retiredAt: ms, reason: 'webui-operator-delete' });
+    expect(out).toEqual({ ok: true, retiredAt: ms, reason: 'webui-operator-delete', usedAt: expect.any(Number) });
     expect(h.progress.renamed).toBe(true);
     expect(fs.readFileSync(dataPath(g, 'm', 'a.json'), 'utf8')).toBe('{"n":5}');
     expect(fs.existsSync(dataPath(g, '.graveyard.json'))).toBe(false);
+    expect(fs.readFileSync(path.join(entryDir(g, ms), 'm', 'a.json'), 'utf8')).toBe('{"n":5}');
     expect(warned(`[DataManager] Guild ${g} restored from graveyard entry ${g}-${ms}`)).toBe(true);
     fs.rmSync(dataPath(g), { recursive: true, force: true });
   });
@@ -287,9 +254,9 @@ describe('sweepGraveyard', () => {
   it('warns and keeps an expired entry it cannot set aside', async () => {
     const name = `${freshGuild()}-${Date.now() - 30 * DAY_MS}`;
     const dir = makeDir(name);
-    const rename = fs.promises.rename.bind(fs.promises);
+    const rename = fs.renameSync.bind(fs);
     const failure = errno('EBUSY');
-    vi.spyOn(fs.promises, 'rename').mockImplementation((async (from: any, to: any) => {
+    vi.spyOn(fs, 'renameSync').mockImplementation(((from: any, to: any) => {
       if (same(from, dir)) throw failure;
       return rename(from, to);
     }) as any);

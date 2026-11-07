@@ -65,7 +65,7 @@ import { commitAnswerOwed, getWorkingSet, DataBackendUnavailableError, resaveTar
 import type { WsTicket } from './dataBackends/workingSet';
 import type { FileRestoreOutcome, FileTicket } from './dataBackends/fileBackend';
 import { deadlineIn, msLeft } from './dataBackends/postgresBackend';
-import type { DataBackend, FenceToken, LateCommit, RestoreOutcome, RestoreStop, RetireOutcome } from './dataBackends/backend';
+import type { DataBackend, FenceToken, LateCommit, ReplacedBatch, RestoreOutcome, RestoreStop, RetireOutcome } from './dataBackends/backend';
 import { resolveDataBackend } from '../../../utils/envLoader';
 import { currentLedger, currentSince, recordRefusal, recordTicket } from './dataBackends/writeLedger';
 import { markBarrier, noteScopeRefusal, noteScopeTicket, pendingFor, saveMark, stampOf, type SaveMark } from './dataBackends/scopeRecord';
@@ -178,6 +178,19 @@ const EXIT_DRAIN_GIVEUP_MS = 3000;
 const AFTER_DRAIN_BOUND_MS = 5000;
 let exitDrain: Promise<void> | null = null;
 let closedForExit = false;
+// The JSON restores between K4's rename and their end: the exit drain waits for every one.
+const restoreRenameSections = new Set<Promise<void>>();
+
+/** Opens a restore's rename section; answers its end, which its own finally runs. */
+function openRenameSection(): () => void {
+  let end!: () => void;
+  const section = new Promise<void>(resolve => { end = resolve; });
+  restoreRenameSections.add(section);
+  return () => {
+    restoreRenameSections.delete(section);
+    end();
+  };
+}
 
 const pause = (ms: number) => new Promise<void>(resolve => { setTimeout(resolve, Math.max(0, ms)); });
 
@@ -240,6 +253,7 @@ export function drainForExit(boundMs: number): Promise<void> {
       try {
         await drainUntilSettled(deadline - Math.floor(boundMs / 5), progress);
         closedForExit = true;
+        await Promise.allSettled([...restoreRenameSections]);
         await drainUntilSettled(deadline, progress);
         logDrainLeft('Shutdown drain', getWorkingSet()?.dirtyGuildIds() ?? []);
         const files = queuedFileWrites();
@@ -466,6 +480,18 @@ export function sharedWritesClosedLost(): boolean {
   return sharedWritesLost;
 }
 
+let writerLockCheck: (() => boolean) | null = null;
+
+/** How a restore reads the lock file itself; the writer lock sets it at a fresh take (it imports this module). */
+export function useWriterLockCheck(check: (() => boolean) | null): void {
+  writerLockCheck = check;
+}
+
+/** Another process took the data files: the cached flag, or the lock file read now. */
+export function writerTakenNow(): boolean {
+  return sharedWritesLost || (writerLockCheck?.() ?? false);
+}
+
 /** Whether a write of this path is a shared-file write (every file write but a session's). */
 export function isSharedPath(absPath: string): boolean {
   return !path.resolve(absPath).startsWith(SESSIONS_DIR);
@@ -662,6 +688,12 @@ export function guildWritePlacement(guildId: string, module: string, filename: s
   return ws.placementOf(guildId, key.module, key.filename);
 }
 
+/** How long a graveyard entry is kept after its delete or its newest restore: GRAVEYARD_TTL_DAYS, 14 days by default. */
+function graveyardTtlMs(): number {
+  const ttlDays = Number(process.env.GRAVEYARD_TTL_DAYS);
+  return (Number.isFinite(ttlDays) && ttlDays > 0 ? ttlDays : 14) * 24 * 60 * 60 * 1000;
+}
+
 /**
  * Graveyard TTL sweep: always sweeps the file _graveyard; in postgres mode it
  * also sweeps graveyard rows, through the served backend's own pool.
@@ -671,12 +703,10 @@ export async function sweepGraveyard(): Promise<void> {
   await sweepFileGraveyard(guildId => guildDataOps.get(guildId) === 'restore');
   if (!pgBackend || !servedByPostgres()) return;
   if (!guildDataServing || guildWritesClosed) return;
-  const served = pgBackend as { servesData?: () => boolean; sweepGraveyard?: (cutoffMs: number) => Promise<number> };
+  const served = pgBackend as { servesData?: () => boolean; sweepGraveyard?: (ttlMs: number) => Promise<number> };
   if (!served.servesData?.() || !served.sweepGraveyard) return;
-  const ttlDays = Number(process.env.GRAVEYARD_TTL_DAYS);
-  const ttlMs = (Number.isFinite(ttlDays) && ttlDays > 0 ? ttlDays : 14) * 24 * 60 * 60 * 1000;
   try {
-    const swept = await served.sweepGraveyard(Date.now() - ttlMs);
+    const swept = await served.sweepGraveyard(graveyardTtlMs());
     if (swept > 0) console.log(`[Data] Swept ${swept} expired graveyard row(s)`);
   } catch (error) {
     console.warn('[Data] Graveyard row sweep failed:', error instanceof Error ? error.message : error);
@@ -1303,7 +1333,7 @@ function acceptAppend(filename: string, options: DataOptions, line: string): App
   refuseInMaintenance(options);
   refuseGuildWhileGated(options);
   if (guildWriteClosed(options, 'Append')) return { outcome: 'refused', cause: 'not-ready' };
-  if (refusedWhileHeld(options, 'Append')) return { outcome: 'refused', cause: 'not-ready' };
+  if (refusedWhileHeld(options, 'Append') || refusedBeforeRestore(options, 'Append')) return { outcome: 'refused', cause: 'not-ready' };
   const checked = (options.scope || 'guild') === 'guild' ? storableKey(filename, options, 'append') : null;
   if (checked && isRefused(checked)) return checked;
   const textRefused = textRefusal(line) ?? sizeRefusal(line);
@@ -1494,7 +1524,7 @@ function refusedWhileHeld(options: DataOptions, what: string): boolean {
   return true;
 }
 
-/** A whole-document write from a run whose ledger is still open and began before the guild's restore ended. */
+/** A write or an append from a run whose ledger is still open and began before the guild's restore ended. */
 function refusedBeforeRestore(options: DataOptions, what: string): boolean {
   if ((options.scope || 'guild') !== 'guild' || !options.guildId) return false;
   const barrier = restoredAt.get(options.guildId);
@@ -1586,19 +1616,64 @@ export const RESTORE_TEXTS = {
   outOfTime: 'the restore ran out of its 40 s before it could commit; nothing was restored; try again in a moment',
   deposed: "another bot process now serves this server's data; nothing was restored",
   nodeStopping: '[Data] This process is stopping; nothing was restored',
-  live: (retiredAt: number) => `live guild data exists; nothing was restored. To restore entry ${retiredAt}, delete this server's data, then restore with retiredAt ${retiredAt} before the bot saves anything new for the server; data it saves in between blocks the restore again. While the server's members are active, remove the bot from the server first and add it back after the restore.`,
+  live: (guildId: string, retiredAt: number) => `server ${guildId} has data saved since entry ${retiredAt} was deleted; nothing was restored. To put entry ${retiredAt} in place and move the current data to the graveyard as a new entry, run: smdb graveyard restore ${guildId} ${retiredAt} --replace`,
+  changed: "the server's data changed during the replace; nothing was restored; try again in a moment",
+  incomplete: (put: number, taken: number) => `the restore stopped: the database put ${put} of ${taken} row(s) in place; nothing was restored; see the bot log`,
   unavailable: (detail: string) => `[Data] The database did not answer or ended the connection (${detail}); nothing was restored; try again in a moment`,
   refused: (detail: string, code?: string) => `the database refused the restore (${detail}); nothing was restored; ${code === '40P01' || code === '57014' ? 'try again in a moment' : 'see the bot log'}`,
-  unknown: (guildId: string, retiredAt?: number) => `can't confirm whether server ${guildId} was restored: the database did not confirm the commit. Within a minute, if it was restored, the server's data is back and ${retiredAt === undefined ? 'its entry' : `entry ${retiredAt}`} is gone from \`smdb graveyard list\`; if not, the entry is still listed, unless it had passed the graveyard's keep time (GRAVEYARD_TTL_DAYS, 14 days by default) and the graveyard sweep removed it, data and all. The list reads the data of the bot behind the web panel it asks; if the main database was replaced meanwhile, check once that bot runs on the new main.`,
+  /** replaced: the move-out's batch (null: it moved nothing), undefined for a plain restore or a move-out with no answer. */
+  unknown: (guildId: string, retiredAt: number | undefined, replaced?: ReplacedBatch) => `${replaced
+    ? `can't confirm whether server ${guildId} was restored: the database did not confirm the commit. Within a minute, if it was restored, \`smdb graveyard list\` lists entry ${replaced.retiredAt}, which holds the server's data from before, and entry ${retiredAt} was copied in; if not, no entry ${replaced.retiredAt} is listed and nothing changed.`
+    : `can't confirm whether server ${guildId} was restored: the database did not confirm the commit; the outcome is fixed within a minute.${replaced === null ? ' The server had no data, so no entry was added.' : ''}`} ${restoreTail(guildId, retiredAt)} ${RESTORE_MAIN}`,
   error: (message: string) => `the restore stopped on an error in the bot (${message}); nothing was restored; see the bot log`,
-  rename: (code: string) => `the graveyard entry could not be moved back (${code}); nothing was restored; try again in a moment`,
-  note: (code: string, step: 'read' | 'remove' = 'remove') => `the graveyard entry's note could not be ${step === 'read' ? 'read' : 'removed'} (${code}); nothing was restored; try again in a moment`,
+  failing: (file: string, code: string) => `a file of this server keeps failing to save (${file}: ${code}); nothing was restored; free disk space or fix the file's permissions, then try again`,
+  stamp: (x: number, code: string) => `entry ${x} could not be marked as restored (${code}); nothing was restored; try again in a moment`,
+  copy: (x: number, code: string) => (code === 'ENOSPC'
+    ? `entry ${x} could not be copied (ENOSPC); nothing was restored; free disk space, then try again`
+    : `entry ${x} could not be copied (${code}); nothing was restored; try again in a moment`),
+  copyDeadline: (x: number, copied: number) => `entry ${x} could not be copied before the restore's deadline (${copied} file(s) copied); nothing was restored`,
+  copySync: (x: number, code: string) => `the disk did not confirm the copy of entry ${x} (${code}); nothing was restored; check the disk, then try again`,
+  move: (code: string) => `the server's current data could not be moved to the graveyard (${code}); nothing was restored; try again in a moment`,
+  put: (x: number, code: string) => `the copy of entry ${x} could not be put in place (${code}); nothing was restored; try again in a moment`,
+  undo: (x: number, code: string) => `the copy of entry ${x} could not be put in place (${code}); nothing was restored; the server's data is back in place; try again in a moment`,
+  undoTaken: (x: number, code: string) => `the copy of entry ${x} could not be put in place (${code}); nothing was restored. The server's data was moved back, but another process took over the bot's data files at the same moment: can't confirm that it saved nothing over those files, and a file it replaced then is in no graveyard entry. Entry ${x} stays listed. Check the server's data before you try again.`,
+  undoUnconfirmed: (guildId: string, r: number, code: string) => ` The disk did not confirm the move back (${code}), so after a power cut the server's data can be in graveyard entry ${r} instead; it stays listed there, and smdb graveyard restore ${guildId} ${r} --replace puts it back.`,
+  half: (guildId: string, x: number, r: number, code: string, undoCode: string) => `the server's data was moved to graveyard entry ${r}, but the copy of entry ${x} could not be put in place (${code}) and the data could not be moved back (${undoCode}). The server had no data when this answer was made; nothing is lost: entries ${r} and ${x} are both in \`smdb graveyard list\`. To put the server's data back, run: smdb graveyard restore ${guildId} ${r} --replace; to restore entry ${x} instead: smdb graveyard restore ${guildId} ${x} --replace`,
+  halfTaken: (guildId: string, x: number, r: number, code: string) => `another process took over the bot's data files during the restore, after the server's data was moved to graveyard entry ${r}: the copy of entry ${x} could not be put in place (${code}), and this process did not move the data back. Can't confirm what the server holds now: no data, entry ${x}'s data (if the bot that took over finished this restore when it started), or data that process saved since. Nothing is lost: entries ${r} and ${x} are both in \`smdb graveyard list\`. To put the server's data back, run: smdb graveyard restore ${guildId} ${r} --replace; to restore entry ${x} instead: smdb graveyard restore ${guildId} ${x} --replace`,
+  afterMove: (guildId: string, r: number, message: string, x: number | undefined) => `can't confirm whether server ${guildId} was restored: the restore stopped on an error in the bot (${message}) after the server's data was moved to graveyard entry ${r}; see the bot log. If \`smdb graveyard list\` lists entry ${r}, it holds the server's data from before. ${restoreTail(guildId, x)}`,
   latched: (why: string) => `this bot process stopped writing to its database (${why}); nothing was restored; try again once the bot runs on its main database`,
   held: (detail: string) => `this bot process is not writing to its database for now (${detail}); nothing was restored; try again in a moment`,
-  late: (guildId: string, late: LateCommit) => `${late.committed
-    ? `can't confirm whether server ${guildId} was restored on the main database: ${late.old} confirmed the restore only after this process stopped writing there (${late.why}).`
-    : `can't confirm whether server ${guildId} was restored: the database did not confirm the commit, and this process stopped writing to ${late.old} while it waited (${late.why}).`} Once the bot runs on the main database, check whether the server's data is back, and repeat the restore if it is not.`,
+  late: (guildId: string, late: LateCommit, retiredAt: number | undefined, replaced?: ReplacedBatch) => {
+    const x = retiredAt === undefined ? '<its retiredAt>' : String(retiredAt);
+    return `${late.committed
+      ? `can't confirm whether server ${guildId} was restored on the main database: ${late.old} confirmed the restore only after this process stopped writing there (${late.why}).`
+      : `can't confirm whether server ${guildId} was restored: the database did not confirm the commit, and this process stopped writing to ${late.old} while it waited (${late.why}).`}${replaced
+      ? ` If the restore landed on ${late.old}, the server's data from before is entry ${replaced.retiredAt} there.`
+      : ''} Once the bot runs on the main database, run: smdb graveyard restore ${guildId} ${x} --replace. It is safe whether or not this restore reached that database: it copies entry ${x} in and moves whatever the server holds into a new entry, so nothing is lost; if that database lists no entry ${x}, the restore answers "no graveyard entry for this guild" and changes nothing.`;
+  },
 };
+
+const RESTORE_MAIN = 'The list reads the data of the bot behind the web panel it asks; if the main database was replaced meanwhile, check once that bot runs on the new main.';
+
+/** The end of every can't confirm text of a restore: entry X stays listed, and the replace of X is safe to run. */
+function restoreTail(guildId: string, retiredAt: number | undefined): string {
+  if (retiredAt === undefined) {
+    return `The entry it restored, if any, stays listed either way, unless it had passed the graveyard's keep time (GRAVEYARD_TTL_DAYS, 14 days by default) and the graveyard sweep removed it, data and all. Running smdb graveyard restore ${guildId} <its retiredAt> --replace is then safe: it copies that entry in and moves whatever the server holds into a new entry, so nothing is lost.`;
+  }
+  return `Entry ${retiredAt} stays listed either way, unless it had passed the graveyard's keep time (GRAVEYARD_TTL_DAYS, 14 days by default) and the graveyard sweep removed it, data and all. Running smdb graveyard restore ${guildId} ${retiredAt} --replace is then safe: it copies entry ${retiredAt} in and moves whatever the server holds into a new entry, so nothing is lost.`;
+}
+
+/**
+ * The end of the route's no-answer text and of the CLI's cut answer: x is the request's retiredAt, else n, the guild's
+ * newest entry read before the send (undefined: none).
+ */
+export function restoreNoAnswerEnding(guildId: string, x: number | undefined, n: number | undefined, replace: boolean): string {
+  if (!replace) return `The outcome is fixed within a minute. ${restoreTail(guildId, x)} ${RESTORE_MAIN}`;
+  const which = x === undefined
+    ? 'whose reason starts with replaced-by-restore- or is empty'
+    : `${n === undefined ? '' : `newer than ${n} `}whose reason is replaced-by-restore-${x} or empty`;
+  return `Within a minute the outcome is fixed (if the bot stopped mid-step, once it has started again). If \`smdb graveyard list\` then lists an entry for this server ${which}, the replace moved the server's data from before into that entry (an empty reason means its note could not be written). If not, either the server had no data or nothing changed. ${restoreTail(guildId, x)} ${RESTORE_MAIN}`;
+}
 
 export const DELETE_TEXTS = {
   failed: 'guild data delete failed; nothing was removed',
@@ -1622,9 +1697,14 @@ export const DELETE_TEXTS = {
     : `can't confirm whether this server's data was deleted: the database did not confirm the commit, and this process stopped writing to ${late.old} while it waited (${late.why}).`} \`smdb graveyard list\` reads the data of the bot behind the web panel it asks: once that bot runs on the main database, look there for a new entry of this server with the reason webui-operator-delete, and repeat the delete if there is none.`,
 };
 
+/**
+ * A restore's answer. ok: keptUntil is the date entry retiredAt stays listed until; copied, the rows a database copied
+ * in; replaced, set only for a replace (null when the server had no data); replaced.reason only when it is stored.
+ * refusal 'live-data' with retiredAt: a plain restore refused because the server has data.
+ */
 export type GraveyardReply =
-  | { ok: true; retiredAt: number; reason: string; moved?: number; moveUnconfirmed?: string }
-  | { ok: false; code: 'invalid' | 'backend-unavailable' | 'not-owner' | 'frozen' | 'io-error'; error?: string };
+  | { ok: true; retiredAt: number; reason: string; keptUntil: number; copied?: number; replaced?: { retiredAt: number; moved?: number; reason?: string } | null; moveUnconfirmed?: string }
+  | { ok: false; code: 'invalid' | 'backend-unavailable' | 'not-owner' | 'frozen' | 'io-error'; error?: string; refusal?: 'live-data'; retiredAt?: number };
 
 export type DeleteReply = { ok: true; moveUnconfirmed?: string } | { ok: false; code: 'invalid' | 'backend-unavailable' | 'not-owner' | 'io-error'; error: string };
 
@@ -1632,7 +1712,7 @@ const errorMessage = (error: unknown): string => (error instanceof Error ? error
 
 const unconfirmedReplies = new WeakSet<object>();
 
-/** A can't confirm answer: the change may have landed, so no later refusal text may replace it. */
+/** An answer about a change that may have landed, or landed in part: no later refusal text may replace it. */
 function unconfirmed<T extends object>(reply: T): T {
   unconfirmedReplies.add(reply);
   return reply;
@@ -1785,16 +1865,22 @@ async function retireFiles(guildId: string, reason: string, deadline: bigint): P
  * from the admission to the end: its writes are refused, its interactions held and its events wait. Refusals and
  * outcomes come back as a reply with its code; maintenance, the exit drain and a database that did not answer throw
  * DataBackendUnavailableError. deadline: a process.hrtime.bigint() reading; nothing commits or is renamed after it.
+ * replace: the server's current data moves to a new graveyard entry in the same step, instead of refusing the restore.
  */
-export async function restoreGuildFromGraveyard(guildId: string, retiredAt?: number, deadline: bigint = deadlineIn(OPERATION_BOUND_MS)): Promise<GraveyardReply> {
+export async function restoreGuildFromGraveyard(guildId: string, retiredAt?: number, deadline: bigint = deadlineIn(OPERATION_BOUND_MS), replace = false): Promise<GraveyardReply> {
   refuseGuildChangeInMaintenance();
   if (closedForExit) throw new DataBackendUnavailableError('node-stopping', RESTORE_TEXTS.nodeStopping);
   const running = guildDataOps.get(guildId);
   if (running) return { ok: false, code: 'invalid', error: running === 'restore' ? RESTORE_TEXTS.alreadyRunning : RESTORE_TEXTS.deleteRunning };
-  return servedByPostgres() ? restoreRows(guildId, retiredAt, deadline) : restoreFiles(guildId, retiredAt, deadline);
+  return servedByPostgres() ? restoreRows(guildId, retiredAt, deadline, replace) : restoreFiles(guildId, retiredAt, deadline, replace);
 }
 
-async function restoreRows(guildId: string, retiredAt: number | undefined, deadline: bigint): Promise<GraveyardReply> {
+/** A plain restore refused because the server has data: the field the route and the panel decide on, and the text. */
+function liveDataRefusal(guildId: string, retiredAt: number): GraveyardReply {
+  return { ok: false, code: 'invalid', refusal: 'live-data', retiredAt, error: RESTORE_TEXTS.live(guildId, retiredAt) };
+}
+
+async function restoreRows(guildId: string, retiredAt: number | undefined, deadline: bigint, replace: boolean): Promise<GraveyardReply> {
   const backend = pgBackend;
   if (!backend) throw new DataBackendUnavailableError('database-unreachable', RESTORE_TEXTS.unavailable('no database backend in this process'));
   const ws = getWorkingSet();
@@ -1821,7 +1907,7 @@ async function restoreRows(guildId: string, retiredAt: number | undefined, deadl
     if (flushed === 'ok' && fence && !stopped) {
       called = true;
       ws.noteRestoreSent(guildId);
-      outcome = await backend.restoreGuild(guildId, retiredAt ?? null, fence, () => operationStop(deadline, COMMIT_FLOOR_MS), deadline);
+      outcome = await backend.restoreGuild(guildId, retiredAt ?? null, fence, () => operationStop(deadline, COMMIT_FLOOR_MS), deadline, replace);
     }
   } catch (error) {
     failure = { error };
@@ -1829,7 +1915,7 @@ async function restoreRows(guildId: string, retiredAt: number | undefined, deadl
     else console.error(`[Data] The restore of guild ${guildId} stopped on an error:`, error);
   }
   if (outcome && !outcome.ok && outcome.reason === 'unknown' && outcome.late) {
-    console.error(`[Data] Guild ${guildId}: ${RESTORE_TEXTS.late(guildId, outcome.late)}`);
+    console.error(`[Data] Guild ${guildId}: ${RESTORE_TEXTS.late(guildId, outcome.late, outcome.retiredAt ?? retiredAt, outcome.replaced)}`);
   } else if (outcome && !outcome.ok && outcome.reason === 'unknown') {
     const batch = outcome.retiredAt ?? retiredAt;
     console.error(`[DataManager] Can't confirm whether guild ${guildId} was restored${batch === undefined ? '' : ` from graveyard batch ${batch}`}: the database did not confirm the commit`);
@@ -1855,10 +1941,19 @@ async function restoreRows(guildId: string, retiredAt: number | undefined, deadl
   if (flushed !== 'ok') return { ok: false, code: 'backend-unavailable', error: RESTORE_TEXTS.flush };
   if (stopped) return { ok: false, code: 'frozen' };
   if (!outcome) return { ok: false, code: 'backend-unavailable', error: RESTORE_TEXTS.notLoaded };
-  if (outcome.ok) return { ok: true, retiredAt: outcome.retiredAt, reason: outcome.reason, moved: outcome.moved };
+  if (outcome.ok) {
+    return {
+      ok: true, retiredAt: outcome.retiredAt, reason: outcome.reason, keptUntil: outcome.usedAt + graveyardTtlMs(), copied: outcome.copied,
+      ...(outcome.replaced === undefined ? {} : { replaced: outcome.replaced }),
+    };
+  }
   switch (outcome.reason) {
     case 'deposed': return { ok: false, code: 'not-owner', error: RESTORE_TEXTS.deposed };
-    case 'live-rows': return { ok: false, code: 'invalid', error: RESTORE_TEXTS.live(outcome.retiredAt) };
+    case 'live-rows': return liveDataRefusal(guildId, outcome.retiredAt);
+    case 'changed': return { ok: false, code: 'invalid', error: RESTORE_TEXTS.changed };
+    case 'incomplete':
+      console.error(`[DataManager] The restore of guild ${guildId} stopped at its ${outcome.step}: the database put ${outcome.put} of ${outcome.taken} row(s) in place; rolled back`);
+      return { ok: false, code: 'backend-unavailable', error: RESTORE_TEXTS.incomplete(outcome.put, outcome.taken) };
     case 'no-entry': return { ok: false, code: 'invalid', error: RESTORE_TEXTS.noEntry };
     case 'schema-mismatch': return { ok: false, code: 'invalid', error: RESTORE_TEXTS.schemaMismatch };
     case 'refused': return { ok: false, code: 'backend-unavailable', error: RESTORE_TEXTS.refused(outcome.detail, outcome.code) };
@@ -1866,7 +1961,10 @@ async function restoreRows(guildId: string, retiredAt: number | undefined, deadl
     case 'not-provisioned': return { ok: false, code: 'backend-unavailable', error: RESTORE_TEXTS.notProvisioned };
     case 'latched': return { ok: false, code: 'backend-unavailable', error: RESTORE_TEXTS.latched(outcome.detail) };
     case 'held': return { ok: false, code: 'backend-unavailable', error: RESTORE_TEXTS.held(outcome.detail) };
-    case 'unknown': return unconfirmed({ ok: false, code: 'backend-unavailable', error: outcome.late ? RESTORE_TEXTS.late(guildId, outcome.late) : RESTORE_TEXTS.unknown(guildId, outcome.retiredAt ?? retiredAt) });
+    case 'unknown': {
+      const x = outcome.retiredAt ?? retiredAt;
+      return unconfirmed({ ok: false, code: 'backend-unavailable', error: outcome.late ? RESTORE_TEXTS.late(guildId, outcome.late, x, outcome.replaced) : RESTORE_TEXTS.unknown(guildId, x, outcome.replaced) });
+    }
     case 'maintenance':
     case 'node-stopping':
     case 'out-of-time':
@@ -1876,33 +1974,71 @@ async function restoreRows(guildId: string, retiredAt: number | undefined, deadl
   }
 }
 
-async function restoreFiles(guildId: string, retiredAt: number | undefined, deadline: bigint): Promise<GraveyardReply> {
+async function restoreFiles(guildId: string, retiredAt: number | undefined, deadline: bigint, replace: boolean): Promise<GraveyardReply> {
   guildDataOps.set(guildId, 'restore');
-  const progress = { renamed: false };
+  const progress: { renamed: boolean; moved: { r: number; x: number } | null } = { renamed: false, moved: null };
   let outcome: FileRestoreOutcome | undefined;
   let failure: { error: unknown } | null = null;
   try {
-    outcome = await restoreGuildDirFromGraveyard(guildId, retiredAt, { stop: () => operationStop(deadline, 0), writerLost: sharedWritesClosedLost, progress });
+    outcome = await restoreGuildDirFromGraveyard(guildId, retiredAt, {
+      stop: (floorMs = 0) => operationStop(deadline, floorMs),
+      writerLost: sharedWritesClosedLost,
+      writerTaken: writerTakenNow,
+      replace,
+      enterSection: openRenameSection,
+      progress,
+    });
   } catch (error) {
     failure = { error };
     console.error(`[Data] The restore of guild ${guildId} stopped on an error:`, error);
   }
   // One synchronous run, whatever the exit: the barrier, the guild released, its events replayed in order.
-  if (progress.renamed) restoredAt.set(guildId, markBarrier().stamp);
+  if (progress.renamed || progress.moved !== null) restoredAt.set(guildId, markBarrier().stamp);
   guildDataOps.delete(guildId);
   replayRestoreEvents(guildId);
 
-  if (failure || !outcome) return { ok: false, code: 'io-error', error: RESTORE_TEXTS.error(errorMessage(failure?.error)) };
-  if (outcome.ok) return { ok: true, retiredAt: outcome.retiredAt, reason: outcome.reason, ...(outcome.moveUnconfirmed === undefined ? {} : { moveUnconfirmed: outcome.moveUnconfirmed }) };
+  const reply = fileRestoreReply(guildId, outcome, failure, progress.moved);
+  return !reply.ok && progress.moved !== null ? unconfirmed(reply) : reply;
+}
+
+function fileRestoreReply(guildId: string, outcome: FileRestoreOutcome | undefined, failure: { error: unknown } | null, moved: { r: number; x: number } | null): GraveyardReply {
+  if (failure || !outcome) {
+    const message = errorMessage(failure?.error);
+    if (moved) return { ok: false, code: 'io-error', error: RESTORE_TEXTS.afterMove(guildId, moved.r, message, moved.x) };
+    return { ok: false, code: 'io-error', error: RESTORE_TEXTS.error(message) };
+  }
+  if (outcome.ok) {
+    return {
+      ok: true, retiredAt: outcome.retiredAt, reason: outcome.reason, keptUntil: outcome.usedAt + graveyardTtlMs(),
+      ...(outcome.replaced === undefined ? {} : { replaced: outcome.replaced }),
+      ...(outcome.moveUnconfirmed === undefined ? {} : { moveUnconfirmed: outcome.moveUnconfirmed }),
+    };
+  }
   switch (outcome.why) {
     case 'no-entry': return { ok: false, code: 'invalid', error: RESTORE_TEXTS.noEntry };
-    case 'live': return { ok: false, code: 'invalid', error: RESTORE_TEXTS.live(outcome.retiredAt) };
+    case 'live': return liveDataRefusal(guildId, outcome.retiredAt);
     case 'stopped': return stopAnswer(outcome.stop, 'restore');
     case 'writer-lost':
       recordRefusal('writer-lost', guildId);
       return { ok: false, code: 'invalid', error: WRITER_LOST_RESTORE_TEXT };
-    case 'note': return { ok: false, code: 'io-error', error: RESTORE_TEXTS.note(outcome.code, outcome.step) };
-    default: return { ok: false, code: 'io-error', error: RESTORE_TEXTS.rename(outcome.code) };
+    case 'failing': return { ok: false, code: 'backend-unavailable', error: RESTORE_TEXTS.failing(outcome.file, outcome.code) };
+    case 'unflushed': return { ok: false, code: 'backend-unavailable', error: RESTORE_TEXTS.flush };
+    case 'stamp': return { ok: false, code: 'io-error', error: RESTORE_TEXTS.stamp(outcome.x, outcome.code) };
+    case 'copy': return { ok: false, code: 'io-error', error: RESTORE_TEXTS.copy(outcome.x, outcome.code) };
+    case 'copy-deadline': return { ok: false, code: 'backend-unavailable', error: RESTORE_TEXTS.copyDeadline(outcome.x, outcome.copied) };
+    case 'copy-sync': return { ok: false, code: 'io-error', error: RESTORE_TEXTS.copySync(outcome.x, outcome.code) };
+    case 'move': return { ok: false, code: 'io-error', error: RESTORE_TEXTS.move(outcome.code) };
+    case 'put': return { ok: false, code: 'io-error', error: RESTORE_TEXTS.put(outcome.x, outcome.code) };
+    case 'undone': {
+      const clause = outcome.syncCode ? RESTORE_TEXTS.undoUnconfirmed(guildId, outcome.r, outcome.syncCode) : '';
+      return { ok: false, code: 'io-error', error: RESTORE_TEXTS.undo(outcome.x, outcome.code) + clause };
+    }
+    case 'undone-taken': {
+      const clause = outcome.syncCode ? RESTORE_TEXTS.undoUnconfirmed(guildId, outcome.r, outcome.syncCode) : '';
+      return { ok: false, code: 'io-error', error: RESTORE_TEXTS.undoTaken(outcome.x, outcome.code) + clause };
+    }
+    case 'half': return { ok: false, code: 'io-error', error: RESTORE_TEXTS.half(guildId, outcome.x, outcome.r, outcome.code, outcome.undoCode) };
+    case 'half-taken': return { ok: false, code: 'io-error', error: RESTORE_TEXTS.halfTaken(guildId, outcome.x, outcome.r, outcome.code) };
   }
 }
 

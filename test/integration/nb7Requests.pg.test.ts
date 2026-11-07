@@ -420,7 +420,7 @@ describe('through the bot\'s own executor', () => {
     await executorSweep(b).pass();
     expect(await answered(id)).toMatchObject({ ok: true, retiredAt: 5 });
     expect(await docsOf(g)).toEqual([{ module: 'm', filename: 'a.json', doc: '{"a":1}' }]);
-    expect(await graveOf(g)).toEqual([]);
+    expect(await graveOf(g)).toEqual([{ filename: 'a.json', doc: '{"a":1}', retired_at: expect.anything() }]);
   }, 60_000);
 
   it('a restore through the table with 30 s left gets NB11\'s 25 s (answer_by less its 5 s margin): it restores the entry and answers ok', async () => {
@@ -432,7 +432,7 @@ describe('through the bot\'s own executor', () => {
     await executorSweep(b).pass();
     expect(await answered(id)).toMatchObject({ ok: true, retiredAt: 7 });
     expect(await docsOf(g)).toEqual([{ module: 'm', filename: 'a.json', doc: '{"a":5}' }]);
-    expect(await graveOf(g)).toEqual([]);
+    expect(await graveOf(g)).toEqual([{ filename: 'a.json', doc: '{"a":5}', retired_at: expect.anything() }]);
   }, 60_000);
 
   it('a namespace delete through the table with less time left than the margin answers out-of-time and removes nothing', async () => {

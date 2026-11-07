@@ -27,7 +27,7 @@ import { setMaintenanceGate } from '../../src/bot/internalSetup/utils/maintenanc
 import { setBackendKind } from '../helpers/backendKind';
 import { FakeStore } from '../helpers/fakeStore';
 import { freshGuild } from '../helpers/gateRig';
-import { batchExistsAnswer, isBatchExists, isFenced, isGraveInsert, scriptedPg } from '../helpers/nb11ScriptedPg';
+import { batchExistsAnswer, isBatchExists, isFenced, isGraveInsert, isMove, scriptedPg } from '../helpers/nb11ScriptedPg';
 import { LEASED } from '../helpers/readinessRig';
 
 // NB11 tests 1 (wip-redesign/sheets/NB11.md): restoring a guild from the graveyard on Postgres, and deleting one, over
@@ -41,8 +41,9 @@ const DELETE_RUNNING = "a delete of this server's data is running; nothing was r
 const DEPOSED = "another bot process now serves this server's data; nothing was restored";
 const OUT_OF_TIME = 'the restore ran out of its 40 s before it could commit; nothing was restored; try again in a moment';
 const NO_ENTRY = 'no graveyard entry for this guild';
-const liveText = (r: number) => `live guild data exists; nothing was restored. To restore entry ${r}, delete this server's data, then restore with retiredAt ${r} before the bot saves anything new for the server; data it saves in between blocks the restore again. While the server's members are active, remove the bot from the server first and add it back after the restore.`;
-const unknownText = (g: string, r: number) => `can't confirm whether server ${g} was restored: the database did not confirm the commit. Within a minute, if it was restored, the server's data is back and entry ${r} is gone from \`smdb graveyard list\`; if not, the entry is still listed, unless it had passed the graveyard's keep time (GRAVEYARD_TTL_DAYS, 14 days by default) and the graveyard sweep removed it, data and all. The list reads the data of the bot behind the web panel it asks; if the main database was replaced meanwhile, check once that bot runs on the new main.`;
+const liveText = (g: string, r: number) => `server ${g} has data saved since entry ${r} was deleted; nothing was restored. To put entry ${r} in place and move the current data to the graveyard as a new entry, run: smdb graveyard restore ${g} ${r} --replace`;
+const liveReply = (g: string, r: number) => ({ ok: false, code: 'invalid', refusal: 'live-data', retiredAt: r, error: liveText(g, r) });
+const unknownText = (g: string, r: number) => `can't confirm whether server ${g} was restored: the database did not confirm the commit; the outcome is fixed within a minute. Entry ${r} stays listed either way, unless it had passed the graveyard's keep time (GRAVEYARD_TTL_DAYS, 14 days by default) and the graveyard sweep removed it, data and all. Running smdb graveyard restore ${g} ${r} --replace is then safe: it copies entry ${r} in and moves whatever the server holds into a new entry, so nothing is lost. The list reads the data of the bot behind the web panel it asks; if the main database was replaced meanwhile, check once that bot runs on the new main.`;
 const DELETE_FLUSH = "the server's unsaved changes are not confirmed saved yet; nothing was removed; try again in a moment";
 const DELETE_ALREADY = "a delete of this server's data is already running; nothing was removed";
 const RESTORE_RUNNING = 'a restore of this server from the graveyard is running; nothing was removed; try again once it ends';
@@ -54,9 +55,9 @@ const DELETE_UNKNOWN = "can't confirm whether this server's data was deleted: th
 type RestoreArgs = [guildId: string, retiredAt: number | null, token: FenceToken, beforeCommit: () => RestoreStop | null, deadline: bigint];
 type RetireArgs = [guildId: string, reason: string, token: FenceToken, deadline?: bigint | null];
 
-/** FakeStore with a graveyard: the retire moves a guild's rows into a batch and the restore moves one back, unless scripted. */
+/** FakeStore with a graveyard: the retire moves a guild's rows into a batch and the restore copies one in, unless scripted. */
 class ScriptedStore extends FakeStore {
-  readonly graveyard = new Map<string, { retiredAt: number; reason: string; docs: Map<string, string>; streams: Map<string, string> }[]>();
+  readonly graveyard = new Map<string, { retiredAt: number; reason: string; usedAt?: number; docs: Map<string, string>; streams: Map<string, string> }[]>();
   readonly order: string[] = [];
   readonly restoreCalls: RestoreArgs[] = [];
   readonly retireCalls: RetireArgs[] = [];
@@ -80,16 +81,15 @@ class ScriptedStore extends FakeStore {
     if ([...this.docs.keys(), ...this.streams.keys()].some(own)) return { ok: false, reason: 'live-rows', retiredAt: batch.retiredAt };
     const stop = beforeCommit();
     if (stop) return { ok: false, reason: stop };
-    this.moveBack(guildId, batch);
-    return { ok: true, moved: batch.docs.size + batch.streams.size, retiredAt: batch.retiredAt, reason: batch.reason };
+    this.copyIn(guildId, batch);
+    return { ok: true, copied: batch.docs.size + batch.streams.size, retiredAt: batch.retiredAt, reason: batch.reason, usedAt: batch.usedAt! };
   }
 
-  /** The move of a committed restore: the batch's rows go live and leave the graveyard. */
-  moveBack(guildId: string, batch: { docs: Map<string, string>; streams: Map<string, string> }): void {
+  /** The copy-in of a committed restore: the batch's rows go live, and the batch stays in the graveyard, stamped. */
+  copyIn(_guildId: string, batch: { usedAt?: number; docs: Map<string, string>; streams: Map<string, string> }): void {
     for (const [row, doc] of batch.docs) this.docs.set(row, doc);
     for (const [row, chunk] of batch.streams) this.streams.set(row, chunk);
-    const batches = this.graveyard.get(guildId) ?? [];
-    batches.splice(batches.indexOf(batch as never), 1);
+    batch.usedAt = Date.now();
   }
 
   override async retireGuild(...args: RetireArgs): Promise<RetireOutcome> {
@@ -183,9 +183,9 @@ describe('writes accepted before the restore', () => {
     const g = await readyGuild(ws);
     const saved = saveDataTracked('a.json', opts(g), { v: 1 });
     expect(saved.outcome).toBe('saved');
-    store.restoreImpl = async () => ({ ok: true, moved: 1, retiredAt: 5, reason: 'r' });
+    store.restoreImpl = async () => ({ ok: true, copied: 1, retiredAt: 5, reason: 'r', usedAt: 1000 });
     const answer = await restoreGuildFromGraveyard(g, 5);
-    expect(answer).toMatchObject({ ok: true, retiredAt: 5, reason: 'r', moved: 1 });
+    expect(answer).toMatchObject({ ok: true, retiredAt: 5, reason: 'r', copied: 1 });
     expect(store.order).toEqual(['flush', 'restore']);
     expect(store.commits[0].batch.upserts).toEqual([{ key: { module: 'm', filename: 'a.json' }, doc: JSON.stringify({ v: 1 }, null, 2) }]);
     expect(await confirmWrite((saved as { ticket: WriteTicket }).ticket, 0)).toBe('ok');
@@ -220,7 +220,7 @@ describe('writes while the restore runs', () => {
     ]);
     expect(writesOf(ledger).refused).toBe(true);
     expect(saveDataTracked('a.json', opts(other), { v: 1 }).outcome).toBe('saved');
-    hold.resolve({ ok: true, moved: 0, retiredAt: 5, reason: 'r' });
+    hold.resolve({ ok: true, copied: 0, retiredAt: 5, reason: 'r', usedAt: 1000 });
     await restoring;
   });
 
@@ -250,8 +250,9 @@ describe('writes while the restore runs', () => {
     expect(r.save).toEqual({ outcome: 'refused', cause: 'not-ready' });
     expect(r.update).toEqual({ outcome: 'refused', cause: 'not-ready' });
     expect(r.del).toEqual({ outcome: 'refused', cause: 'not-ready' });
-    expect(r.append.outcome).toBe('appended');
+    expect(r.append).toEqual({ outcome: 'refused', cause: 'not-ready' });
     expect(lines(warn)).toContain(`[Data] Write for guild ${g} refused: it comes from a command that started before the server's data was restored from the graveyard`);
+    expect(lines(warn)).toContain(`[Data] Append for guild ${g} refused: it comes from a command that started before the server's data was restored from the graveyard`);
     expect(loadData('a.json', opts(g), null)).toEqual({ v: 'restored' });
     const later = runInLedger(openLedger('interaction'), 'm', () => saveDataTracked('a.json', opts(g), { v: 'new' }));
     expect(later.outcome).toBe('saved');
@@ -266,7 +267,7 @@ describe('writes while the restore runs', () => {
       return saveDataTracked('a.json', opts(g), { v: 1 });
     });
     store.restoreImpl = async () => ({ ok: false, reason: 'live-rows', retiredAt: 5 });
-    expect(await applyOperatorDataWrite(restoreRequest(g, 5))).toEqual({ ok: false, code: 'invalid', error: liveText(5) });
+    expect(await applyOperatorDataWrite(restoreRequest(g, 5))).toEqual(liveReply(g, 5));
     gate.resolve();
     expect((await oldRun).outcome).toBe('saved');
   });
@@ -415,7 +416,7 @@ describe('the claim and the set', () => {
     const { store, ws } = setup();
     setOwnerInfoProvider(() => ({ nodeId: 'node-b', processId: 'process-b', shardCount: 1, claimOf: () => 8 }));
     const g = await readyGuild(ws, 7);
-    store.restoreImpl = async () => ({ ok: true, moved: 0, retiredAt: 5, reason: 'r' });
+    store.restoreImpl = async () => ({ ok: true, copied: 0, retiredAt: 5, reason: 'r', usedAt: 1000 });
     await restoreGuildFromGraveyard(g, 5);
     expect(store.restoreCalls[0][2]).toEqual({ nodeId: 'node-a', claim: 7, processId: 'process-a', shardId: 0, shardCount: 1 });
     const none = freshGuild();
@@ -423,8 +424,8 @@ describe('the claim and the set', () => {
     expect(store.restoreCalls).toHaveLength(1);
   });
 
-  it.each<[string, RestoreOutcome, { code?: string; error?: string; throws?: string; message?: string }]>([
-    ['live-rows', { ok: false, reason: 'live-rows', retiredAt: 5 }, { code: 'invalid', error: liveText(5) }],
+  it.each<[string, RestoreOutcome, { code?: string; error?: string; live?: boolean; throws?: string; message?: string }]>([
+    ['live-rows', { ok: false, reason: 'live-rows', retiredAt: 5 }, { code: 'invalid', live: true }],
     ['no-entry', { ok: false, reason: 'no-entry' }, { code: 'invalid', error: NO_ENTRY }],
     ['schema-mismatch', { ok: false, reason: 'schema-mismatch' }, { code: 'invalid', error: 'this bot refused the database at boot (its log says why); nothing was restored' }],
     ['refused 40P01', { ok: false, reason: 'refused', detail: 'SQLSTATE 40P01: deadlock detected', code: '40P01' }, { code: 'backend-unavailable', error: 'the database refused the restore (SQLSTATE 40P01: deadlock detected); nothing was restored; try again in a moment' }],
@@ -452,7 +453,7 @@ describe('the claim and the set', () => {
       expect(thrown.causeKey).toBe(expected.throws);
       if (expected.message) expect(thrown.message).toBe(expected.message);
     } else {
-      expect(await restoring).toEqual({ ok: false, code: expected.code, error: expected.error });
+      expect(await restoring).toEqual(expected.live ? liveReply(g, 5) : { ok: false, code: expected.code, error: expected.error });
     }
     expect(await waiting).toBe('ready');
     expect(setOf(ws, g)).toBe(before);
@@ -469,12 +470,12 @@ describe('the claim and the set', () => {
     vi.spyOn(ws as any, 'forgetDirty').mockImplementation((set: any) => { held.push(set.dirtyKeys.size + set.appendBuf.size); return forget(set); });
     store.restoreImpl = async () => {
       store.docs.delete(`${g}|m/a.json`);
-      return kind === 'ok' ? { ok: true, moved: 0, retiredAt: 5, reason: 'r' } : { ok: false, reason: 'unknown', retiredAt: 5 };
+      return kind === 'ok' ? { ok: true, copied: 0, retiredAt: 5, reason: 'r', usedAt: 1000 } : { ok: false, reason: 'unknown', retiredAt: 5 };
     };
     const hydrations = store.hydrationsSent;
     const reply = await applyOperatorDataWrite(restoreRequest(g, 5));
     expect(reply).toEqual(kind === 'ok'
-      ? { ok: true, retiredAt: 5, reason: 'r', moved: 0 }
+      ? { ok: true, retiredAt: 5, reason: 'r', copied: 0, keptUntil: expect.any(Number) }
       : { ok: false, code: 'backend-unavailable', error: unknownText(g, 5) });
     expect(held).toEqual([0]);
     expect(store.hydrationsSent).toBeGreaterThan(hydrations);
@@ -595,9 +596,9 @@ describe('the deadline', () => {
       if (/max\(retired_at\)/i.test(sql)) return { rows: [{ retired_at: '5' }], rowCount: 1 };
       if (isBatchExists(sql)) return batchExistsAnswer(sql, store.graveyard.get(g)?.some(b => b.retiredAt === 5) ?? false);
       if (/AS present/.test(sql)) return { rows: [{ present: false }], rowCount: 1 };
-      if (/^WITH moved AS/.test(sql)) {
+      if (isMove(sql)) {
         vi.advanceTimersByTime(40.5 * SECOND);
-        return { rows: [{ taken: '1', put: '1', reason: 'r' }], rowCount: 1 };
+        return { rows: [{ taken: '1', put: '1', reason: 'r', used_at: '1000' }], rowCount: 1 };
       }
       return undefined;
     });
@@ -682,13 +683,13 @@ describe('the deadline', () => {
         await vi.advanceTimersByTimeAsync(39 * SECOND);
         const stop = beforeCommit();
         if (!stop) commitAt = process.hrtime.bigint();
-        return stop ? { ok: false, reason: stop } : { ok: true, moved: 0, retiredAt: 5, reason: 'r' };
+        return stop ? { ok: false, reason: stop } : { ok: true, copied: 0, retiredAt: 5, reason: 'r', usedAt: 1000 };
       };
       expect(await applyOperatorDataWrite(restoreRequest(g, 5, (sent + 45_000_000_000n).toString()))).toEqual({ ok: false, code: 'backend-unavailable', error: OUT_OF_TIME });
       expect(commitAt).toBeNull();
     }
     const g = await readyGuild(ws);
-    store.restoreImpl = async () => ({ ok: true, moved: 0, retiredAt: 5, reason: 'r' });
+    store.restoreImpl = async () => ({ ok: true, copied: 0, retiredAt: 5, reason: 'r', usedAt: 1000 });
     const receipt = process.hrtime.bigint();
     await applyOperatorDataWrite(restoreRequest(g, 5, (receipt + 100_000_000_000n).toString()));
     expect(store.restoreCalls.at(-1)![4] - receipt).toBe(40_000_000_000n);
@@ -806,7 +807,7 @@ describe('the delete', () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance', 'Date', 'hrtime'] });
     const pg = scriptedPg(sql => {
       if (isFenced(sql)) return { rows: [], rowCount: 1 };
-      if (isGraveInsert(sql) && sql.includes("'doc'")) return new Promise(resolve => { setTimeout(() => resolve({ rows: [], rowCount: 1 }), 9 * SECOND); });
+      if (isGraveInsert(sql)) return new Promise(resolve => { setTimeout(() => resolve({ rows: [{ at: '5', docs: '1', streams: '0', put: '1' }], rowCount: 1 }), 9 * SECOND); });
       if (sql === 'COMMIT') store.retireNow(g, 'webui-operator-delete');
       return undefined;
     });
@@ -820,7 +821,7 @@ describe('the delete', () => {
       const insert = pg.sent.find(s => isGraveInsert(s.sql))!;
       expect(insert.timeout).toBeGreaterThanOrEqual(39_900);
       expect(insert.timeout).toBeLessThanOrEqual(40_000);
-      expect(pg.statements().filter(isGraveInsert)).toHaveLength(2);
+      expect(pg.statements().filter(isGraveInsert)).toHaveLength(1);
       expect(pg.statements().at(-1)).toBe('COMMIT');
       expect(pg.releases).toEqual([undefined]);
       expect(store.doc(g, 'a.json')).toBeUndefined();
@@ -1003,13 +1004,13 @@ describe('every accepted write is stored, held or deposed (property)', () => {
           const live = [...store.docs.keys(), ...store.streams.keys()].some(row => row.startsWith(`${g}|`));
           const failure = restoreAnswer === 'deposed' || restoreAnswer === 'unavailable' || restoreAnswer === 'unknown-lost';
           const outcome: RestoreOutcome = live && !failure ? { ok: false, reason: 'live-rows', retiredAt: 5 }
-            : restoreAnswer === 'ok' ? { ok: true, moved: 2, retiredAt: 5, reason: 'r' }
+            : restoreAnswer === 'ok' ? { ok: true, copied: 2, retiredAt: 5, reason: 'r', usedAt: 1000 }
               : restoreAnswer === 'live-rows' ? { ok: false, reason: 'live-rows', retiredAt: 5 }
                 : restoreAnswer === 'deposed' ? { ok: false, reason: 'deposed' }
                   : restoreAnswer === 'unavailable' ? { ok: false, reason: 'unavailable', detail: 'x' }
                     : { ok: false, reason: 'unknown', retiredAt: 5 };
           if (!live && (restoreAnswer === 'ok' || restoreAnswer === 'unknown-committed')) {
-            store.moveBack(g, batch);
+            store.copyIn(g, batch);
             movedAt = accepted.length;
           }
           answered = outcome.ok ? 'ok' : outcome.reason;
@@ -1066,7 +1067,7 @@ describe('every accepted write is stored, held or deposed (property)', () => {
         const restoredRow = rowOf(g, 'r.json');
         const restoredSomewhere = store.docs.has(restoredRow) || (store.graveyard.get(g) ?? []).some(b => b !== batch && b.docs.has(restoredRow));
         expect(restoredSomewhere).toBe(committed);
-        expect((store.graveyard.get(g) ?? []).includes(batch)).toBe(!committed);
+        expect((store.graveyard.get(g) ?? []).includes(batch)).toBe(true);
         for (const driver of drivers.splice(0)) driver.stop();
       },
     ), { numRuns: 200 });
@@ -1088,13 +1089,13 @@ describe('the state x exit table (Postgres cells)', () => {
     return { ...ctx, g, saved };
   }
   const batchOf = (c: Cell) => c.store.graveyard.get(c.g)!.find(b => b.retiredAt === 5);
-  /** The model's restore with its live check left out: beforeCommit, then the move of batch 5. */
+  /** The model's restore with its live check left out: beforeCommit, then the copy-in of batch 5, which stays. */
   const committing = (c: Cell, before: () => Promise<void> = async () => {}) => async (_g: string, _r: number | null, _t: FenceToken, beforeCommit: () => RestoreStop | null): Promise<RestoreOutcome> => {
     await before();
     const stop = beforeCommit();
     if (stop) return { ok: false, reason: stop };
-    c.store.moveBack(c.g, batchOf(c)!);
-    return { ok: true, moved: 1, retiredAt: 5, reason: 'r' };
+    c.store.copyIn(c.g, batchOf(c)!);
+    return { ok: true, copied: 1, retiredAt: 5, reason: 'r', usedAt: batchOf(c)!.usedAt! };
   };
   /** Nothing was restored: the earlier write is stored (or lands once the set flushes), batch 5 is still in the graveyard. */
   async function expectNothingRestored(c: Cell): Promise<void> {
@@ -1106,10 +1107,11 @@ describe('the state x exit table (Postgres cells)', () => {
     expect(c.store.doc(c.g, 'r.json')).toBeUndefined();
     expect(batchOf(c)?.docs.get(`${c.g}|m/r.json`)).toBe(RESTORED);
   }
-  /** Batch 5 was moved in: r.json is live, batch 5 is gone, and the earlier write is stored. */
+  /** Batch 5 was copied in: r.json is live, batch 5 stays, stamped, and the earlier write is stored. */
   async function expectRestored(c: Cell): Promise<void> {
     expect(c.store.doc(c.g, 'r.json')).toBe(RESTORED);
-    expect(batchOf(c)).toBeUndefined();
+    expect(batchOf(c)?.docs.get(`${c.g}|m/r.json`)).toBe(RESTORED);
+    expect(batchOf(c)?.usedAt).toEqual(expect.any(Number));
     if (c.saved) {
       expect(c.store.doc(c.g, 'a.json')).toBe(SAVED);
       expect(await confirmWrite(c.saved.ticket, 0)).toBe('ok');
@@ -1118,9 +1120,9 @@ describe('the state x exit table (Postgres cells)', () => {
   const restoreThrows = async (running: Promise<unknown>) => ((await running.catch(e => e)) as { causeKey?: string }).causeKey;
 
   it.each<[string, (c: Cell) => Promise<void>]>([
-    ['P1 continue, P2 ok, P3 answered: evicted, the batch moved in', async c => {
+    ['P1 continue, P2 ok, P3 answered: evicted, the batch copied in', async c => {
       c.store.restoreImpl = committing(c);
-      expect(await restoreGuildFromGraveyard(c.g, 5)).toEqual({ ok: true, retiredAt: 5, reason: 'r', moved: 1 });
+      expect(await restoreGuildFromGraveyard(c.g, 5)).toEqual({ ok: true, retiredAt: 5, reason: 'r', copied: 1, keptUntil: expect.any(Number) });
       expect(c.ws.stateOf(c.g)).toBeNull();
       await expectRestored(c);
     }],
@@ -1141,7 +1143,7 @@ describe('the state x exit table (Postgres cells)', () => {
       expect(batchOf(c)).toBeDefined();
     }],
     ['P2 live rows: reopened, nothing moved', async c => {
-      expect(await restoreGuildFromGraveyard(c.g, 5)).toEqual({ ok: false, code: 'invalid', error: liveText(5) });
+      expect(await restoreGuildFromGraveyard(c.g, 5)).toEqual(liveReply(c.g, 5));
       expect(c.ws.stateOf(c.g)).toBe('ready');
       await expectNothingRestored(c);
     }],
@@ -1208,10 +1210,10 @@ describe('the state x exit table (Postgres cells)', () => {
       c.store.restoreImpl = async (_g, _r, _t, beforeCommit) => {
         expect(beforeCommit()).toBeNull();
         setMaintenanceGate({ cause: 'hook', message: 'down for a moment' });
-        c.store.moveBack(c.g, batchOf(c)!);
-        return { ok: true, moved: 1, retiredAt: 5, reason: 'r' };
+        c.store.copyIn(c.g, batchOf(c)!);
+        return { ok: true, copied: 1, retiredAt: 5, reason: 'r', usedAt: batchOf(c)!.usedAt! };
       };
-      expect(await restoreGuildFromGraveyard(c.g, 5)).toEqual({ ok: true, retiredAt: 5, reason: 'r', moved: 1 });
+      expect(await restoreGuildFromGraveyard(c.g, 5)).toEqual({ ok: true, retiredAt: 5, reason: 'r', copied: 1, keptUntil: expect.any(Number) });
       setMaintenanceGate(null);
       expect(c.ws.stateOf(c.g)).toBeNull();
       await expectRestored(c);
@@ -1336,8 +1338,8 @@ describe('the state x exit table (Postgres cells)', () => {
       c.store.restoreImpl = async (_g, _r, _t, beforeCommit) => {
         expect(beforeCommit()).toBeNull();
         await hold.promise;
-        c.store.moveBack(c.g, batchOf(c)!);
-        return { ok: true, moved: 1, retiredAt: 5, reason: 'r' };
+        c.store.copyIn(c.g, batchOf(c)!);
+        return { ok: true, copied: 1, retiredAt: 5, reason: 'r', usedAt: batchOf(c)!.usedAt! };
       };
       const restoring = restoreGuildFromGraveyard(c.g, 5);
       await vi.waitFor(() => expect(c.store.restoreCalls).toHaveLength(1));
@@ -1350,9 +1352,9 @@ describe('the state x exit table (Postgres cells)', () => {
       c.store.restoreImpl = committing(c);
       expect(await applyOperatorDataWrite(restoreRequest(c.g, 5))).toMatchObject({ ok: true });
       c.store.restoreImpl = null;
-      expect(await applyOperatorDataWrite(restoreRequest(c.g, 5))).toEqual({ ok: false, code: 'invalid', error: NO_ENTRY });
+      expect(await applyOperatorDataWrite(restoreRequest(c.g, 5))).toEqual(liveReply(c.g, 5));
       c.store.bury(c.g, 3, { 'o.json': { v: 'older' } });
-      expect(await applyOperatorDataWrite(restoreRequest(c.g))).toEqual({ ok: false, code: 'invalid', error: liveText(3) });
+      expect(await applyOperatorDataWrite(restoreRequest(c.g))).toEqual(liveReply(c.g, 3));
       await expectRestored(c);
       expect(c.store.doc(c.g, 'o.json')).toBeUndefined();
     }],
@@ -1544,8 +1546,8 @@ describe('the exit', () => {
         if (stop) return { ok: false, reason: stop };
       }
       const batch = store.graveyard.get(g)!.find(b => b.retiredAt === 5)!;
-      store.moveBack(g, batch);
-      return { ok: true, moved: 1, retiredAt: 5, reason: 'r' };
+      store.copyIn(g, batch);
+      return { ok: true, copied: 1, retiredAt: 5, reason: 'r', usedAt: batch.usedAt! };
     };
     store.retireImpl = async (g, reason) => {
       if (g === d2) await retireD2.promise;

@@ -240,6 +240,9 @@ export class WebuiDataReader {
         max: READER_MAX,
         connectionTimeoutMillis: 5000,
         idleTimeoutMillis: 30000,
+        // Two hung reads would otherwise hold both clients for good: pool.query destroys a client its timeout ended.
+        query_timeout: 10000,
+        keepAlive: true,
         // A data migration leaves this reader's sessions out of its count of other sessions: they only read.
         application_name: 'smdb-webui-reader',
         ...pgConfig(url),
@@ -367,6 +370,25 @@ export class WebuiDataReader {
        GROUP BY guild_id, retired_at, reason
        ORDER BY retired_at DESC`,
       []
+    );
+    return rows.map(row => ({
+      guildId: row.guild_id,
+      retiredAt: Number(row.retired_at),
+      reason: row.reason,
+      rows: Number(row.row_count)
+    }));
+  }
+
+  /** One guild's batches, newest first, through the primary key's prefix; an error keeps its SQLSTATE. */
+  async listGuildGraveyard(guildId: string, boundMs = QUERY_BOUND_MS): Promise<Array<{ guildId: string; retiredAt: number; reason: string; rows: number }>> {
+    const { rows } = await this.boundedQuery(
+      `SELECT guild_id, retired_at, reason, COUNT(*)::int AS row_count
+       FROM smdb_data.guild_data_graveyard
+       WHERE guild_id = $1
+       GROUP BY guild_id, retired_at, reason
+       ORDER BY retired_at DESC`,
+      [guildId],
+      boundMs
     );
     return rows.map(row => ({
       guildId: row.guild_id,

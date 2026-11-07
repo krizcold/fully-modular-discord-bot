@@ -27,12 +27,13 @@ import type {
   GuildOwner,
   HydrationOutcome,
   LateCommit,
+  ReplacedBatch,
   RestoreOutcome,
   RestoreStop,
   RetireOutcome,
 } from './backend';
 
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 7;
 const PROVISION_VERDICT_POLL_MS = 250;
 const PARTITION_COUNT = 32;
 const MAX_ROWS_PER_STATEMENT = 200;
@@ -156,6 +157,7 @@ export function provisionDdl(s: string): string[] {
     doc        text NOT NULL,
     retired_at bigint NOT NULL,
     reason     text NOT NULL,
+    used_at    bigint,
     PRIMARY KEY (guild_id, retired_at, module, filename)
   )`,
   `CREATE INDEX IF NOT EXISTS guild_graveyard_ttl_idx ON ${s}.guild_data_graveyard (retired_at)`,
@@ -547,18 +549,58 @@ class BoundedClient {
 
 const LIVE_CHECK = `SELECT EXISTS (SELECT 1 FROM smdb_data.guild_data WHERE guild_id = $1) OR EXISTS (SELECT 1 FROM smdb_data.guild_append WHERE guild_id = $1) AS present`;
 
-// The rows put back are exactly the rows the DELETE took out: a row a concurrent sweep removed is skipped by both.
 const STORE_ID_INSERT = `INSERT INTO smdb_data.meta (key, value) VALUES ('store_id', $1) ON CONFLICT (key) DO NOTHING`;
 
-const RESTORE_MOVE = `WITH moved AS (
-    DELETE FROM smdb_data.guild_data_graveyard WHERE guild_id = $1 AND retired_at = $2
-    RETURNING guild_id, module, filename, kind, doc, reason),
+/**
+ * NB14 decision 6 and C4: a new batch of a guild is named by the later of the database's clock and the guild's newest
+ * batch plus 1, over the guild's graveyard rows, so it is above every batch of the guild and shards on two machines
+ * share one clock.
+ */
+export const NEW_BATCH_AT = `greatest((extract(epoch FROM clock_timestamp()) * 1000)::bigint, coalesce(max(retired_at), 0) + 1)`;
+
+/**
+ * NB14 decision 5: the guild's live rows into one new batch, in one statement whose inserts read only the rows its
+ * DELETEs removed, so the batch holds exactly the rows taken out. $2 is the batch's reason.
+ */
+const MOVE_OUT_SQL = `WITH r AS (
+    SELECT ${NEW_BATCH_AT} AS at
+      FROM smdb_data.guild_data_graveyard WHERE guild_id = $1),
+  gd AS (DELETE FROM smdb_data.guild_data WHERE guild_id = $1 RETURNING module, filename, doc),
+  ga AS (DELETE FROM smdb_data.guild_append WHERE guild_id = $1 RETURNING module, filename, seq, chunk),
+  id AS (INSERT INTO smdb_data.guild_data_graveyard (guild_id, module, filename, kind, doc, retired_at, reason)
+         SELECT $1, module, filename, 'doc', doc, r.at, $2 FROM gd, r RETURNING 1),
+  ia AS (INSERT INTO smdb_data.guild_data_graveyard (guild_id, module, filename, kind, doc, retired_at, reason)
+         SELECT $1, module, filename, 'append', string_agg(chunk, '' ORDER BY seq), r.at, $2
+           FROM ga, r GROUP BY module, filename, r.at RETURNING 1)
+  SELECT (SELECT at FROM r) AS at, (SELECT count(*) FROM gd) AS docs,
+         (SELECT count(*) FROM (SELECT DISTINCT module, filename FROM ga) s) AS streams,
+         (SELECT count(*) FROM id) + (SELECT count(*) FROM ia) AS put`;
+
+/**
+ * NB14 decisions 5 and 19: batch $2 copied into the live tables and kept, its rows stamped with the restore's
+ * statement time in the same statement.
+ */
+const COPY_IN_SQL = `WITH src AS (
+    UPDATE smdb_data.guild_data_graveyard
+       SET used_at = (extract(epoch FROM statement_timestamp()) * 1000)::bigint
+     WHERE guild_id = $1 AND retired_at = $2
+     RETURNING module, filename, kind, doc, reason, used_at),
   d AS (INSERT INTO smdb_data.guild_data (guild_id, module, filename, doc)
-        SELECT guild_id, module, filename, doc FROM moved WHERE kind = 'doc' RETURNING 1),
+        SELECT $1, module, filename, doc FROM src WHERE kind = 'doc' RETURNING 1),
   a AS (INSERT INTO smdb_data.guild_append (guild_id, module, filename, chunk)
-        SELECT guild_id, module, filename, doc FROM moved WHERE kind = 'append' RETURNING 1)
-  SELECT (SELECT count(*) FROM moved) AS taken, (SELECT count(*) FROM d) + (SELECT count(*) FROM a) AS put,
-         (SELECT min(reason) FROM moved) AS reason`;
+        SELECT $1, module, filename, doc FROM src WHERE kind = 'append' RETURNING 1)
+  SELECT (SELECT count(*) FROM src) AS taken, (SELECT count(*) FROM d) + (SELECT count(*) FROM a) AS put,
+         (SELECT min(reason) FROM src) AS reason, (SELECT max(used_at) FROM src) AS used_at`;
+
+/** NB14 decision 19: restores share this lock and the sweep tries it exclusive, so neither touches a batch the other is in. */
+const GRAVEYARD_LOCK_SHARED = `SELECT pg_advisory_xact_lock_shared(hashtext('smdb_data_graveyard'))`;
+const GRAVEYARD_LOCK_TRY = `SELECT pg_try_advisory_xact_lock(hashtext('smdb_data_graveyard')) AS locked`;
+
+/** A batch goes once both its delete and its newest restore are older than $1 ms on the database's clock. */
+const SWEEP_SQL = `DELETE FROM smdb_data.guild_data_graveyard
+  WHERE retired_at < (extract(epoch FROM statement_timestamp()) * 1000)::bigint - $1
+    AND (used_at IS NULL OR used_at < (extract(epoch FROM statement_timestamp()) * 1000)::bigint - $1)`;
+const SWEEP_STEP_MS = 5000;
 
 // Decision 12 (e) and J2: whether a retire's batch is on the target, as one row.
 const BATCH_PRESENT = `SELECT EXISTS (SELECT 1 FROM smdb_data.guild_data_graveyard WHERE guild_id = $1 AND retired_at = $2) AS present`;
@@ -789,15 +831,40 @@ export class PostgresBackend implements DataBackend {
     }
   }
 
-  /** TTL sweep of graveyard rows older than the cutoff; guild_ownership rows are the claim fence and are never deleted.
-   * Returns the number of rows deleted; idempotent, safe to misfire. */
-  async sweepGraveyard(cutoffMs: number): Promise<number> {
+  /**
+   * TTL sweep of graveyard batches whose delete and newest restore are both older than ttlMs on the database's clock,
+   * in one transaction on one lease under the graveyard lock, tried and never waited for; guild_ownership rows are the
+   * claim fence and are never deleted. Returns the number of rows deleted, 0 when a restore or another sweep holds the
+   * lock; after any error nothing more is sent and the client is destroyed.
+   */
+  async sweepGraveyard(ttlMs: number): Promise<number> {
+    let lease: DataLease;
     try {
-      const tombstones = await this.leaseQuery(`DELETE FROM smdb_data.guild_data_graveyard WHERE retired_at < $1`, [cutoffMs], ANSWER_BOUND_MS);
-      return tombstones.rowCount ?? 0;
+      lease = await this.checkout();
     } catch (error) {
+      if (!(error instanceof OwnStateRefusal) && classifyFailure(error).kind !== 'answered') this.noteFailure(error);
+      throw error;
+    }
+    let destroy = false;
+    try {
+      await this.sendOn(lease, 'BEGIN', [], SWEEP_STEP_MS);
+      const locked = (await this.sendOn(lease, GRAVEYARD_LOCK_TRY, [], SWEEP_STEP_MS)).rows[0]?.locked === true;
+      if (!locked) {
+        await this.sendOn(lease, 'ROLLBACK', [], SWEEP_STEP_MS);
+        console.log("[Data] Graveyard row sweep skipped: the graveyard lock is held (a restore, or another process's sweep); the next sweep runs it");
+        return 0;
+      }
+      const swept = await this.sendOn(lease, SWEEP_SQL, [ttlMs], STATEMENT_TIMEOUT_MS + SWEEP_STEP_MS);
+      await this.sendOn(lease, 'COMMIT', [], SWEEP_STEP_MS);
+      return swept.rowCount ?? 0;
+    } catch (error) {
+      destroy = true;
+      const refusal = this.ownRefusal(lease, error);
+      if (refusal) throw refusal;
       if (classifyFailure(error).kind !== 'answered') this.noteFailure(error);
       throw error;
+    } finally {
+      this.releaseLease(lease, destroy);
     }
   }
 
@@ -1742,7 +1809,7 @@ export class PostgresBackend implements DataBackend {
     let began = false;
     let commitSent = false;
     let moved = 0;
-    const retiredAt = Date.now();
+    let retiredAt = 0;
     try {
       await tx.send('BEGIN');
       began = true;
@@ -1752,20 +1819,17 @@ export class PostgresBackend implements DataBackend {
         this.noteClosed(lease);
         return { ok: false, reason: 'deposed' };
       }
-      const docsMoved = await tx.send(
-        `INSERT INTO smdb_data.guild_data_graveyard (guild_id, module, filename, kind, doc, retired_at, reason)
-         SELECT guild_id, module, filename, 'doc', doc, $2, $3
-           FROM smdb_data.guild_data WHERE guild_id = $1`,
-        [guildId, retiredAt, reason]);
-      const streamsMoved = await tx.send(
-        `INSERT INTO smdb_data.guild_data_graveyard (guild_id, module, filename, kind, doc, retired_at, reason)
-         SELECT guild_id, module, filename, 'append', string_agg(chunk, '' ORDER BY seq), $2, $3
-           FROM smdb_data.guild_append WHERE guild_id = $1
-          GROUP BY guild_id, module, filename`,
-        [guildId, retiredAt, reason]);
-      moved = (docsMoved.rowCount ?? 0) + (streamsMoved.rowCount ?? 0);
-      await tx.send(`DELETE FROM smdb_data.guild_data WHERE guild_id = $1`, [guildId]);
-      await tx.send(`DELETE FROM smdb_data.guild_append WHERE guild_id = $1`, [guildId]);
+      const out = (await tx.send(MOVE_OUT_SQL, [guildId, reason])).rows[0] ?? {};
+      const taken = Number(out.docs ?? 0) + Number(out.streams ?? 0);
+      const put = Number(out.put ?? 0);
+      if (put !== taken) {
+        console.error(`[PostgresBackend] retireGuild of guild ${guildId}: the graveyard took ${put} of ${taken} row(s); rolled back`);
+        await tx.close('ROLLBACK');
+        this.noteClosed(lease);
+        return { ok: false, reason: 'incomplete' };
+      }
+      retiredAt = Number(out.at ?? 0);
+      moved = put;
       await tx.send(`UPDATE smdb_data.guild_ownership SET retired_at = now() WHERE guild_id = $1`, [guildId]);
       if (tx.left() < COMMIT_FLOOR_MS) {
         await tx.close('ROLLBACK');
@@ -1809,11 +1873,12 @@ export class PostgresBackend implements DataBackend {
   }
 
   /**
-   * Moves one graveyard batch back (the given retiredAt, else the newest) in one transaction fenced like a flush: the
-   * fenced update locks the guild's ownership row, the restore is refused while the guild has any live row, and the
-   * batch leaves the graveyard in the statement that puts it back. Every statement is bounded by deadline.
+   * Copies one graveyard batch in (the given retiredAt, else the newest) and keeps it, in one transaction under the
+   * shared graveyard lock and fenced like a flush: the fenced update locks the guild's ownership row. A plain restore is
+   * refused while the guild has any live row; a replace first moves those rows into a new batch in the same
+   * transaction. Every statement is bounded by deadline.
    */
-  async restoreGuild(guildId: string, retiredAt: number | null, token: FenceToken, beforeCommit: () => RestoreStop | null, deadline: bigint): Promise<RestoreOutcome> {
+  async restoreGuild(guildId: string, retiredAt: number | null, token: FenceToken, beforeCommit: () => RestoreStop | null, deadline: bigint, replace = false): Promise<RestoreOutcome> {
     if (this.schemaMismatch || !this.provisioned) {
       const reason = this.schemaMismatch ? 'schema-mismatch' : 'not-provisioned';
       console.error(`[PostgresBackend] Refused restore for guild ${guildId}: ${this.schemaMismatch
@@ -1835,6 +1900,7 @@ export class PostgresBackend implements DataBackend {
     let began = false;
     let commitSent = false;
     let batch = retiredAt;
+    let replaced: ReplacedBatch | undefined;
     const decided = async (answer: RestoreOutcome): Promise<RestoreOutcome> => {
       await tx.close('ROLLBACK');
       this.noteClosed(lease);
@@ -1843,6 +1909,7 @@ export class PostgresBackend implements DataBackend {
     try {
       await tx.send('BEGIN');
       began = true;
+      await tx.send(GRAVEYARD_LOCK_SHARED);
       const params = this.fenceParams(guildId, token);
       const claimed = ((await tx.send(FENCED_OWNERSHIP_UPSERT, params)).rowCount ?? 0) === 1;
       if (!claimed) {
@@ -1859,20 +1926,30 @@ export class PostgresBackend implements DataBackend {
         const found = (await tx.send(`SELECT 1 FROM smdb_data.guild_data_graveyard WHERE guild_id = $1 AND retired_at = $2 LIMIT 1`, [guildId, batch])).rowCount ?? 0;
         if (found === 0) return await decided({ ok: false, reason: 'no-entry' });
       }
+      if (replace) {
+        const reason = `replaced-by-restore-${batch}`;
+        const out = (await tx.send(MOVE_OUT_SQL, [guildId, reason])).rows[0] ?? {};
+        const taken = Number(out.docs ?? 0) + Number(out.streams ?? 0);
+        const put = Number(out.put ?? 0);
+        if (put !== taken) return await decided({ ok: false, reason: 'incomplete', step: 'move-out', taken, put });
+        replaced = taken > 0 ? { retiredAt: Number(out.at), moved: taken, reason } : null;
+      }
       const live = await tx.send(LIVE_CHECK, [guildId]);
-      if (live.rows[0]?.present === true) return await decided({ ok: false, reason: 'live-rows', retiredAt: batch });
-      const moved = (await tx.send(RESTORE_MOVE, [guildId, batch])).rows[0] ?? {};
-      const taken = Number(moved.taken ?? 0);
-      const put = Number(moved.put ?? 0);
+      if (live.rows[0]?.present === true) return await decided(replace ? { ok: false, reason: 'changed' } : { ok: false, reason: 'live-rows', retiredAt: batch });
+      const copied = (await tx.send(COPY_IN_SQL, [guildId, batch])).rows[0] ?? {};
+      const taken = Number(copied.taken ?? 0);
+      const put = Number(copied.put ?? 0);
       if (taken === 0) return await decided({ ok: false, reason: 'no-entry', retiredAt: batch });
-      if (taken !== put) return await decided({ ok: false, reason: 'refused', detail: `the batch holds ${taken - put} row(s) of an unknown kind` });
+      if (taken !== put) return await decided({ ok: false, reason: 'incomplete', step: 'copy-in', taken, put });
       const stop = beforeCommit() ?? (tx.left() < COMMIT_FLOOR_MS ? 'out-of-time' : null);
       if (stop) return await decided({ ok: false, reason: stop });
       await tx.send('COMMIT', [], COMMIT_FLOOR_MS, () => { commitSent = true; });
-      if (lease.epoch !== this.epoch) return { ok: false, reason: 'unknown', retiredAt: batch, ...this.lateCommit(lease, true) };
+      const mode = replace ? { replaced: replaced ?? null } : {};
+      if (lease.epoch !== this.epoch) return { ok: false, reason: 'unknown', retiredAt: batch, ...mode, ...this.lateCommit(lease, true) };
       this.noteSuccess();
-      console.log(`[PostgresBackend] Guild ${guildId} restored from graveyard batch ${batch}; ${taken} row(s) moved back`);
-      return { ok: true, moved: taken, retiredAt: batch, reason: typeof moved.reason === 'string' ? moved.reason : '' };
+      const movedTo = replaced ? `; ${replaced.moved} row(s) moved to batch ${replaced.retiredAt}` : '';
+      console.log(`[PostgresBackend] Guild ${guildId} restored from graveyard batch ${batch}; ${taken} row(s) copied in${movedTo}`);
+      return { ok: true, copied: taken, retiredAt: batch, reason: typeof copied.reason === 'string' ? copied.reason : '', usedAt: Number(copied.used_at), ...mode };
     } catch (error) {
       if (began) tx.destroy = true;
       if (error instanceof OutOfTime) return { ok: false, reason: 'out-of-time' };
@@ -1885,7 +1962,8 @@ export class PostgresBackend implements DataBackend {
       const at = batch === null ? {} : { retiredAt: batch };
       if (commitSent) {
         if (commitRolledBack(error)) return { ok: false, reason: 'refused', detail: describeFailure(error).detail, code: describeFailure(error).code };
-        return { ok: false, reason: 'unknown', ...at, ...(lease.epoch !== this.epoch ? this.lateCommit(lease, false) : {}) };
+        const mode = replace && replaced !== undefined ? { replaced } : {};
+        return { ok: false, reason: 'unknown', ...at, ...mode, ...(lease.epoch !== this.epoch ? this.lateCommit(lease, false) : {}) };
       }
       if (failure.kind === 'answered') return { ok: false, reason: 'refused', detail: failure.detail, code: failure.code };
       return failure.kind === 'timeout'
@@ -2077,16 +2155,16 @@ interface Statement {
  * own, numbered above the guild's newest batch, and answers the rows copied and the batch.
  */
 const REPLACE_COPY = `WITH batch AS (
-    SELECT GREATEST($2::bigint, COALESCE((SELECT max(retired_at) FROM smdb_data.guild_data_graveyard WHERE guild_id = $1), 0) + 1) AS at),
+    SELECT ${NEW_BATCH_AT} AS at FROM smdb_data.guild_data_graveyard WHERE guild_id = $1),
   docs AS (INSERT INTO smdb_data.guild_data_graveyard (guild_id, module, filename, kind, doc, retired_at, reason)
-    SELECT d.guild_id, d.module, d.filename, 'doc', d.doc, (SELECT at FROM batch), $7
+    SELECT d.guild_id, d.module, d.filename, 'doc', d.doc, (SELECT at FROM batch), $6
       FROM smdb_data.guild_data d
-     WHERE d.guild_id = $1 AND (d.module, d.filename) NOT IN (SELECT * FROM unnest($3::text[], $4::text[]))
+     WHERE d.guild_id = $1 AND (d.module, d.filename) NOT IN (SELECT * FROM unnest($2::text[], $3::text[]))
     RETURNING 1),
   appends AS (INSERT INTO smdb_data.guild_data_graveyard (guild_id, module, filename, kind, doc, retired_at, reason)
-    SELECT a.guild_id, a.module, a.filename, 'append', string_agg(a.chunk, '' ORDER BY a.seq), (SELECT at FROM batch), $7
+    SELECT a.guild_id, a.module, a.filename, 'append', string_agg(a.chunk, '' ORDER BY a.seq), (SELECT at FROM batch), $6
       FROM smdb_data.guild_append a
-     WHERE a.guild_id = $1 AND (a.module, a.filename) NOT IN (SELECT * FROM unnest($5::text[], $6::text[]))
+     WHERE a.guild_id = $1 AND (a.module, a.filename) NOT IN (SELECT * FROM unnest($4::text[], $5::text[]))
      GROUP BY a.guild_id, a.module, a.filename
     RETURNING 1)
   SELECT (SELECT count(*) FROM docs) + (SELECT count(*) FROM appends) AS moved, (SELECT at FROM batch) AS retired_at`;
@@ -2107,7 +2185,7 @@ function flushStatements(guildId: string, batch: GuildFlushBatch): Statement[] {
     const docFiles = batch.replace.docKeys.map(k => k.filename);
     const appendModules = batch.replace.appendKeys.map(k => k.module);
     const appendFiles = batch.replace.appendKeys.map(k => k.filename);
-    add({ text: REPLACE_COPY, values: [guildId, Date.now(), docModules, docFiles, appendModules, appendFiles, batch.replace.reason], copy: true });
+    add({ text: REPLACE_COPY, values: [guildId, docModules, docFiles, appendModules, appendFiles, batch.replace.reason], copy: true });
     add({ text: REPLACE_DELETE_DATA, values: [guildId, docModules, docFiles] });
     add({ text: REPLACE_DELETE_APPEND, values: [guildId, appendModules, appendFiles] });
   }

@@ -254,8 +254,8 @@ export class FakeClient {
       return { rows: [] };
     }
     if (/INSERT INTO smdb_data\.guild_data_graveyard/.test(sql)) {
-      const [g, m, f, k, d, r, why] = params;
-      for (let i = 0; i < g.length; i++) this.store().grave.push({ guild_id: g[i], module: m[i], filename: f[i], kind: k[i], doc: d[i], retired_at: String(r[i]), reason: why[i] });
+      const [g, m, f, k, d, r, why, used] = params;
+      for (let i = 0; i < g.length; i++) this.store().grave.push({ guild_id: g[i], module: m[i], filename: f[i], kind: k[i], doc: d[i], retired_at: String(r[i]), reason: why[i], ...(used?.[i] === null || used?.[i] === undefined ? {} : { used_at: used[i] }) });
       return { rows: [] };
     }
     if (/INSERT INTO smdb_data\.guild_data/.test(sql)) {
@@ -278,7 +278,7 @@ export class FakeClient {
     }
     if (/FROM smdb_data\.guild_ownership/.test(sql)) return { rows: this.store().owners.map(o => ({ ...o })) };
     if (/sha256\(convert_to\(doc, 'UTF8'\)\).*FROM smdb_data\.guild_data_graveyard/.test(sql)) {
-      return { rows: this.store().grave.map(r => ({ guild_id: r.guild_id, retired_at: String(r.retired_at), module: r.module, filename: r.filename, kind: r.kind, reason: r.reason, h: sha(r.doc), bytes: Buffer.byteLength(r.doc) })) };
+      return { rows: this.store().grave.map(r => ({ guild_id: r.guild_id, retired_at: String(r.retired_at), module: r.module, filename: r.filename, kind: r.kind, reason: r.reason, used_at: r.used_at ?? null, h: sha(r.doc), bytes: Buffer.byteLength(r.doc) })) };
     }
     if (/sha256\(convert_to\(doc, 'UTF8'\)\).*FROM smdb_data\.guild_data/.test(sql)) {
       return { rows: this.store().data.map(r => ({ guild_id: r.guild_id, module: r.module, filename: r.filename, h: sha(r.doc), bytes: Buffer.byteLength(r.doc) })) };
