@@ -197,7 +197,13 @@ async function saveProviderCredentials(args: { providerId?: unknown; changes?: u
     try {
       const text = readRawStrict(file);
       base = baseOf(file);
-      if (text !== null) doc = JSON.parse(text);
+      if (text !== null) {
+        try {
+          doc = JSON.parse(text);
+        } catch {
+          throw new Error('it is not valid JSON');
+        }
+      }
     } catch (error) {
       const cause = error instanceof Error ? error.message : String(error);
       throw new StoreWriteError(500, `${PROVIDER_CREDENTIALS_FILE} cannot be read, so the keys of ${providerId} were not saved: ${cause}${cause.endsWith('.') ? '' : '.'}`);

@@ -328,34 +328,231 @@ export function readEnvFileDataBackend(): string | null {
   }
 }
 
+// dotenv 16.6.1's LINE (node_modules/dotenv/lib/main.js:9), with match indices.
+const DOTENV_LINE = /(?:^|^)\s*(?:export\s+)?([\w.-]+)(?:\s*=\s*?|:\s+?)(\s*'(?:\\'|[^'])*'|\s*"(?:\\"|[^"])*"|\s*`(?:\\`|[^`])*`|[^#\r\n]+)?\s*(?:#.*)?(?:$|$)/mgd;
+
+const hasOwn = (o: object, key: string) => Object.prototype.hasOwnProperty.call(o, key);
+
+/** /data/.env's bytes as text, or null when they are not valid UTF-8; a BOM stays in the text. */
+export function envTextOf(raw: Buffer): string | null {
+  try {
+    return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(raw);
+  } catch {
+    return null;
+  }
+}
+
+const notUtf8 = (what: string) => `${dataPath('.env')} is not valid UTF-8, so ${what} without changing other bytes; save it as UTF-8, then run the migration again`;
+export const NOT_UTF8_KEYS = () => notUtf8('the payment provider keys cannot be written to it');
+const NOT_UTF8_BACKEND = () => notUtf8('the migration cannot write DATA_BACKEND to it');
+
+interface EnvSpan {
+  key: string;
+  /** The span in the original text: the start of the key's line to the end of its value's last line. */
+  start: number;
+  end: number;
+  /** The end of the span's line break (end when there is none). */
+  next: number;
+}
+
+/** Each match of dotenv's parse, as the lines it covers in the original text. */
+function envSpans(text: string): EnvSpan[] {
+  const at: number[] = [];
+  let norm = '';
+  for (let i = 0; i < text.length; i++) {
+    at.push(i);
+    if (text[i] === '\r') {
+      norm += '\n';
+      if (text[i + 1] === '\n') i++;
+    } else {
+      norm += text[i];
+    }
+  }
+  at.push(text.length);
+  const spans: EnvSpan[] = [];
+  const line = new RegExp(DOTENV_LINE.source, 'mgd');
+  for (let m = line.exec(norm); m !== null; m = line.exec(norm)) {
+    const indices = m.indices!;
+    const keyAt = indices[1][0];
+    let start = norm.lastIndexOf('\n', keyAt - 1) + 1;
+    if (start === 0 && norm[0] === '\uFEFF') start = 1;
+    const value = indices[2];
+    const last = value && value[1] > value[0] ? value[1] - 1 : keyAt;
+    const lineEnd = norm.indexOf('\n', last) < 0 ? norm.length : norm.indexOf('\n', last);
+    spans.push({ key: m[1], start: at[start], end: at[lineEnd], next: at[lineEnd < norm.length ? lineEnd + 1 : lineEnd] });
+  }
+  return spans;
+}
+
+function renderEnv(text: string, spans: EnvSpan[], edits: Map<number, string | null>, appended: Array<{ line: string; gap: boolean }>): string {
+  let out = '';
+  let pos = 0;
+  spans.forEach((s, i) => {
+    if (!edits.has(i)) return;
+    out += text.slice(pos, s.start);
+    const replacement = edits.get(i);
+    if (replacement === null || replacement === undefined) {
+      pos = s.next;
+    } else {
+      out += replacement;
+      pos = s.end;
+    }
+  });
+  out += text.slice(pos);
+  for (const a of appended) {
+    if (out.length > 0 && !/[\r\n]$/.test(out)) out += '\n';
+    out += `${a.gap ? '\n' : ''}${a.line}\n`;
+  }
+  return out;
+}
+
+const listed = (keys: string[]) => keys.join(', ');
+
 /**
- * Rewrites the DATA_BACKEND line of /data/.env and nothing else (temp file, fsync, rename, fsync of /data), then reads
- * it back; throws when the write or the read back fails.
+ * /data/.env's text with each changed key written (a string) or removed (null), every other byte kept: the spans
+ * dotenv's own parse reads are edited (NB6F V1). `unread` names the provider of a key removed because its entry in the
+ * database cannot be read. Throws, in this order, when the result would change another key, misread a set key, or
+ * still set a removed key.
  */
-export function writeEnvDataBackend(value: DataBackendKind): void {
+export function envKeysText(text: string, changes: Record<string, string | null>, unread: Record<string, string> = {}): string {
   const envPath = dataPath('.env');
-  let text = '';
+  const keys = Object.keys(changes);
+  const spans = envSpans(text);
+  const before = dotenv.parse(text);
+  const edits = new Map<number, string | null>();
+  const lastOf = new Map<string, number>();
+  spans.forEach((s, i) => {
+    if (!hasOwn(changes, s.key)) return;
+    if (changes[s.key] === null) edits.set(i, null);
+    else lastOf.set(s.key, i);
+  });
+  spans.forEach((s, i) => {
+    if (hasOwn(changes, s.key) && typeof changes[s.key] === 'string' && lastOf.get(s.key) !== i) edits.set(i, null);
+  });
+  const setKeys = keys.filter(k => typeof changes[k] === 'string');
+  const order = [
+    ...setKeys.filter(k => lastOf.has(k)).sort((a, b) => lastOf.get(a)! - lastOf.get(b)!),
+    ...setKeys.filter(k => !lastOf.has(k)),
+  ];
+  const outsideKept = (after: Record<string, string>) =>
+    [...new Set([...Object.keys(before), ...Object.keys(after)])].filter(k => !hasOwn(changes, k) && before[k] !== after[k]);
+  const reads = (after: Record<string, string>, placed: string[]) => placed.every(k => after[k] === changes[k]);
+  const nullsGone = (after: Record<string, string>) => keys.every(k => changes[k] !== null || !hasOwn(after, k));
+  const appended: Array<{ line: string; gap: boolean }> = [];
+  const placed: string[] = [];
+  for (const key of order) {
+    const value = changes[key] as string;
+    const span = lastOf.get(key);
+    const forms = [value, `'${value}'`, `"${value}"`, `\`${value}\``];
+    const tries = (span === undefined ? [false, true] : [false]).flatMap(gap => forms.map(form => ({ form, gap })));
+    const apply = (t: { form: string; gap: boolean }) => {
+      if (span === undefined) appended.push({ line: `${key}=${t.form}`, gap: t.gap });
+      else edits.set(span, `${key}=${t.form}`);
+    };
+    const parsedWith = (t: { form: string; gap: boolean }) => {
+      apply(t);
+      const after = dotenv.parse(renderEnv(text, spans, edits, appended));
+      if (span === undefined) appended.pop();
+      return after;
+    };
+    const chosen = tries.find(t => { const a = parsedWith(t); return outsideKept(a).length === 0 && reads(a, [...placed, key]) && nullsGone(a); })
+      ?? tries.find(t => { const a = parsedWith(t); return outsideKept(a).length === 0 && reads(a, placed); })
+      ?? tries[0];
+    apply(chosen);
+    placed.push(key);
+  }
+  const out = renderEnv(text, spans, edits, appended);
+  const after = dotenv.parse(out);
+  const others = outsideKept(after);
+  if (others.length === 1) throw new Error(`Writing ${listed(keys)} would change the value of ${others[0]} in ${envPath}; edit that line of ${envPath}, then run the migration again`);
+  if (others.length > 1) throw new Error(`Writing ${listed(keys)} would change the values of ${listed(others)} in ${envPath}; edit those lines of ${envPath}, then run the migration again`);
+  const wrong = order.find(k => after[k] !== changes[k]);
+  if (wrong !== undefined) {
+    const tail = wrong === 'DATA_BACKEND'
+      ? `edit the DATA_BACKEND lines of ${envPath}, then run the migration again`
+      : `change ${wrong} in the premium tab, then run the migration again`;
+    throw new Error(`The value of ${wrong} cannot be written to ${envPath} so that it reads back the same; ${tail}`);
+  }
+  const still = keys.filter(k => changes[k] === null && hasOwn(after, k));
+  const cleared = still.filter(k => !hasOwn(unread, k));
+  if (cleared.length === 1) throw new Error(`${cleared[0]} was cleared in the database, but a line of ${envPath} still sets it; remove that line, then run the migration again`);
+  if (cleared.length > 1) throw new Error(`${listed(cleared)} were cleared in the database, but lines of ${envPath} still set them; remove those lines, then run the migration again`);
+  if (still.length > 0) {
+    const id = unread[still[0]];
+    const ofId = still.filter(k => unread[k] === id);
+    throw new Error(ofId.length === 1
+      ? `The database's keys of ${id} cannot be read, so ${ofId[0]} must not be set, but a line of ${envPath} still sets it; remove that line, then run the migration again`
+      : `The database's keys of ${id} cannot be read, so ${listed(ofId)} must not be set, but lines of ${envPath} still set them; remove those lines, then run the migration again`);
+  }
+  return out;
+}
+
+/** envKeysText over /data/.env as it is (temp file, fsync, rename, fsync of /data), keeping its mode, uid and gid. */
+function writeEnvLines(changes: Record<string, string | null>, unread: Record<string, string>, notUtf8Text: string): void {
+  const envPath = dataPath('.env');
+  let raw: Buffer | null = null;
   let keep: { mode: number; uid: number; gid: number } | undefined;
   try {
-    text = fs.readFileSync(envPath, 'utf-8');
+    raw = fs.readFileSync(envPath);
     const st = fs.statSync(envPath);
     keep = { mode: st.mode, uid: st.uid, gid: st.gid };
   } catch (error) {
     if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error;
   }
-  const lines = text === '' ? [] : text.split('\n');
-  if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
-  let found = false;
-  const next = lines.map(line => {
-    if (/^\s*(export\s+)?DATA_BACKEND\s*=/.test(line)) {
-      found = true;
-      return `DATA_BACKEND=${value}`;
+  const text = raw === null ? '' : envTextOf(raw);
+  if (text === null) throw new Error(notUtf8Text);
+  atomicWriteFileSync(envPath, envKeysText(text, changes, unread), keep);
+}
+
+/**
+ * Why DATA_BACKEND cannot be written to /data/.env (the text given, or the file as it is) so that it reads `to` and
+ * every other byte stays, or null when it can (NB6F U3, W5, Y3).
+ */
+export function envSwitchRefusal(to: DataBackendKind, text?: string): string | null {
+  const envPath = dataPath('.env');
+  let current = text;
+  if (current === undefined) {
+    let raw: Buffer | null = null;
+    try {
+      raw = fs.readFileSync(envPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') return `${envPath} cannot be read: ${causeOf(error)}`;
     }
-    return line;
-  });
-  if (!found) next.push(`DATA_BACKEND=${value}`);
-  atomicWriteFileSync(envPath, `${next.join('\n')}\n`, keep);
+    const decoded = raw === null ? '' : envTextOf(raw);
+    if (decoded === null) return NOT_UTF8_BACKEND();
+    current = decoded;
+  }
+  try {
+    envKeysText(current, { DATA_BACKEND: to });
+    return null;
+  } catch (error) {
+    return causeOf(error);
+  }
+}
+
+/**
+ * Rewrites the DATA_BACKEND lines of /data/.env and nothing else (temp file, fsync, rename, fsync of /data), then reads
+ * it back; throws when the write or the read back fails.
+ */
+export function writeEnvDataBackend(value: DataBackendKind): void {
+  const envPath = dataPath('.env');
+  writeEnvLines({ DATA_BACKEND: value }, {}, NOT_UTF8_BACKEND());
   if (readEnvFileDataBackend() !== value) throw new Error(`${envPath} does not read back DATA_BACKEND=${value}`);
+}
+
+/**
+ * Writes the payment provider keys a migration to JSON carries into /data/.env (NB6F D5), then reads each one back.
+ * `kept` is where the file as it was is kept, null when there was none.
+ */
+export function writeEnvKeys(changes: Record<string, string | null>, unread: Record<string, string>, kept: string | null): void {
+  const envPath = dataPath('.env');
+  writeEnvLines(changes, unread, NOT_UTF8_KEYS());
+  const back = dotenv.parse(fs.readFileSync(envPath));
+  const wrong = Object.keys(changes).filter(k => (changes[k] === null ? hasOwn(back, k) : back[k] !== changes[k]));
+  if (wrong.length > 0) {
+    const where = kept ? `the file as it was is kept at ${kept}` : `there was no ${envPath} before`;
+    throw new Error(`${envPath} was written but does not read back ${listed(wrong)} as written; ${where}; run the migration again`);
+  }
 }
 
 /** The keys of each built-in payment provider that the credentials doc may hold (NB6 decision 57). */
@@ -409,8 +606,8 @@ function docEntry(read: SharedDocReader, providerId: string): DocEntry | undefin
   let doc: unknown;
   try {
     doc = JSON.parse(raw);
-  } catch (error) {
-    return { unread: causeOf(error) };
+  } catch {
+    return { unread: 'it is not valid JSON' };
   }
   if (typeof doc !== 'object' || doc === null || Array.isArray(doc)) return { unread: 'it holds no object' };
   if (!Object.prototype.hasOwnProperty.call(doc, providerId)) return undefined;
@@ -473,6 +670,104 @@ export function providerCredentials(providerId: string): BotCredentials {
     credentials[key] = value === null || isPlaceholderValue(value) ? undefined : value;
   }
   return credentials;
+}
+
+/**
+ * The built-in providers' keys this machine reads now (NB6F D6), as the credentials doc the premium tab's op writes:
+ * `{ <id>: { <KEY>: <value> } }`, ids in the order of BUILTIN_PROVIDER_KEYS and keys sorted; null when none is set.
+ * Throws when /data/.env cannot be read.
+ */
+export function providerKeysFromEnv(): { body: Buffer | null; keys: number } {
+  const credentials = loadCredentials();
+  const readError = credentialsReadError();
+  if (readError) throw new Error(`${dataPath('.env')} cannot be read: ${readError}`);
+  const doc: Record<string, Record<string, string>> = {};
+  let keys = 0;
+  for (const [id, owns] of Object.entries(BUILTIN_PROVIDER_KEYS)) {
+    const owned = Object.keys(credentials).filter(k => owns(k) && typeof credentials[k] === 'string').sort();
+    if (owned.length === 0) continue;
+    doc[id] = Object.fromEntries(owned.map(k => [k, credentials[k] as string]));
+    keys += owned.length;
+  }
+  return keys === 0 ? { body: null, keys: 0 } : { body: Buffer.from(JSON.stringify(doc, null, 2)), keys };
+}
+
+/** A key the container environment pins whose value a JSON bot would read otherwise than Postgres does. */
+export interface PinnedKey {
+  key: string;
+  /** 'set': the doc's entry holds the key; 'doc': the doc cannot be read; 'entry': the provider's entry cannot be read. */
+  kind: 'set' | 'doc' | 'entry';
+  provider: string;
+}
+
+/** What a migration to JSON writes to /data/.env so each built-in provider reads what it reads on Postgres (NB6F D6). */
+export interface EnvKeyPlan {
+  changes: Record<string, string | null>;
+  /** Each key removed because its provider's keys cannot be read, with that provider. */
+  unread: Record<string, string>;
+  /** The owned keys the doc's readable entries hold, strings and nulls. */
+  held: number;
+  /** The doc's cause when it cannot be read; each provider whose entry cannot be read, with its cause. */
+  unreadDoc: string | null;
+  unreadEntries: Array<{ provider: string; cause: string }>;
+  pinned: PinnedKey[];
+  /** /data/.env's text (lossy when it is not valid UTF-8; empty when it was not read or is absent). */
+  text: string;
+  utf8: boolean;
+}
+
+/**
+ * The plan for the credentials doc's text (null: no row): with no entry in it, /data/.env is not read and nothing
+ * changes. Throws when /data/.env cannot be read.
+ */
+export function providerKeysToEnv(docText: string | null): EnvKeyPlan {
+  const plan: EnvKeyPlan = { changes: {}, unread: {}, held: 0, unreadDoc: null, unreadEntries: [], pinned: [], text: '', utf8: true };
+  if (docText === null) return plan;
+  const entries = Object.keys(BUILTIN_PROVIDER_KEYS)
+    .map(id => [id, docEntry(() => docText, id)] as const)
+    .filter((e): e is readonly [string, DocEntry] => e[1] !== undefined);
+  if (entries.length === 0) return plan;
+  const envPath = dataPath('.env');
+  loadCredentials();
+  const readError = credentialsReadError();
+  if (readError) throw new Error(`${envPath} cannot be read: ${readError}`);
+  let raw: Buffer | null = null;
+  try {
+    raw = fs.readFileSync(envPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw new Error(`${envPath} cannot be read: ${causeOf(error)}`);
+  }
+  const strict = raw === null ? '' : envTextOf(raw);
+  plan.utf8 = strict !== null;
+  plan.text = strict ?? raw!.toString('utf8');
+  const file = dotenv.parse(plan.text);
+  for (const [id, read] of entries) {
+    const owns = BUILTIN_PROVIDER_KEYS[id];
+    if ('unread' in read) {
+      if (read.provider) plan.unreadEntries.push({ provider: id, cause: read.unread });
+      else plan.unreadDoc = read.unread;
+      for (const key of Object.keys(file).filter(owns).sort()) {
+        plan.changes[key] = null;
+        plan.unread[key] = id;
+      }
+      for (const key of Object.keys(process.env).filter(owns).sort()) {
+        if (isContainerPinned(key)) plan.pinned.push({ key, kind: read.provider ? 'entry' : 'doc', provider: id });
+      }
+      continue;
+    }
+    for (const [key, value] of Object.entries(read.entry)) {
+      if (!owns(key)) continue;
+      plan.held += 1;
+      if (typeof value === 'string') {
+        if (file[key] !== value) plan.changes[key] = value;
+      } else if (hasOwn(file, key)) {
+        plan.changes[key] = null;
+      }
+      const onPostgres = value === null || isPlaceholderValue(value) ? undefined : value;
+      if (isContainerPinned(key) && process.env[key] !== onPostgres) plan.pinned.push({ key, kind: 'set', provider: id });
+    }
+  }
+  return plan;
 }
 
 /**

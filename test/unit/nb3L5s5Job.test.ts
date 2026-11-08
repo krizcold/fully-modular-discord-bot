@@ -50,7 +50,7 @@ describe('a move to Postgres stores every row as the JSON source holds it', () =
     const job = service.status().body.job;
     expect(job, why(job)).toMatchObject({ state: 'done' });
     const bytes = Object.values(files).reduce((n, t) => n + Buffer.byteLength(t), 0);
-    expect(job.counts).toEqual({ documents: 1, appendFiles: 1, graveyardEntries: 2, bytes, sharedDocs: 0, sharedLines: 0, modules: 0, moduleFiles: 0, sharedBytes: 0 });
+    expect(job.counts).toEqual({ documents: 1, appendFiles: 1, graveyardEntries: 2, bytes, sharedDocs: 0, sharedLines: 0, modules: 0, moduleFiles: 0, sharedBytes: 0, providerKeys: 0 });
     const store = db.schemas.get('smdb_data')!;
     expect(store.data).toEqual([{ guild_id: G1, module: 'm', filename: 'a.json', doc: '{"a":1}' }]);
     expect(store.append.map(r => ({ guild_id: r.guild_id, module: r.module, filename: r.filename, chunk: r.chunk })))

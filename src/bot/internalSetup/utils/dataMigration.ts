@@ -18,8 +18,9 @@ import { isLinesKey, mirrorPathOf, ROOT_CONFIG_KEY, sharedKeyFor } from './share
 import { moduleRelRefusal, moduleShaOf } from './sharedModules';
 import { getSourceModulesDir } from './pathHelpers';
 import {
-  credentialsReadError, isContainerPinned, loadCredentials, readEnvFileDataBackend, resetDataBackendCache, writeEnvDataBackend,
-  type DataBackendKind,
+  credentialsReadError, envKeysText, envSwitchRefusal, isContainerPinned, loadCredentials, NOT_UTF8_KEYS, PROVIDER_CREDENTIALS_FILE,
+  providerCredentialsPath, providerKeysFromEnv, providerKeysToEnv, readEnvFileDataBackend, resetDataBackendCache, writeEnvDataBackend,
+  writeEnvKeys, type DataBackendKind, type EnvKeyPlan,
 } from '../../../utils/envLoader';
 import { flushAll, queuedFilePaths } from './dataBackends/fileBackend';
 import { commitMayHaveLanded, isLoginRefused, provisionStoreInTransaction } from './dataBackends/postgresBackend';
@@ -650,8 +651,8 @@ export async function placeStaged(root: string, staging: string, superseded: str
       return u.key === ROOT_CONFIG_KEY ? into.rootConfig : path.join(into.global, ...u.key.slice('global/'.length).split('/'));
     };
     const aside: SharedTargets = { rootConfig: path.join(superseded, 'config.json'), global: path.join(superseded, 'global'), modules: path.join(superseded, 'appstore-modules') };
-    for (const u of await listJsonShared({ ...shared, listed: 'installed' }, [])) stale.push([u.kind === 'module' ? u.dir! : u.full!, target(u, aside)]);
-    for (const u of await listJsonShared(stagedPlaces(staging), [])) incoming.push([u.kind === 'module' ? u.dir! : u.full!, target(u, shared)]);
+    for (const u of await listJsonShared({ ...shared, listed: 'installed', credentials: 'none' }, [])) stale.push([u.kind === 'module' ? u.dir! : u.full!, target(u, aside)]);
+    for (const u of await listJsonShared({ ...stagedPlaces(staging), credentials: 'none' }, [])) incoming.push([u.kind === 'module' ? u.dir! : u.full!, target(u, shared)]);
   }
   for (const [, to] of stale) if (fs.existsSync(to)) throw new Refusal(`${to} exists; nothing was moved`);
   const staleSources = new Set(stale.map(([from]) => path.resolve(from)));
@@ -1239,7 +1240,7 @@ interface Tally {
 function emptyTally(): Tally {
   return {
     copied: new Map(), all: new Map(), shared: new Map(),
-    counts: { documents: 0, appendFiles: 0, graveyardEntries: 0, bytes: 0, sharedDocs: 0, sharedLines: 0, modules: 0, moduleFiles: 0, sharedBytes: 0 },
+    counts: { documents: 0, appendFiles: 0, graveyardEntries: 0, bytes: 0, sharedDocs: 0, sharedLines: 0, modules: 0, moduleFiles: 0, sharedBytes: 0, providerKeys: 0 },
     graves: [], guilds: [], leftOut: [], shadowNotes: [], shadowUnits: [], closedTails: [],
   };
 }
@@ -1350,7 +1351,7 @@ async function readBackPg(session: PgSession): Promise<{ hashes: Map<string, str
 
 /** One unit of the data of no guild: a doc key, a lines key or a module. A unit of a JSON tree names its file or folder. */
 export type SharedUnit =
-  | { kind: 'doc'; key: string; full?: string }
+  | { kind: 'doc'; key: string; full?: string; env?: true }
   | { kind: 'lines'; key: string; full?: string }
   | { kind: 'module'; module: string; dir?: string; version?: string | null };
 
@@ -1377,6 +1378,98 @@ export interface SharedTargets {
 /** A JSON tree's shared places; 'installed' takes the module folders installed.json lists, 'all' every folder (a staging). */
 export interface SharedPlaces extends SharedTargets {
   listed: 'installed' | 'all';
+  /**
+   * The built-in payment providers' credentials doc (NB6F D2): 'file' (the default) lists its file like any doc, 'env'
+   * lists the keys this machine reads in place of the file, 'none' leaves the key out.
+   */
+  credentials?: 'file' | 'env' | 'none';
+}
+
+const credentialsKey = (): string => sharedKeyFor(providerCredentialsPath())!;
+const KEYS_DIFFER = () => `The source read a second time differs from the source in the payment provider keys of ${dataPath('.env')}`;
+
+/** Moves the credentials doc's file under /data/global to the job's superseded folder; answers where, or null when there is none. */
+async function moveCredentialsAside(superseded: string): Promise<string | null> {
+  const file = providerCredentialsPath();
+  if (!(await lstatOrNull(file))) return null;
+  const to = path.join(superseded, 'global', ...PROVIDER_CREDENTIALS_FILE.split('/'));
+  if (fs.existsSync(to)) throw new Refusal(`${to} exists; nothing was moved`);
+  await fs.promises.mkdir(path.dirname(to), { recursive: true });
+  await fs.promises.rename(file, to);
+  return to;
+}
+
+function keysFromEnv(): { body: Buffer | null; keys: number } {
+  try {
+    return providerKeysFromEnv();
+  } catch (error) {
+    throw new Refusal(message(error));
+  }
+}
+
+/** T4 in the form of the first pinned key's state (NB6F design T4, R5, S7), or null. */
+function pinnedText(plan: EnvKeyPlan): string | null {
+  const tail = (one: boolean) => `remove ${one ? 'it' : 'them'} from the container environment, restart the container, and run the migration again`;
+  const set = plan.pinned.filter(p => p.kind === 'set').map(p => p.key);
+  if (set.length === 1) return `${set[0]} is set by the container environment, which a JSON bot reads before /data/.env, so after the move the bot would not read that payment provider key as the database holds it; ${tail(true)}`;
+  if (set.length > 1) return `${set.join(', ')} are set by the container environment, which a JSON bot reads before /data/.env, so after the move the bot would not read those payment provider keys as the database holds them; ${tail(false)}`;
+  const docPins = plan.pinned.filter(p => p.kind === 'doc');
+  const doc = docPins.map(p => p.key);
+  const whose = new Set(docPins.map(p => p.provider)).size === 1 ? 'that provider\'s' : 'those providers\'';
+  if (doc.length === 1) return `${doc[0]} is set by the container environment, and the database's payment provider keys cannot be read, so after the move the bot would read ${doc[0]} from the container while on Postgres it reads none of ${whose} keys; ${tail(true)}`;
+  if (doc.length > 1) return `${doc.join(', ')} are set by the container environment, and the database's payment provider keys cannot be read, so after the move the bot would read them from the container while on Postgres it reads none of ${whose} keys; ${tail(false)}`;
+  const first = plan.pinned.find(p => p.kind === 'entry');
+  if (!first) return null;
+  const id = first.provider;
+  const entry = plan.pinned.filter(p => p.kind === 'entry' && p.provider === id).map(p => p.key);
+  if (entry.length === 1) return `${entry[0]} is set by the container environment, and the database's keys of ${id} cannot be read, so after the move the bot would read ${entry[0]} from the container while on Postgres it reads none of ${id}'s keys; ${tail(true)}`;
+  return `${entry.join(', ')} are set by the container environment, and the database's keys of ${id} cannot be read, so after the move the bot would read them from the container while on Postgres it reads none of ${id}'s keys; ${tail(false)}`;
+}
+
+/** NB6F D4's plan for the credentials doc's text, with its refusals (T2, T4, T11, then the writer's own). */
+function planKeys(docText: string | null): EnvKeyPlan {
+  let plan: EnvKeyPlan;
+  try {
+    plan = providerKeysToEnv(docText);
+  } catch (error) {
+    throw new Refusal(message(error));
+  }
+  const pinned = pinnedText(plan);
+  if (pinned) throw new Refusal(pinned);
+  if (Object.keys(plan.changes).length > 0) {
+    if (!plan.utf8) throw new Refusal(NOT_UTF8_KEYS());
+    try {
+      envKeysText(plan.text, plan.changes, plan.unread);
+    } catch (error) {
+      throw new Refusal(message(error));
+    }
+  }
+  return plan;
+}
+
+/** T6, one note for an unreadable doc or one per provider whose entry cannot be read. */
+function keyNotes(plan: EnvKeyPlan): string[] {
+  const where = (cause: string) => `(${PROVIDER_CREDENTIALS_FILE}: ${cause})`;
+  if (plan.unreadDoc !== null) {
+    return [`The payment provider keys in the database could not be read ${where(plan.unreadDoc)}, so none was copied; after the move the built-in providers read none of their keys until they are set in the premium tab`];
+  }
+  return plan.unreadEntries.map(e => `The payment provider keys of ${e.provider} in the database could not be read ${where(e.cause)}, so none was copied; after the move ${e.provider} reads none of its keys until they are set in the premium tab`);
+}
+
+/** T7: what the move to JSON changed in /data/.env. */
+function keysAppliedText(plan: EnvKeyPlan, kept: string | null): string {
+  const envPath = dataPath('.env');
+  const keys = Object.keys(plan.changes);
+  const parts: string[] = [];
+  const set = keys.filter(k => typeof plan.changes[k] === 'string');
+  const removed = keys.filter(k => plan.changes[k] === null && !Object.prototype.hasOwnProperty.call(plan.unread, k));
+  if (set.length > 0) parts.push(`set: ${set.join(', ')}`);
+  if (removed.length > 0) parts.push(`removed: ${removed.join(', ')}`);
+  for (const id of [...new Set(keys.map(k => plan.unread[k]).filter((v): v is string => typeof v === 'string'))]) {
+    parts.push(`removed, since the database's keys of ${id} cannot be read: ${keys.filter(k => plan.unread[k] === id).join(', ')}`);
+  }
+  const tail = kept ? `the file as it was is kept at ${kept}` : `there was no ${envPath} before`;
+  return `[Migration] Changed the payment provider key lines of ${envPath} (${parts.join('; ')}); ${tail}`;
 }
 
 const SHARED_WHERE = "the database's shared files";
@@ -1527,6 +1620,12 @@ async function listJsonShared(p: SharedPlaces, leftOut: string[]): Promise<Share
     if (global.isSymbolicLink() || !global.isDirectory()) throw new Refusal(NOT_A_FOLDER(p.global));
     await listGlobal(p.global, '', leftOut, units);
   }
+  if ((p.credentials ?? 'file') !== 'file') {
+    const key = credentialsKey();
+    const at = units.findIndex(u => u.kind === 'doc' && u.key === key);
+    if (at >= 0) units.splice(at, 1);
+    if (p.credentials === 'env' && keysFromEnv().keys > 0) units.push({ kind: 'doc', key, env: true });
+  }
   units.push(...await listModuleFolders(p, leftOut));
   return orderShared(units);
 }
@@ -1584,6 +1683,11 @@ function linesOf(bytes: Buffer): { lines: Buffer[]; closedTail?: boolean } {
 /** One shared unit read whole: from its file or folder for a JSON tree, from its rows for a session. */
 export async function readSharedUnit(unit: SharedUnit, source: SharedPlaces | PgSession, leftOut: string[] = []): Promise<SharedPart> {
   if ('query' in source) return readPgShared(source, unit);
+  if (unit.kind === 'doc' && unit.env) {
+    const body = keysFromEnv().body;
+    if (!body) throw new Refusal(KEYS_DIFFER());
+    return { kind: 'doc', key: unit.key, bytes: body };
+  }
   if (unit.kind === 'doc') return { kind: 'doc', key: unit.key, bytes: await readFileStrict(unit.full!) };
   if (unit.kind === 'lines') return { kind: 'lines', key: unit.key, ...linesOf(await readFileStrict(unit.full!)) };
   const files: SharedFile[] = [];
@@ -1707,7 +1811,7 @@ async function writePgShared(session: PgSession, part: SharedPart, by: string): 
 
 /** A staging's shared places: config.json, global/<rel> and appstore-modules/<module>/ (C8). */
 function stagedPlaces(staging: string): SharedPlaces {
-  return { rootConfig: path.join(staging, 'config.json'), global: path.join(staging, 'global'), modules: path.join(staging, 'appstore-modules'), listed: 'all' };
+  return { rootConfig: path.join(staging, 'config.json'), global: path.join(staging, 'global'), modules: path.join(staging, 'appstore-modules'), listed: 'all', credentials: 'file' };
 }
 
 /** A shared part staged as files, each fsynced; a lines key's rows become one file, each line followed by "\n". */
@@ -2097,6 +2201,10 @@ export class MigrationService {
     const managed = isManaged();
     try {
       this.checkEnvAndData(managed);
+      if (!managed && readEnvFileDataBackend() !== earlier.to) {
+        const refused = envSwitchRefusal(earlier.to);
+        if (refused) throw new Refusal(refused);
+      }
     } catch (error) {
       return { status: 409, body: { success: false, error: message(error), jobId: earlier.jobId, to: earlier.to } };
     }
@@ -2312,6 +2420,10 @@ export class MigrationService {
     const bot = this.host.migrationBotState();
     if (!bot.ok) throw new Refusal(bot.error);
     this.checkEnvAndData(managed);
+    if (!managed) {
+      const refused = envSwitchRefusal(to);
+      if (refused) throw new Refusal(refused);
+    }
     const bundles = bundleImportsPresent();
     if (bundles.length > 0) throw new Refusal(`A bundle import is in progress (${bundles.join(', ')}); run the migration once it ends`);
     const facts = readDataFacts();
@@ -2384,6 +2496,12 @@ export class MigrationService {
       throw new Refusal(`${stuck.every(isGuildDataPath) ? 'Guild writes' : 'Writes'} of the web UI are still queued and could not be written: ${stuck.join(', ')}`);
     }
     await moveEarlierStaging(DATA_ROOT, ctx.superseded);
+    if (from === 'file') {
+      const aside = await moveCredentialsAside(ctx.superseded);
+      if (aside) {
+        console.log(`[Migration] Moved ${providerCredentialsPath()} to ${aside}: a JSON bot never reads that file, so a move to Postgres takes the payment provider keys from /data/.env and the container environment, not from it`);
+      }
+    }
 
     // S4: the read of the source, one guild or graveyard entry at a time; only keys, hashes and counts are kept.
     stage('reading');
@@ -2391,7 +2509,10 @@ export class MigrationService {
     let tally: Tally;
     let channel: OwnerChannelValue;
     const places = this.sharedPlaces();
+    let providerKeys: number;
+    let keyPlanNotes: string[] = [];
     if (from === 'file') {
+      providerKeys = keysFromEnv().keys;
       tally = await tallySource(jsonReader(DATA_ROOT));
       await tallyShared(tally, places);
       channel = ownerChannelFromFile(path.join(DATA_ROOT, OWNER_CHANNEL_NAME));
@@ -2405,11 +2526,17 @@ export class MigrationService {
       tally = await tallySource(pgReader(main));
       await tallyShared(tally, main);
       channel = await ownerChannelRow(main);
+      const docRows = (await main.query('SELECT body FROM smdb_data.shared_docs WHERE key = $1', [credentialsKey()])).rows;
+      const plan = planKeys(docRows.length === 0 ? null : Buffer.from(docRows[0].body).toString('utf8'));
+      providerKeys = plan.held;
+      keyPlanNotes = keyNotes(plan);
     }
     const counts = tally.counts;
+    counts.providerKeys = providerKeys;
     const notes = channel.kind === 'unreadable'
       ? [`The owner messages channel setting could not be read (${channel.cause}), so it was not copied; owner messages go to the owner's DMs until it is set again in the web panel`]
       : [];
+    notes.push(...keyPlanNotes);
     const copiedChannel: OwnerChannelValue = channel.kind === 'id' ? channel : { kind: 'none' };
 
     // S5: the copy, fed guild by guild.
@@ -2483,6 +2610,8 @@ export class MigrationService {
     if (from === 'file') {
       const again = await tallySource(jsonReader(DATA_ROOT));
       await tallyShared(again, places);
+      const keysId = sharedId('doc', credentialsKey());
+      if (tally.shared.get(keysId) !== again.shared.get(keysId)) throw new Error(KEYS_DIFFER());
       compareHashes(tally.all, again.all, 'The source read a second time');
       compareHashes(tally.shared, again.shared, 'The source read a second time');
       channelAgainDiffers(ownerChannelFromFile(path.join(DATA_ROOT, OWNER_CHANNEL_NAME)));
@@ -2526,7 +2655,36 @@ export class MigrationService {
           await writeSynced(target, s.bytes);
         }
       }
+      const stagedDoc = path.join(ctx.staging!, ...credentialsKey().split('/'));
+      const keys = planKeys((await lstatOrNull(stagedDoc)) ? (await readFileStrict(stagedDoc)).toString('utf8') : null);
+      const keysChange = Object.keys(keys.changes).length > 0;
+      if (!managed) {
+        const refused = envSwitchRefusal(to, keysChange ? envKeysText(keys.text, keys.changes, keys.unread) : undefined);
+        if (refused) throw new Refusal(refused);
+      }
       await placeStaged(DATA_ROOT, ctx.staging!, ctx.superseded, () => { ctx.placingBegun = true; }, places);
+      await this.fault('before-keys-env');
+      if (keysChange) {
+        const envPath = dataPath('.env');
+        let kept: string | null = null;
+        let raw: Buffer | null = null;
+        let st: fs.Stats | null = null;
+        try {
+          raw = fs.readFileSync(envPath);
+          st = fs.statSync(envPath);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error;
+        }
+        if (raw !== null && st !== null) {
+          kept = path.join(ctx.superseded, '.env');
+          if (fs.existsSync(kept)) throw new Refusal(`${kept} exists; nothing was moved`);
+          atomicWriteFileSync(kept, raw, { mode: st.mode, uid: st.uid, gid: st.gid });
+        }
+        writeEnvKeys(keys.changes, keys.unread, kept);
+        console.log(keysAppliedText(keys, kept));
+      }
+      await moveCredentialsAside(ctx.superseded);
+      await this.fault('after-keys-env');
 
       // S9: the source retired.
       await this.fault('S9');
@@ -2559,6 +2717,9 @@ export class MigrationService {
       console.error(`[Migration] Migration ${jobId} is done, but its journal's done could not be written: ${message(error)}`);
     }
     console.log(`[Migration] Migration ${jobId} (--to ${to}) is done: ${counts.documents} documents, ${counts.appendFiles} streams, ${counts.graveyardEntries} graveyard entries`
+      + (counts.providerKeys > 0
+        ? `; ${counts.providerKeys} payment provider ${counts.providerKeys === 1 ? 'key' : 'keys'} ${to === 'postgres' ? 'copied into the database' : `from the database applied to ${dataPath('.env')}`}`
+        : '')
       + (tally.leftOut.length > 0 ? `; left out: ${tally.leftOut.join(', ')}` : '')
       + (notes.length > 0 ? `; ${notes.join('; ')}` : ''));
   }
@@ -2570,6 +2731,7 @@ export class MigrationService {
       global: dataPath('global'),
       modules: this.opts.sourceModulesDir ?? getSourceModulesDir(),
       listed: 'installed',
+      credentials: 'env',
     };
   }
 

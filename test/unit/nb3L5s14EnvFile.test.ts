@@ -38,9 +38,10 @@ describe('writeEnvDataBackend', () => {
     expect(fs.readFileSync(ENV, 'utf-8')).toBe('DATA_BACKEND=file\n');
   });
 
-  it('fails, naming the value, when the file does not read back what was written', () => {
+  it('rewrites a `DATA_BACKEND:` line dotenv reads, and drops the earlier line (NB6F V1)', () => {
     fs.writeFileSync(ENV, 'DATA_BACKEND=postgres\nDATA_BACKEND: postgres\n');
-    expect(() => writeEnvDataBackend('file')).toThrow(`${ENV} does not read back DATA_BACKEND=file`);
+    writeEnvDataBackend('file');
+    expect(fs.readFileSync(ENV, 'utf-8')).toBe('DATA_BACKEND=file\n');
   });
 
   it('fails on the read when the file cannot be read, and writes nothing', () => {

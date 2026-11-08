@@ -2028,7 +2028,8 @@ export class AppStoreManager {
       const content = fs.readFileSync(credPath, 'utf-8');
       return JSON.parse(content);
     } catch (error) {
-      console.error(`[AppStoreManager] Failed to load credentials for ${moduleName}:`, error);
+      const cause = error instanceof SyntaxError ? 'it is not valid JSON' : error instanceof Error ? error.message : String(error);
+      console.error(`[AppStoreManager] The credentials of ${moduleName} cannot be read (${cause})`);
       return null;
     }
   }

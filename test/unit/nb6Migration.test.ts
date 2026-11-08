@@ -123,7 +123,7 @@ describe('row 68: a move to Postgres copies the data of no guild in the copy tra
     expect(typeof files[0].mode).toBe('number');
     expect(job.counts).toEqual({
       documents: 1, appendFiles: 0, graveyardEntries: 0, bytes: 7,
-      sharedDocs: 5, sharedLines: 2, modules: 1, moduleFiles: 2, sharedBytes: SHARED_BYTES,
+      sharedDocs: 5, sharedLines: 2, modules: 1, moduleFiles: 2, sharedBytes: SHARED_BYTES, providerKeys: 0,
     });
     expect(job.closedTails).toEqual(['global/m/log.jsonl']);
     expect(readJson(JOURNAL).counts).toEqual(job.counts);
@@ -269,7 +269,7 @@ describe('row 71 and cells 433 and 434: a move to JSON places every shared item 
     expect(fs.existsSync(path.join(sup, 'global', 'fleet'))).toBe(false);
     expect(job.counts).toEqual({
       documents: 1, appendFiles: 0, graveyardEntries: 0, bytes: 7,
-      sharedDocs: 5, sharedLines: 2, modules: 1, moduleFiles: 2, sharedBytes: SHARED_BYTES,
+      sharedDocs: 5, sharedLines: 2, modules: 1, moduleFiles: 2, sharedBytes: SHARED_BYTES, providerKeys: 0,
     });
     expect(fs.readdirSync(root).filter(n => n.startsWith('.migrate-'))).toEqual([]);
   });

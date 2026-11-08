@@ -51,9 +51,11 @@ export interface SharedCounts {
   modules: number;
   moduleFiles: number;
   sharedBytes: number;
+  /** The built-in payment providers' keys the move carried (NB6F D7). */
+  providerKeys: number;
 }
 
-/** A job's counts (NB6 D2): the guild units' and the shared units', all nine always present. */
+/** A job's counts (NB6 D2): the guild units' and the shared units', all ten always present. */
 export type JobCounts = MigrationCounts & SharedCounts;
 
 /** /data/.migration.json: the last data migration, as its job wrote it. */
