@@ -157,9 +157,9 @@ describe('NB5F: the texts of a marker that cannot be read, the move check and th
 
   it('T8 to T17, the move check and the bootstrap line', () => {
     expect(seen(moveCheckTexts.markerUnknown(why))).toBe(`${why}, so the bot can't confirm which store this machine records`);
-    expect(seen(moveCheckTexts.version('{"v":5}'))).toBe('the database holds schema version {"v":5}, and this bot reads only version 8');
+    expect(seen(moveCheckTexts.version('{"v":5}'))).toBe('the database holds schema version {"v":5}, and this bot reads only version 9');
     expect(seen(moveCheckTexts.empty)).toBe("the database holds no tables in smdb_data, so it holds no copy of this bot's store; a move does not provision a database");
-    expect(seen(moveCheckTexts.noStoreId)).toBe("the database's smdb_data matches this bot's schema (version 8) but smdb_data.meta holds no store_id row, and this machine records no store id, so this bot can't confirm whose store it is; a move writes no store id");
+    expect(seen(moveCheckTexts.noStoreId)).toBe("the database's smdb_data matches this bot's schema (version 9) but smdb_data.meta holds no store_id row, and this machine records no store id, so this bot can't confirm whose store it is; a move writes no store id");
     expect(seen(moveCheckTexts.unreadableStoreId)).toBe("its store id can't be read (the stored value is not a JSON string)");
     expect(seen(moveCheckTexts.otherStore('store-x', 'store-a'))).toBe("the configured database is not the one this deployment's data lives in (store store-x vs recorded store-a)");
     expect(seen(moveCheckTexts.incomplete('SQLSTATE 42501: permission denied for schema smdb_data'))).toBe('the check of its store could not be completed (SQLSTATE 42501: permission denied for schema smdb_data)');

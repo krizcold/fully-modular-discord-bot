@@ -12,12 +12,20 @@
  * The cache follows premium-tiers.json's rule (decision 12 of NB10): the bot
  * process holds the writer lock and never reloads; the web UI reloads when the
  * file, read through the queue, differs from the text it last loaded or saved.
+ * On a Postgres bot the file is a shared key (NB6): a save carries the sha its
+ * cache was built on, another machine's change applied here drops the cache,
+ * and a method that changes a record answers once its op settled, as an
+ * external provider answers once its API stored the change.
  */
 
+import { randomUUID } from 'crypto';
 import { dataPath } from '../../../../utils/dataRoot';
-import { DataBackendUnavailableError, onWriterTake, readRawStrict, saveDataTracked } from '../dataManager';
+import { resolveDataBackend } from '../../../../utils/envLoader';
+import { DataBackendUnavailableError, onSharedApplied, onWriterTake, readRawStrict, saveDataTracked, type DataOptions } from '../dataManager';
 import { markRetried, outsideLedgers, recordRefusal, type LedgerCause } from '../dataBackends/writeLedger';
-import { errnoOf, isBotProcess, isPremiumReplaying, registerCacheStop, stopCause, stopWords, unregisterCacheStop, type StopKind } from '../premiumManager';
+import { errnoOf, isBotProcess, registerCacheStop, stopCause, stopWords, unregisterCacheStop, type StopKind } from '../premiumManager';
+import { failItems, landItems, makeItem, newCarry, runItems, type Carry, type Item, type ItemSink, type SaveOp, type SaveOutcome } from '../premiumItems';
+import { rowOutcome, shaOf, type RowTicket } from '../sharedStore';
 import { getPaymentRegistry } from './paymentRegistry';
 import { isMaintenanceGateClosed } from '../maintenanceGate';
 import { writerLockDepth } from '../writerLock';
@@ -30,6 +38,8 @@ import type {
   InitiateResult,
   OfferingVariant,
   ProviderCouponValidation,
+  SubscriptionView,
+  WalkBatch,
 } from './paymentTypes';
 
 // ============================================================================
@@ -99,14 +109,27 @@ interface DummyState {
   nextId: number;
 }
 
+type WalkEvent = WalkBatch['events'][number];
+
 const STATE_PATH = dataPath('global', 'payment-providers', 'dummy', 'state.json');
 const STATE_FILE = 'payment-providers/dummy/state.json';
 /** The document the facade names state.json by in a ledger's refusals. */
 const STATE_DOC = 'global:payment-providers/dummy/state.json';
+/** The shared keys of a Postgres bot: state.json, and premium's file the tick's writes are built on (NB6 decision 102). */
+const STATE_KEY = 'global/payment-providers/dummy/state.json';
+const PREMIUM_KEY = 'global/premium-tiers.json';
+const SAVE_OPTIONS: DataOptions = { scope: 'global', category: 'payment-providers/dummy' };
 const DAY_MS = 24 * 60 * 60 * 1000;
 const LOAD_RETRY_MS = 5_000;
 const RETRY_FIRST_MS = 1_000;
 const RETRY_MAX_MS = 60_000;
+/** How long a method waits for its op's outcome (CONFIRM_MS, replyGate.ts). */
+const CONFIRM_MS = 8_000;
+/** T26's words for a field's value: a null endDate is "no end date", a null resumesAt "none". */
+const fieldWords = (field: string, value: unknown): string =>
+  value === null && field === 'endDate' ? 'no end date' : value === null && field === 'resumesAt' ? 'none' : String(value);
+/** The fields of a record the tick compares with premium's copy, in T26's order. */
+const VIEW_FIELDS = ['status', 'endDate', 'autoRenew', 'variantId', 'resumesAt'] as const;
 
 const liveProviders = new Set<DummyProvider>();
 
@@ -117,6 +140,30 @@ export function invalidateDummyCaches(): void {
 
 // What this process knew of state.json may be stale after another holder of the writer lock.
 onWriterTake(invalidateDummyCaches);
+
+/** Decision 27's cause words for a refused Dummy change. */
+function causeWords(cause: string): string {
+  return cause === 'changed-elsewhere' ? 'another machine changed premium-tiers.json (or the Dummy state) at the same time' : cause;
+}
+
+/** T20: the Dummy provider's error for a change its op did not store. */
+function notSavedError(cause: string): Error {
+  return new Error(`The Dummy provider did not save this change (${causeWords(cause)}), so nothing was changed at the provider.`);
+}
+
+/** T23: a change the database did not confirm; `code` and `reason` let premium word its warnings (decision 88). */
+function unconfirmedError(reason: string, purchase: boolean): Error {
+  const tail = purchase
+    ? ' If the purchase was saved, it is listed under "Subscriptions needing attention" on this server\'s subscription page, where it can be adopted or cancelled.'
+    : " If the provider saved it, the Dummy provider puts the subscription back to the bot's copy within about 2 minutes.";
+  return Object.assign(new Error(`Can't confirm that the Dummy provider saved this change (${reason}), so the bot did not apply it. Check the subscription before trying again.${tail}`), {
+    code: 'unconfirmed',
+    reason,
+  });
+}
+
+/** T25: a call on a record that has nothing to change. */
+const notFound = (id: string) => new Error(`Dummy subscription '${id}' not found.`);
 
 /**
  * Seed state on first run so testing has something to click on out of the box.
@@ -180,6 +227,8 @@ export class DummyProvider implements PaymentProvider {
   /** The cache holds a loaded state; lastRaw is the text it was loaded from or last saved as (undefined: not known). */
   private loaded = false;
   private lastRaw: string | null | undefined = undefined;
+  /** Decision 13's lastSha: the sha of lastRaw, 'absent' for the seed with no file; the base of the next save. */
+  private lastSha: string | undefined = undefined;
   private unreadable: string | null = null;
   private loggedCause: string | null = null;
   private loggedRecheck: string | null = null;
@@ -192,10 +241,20 @@ export class DummyProvider implements PaymentProvider {
   private retryTimer: NodeJS.Timeout | null = null;
   private retryDelay = RETRY_FIRST_MS;
   private disposed = false;
+  /** Ops of state.json from this process accepted and not settled (decision 96's gate). */
+  private openSaves = 0;
+  /** Held saves' handles, answered with the op of the save that next takes the cache (decision 64). */
+  private heldWaits: Array<(outcome: Promise<SaveOutcome>) => void> = [];
+  private lastRefusal: string = 'io';
+  /** Decision 94's seen: per record, its updatedAt and premium's answer at the last run that found a difference. */
+  private seen = new Map<string, { updatedAt: string; answer: string }>();
+  private offApplied: (() => void) | null = null;
 
   constructor() {
     liveProviders.add(this);
     if (isBotProcess()) registerCacheStop(this);
+    // Decision 13: another machine's change applied to the mirror drops the cache; the next use loads it.
+    this.offApplied = onSharedApplied(STATE_KEY, () => this.invalidate());
   }
 
   isConfigured(): boolean {
@@ -235,6 +294,7 @@ export class DummyProvider implements PaymentProvider {
         }
       : buildSeedState();
     this.lastRaw = raw;
+    this.lastSha = raw === null ? 'absent' : shaOf(Buffer.from(raw, 'utf8'));
     this.loaded = true;
     if (this.unreadable) console.log(`[DummyProvider] ${STATE_FILE} can be read again`);
     this.unreadable = null;
@@ -273,8 +333,10 @@ export class DummyProvider implements PaymentProvider {
     this.load();
   }
 
-  /** Drops the cache (the web UI, at each take of the writer lock and after a local op that was not ok). */
+  /** Drops the cache (another machine's change applied, a take of the writer lock, an op not stored, a local op that was not ok). */
   invalidate(): void {
+    // A held save keeps the state it was made from until its retry is sent, so a change applied meanwhile refuses it.
+    if (this.saveHeld) return;
     this.loaded = false;
     this.lastRaw = undefined;
     this.lastLoadTry = -Infinity;
@@ -303,32 +365,57 @@ export class DummyProvider implements PaymentProvider {
       : `The Dummy provider changed nothing: ${STATE_FILE} cannot be read (${this.unreadable}).`);
   }
 
+  private sharedBackend(): boolean {
+    return resolveDataBackend() === 'postgres';
+  }
+
   /**
-   * Saves the whole state. In the bot a save the disk refuses stays in the cache and is retried (it answers held); a
-   * refusal of the stop or a deposition, and every save while the state cannot be read, is not.
+   * Saves the whole state (NB6 decision 63): the save takes the carry's items into its op. In the bot a save the disk
+   * refuses stays in the cache and is retried (it answers held); a refusal of the stop or a deposition, and every save
+   * while the state cannot be read, is not. The tick's save (`tick`) carries premium's sha as a check on a Postgres bot
+   * and is never held (decision 102). null: refused; the cache is dropped then (decision 71).
    */
-  private save(): boolean {
+  private save(opts: { carry?: Carry; tick?: { premiumSha: string | null } } = {}): SaveOp | null {
+    const items = opts.carry ? opts.carry.items.splice(0) : [];
     if (this.stopped) {
       recordRefusal(stopCause(this.stopped), STATE_DOC);
-      return false;
+      this.refuseItems(items, stopCause(this.stopped));
+      return null;
     }
     if (this.unreadable !== null) {
       recordRefusal('io', STATE_DOC);
-      return false;
+      this.refuseItems(items, 'io');
+      return null;
     }
-    return this.writeState();
+    return this.writeState(items, opts.tick);
   }
 
-  private writeState(): boolean {
+  private writeState(items: Item[] = [], tick?: { premiumSha: string | null }): SaveOp | null {
     const content = JSON.stringify(this.state, null, 2);
+    const shared = this.sharedBackend();
+    const options: DataOptions = shared
+      ? {
+          ...SAVE_OPTIONS,
+          ...(this.lastSha !== undefined ? { baseSha: this.lastSha } : {}),
+          ...(tick ? { check: { [PREMIUM_KEY]: tick.premiumSha } } : {}),
+        }
+      : SAVE_OPTIONS;
     let cause: LedgerCause;
     try {
-      const tracked = saveDataTracked('state.json', { scope: 'global', category: 'payment-providers/dummy' }, this.state);
+      const tracked = saveDataTracked('state.json', options, this.state);
       if (tracked.outcome === 'saved') {
         this.lastRaw = content;
+        this.lastSha = shaOf(Buffer.from(content, 'utf8'));
         this.saveHeld = false;
         this.unstorableSave = false;
-        return true;
+        if (tracked.ticket.kind === 'row') {
+          const outcome = this.watchOp(tracked.ticket, items);
+          this.answerWaits(outcome);
+          return { key: STATE_KEY, outcome, ticket: tracked.ticket };
+        }
+        this.answerWaits(null);
+        runItems(items);
+        return { key: STATE_KEY, outcome: null, ticket: tracked.ticket };
       }
       cause = tracked.outcome === 'frozen' ? 'frozen' : tracked.cause;
     } catch (error) {
@@ -343,13 +430,81 @@ export class DummyProvider implements PaymentProvider {
     if (cause === 'unstorable') {
       this.saveHeld = false;
       this.unstorableSave = true;
-      return false;
+      return this.refused(items, cause);
     }
-    if (cause === 'node-stopping' || cause === 'writer-lost' || !isBotProcess()) return false;
+    if (tick || cause === 'node-stopping' || cause === 'writer-lost' || !isBotProcess()) return this.refused(items, cause);
     this.saveHeld = true;
     markRetried(STATE_DOC);
     this.armRetry();
-    return true;
+    if (shared) return { key: STATE_KEY, outcome: new Promise(resolve => this.heldWaits.push(resolve)) };
+    runItems(items);
+    return { key: STATE_KEY, outcome: null };
+  }
+
+  /** A save refused at the accept and not held: the change is not stored, so the cache drops it (decision 71). */
+  private refused(items: Item[], cause: LedgerCause): null {
+    this.invalidate();
+    this.refuseItems(items, cause);
+    const waits = this.heldWaits.splice(0);
+    for (const resolve of waits) resolve(Promise.resolve({ refused: cause }));
+    return null;
+  }
+
+  /** The held saves' handles answer with the op of the save that took the cache. */
+  private answerWaits(outcome: Promise<SaveOutcome> | null): void {
+    const waits = this.heldWaits.splice(0);
+    for (const resolve of waits) resolve(outcome ?? Promise.resolve<SaveOutcome>('landed'));
+  }
+
+  /** Settles a save's items with its op (decision 64); an op refused or 'unconfirmed' drops the cache (decision 71). */
+  private watchOp(ticket: RowTicket, items: Item[]): Promise<SaveOutcome> {
+    this.openSaves += 1;
+    return rowOutcome(ticket).then(outcome => {
+      this.openSaves -= 1;
+      if (outcome === 'landed') {
+        landItems(items, ticket);
+        return 'landed' as const;
+      }
+      this.invalidate();
+      if (outcome === 'unconfirmed') {
+        failItems(items, 'unconfirmed', this.itemSink);
+        return 'unconfirmed' as const;
+      }
+      const cause = outcome.refused.cause;
+      failItems(items, { refused: cause, words: causeWords(cause) }, this.itemSink);
+      return { refused: cause };
+    });
+  }
+
+  private refuseItems(items: Item[], cause: LedgerCause): void {
+    this.lastRefusal = cause;
+    if (items.length > 0) failItems(items, { refused: cause, words: causeWords(cause) }, this.itemSink);
+  }
+
+  private readonly itemSink: ItemSink = {
+    stopWords: () => (this.stopped ? stopWords(this.stopped) : null),
+    writeMarked: () => undefined,
+  };
+
+  /**
+   * Decision 71: a method's answer once its op settled. Refused at the accept or at the flush: T20; 'unconfirmed' or
+   * no outcome within 8 s: T23 (the op goes on, and its outcome still drops the cache). A JSON bot's write is judged
+   * by NB10's verdict in the op's ledger, so it answers at the accept.
+   */
+  private async settled(op: SaveOp | null, purchase: boolean): Promise<void> {
+    if (op === null) throw notSavedError(this.lastRefusal);
+    if (op.outcome === null) return;
+    let timer: NodeJS.Timeout | undefined;
+    const bound = new Promise<'bound'>(resolve => {
+      timer = setTimeout(() => resolve('bound'), CONFIRM_MS);
+      timer.unref?.();
+    });
+    const outcome = await Promise.race([op.outcome, bound]);
+    if (timer) clearTimeout(timer);
+    if (outcome === 'landed') return;
+    if (outcome === 'bound') throw unconfirmedError('the database did not confirm it within 8 s', purchase);
+    if (outcome === 'unconfirmed') throw unconfirmedError("the database's answer was lost", purchase);
+    throw notSavedError(outcome.refused);
   }
 
   private armRetry(): void {
@@ -526,7 +681,7 @@ export class DummyProvider implements PaymentProvider {
       updatedAt: nowIso,
     };
     this.state.subscriptions[providerSubId] = record;
-    this.save();
+    await this.settled(this.save(), true);
 
     return {
       providerSubId,
@@ -539,81 +694,54 @@ export class DummyProvider implements PaymentProvider {
   // LIFECYCLE
   // ============================================================================
 
-  async cancelSubscription(providerSubId: string, immediately?: boolean): Promise<void> {
+  async cancelSubscription(providerSubId: string, immediately?: boolean): Promise<ProviderSubscriptionState> {
     this.refuseCall();
     const r = this.state.subscriptions[providerSubId];
-    if (!r) return;
-    const registry = getPaymentRegistry();
+    if (!r) throw notFound(providerSubId);
     if (immediately) {
       r.status = 'expired';
-      r.autoRenew = false;
       r.paused = false;
-      r.updatedAt = new Date().toISOString();
-      this.save();
-      registry.emitEvent({
-        type: 'subscription.expired',
-        providerId: this.id,
-        providerSubId,
-        guildId: r.guildId,
-        state: this.stateFrom(r),
-      });
-      return;
     }
     r.autoRenew = false;
     r.updatedAt = new Date().toISOString();
-    this.save();
-    registry.emitEvent({
-      type: 'subscription.cancelled',
-      providerId: this.id,
-      providerSubId,
-      guildId: r.guildId,
-      state: this.stateFrom(r),
-    });
+    await this.settled(this.save(), false);
+    return this.stateFrom(r);
   }
 
-  async reactivateSubscription(providerSubId: string): Promise<void> {
+  async reactivateSubscription(providerSubId: string): Promise<ProviderSubscriptionState> {
     this.refuseCall();
     const r = this.state.subscriptions[providerSubId];
-    if (!r) return;
-    if (r.status !== 'active') return;
-    if (r.endDate !== null && Date.parse(r.endDate) <= Date.now()) return;
+    if (!r) throw notFound(providerSubId);
+    if (r.status !== 'active') throw new Error(`Dummy subscription '${providerSubId}' is ${r.status}, so it was not reactivated.`);
+    if (r.endDate !== null && Date.parse(r.endDate) <= Date.now()) {
+      throw new Error(`Dummy subscription '${providerSubId}' is past its end date, so it was not reactivated.`);
+    }
     r.autoRenew = true;
     r.updatedAt = new Date().toISOString();
-    this.save();
-    getPaymentRegistry().emitEvent({
-      type: 'subscription.updated',
-      providerId: this.id,
-      providerSubId,
-      guildId: r.guildId,
-      state: this.stateFrom(r),
-    });
+    await this.settled(this.save(), false);
+    return this.stateFrom(r);
   }
 
-  async pauseSubscription(providerSubId: string, resumesAt: string | null): Promise<void> {
+  async pauseSubscription(providerSubId: string, resumesAt: string | null): Promise<ProviderSubscriptionState> {
     this.refuseCall();
     const r = this.state.subscriptions[providerSubId];
-    if (!r) return;
-    if (r.status !== 'active' || r.paused) return;
+    if (!r) throw notFound(providerSubId);
+    if (r.paused) throw new Error(`Dummy subscription '${providerSubId}' is already paused, so it was not paused.`);
+    if (r.status !== 'active') throw new Error(`Dummy subscription '${providerSubId}' is ${r.status}, so it was not paused.`);
     r.paused = true;
     r.pausedAt = new Date().toISOString();
     r.resumesAt = resumesAt;
     r.status = 'paused';
     r.updatedAt = r.pausedAt;
-    this.save();
-    getPaymentRegistry().emitEvent({
-      type: 'subscription.paused',
-      providerId: this.id,
-      providerSubId,
-      guildId: r.guildId,
-      resumesAt,
-    });
+    await this.settled(this.save(), false);
+    return this.stateFrom(r);
   }
 
-  async resumeSubscription(providerSubId: string, newEndDate: string | null): Promise<void> {
+  async resumeSubscription(providerSubId: string, newEndDate: string | null): Promise<ProviderSubscriptionState> {
     this.refuseCall();
     const r = this.state.subscriptions[providerSubId];
-    if (!r) return;
-    if (!r.paused) return;
+    if (!r) throw notFound(providerSubId);
+    if (!r.paused) throw new Error(`Dummy subscription '${providerSubId}' is not paused, so it was not resumed.`);
     const nowIso = new Date().toISOString();
     r.paused = false;
     r.pausedAt = undefined;
@@ -622,44 +750,35 @@ export class DummyProvider implements PaymentProvider {
     r.endDate = newEndDate;
     r.status = 'active';
     r.updatedAt = nowIso;
-    this.save();
-    getPaymentRegistry().emitEvent({
-      type: 'subscription.resumed',
-      providerId: this.id,
-      providerSubId,
-      guildId: r.guildId,
-      state: this.stateFrom(r),
-    });
+    await this.settled(this.save(), false);
+    return this.stateFrom(r);
   }
 
   async migrateSubscriptionPrice(
     providerSubId: string,
     newVariantId: string,
     _prorationBehavior: 'none' | 'create_prorations',
-  ): Promise<void> {
+  ): Promise<ProviderSubscriptionState> {
     this.refuseCall();
     const r = this.state.subscriptions[providerSubId];
-    if (!r) throw new Error(`Dummy subscription '${providerSubId}' not found.`);
+    if (!r) throw notFound(providerSubId);
     const variant = this.state.variants[newVariantId];
     if (!variant || !variant.active) {
       throw new Error(`Dummy variant '${newVariantId}' does not exist or is inactive.`);
     }
-    r.variantId = newVariantId;
-    r.durationDays = variant.durationDays;
-    // Reset endDate based on new duration (start of "next cycle" semantics).
-    r.endDate = variant.durationDays === null
-      ? null
-      : new Date(Date.now() + variant.durationDays * DAY_MS).toISOString();
-    r.startDate = new Date().toISOString();
-    r.updatedAt = r.startDate;
-    this.save();
-    getPaymentRegistry().emitEvent({
-      type: 'subscription.updated',
-      providerId: this.id,
-      providerSubId,
-      guildId: r.guildId,
-      state: this.stateFrom(r),
-    });
+    // Decision 86: a record already on the variant changes nothing; the no-change save lands behind any earlier op.
+    if (r.variantId !== newVariantId) {
+      r.variantId = newVariantId;
+      r.durationDays = variant.durationDays;
+      // Reset endDate based on new duration (start of "next cycle" semantics).
+      r.endDate = variant.durationDays === null
+        ? null
+        : new Date(Date.now() + variant.durationDays * DAY_MS).toISOString();
+      r.startDate = new Date().toISOString();
+      r.updatedAt = r.startDate;
+    }
+    await this.settled(this.save(), false);
+    return this.stateFrom(r);
   }
 
   async getSubscriptionState(providerSubId: string): Promise<ProviderSubscriptionState | null> {
@@ -726,26 +845,103 @@ export class DummyProvider implements PaymentProvider {
     this.clearRetry();
     liveProviders.delete(this);
     unregisterCacheStop(this);
+    this.offApplied?.();
+    this.offApplied = null;
+  }
+
+  /** Decision 94's view of a record, compared field by field with premium's answer. */
+  private viewOf(r: DummyRecord): SubscriptionView {
+    return {
+      status: r.paused ? 'paused' : (r.status as SubscriptionView['status']),
+      endDate: r.endDate,
+      autoRenew: r.autoRenew,
+      variantId: r.variantId,
+      resumesAt: r.paused ? (r.resumesAt ?? null) : null,
+    };
+  }
+
+  /** The fields of premium's answer that differ from the record's view, each with the record's value and premium's. */
+  private differences(r: DummyRecord, answer: SubscriptionView): Array<{ field: string; was: unknown; now: unknown }> {
+    const view = this.viewOf(r);
+    const out: Array<{ field: string; was: unknown; now: unknown }> = [];
+    for (const field of VIEW_FIELDS) {
+      if (answer[field] === undefined) continue;
+      if (view[field] !== answer[field]) out.push({ field, was: view[field], now: answer[field] });
+    }
+    return out;
+  }
+
+  /** Decision 94's write from premium's answer: the slot's state, dates and variant; no event. */
+  private writeFromAnswer(r: DummyRecord, a: SubscriptionView, nowIso: string): void {
+    r.status = a.status;
+    if (a.status === 'paused') {
+      if (!r.paused) r.pausedAt = nowIso;
+      r.paused = true;
+      r.resumesAt = a.resumesAt;
+    } else {
+      r.paused = false;
+      delete r.pausedAt;
+      delete r.resumesAt;
+    }
+    r.endDate = a.endDate;
+    r.autoRenew = a.autoRenew;
+    if (a.variantId !== undefined && a.variantId !== r.variantId) {
+      r.variantId = a.variantId;
+      const variant = this.state.variants[a.variantId];
+      if (variant) r.durationDays = variant.durationDays;
+    }
+    r.updatedAt = nowIso;
   }
 
   /**
-   * Periodic simulation: walk every active subscription whose endDate has
-   * passed and either roll it forward (autoRenew=true) or expire it. Paused
-   * subs don't tick.
+   * The minute's run (decisions 94, 96, 102 and 110), when no op of state.json is open in this process, no save of it
+   * is held and premium's reader is ready: (1) each record premium holds that differs from premium's copy at two runs
+   * with the same updatedAt and answer is written to that copy; (2) every other record that agrees, or that premium
+   * does not hold, is renewed or expired when its end passed; (3) one save carries what changed and the walk's events
+   * as one batch, on a Postgres bot checked against the premium sha step 1 read. Otherwise it does nothing and forgets
+   * what it saw.
    */
   private tick(): void {
     this.ensureLoaded();
     if (this.unreadable !== null) {
+      this.seen.clear();
       console.warn(`[DummyProvider] Skipped the tick: ${STATE_FILE} cannot be read (${this.unreadable})`);
       return;
     }
-    if (this.stopped || isPremiumReplaying()) return;
-    const now = Date.now();
-    const nowIso = new Date().toISOString();
-    let changed = false;
+    if (this.stopped) return;
     const registry = getPaymentRegistry();
+    if (this.openSaves > 0 || this.saveHeld || !registry.subscriptionReaderReady()) {
+      this.seen.clear();
+      return;
+    }
+    const premiumSha = registry.subscriptionReaderSha();
+    const now = Date.now();
+    const nowIso = new Date(now).toISOString();
+    const records = Object.values(this.state.subscriptions);
 
-    for (const r of Object.values(this.state.subscriptions)) {
+    const seen = new Map<string, { updatedAt: string; answer: string }>();
+    const differing = new Set<string>();
+    const written: Array<{ id: string; parts: string }> = [];
+    for (const r of records) {
+      const answer = registry.readSubscription(this.id, r.guildId, r.providerSubId);
+      if (!answer) continue;
+      const diff = this.differences(r, answer);
+      if (diff.length === 0) continue;
+      const text = JSON.stringify(answer);
+      const before = this.seen.get(r.providerSubId);
+      if (before && before.updatedAt === r.updatedAt && before.answer === text) {
+        written.push({ id: r.providerSubId, parts: diff.map(d => `${d.field} was ${fieldWords(d.field, d.was)}, now ${fieldWords(d.field, d.now)}`).join('; ') });
+        this.writeFromAnswer(r, answer, nowIso);
+        continue;
+      }
+      seen.set(r.providerSubId, { updatedAt: r.updatedAt, answer: text });
+      differing.add(r.providerSubId);
+    }
+    this.seen = seen;
+
+    const events: WalkEvent[] = [];
+    for (const r of records) {
+      if (differing.has(r.providerSubId)) continue;
       if (r.status !== 'active') continue;
       if (r.paused) continue;
       if (r.endDate === null) continue;
@@ -755,28 +951,53 @@ export class DummyProvider implements PaymentProvider {
         const base = Date.parse(r.endDate);
         r.endDate = new Date(base + r.durationDays * DAY_MS).toISOString();
         r.updatedAt = nowIso;
-        changed = true;
-        registry.emitEvent({
-          type: 'subscription.renewed',
-          providerId: this.id,
-          providerSubId: r.providerSubId,
-          guildId: r.guildId,
-          state: this.stateFrom(r),
-        });
+        events.push({ type: 'subscription.renewed', providerId: this.id, providerSubId: r.providerSubId, guildId: r.guildId, state: this.stateFrom(r) });
       } else {
         r.status = 'expired';
         r.updatedAt = nowIso;
-        changed = true;
-        registry.emitEvent({
-          type: 'subscription.expired',
-          providerId: this.id,
-          providerSubId: r.providerSubId,
-          guildId: r.guildId,
-          state: this.stateFrom(r),
-        });
+        events.push({ type: 'subscription.expired', providerId: this.id, providerSubId: r.providerSubId, guildId: r.guildId, state: this.stateFrom(r) });
       }
     }
-    if (changed) this.save();
+    if (written.length === 0 && events.length === 0) return;
+
+    const carry = newCarry();
+    if (events.length > 0) this.emitWalk({ premiumSha, events }, { carry });
+    const op = this.save({ carry, tick: { premiumSha } });
+    if (op === null || written.length === 0) return;
+    const logWritten = () => {
+      for (const w of written) {
+        console.log(`[DummyProvider] Subscription ${w.id} now matches the bot's copy (${w.parts}); they differed at two checks a minute apart`);
+      }
+    };
+    if (op.outcome === null) {
+      logWritten();
+      return;
+    }
+    void op.outcome.then(outcome => {
+      if (outcome === 'landed') logWritten();
+    });
+  }
+
+  /**
+   * The walk's events as one item (decision 110), the Dummy provider's only caller of the registry's walk batch: it goes
+   * out once the op of the save that takes the carry landed; dropped, each event is logged in walk order (T16).
+   */
+  private emitWalk(batch: WalkBatch, link: { carry: Carry }): void {
+    link.carry.items.push(makeItem({
+      kind: 'event',
+      id: randomUUID(),
+      owner: this,
+      run: () => getPaymentRegistry().emitWalkBatch(batch),
+      drop: how => {
+        for (const event of batch.events) {
+          console.warn(how.kind === 'refused'
+            ? `[DummyProvider] The ${event.type} event for subscription ${event.providerSubId} was not sent: the change was not saved (${how.words})`
+            : how.kind === 'unconfirmed'
+              ? `[DummyProvider] The ${event.type} event for subscription ${event.providerSubId} was not sent: can't confirm that the change was saved (the database's answer was lost)`
+              : `[DummyProvider] The ${event.type} event for subscription ${event.providerSubId} was not sent: ${how.words}`);
+        }
+      },
+    }));
   }
 
   // ============================================================================

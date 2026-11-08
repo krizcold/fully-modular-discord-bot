@@ -124,7 +124,7 @@ async function settledOwnChoice(): Promise<ReturnType<typeof resolveWebuiDatabas
 describe('decision 17: the three cases', () => {
   it('answers the reported entry, for a one-entry and a list env alike', () => {
     setWebuiDataStoreUrl({ url: A });
-    expect(resolveWebuiDatabase()).toEqual({ entry: A });
+    expect(resolveWebuiDatabase()).toEqual({ entry: A, tag: null });
   });
 
   it('a choosing report refuses with its reason; a report at the latch refuses until the new entry is reported', () => {
@@ -132,21 +132,21 @@ describe('decision 17: the three cases', () => {
     setWebuiDataStoreUrl({ url: null, choosing: true, reason: 'the database at a.example:5432/bot was replaced' });
     expect(resolveWebuiDatabase()).toEqual({ refusal: 'the database at a.example:5432/bot was replaced' });
     setWebuiDataStoreUrl({ url: W });
-    expect(resolveWebuiDatabase()).toEqual({ entry: W });
+    expect(resolveWebuiDatabase()).toEqual({ entry: W, tag: null });
   });
 
   it('a held report answers the entry with held; a second held report replaces the reason; a later plain report clears it', () => {
     setWebuiDataStoreUrl({ url: A, held: true, reason: 'checking' });
-    expect(resolveWebuiDatabase()).toEqual({ entry: A, held: { reason: 'checking' } });
+    expect(resolveWebuiDatabase()).toEqual({ entry: A, tag: null, held: { reason: 'checking' } });
     setWebuiDataStoreUrl({ url: A, held: true, reason: 'the switch notices could not be read (HTTP 403 (Missing Access))' });
-    expect(resolveWebuiDatabase()).toEqual({ entry: A, held: { reason: 'the switch notices could not be read (HTTP 403 (Missing Access))' } });
+    expect(resolveWebuiDatabase()).toEqual({ entry: A, tag: null, held: { reason: 'the switch notices could not be read (HTTP 403 (Missing Access))' } });
     setWebuiDataStoreUrl({ url: A });
-    expect(resolveWebuiDatabase()).toEqual({ entry: A });
+    expect(resolveWebuiDatabase()).toEqual({ entry: A, tag: null });
   });
 
   it('with no bot process: choosing the main database before the first result, then the chosen entry', async () => {
     expect(resolveWebuiDatabase()).toEqual({ refusal: 'choosing the main database' });
-    expect(await settledOwnChoice()).toEqual({ entry: A });
+    expect(await settledOwnChoice()).toEqual({ entry: A, tag: '1:M' });
   });
 
   it('with no bot process: a one-entry main behind a newer notice refuses with its reason', async () => {
@@ -177,7 +177,7 @@ describe('decision 17 on botManager: the report, the starting refusal and the re
     expect(resolveWebuiDatabase()).toEqual({ refusal: 'R' });
     store(child, { url: A, held: true, reason: 'H' });
     expect(webuiReportCount()).toBeGreaterThan(c2);
-    expect(resolveWebuiDatabase()).toEqual({ entry: A, held: { reason: 'H' } });
+    expect(resolveWebuiDatabase()).toEqual({ entry: A, tag: null, held: { reason: 'H' } });
     const c3 = webuiReportCount();
     await manager.shutdown();
     expect(webuiReportCount()).toBeGreaterThan(c3);
@@ -198,7 +198,7 @@ describe('decision 17 on botManager: the report, the starting refusal and the re
     const before = webuiReportCount();
     mode(forks.children[0], { mode: 'login-refused', boot: true });
     expect(webuiReportCount()).toBeGreaterThan(before);
-    expect(await settledOwnChoice()).toEqual({ entry: A });
+    expect(await settledOwnChoice()).toEqual({ entry: A, tag: '1:M' });
     _resetWebuiChoice();
     fake.answers = [{ kind: 'refused', address: 'a.example:5432/bot', entry: A } as ProbeAnswer];
     const refused = await settledOwnChoice();
@@ -249,17 +249,17 @@ describe('decision 17: chooseNow()', () => {
     expect(Date.now() - started).toBeLessThan(400);
     expect(overlapped).toBe(true);
     expect(ownReads).toBe(1);
-    expect(resolution).toEqual({ entry: W });
+    expect(resolution).toEqual({ entry: W, tag: '1:M' });
   });
 
   it('with a bot process reporting A, the resolution answers A and chooseNow still runs a pass and a read of its own', async () => {
     setWebuiDataStoreUrl({ url: A });
-    expect(resolveWebuiDatabase()).toEqual({ entry: A });
+    expect(resolveWebuiDatabase()).toEqual({ entry: A, tag: null });
     expect(fake.probes).toBe(0);
     const { resolution, countAtStart } = await chooseNow();
     expect(fake.probes).toBe(1);
     expect(fake.ownReads).toBe(1);
-    expect(resolution).toEqual({ entry: A });
+    expect(resolution).toEqual({ entry: A, tag: '1:M' });
     expect(countAtStart).toBe(webuiReportCount());
   });
 
@@ -275,7 +275,7 @@ describe('decision 17: chooseNow()', () => {
 
   it('its result becomes the last result of the own choice', async () => {
     await chooseNow();
-    expect(resolveWebuiDatabase()).toEqual({ entry: A });
+    expect(resolveWebuiDatabase()).toEqual({ entry: A, tag: '1:M' });
   });
 
   it('D6: a PUT-era own result for A is dropped at each change of case, so after the bot ends no read gets A', async () => {
@@ -286,7 +286,7 @@ describe('decision 17: chooseNow()', () => {
     fake.probeMs = 100;
     setWebuiDataStoreUrl(null);
     expect(resolveWebuiDatabase()).toEqual({ refusal: 'choosing the main database' });
-    expect(await settledOwnChoice()).toEqual({ entry: W });
+    expect(await settledOwnChoice()).toEqual({ entry: W, tag: '2:N' });
     noteWebuiChild('started');
     noteWebuiChild('gone');
     expect(resolveWebuiDatabase()).toEqual({ refusal: 'choosing the main database' });
@@ -321,7 +321,7 @@ describe('G8: the pools and the holder check', () => {
     setWebuiDataStoreUrl({ url: null, choosing: true, reason: 'R' });
     expect(resolveWebuiDatabase()).toEqual({ refusal: 'R' });
     setWebuiDataStoreUrl({ url: A, held: true, reason: 'R' });
-    expect(resolveWebuiDatabase()).toEqual({ entry: A, held: { reason: 'R' } });
+    expect(resolveWebuiDatabase()).toEqual({ entry: A, tag: null, held: { reason: 'R' } });
   });
 
   it('(3) the request pool for a verify-full IP entry has ssl.host and no connectionString', () => {

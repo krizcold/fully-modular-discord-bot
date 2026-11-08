@@ -214,7 +214,8 @@ describe('a save that meets a stop or an unreadable file between the check and t
     const dummy = provider();
     const answer = purchase(dummy);
     dummy.markStopped('stopping');
-    await answer;
+    // NB6 decision 71 (sheet 3145): the save refused at the accept throws T20 with the accept's cause words.
+    await expect(answer).rejects.toThrow('The Dummy provider did not save this change (node-stopping), so nothing was changed at the provider.');
     await settleQueue();
     expect(rawOf(DUMMY_STATE)).toBeNull();
   });
@@ -225,7 +226,8 @@ describe('a save that meets a stop or an unreadable file between the check and t
     writeState('5');
     dummy.invalidate();
     expect(dummy.cannotReadText()).not.toBeNull();
-    await answer;
+    // NB6 decision 71 (sheet 3145): the save refused at the accept throws T20 with the accept's cause words.
+    await expect(answer).rejects.toThrow('The Dummy provider did not save this change (io), so nothing was changed at the provider.');
     await settleQueue();
     expect(rawOf(DUMMY_STATE)).toBe('5');
   });

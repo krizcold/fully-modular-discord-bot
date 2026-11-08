@@ -7,12 +7,13 @@ import { AsyncLocalStorage } from 'async_hooks';
 import type { Client } from 'discord.js';
 import { fileTicketState, type FileTicket } from './fileBackend';
 import { saveMark, type SaveMark } from './scopeRecord';
+import type { RowTicket } from '../sharedStore';
 import type { DataUnavailableCause, WsTicket } from './workingSet';
 
 export type LedgerKind = 'interaction' | 'panel' | 'console' | 'message';
-export type LedgerTicket = WsTicket | FileTicket;
+export type LedgerTicket = WsTicket | FileTicket | RowTicket;
 /** Why a write was refused: the facade's own refusals, or the cause of a DataBackendUnavailableError. */
-export type LedgerCause = 'frozen' | 'not-ready' | 'io' | 'writer-lost' | 'unstorable' | DataUnavailableCause;
+export type LedgerCause = 'frozen' | 'not-ready' | 'io' | 'writer-lost' | 'unstorable' | 'changed-elsewhere' | DataUnavailableCause;
 
 /** An interaction token's life; no reply can be sent after it. */
 export const INTERACTION_LEDGER_LIFE_MS = 15 * 60 * 1000;
@@ -75,16 +76,17 @@ export class WriteLedger {
   noteTicket(ticket: LedgerTicket, module: string, rewrites?: string): void {
     if (this.sealed) return;
     if (rewrites !== undefined) this.rewritten.set(rewrites, ++docSeq);
-    const key = ticket.kind === 'file' ? ticket.record : ticket.set;
-    const target = ticket.kind === 'file' ? `file:${ticket.path}` : `ws:${ticket.guildId}`;
+    const key = ledgerKeyOf(ticket);
+    const target = ticket.kind === 'file' ? `file:${ticket.path}` : ticket.kind === 'row' ? `row:${ticket.key}` : `ws:${ticket.guildId}`;
     const entry = this.entries.get(key);
     if (entry) {
       entry.earlier = entry.earlier.filter(earlier => !landed(earlier));
       if (ticket.seq > entry.ticket.seq) {
+        // A row op's writes all settle together, so a later write of the same op stands for the earlier one.
         if (landed(entry.ticket)) this.droppedLanded = true;
-        else entry.earlier.push(entry.ticket);
+        else if (ticket.kind !== 'row') entry.earlier.push(entry.ticket);
         entry.ticket = ticket;
-      } else if (ticket.seq < entry.ticket.seq && !landed(ticket) && !entry.earlier.some(earlier => earlier.seq === ticket.seq)) {
+      } else if (ticket.kind !== 'row' && ticket.seq < entry.ticket.seq && !landed(ticket) && !entry.earlier.some(earlier => earlier.seq === ticket.seq)) {
         // D8: a lower ticket recorded late (a redelivery's queued line) is not covered by the higher one.
         entry.earlier.push(ticket);
       }
@@ -139,11 +141,11 @@ export class WriteLedger {
     return [...this.refused].map(([cause, { modules }]) => ({ cause, modules: [...modules].sort() }));
   }
 
-  /** Marks every refusal of this document as one its writer keeps and retries (never one of the stop, a deposition or content no store takes). */
+  /** Marks every refusal of this document as one its writer keeps and retries (never one of the stop, a deposition, content no store takes or another machine's change). */
   noteRetried(doc: string): void {
     if (this.sealed) return;
     for (const [cause, { docs }] of this.refused) {
-      if (docs.has(doc) && cause !== 'node-stopping' && cause !== 'writer-lost' && cause !== 'unstorable') this.retried.add(`${cause}|${doc}`);
+      if (docs.has(doc) && cause !== 'node-stopping' && cause !== 'writer-lost' && cause !== 'unstorable' && cause !== 'changed-elsewhere') this.retried.add(`${cause}|${doc}`);
     }
   }
 
@@ -169,7 +171,15 @@ export class WriteLedger {
 }
 
 export function landed(ticket: LedgerTicket): boolean {
-  return ticket.kind === 'file' ? fileTicketState(ticket) === 'landed' : ticket.set.landedSeq >= ticket.seq;
+  if (ticket.kind === 'file') return fileTicketState(ticket) === 'landed';
+  // A row op is stored once it reaches 'mirror' (its mirror write may still be pending), as rowTicketState answers.
+  if (ticket.kind === 'row') return ticket.op.state === 'mirror' || ticket.op.state === 'landed';
+  return ticket.set.landedSeq >= ticket.seq;
+}
+
+/** The object a ticket's entry is kept under: a file's landing record, a guild's working set, or a row op. */
+export function ledgerKeyOf(ticket: LedgerTicket): object {
+  return ticket.kind === 'file' ? ticket.record : ticket.kind === 'row' ? ticket.op : ticket.set;
 }
 
 /** An op's own writes, which its reply carries to the web UI's local chain (never over IPC). */

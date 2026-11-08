@@ -16,7 +16,9 @@ import {
   deleteDataOutcome,
   saveData,
   saveDataOutcome,
+  setGuildDataBackend,
 } from '../../src/bot/internalSetup/utils/dataManager';
+import { dataPath } from '../../src/utils/dataRoot';
 import { freezeGuildWrites, unfreezeGuildWrites } from '../helpers/freezeGuild';
 import { readSourceText } from '../helpers/sourceText';
 import {
@@ -29,6 +31,8 @@ import { ACK_MS, answerWrites, installReplyGate, truthText } from '../../src/bot
 import { IngestService } from '../../src/bot/internalSetup/ingest/ingestService';
 import { getWorkingSet } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
 import { tokenFor } from '../helpers/fakeStore';
+import { scriptedBackend } from '../helpers/scriptedPg';
+import { sharedRows } from '../helpers/sharedRows';
 
 // BT-3, the interaction reply gate (notes/BT.md, "BT-3 design sheet (L0)"). A response method on a real interaction
 // sends the module's payload only once every write in the union of its ledgers has landed and none was refused;
@@ -1588,12 +1592,23 @@ describe('the answer over several writes', () => {
     const { store, options } = await storeGuild();
     store.mode = 'unavailable';
     const global = { scope: 'global' as const, category: 'rg-in-full' };
-    await emit(rawCommand('c18'), async i => {
-      saveData('f.json', global, { v: 1 });
-      saveData('x.json', options, { v: 1 });
-      await i.reply({ content: 'Saved!' });
-    });
-    expect(wire.map(textOf)).toEqual([truthText('held', true)]);
+    // NB6: on a Postgres bot the global save is a row op, which lands once the flush stores it in the shared tables.
+    const rows = sharedRows();
+    const rowRig = scriptedBackend(rows.answer);
+    setGuildDataBackend(rowRig.backend);
+    try {
+      await emit(rawCommand('c18'), async i => {
+        saveData('f.json', global, { v: 1 });
+        saveData('x.json', options, { v: 1 });
+        await i.reply({ content: 'Saved!' });
+      });
+      expect(rows.docs.get('global/rg-in-full/f.json')?.body.toString('utf8')).toBe(JSON.stringify({ v: 1 }, null, 2));
+      expect(wire.map(textOf)).toEqual([truthText('held', true)]);
+    } finally {
+      setGuildDataBackend(null);
+      await rowRig.backend.stop();
+      fs.rmSync(dataPath('global', 'rg-in-full'), { recursive: true, force: true });
+    }
   });
 
   it('the worst refusal names the text', async () => {

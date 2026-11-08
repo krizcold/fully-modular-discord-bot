@@ -21,11 +21,25 @@ import { PanelOptions, PanelContext, PanelResponse } from '../../types/panelType
 import { discoverConfigFiles, ConfigFileMetadata } from '../utils/configDiscovery';
 import { loadGlobalConfig, saveGlobalConfig, getMergedConfig } from '../utils/configManager';
 import { deleteRawAtomic } from '../utils/dataManager';
+import { mirrorPathOf, ROOT_CONFIG_KEY } from '../utils/sharedStore';
+import { EDITOR_BASE_GONE_TEXT, editorSaveOptions, noteEditorBase } from '../utils/panel/editorBase';
 import * as fs from 'fs';
 import { createV2Response, V2Colors } from '../utils/panel/v2';
 import { validateAndSanitizeJson } from '../utils/json';
 
 const ITEMS_PER_PAGE = 8;
+const PANEL_ID = 'config_editor_global';
+
+/** The file a save of fileId writes: the root config's own path, else the discovered file's. */
+function configFilePath(fileId: string, metadata: ConfigFileMetadata | undefined): string | undefined {
+  return fileId === 'config.json' ? mirrorPathOf(ROOT_CONFIG_KEY) : metadata?.path;
+}
+
+/** The options a save or reset of fileId takes (NB6 decision 50); null when the editor's base is gone (T14). */
+function saveOptions(context: PanelContext, fileId: string, metadata: ConfigFileMetadata | undefined): { baseSha?: string } | null {
+  const file = configFilePath(fileId, metadata);
+  return file === undefined ? {} : editorSaveOptions(context.userId, PANEL_ID, file);
+}
 
 interface PanelData {
   selectedFile?: string;
@@ -142,8 +156,10 @@ const configEditorGlobalPanel: PanelOptions = {
       const metadata = configFiles.find(f => f.id === fileId);
 
       if (metadata?.path) {
+        const options = saveOptions(context, fileId, metadata);
+        if (!options) return showError(EDITOR_BASE_GONE_TEXT);
         try {
-          resetGlobalFile(metadata.path);
+          resetGlobalFile(metadata.path, options);
         } catch (error) {
           return showError(`Reset failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
         }
@@ -203,10 +219,12 @@ const configEditorGlobalPanel: PanelOptions = {
           overridesOnly = parsedConfig;
         }
 
+        const options = saveOptions(context, fileId, metadata);
+        if (!options) return showError(EDITOR_BASE_GONE_TEXT);
         if (Object.keys(overridesOnly).length === 0 && metadata?.path) {
-          resetGlobalFile(metadata.path);
+          resetGlobalFile(metadata.path, options);
         } else {
-          saveGlobalConfig(fileId, overridesOnly);
+          saveGlobalConfig(fileId, overridesOnly, options);
         }
 
         const updatedConfig = loadGlobalConfig(fileId);
@@ -241,11 +259,13 @@ const configEditorGlobalPanel: PanelOptions = {
       overridesOnly = parsedConfig;
     }
 
+    const options = saveOptions(context, fileId, metadata);
+    if (!options) return showError(EDITOR_BASE_GONE_TEXT);
     try {
       if (Object.keys(overridesOnly).length === 0 && metadata?.path) {
-        resetGlobalFile(metadata.path);
+        resetGlobalFile(metadata.path, options);
       } else {
-        saveGlobalConfig(fileId, overridesOnly);
+        saveGlobalConfig(fileId, overridesOnly, options);
       }
     } catch (error) {
       return showError(`Save failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
@@ -375,6 +395,8 @@ async function showConfigView(
   metadata: any
 ): Promise<PanelResponse> {
   const mergedConfig = getMergedConfig(fileId);
+  const viewed = configFilePath(fileId, metadata);
+  if (viewed !== undefined) noteEditorBase(context.userId, PANEL_ID, viewed);
   const setCount = Object.keys(configData).length;
   const totalKeys = Object.keys(mergedConfig.properties).length;
 
@@ -475,6 +497,8 @@ async function showEditModal(context: PanelContext, fileId: string): Promise<Pan
   if (formattedJson.length > MODAL_VALUE_LIMIT) {
     return showError(`This config is too large to edit here (${formattedJson.length} characters, the limit is ${MODAL_VALUE_LIMIT}); use Download and Upload JSON instead.`);
   }
+  const shown = configFilePath(fileId, metadata);
+  if (shown !== undefined) noteEditorBase(context.userId, PANEL_ID, shown);
 
   const modal = new ModalBuilder()
     .setCustomId(`panel_config_editor_global_modal_edit_${fileId}`)
@@ -576,8 +600,8 @@ async function showUploadModal(context: PanelContext, fileId: string): Promise<P
   return { modal: modal } as any;
 }
 
-function resetGlobalFile(filePath: string): void {
-  if (!deleteRawAtomic(filePath) && fs.existsSync(filePath)) throw new Error('the reset was not saved because disk writes are failing');
+function resetGlobalFile(filePath: string, options: { baseSha?: string } = {}): void {
+  if (!deleteRawAtomic(filePath, options) && fs.existsSync(filePath)) throw new Error('the reset was not saved because disk writes are failing');
 }
 
 export default configEditorGlobalPanel;

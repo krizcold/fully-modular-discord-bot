@@ -60,11 +60,11 @@ function spySave(pm: ReturnType<typeof getPremiumManager>, inner?: (file: string
     return inner?.(file);
   };
   const real = (pm as any).save.bind(pm);
-  (pm as any).save = () => {
+  (pm as any).save = (opts?: unknown) => {
     wrote = undefined;
-    const answer = real();
-    answers.push({ answer, wrote });
-    return answer;
+    const op = real(opts);
+    answers.push({ answer: op !== null, wrote });
+    return op;
   };
   return answers;
 }

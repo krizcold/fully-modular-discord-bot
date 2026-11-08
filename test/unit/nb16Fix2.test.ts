@@ -86,8 +86,8 @@ describe('ruling 1: the scratch and the privilege checks need no seed row', () =
       'INSERT INTO smdb_data.reshard (id) VALUES (1) ON CONFLICT (id) DO NOTHING',
     ]);
     expect(provisionSchemaDdl('smdb_data')).toEqual(all.filter(s => !seeds.includes(s)));
-    expect(provisionSchemaDdl('smdb_data')).toHaveLength(20);
-    expect(all).toHaveLength(22);
+    expect(provisionSchemaDdl('smdb_data')).toHaveLength(28);
+    expect(all).toHaveLength(30);
     expect(provisionSchemaDdl('smdb_data').some(s => /^\s*INSERT/i.test(s))).toBe(false);
   });
 
@@ -96,7 +96,7 @@ describe('ruling 1: the scratch and the privilege checks need no seed row', () =
     await checkShape({ query: async (text: string) => { sent.push(text); return { rows: [] }; } }, 'provisioned');
     expect(sent.filter(s => /^\s*INSERT/i.test(s))).toEqual([]);
     const ddl = sent.filter(s => /^CREATE /.test(s));
-    expect(ddl).toHaveLength(20 + 64);
+    expect(ddl).toHaveLength(28 + 64);
     expect(sent.filter(s => /smdb_shape_\w+\.claim_clock \(/.test(s))).toHaveLength(1);
   });
 

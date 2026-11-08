@@ -14,7 +14,7 @@ import { dataPath } from '../../../../utils/dataRoot';
 import * as fs from 'fs';
 import { componentConfigPath, getLastAppliedDisabledCommands, readConfigFile, setLastAppliedDisabledCommands } from '../../utils/appStoreConfigFile';
 import { resolveClientApplication } from '../../utils/clientApplication';
-import { getLoadFailures, getReloadState } from '../../utils/loadFailures';
+import { getHeldBack, getLoadFailures, getReloadState } from '../../utils/loadFailures';
 
 /** Check if auto-cleanup is enabled in AppStore config (default: false) */
 export function isAutoCleanupEnabled(): boolean {
@@ -392,13 +392,26 @@ export default async function registerCommands(
     }
     if (cleanupEnabled) {
       const recorded = getLoadFailures();
-      const absent = recorded.length === 0 ? await installedButAbsent() : [];
+      const held = getHeldBack();
+      const absent = recorded.length === 0 && held.length === 0 ? await installedButAbsent() : [];
       // Listing the modules can record a module.json it could not read.
       const recordedNow = getLoadFailures();
-      if (recordedNow.length > 0) {
+      const failed = recordedNow.join(', ');
+      const heldList = held.join(', ');
+      if (recordedNow.length > 0 && held.length > 0) {
         skipSweep(
-          `orphan sweep skipped until the bot restarts: these modules did not load, lack a dependency or could not be read: ${recordedNow.join(', ')}`,
-          `Did not load, lack a dependency or could not be read: ${recordedNow.join(', ')}`
+          `orphan sweep skipped: these modules did not load, lack a dependency or could not be read (until the bot restarts): ${failed}; these are held back on this machine until they are updated, or uninstalled and installed again: ${heldList}`,
+          `Did not load, lack a dependency or could not be read: ${failed} Held back until updated, or uninstalled and installed again: ${heldList}`
+        );
+      } else if (held.length > 0) {
+        skipSweep(
+          `orphan sweep skipped: these modules are held back on this machine until they are updated, or uninstalled and installed again: ${heldList}`,
+          `Held back on this machine until updated, or uninstalled and installed again: ${heldList}`
+        );
+      } else if (recordedNow.length > 0) {
+        skipSweep(
+          `orphan sweep skipped until the bot restarts: these modules did not load, lack a dependency or could not be read: ${failed}`,
+          `Did not load, lack a dependency or could not be read: ${failed}`
         );
       } else if (absent === null) {
         skipSweep('orphan sweep skipped: the installed module list could not be read', 'The installed module list could not be read.');

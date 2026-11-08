@@ -136,6 +136,33 @@ export function keyRefusal(pathKey: string, kind?: 'save' | 'append'): string | 
   return null;
 }
 
+/**
+ * Rule K and the kind rule on a key below /data/global/ (NB6 decision 18): each part, the whole key as 'global/<rel>'
+ * and, for a write that names one, its kind. null when the key passes.
+ */
+export function globalKeyRefusal(rel: string, kind?: 'save' | 'append'): string | null {
+  const segments = rel.split('/');
+  for (const seg of segments) {
+    const refusal = segmentRefusal(seg);
+    if (refusal) return refusal;
+  }
+  const bytes = Buffer.byteLength(`global/${rel}`, 'utf8');
+  if (bytes > KEY_MAX_BYTES) return `the key is ${bytes} bytes; a key holds at most ${KEY_MAX_BYTES}`;
+  const last = segments[segments.length - 1];
+  if (kind === 'save' && last.endsWith('.jsonl')) return 'a .jsonl file is written by appends only';
+  if (kind === 'append' && !last.endsWith('.jsonl')) return 'an appended file must end in .jsonl';
+  return null;
+}
+
+/** Rule T for a raw text or a line of no guild, as textRefusal; its tables keep bytes, so U+0000 is named without a store's limit (NB6 C12). */
+export function globalTextRefusal(text: unknown, noun: 'line' | 'text' = 'text'): string | null {
+  if (typeof text !== 'string') return `the ${noun} is not a string`;
+  const nul = text.indexOf('\u0000');
+  const other = badCharacter(nul < 0 ? text : text.slice(0, nul));
+  if (other) return other;
+  return nul < 0 ? null : `it holds U+0000 at character ${nul}`;
+}
+
 /** Why a key cannot be placed beside the tree's keys, and the stored key or folder in its way. */
 export interface Collision {
   reason: string;

@@ -15,13 +15,14 @@ import {
 } from './maintenanceGate';
 import { readMaintenanceFile } from '../../../utils/maintenanceFile';
 import { loadCredentials, resolveDataBackend } from '../../../utils/envLoader';
-import { addStopStep, isExitDraining, resaveTarget, saveHeldWrites, stopProcess } from './dataManager';
+import { addStopStep, isExitDraining, resaveTarget, saveHeldWrites, stopProcess, unansweredRowOps, unsavedRowPaths } from './dataManager';
 import { probePass, setStepLayers, stepLayers } from './dataBackends/mainDatabase';
 import { addressListInUse, parseAddressList, showEntry } from '../../../utils/databaseAddress';
 import { heldClauses, type HeldCounts } from './heldWords';
 import { STOPPED_SERVING_TEXT, stoppedServing } from './servingGate';
 import { setupSharedOpsIPC } from './sharedOps';
 import { reportWriterStage } from './writerLock';
+import { countCrash } from './moduleCrashes';
 import { getWorkingSet } from './dataBackends/workingSet';
 import { unsavedFilePaths } from './dataBackends/fileBackend';
 import { isLoginRefused } from './dataBackends/postgresBackend';
@@ -58,10 +59,10 @@ export type MaintenanceMode = 'running' | 'maintenance' | 'login-refused' | 'out
 export type LoginProbe = () => Promise<'accepted' | 'refused' | 'unreachable' | 'none'>;
 export type SaveAnswer =
   | { saved: true }
-  | { saved: null; unansweredGuilds: number; unconfirmedFiles: number }
+  | { saved: null; unansweredGuilds: number; unconfirmedFiles: number; unansweredFiles?: number }
   | ({ saved: false } & HeldCounts);
 export type DatabaseAnswer = 'answers' | 'refused' | 'unreachable';
-type Held = { unsavedGuilds: number; unsavedFiles: number; unansweredGuilds: number; resaveGuilds?: number };
+type Held = { unsavedGuilds: number; unsavedFiles: number; unansweredGuilds: number; resaveGuilds?: number; unansweredFiles?: number };
 
 let clientRef: Client | null = null;
 let mode: MaintenanceMode = 'running';
@@ -190,6 +191,7 @@ export function guardUncaught(error: unknown): void {
   // The exit drain's own handler logs it and lets the drain finish.
   if (isExitDraining()) return;
   console.error('[Error] Uncaught exception; the bot process exits:', error);
+  countCrash(error);
   process.exit(1);
 }
 
@@ -289,13 +291,14 @@ export async function enterMaintenance(message: string, opts: { handlerWaitMs?: 
   if (handlersInFlight() > 0) console.warn(`[Maintenance] ${handlersInFlight()} handler(s) still run; any write they make from now on is refused`);
   const left = await saveHeldWrites(opts.saveBoundMs ?? ENTER_BOUNDS.saveBoundMs);
   const resave = left.resaveGuilds ?? 0;
-  if (left.unsavedGuilds === 0 && left.unsavedFiles === 0 && left.unansweredGuilds === 0 && left.unconfirmedFiles === 0 && resave === 0) {
+  const unansweredFiles = left.unansweredFiles ?? 0;
+  if (left.unsavedGuilds === 0 && left.unsavedFiles === 0 && left.unansweredGuilds === 0 && unansweredFiles === 0 && left.unconfirmedFiles === 0 && resave === 0) {
     console.log('[Maintenance] Every change this process held is saved');
     return { saved: true };
   }
   if (left.unsavedGuilds === 0 && left.unsavedFiles === 0 && resave === 0) {
     console.warn(`[Maintenance] ${heldClauses(left)}; can't confirm whether every change this process held is saved`);
-    return { saved: null, unansweredGuilds: left.unansweredGuilds, unconfirmedFiles: left.unconfirmedFiles };
+    return { saved: null, unansweredGuilds: left.unansweredGuilds, unconfirmedFiles: left.unconfirmedFiles, ...(unansweredFiles > 0 ? { unansweredFiles } : {}) };
   }
   console.warn(`[Maintenance] ${heldClauses(left)}`);
   return { saved: false, ...left };
@@ -305,7 +308,7 @@ export async function enterMaintenance(message: string, opts: { handlerWaitMs?: 
  * The answer for an IPC request while the gate is closed, or null to let its handler run. Requests that run module
  * code or write data are refused with the message; in maintenance mode every request is refused.
  */
-const MODULE_CODE_REQUESTS = new Set(['command:invoke', 'module:reload', 'module:reload-all', 'module:load', 'module:unload', 'component:toggle']);
+const MODULE_CODE_REQUESTS = new Set(['command:invoke', 'module:reload', 'module:reload-all', 'module:load', 'module:unload', 'module:apply', 'component:toggle']);
 
 export function maintenanceIpcRefusal(type: string): object | null {
   if ((MODULE_CODE_REQUESTS.has(type) || type.startsWith('panel:')) && stoppedServing()) return { success: false, error: STOPPED_SERVING_TEXT };
@@ -449,7 +452,7 @@ export function maintenanceUnfit(): string | null {
 function heldNames(unansweredOnly: string[]): string {
   const guilds = (getWorkingSet()?.heldGuilds() ?? []).filter(g => !unansweredOnly.includes(g.guildId))
     .map(g => `guild ${g.guildId} (${g.reason ?? 'no save tried yet'})`);
-  const files = unsavedFilePaths().map(file => `file ${file}`);
+  const files = [...unsavedFilePaths(), ...unsavedRowPaths()].map(file => `file ${file}`);
   return [...guilds, ...files].join('; ');
 }
 
@@ -458,7 +461,7 @@ function heldNames(unansweredOnly: string[]): string {
  * and none holds a save the database did not answer, which may have landed.
  */
 export function heldForContent(): boolean {
-  if ((getWorkingSet()?.unansweredGuilds().all.length ?? 0) > 0) return false;
+  if ((getWorkingSet()?.unansweredGuilds().all.length ?? 0) > 0 || unansweredRowOps() > 0) return false;
   const guilds = getWorkingSet()?.heldGuilds() ?? [];
   return guilds.length > 0 && guilds.every(g => g.code !== null && /^(22|23|54)/.test(g.code));
 }
@@ -512,7 +515,8 @@ export function startLeave(reason: string, handOver?: { attempt: string | null }
       if (own !== generation) return;
       // Appended lines the disk did not confirm are in their files: waiting cannot confirm them, so they never hold the leave.
       const resave = left.resaveGuilds ?? 0;
-      if (left.unsavedGuilds === 0 && left.unsavedFiles === 0 && left.unansweredGuilds === 0 && resave === 0) {
+      const unansweredFiles = left.unansweredFiles ?? 0;
+      if (left.unsavedGuilds === 0 && left.unsavedFiles === 0 && left.unansweredGuilds === 0 && unansweredFiles === 0 && resave === 0) {
         restart();
         return;
       }
@@ -523,7 +527,10 @@ export function startLeave(reason: string, handOver?: { attempt: string | null }
       if (answeredPasses >= timing.heldAfterPasses) {
         const only = getWorkingSet()?.unansweredGuilds().only ?? [];
         const names = heldNames(only);
-        const held: Held = { unsavedGuilds: left.unsavedGuilds, unsavedFiles: left.unsavedFiles, unansweredGuilds: left.unansweredGuilds, ...(resave > 0 ? { resaveGuilds: resave } : {}) };
+        const held: Held = {
+          unsavedGuilds: left.unsavedGuilds, unsavedFiles: left.unsavedFiles, unansweredGuilds: left.unansweredGuilds,
+          ...(resave > 0 ? { resaveGuilds: resave } : {}), ...(unansweredFiles > 0 ? { unansweredFiles } : {}),
+        };
         if (refusedPasses >= timing.heldAfterPasses && resave === 0) {
           console.error(`[Maintenance] ${refusedPasses} saves in a row left changes the database refuses for their content: ${names}; ${end === 'hand-over'
             ? 'the bot process stops for the hand-over, which drops these changes'
@@ -537,17 +544,20 @@ export function startLeave(reason: string, handOver?: { attempt: string | null }
         }
         const forContent = refusedPasses > 0;
         const resaveIds = getWorkingSet()?.resaveGuilds() ?? [];
-        const key = `${left.unsavedGuilds}/${left.unsavedFiles}/${left.unansweredGuilds}/${names}/${only.join(',')}/${forContent}/${resaveIds.join(',')}`;
+        const key = `${left.unsavedGuilds}/${left.unsavedFiles}/${left.unansweredGuilds}/${unansweredFiles}/${names}/${only.join(',')}/${forContent}/${resaveIds.join(',')}`;
         if (key !== heldKey) {
           heldKey = key;
           const onlyWords = `guild(s) ${only.join(', ')}`;
-          const resaveWords = `${resaveIds.length} guild(s) ${names || only.length > 0 ? 'wait' : 'waiting'} to be re-saved on ${resaveTarget()}: ${resaveIds.join(', ')}; this process holds their newest state`;
-          const saveHead = names
+          const resaveWords = `${resaveIds.length} guild(s) ${names || only.length > 0 || unansweredFiles > 0 ? 'wait' : 'waiting'} to be re-saved on ${resaveTarget()}: ${resaveIds.join(', ')}; this process holds their newest state`;
+          const guildHead = names
             ? `${answeredPasses} saves in a row left changes unsaved: ${names}${only.length > 0 ? `; ${onlyWords} hold only a save the database did not answer, which may have landed` : ''}`
             : only.length > 0 ? `${answeredPasses} saves in a row left ${onlyWords} holding only a save the database did not answer, which may have landed` : '';
+          const saveHead = unansweredFiles === 0 ? guildHead
+            : guildHead ? `${guildHead}; ${heldClauses({ unansweredFiles })}`
+              : `${answeredPasses} saves in a row left ${unansweredFiles} file(s) holding a save the database did not answer, which may have landed`;
           const head = resaveIds.length === 0 ? saveHead
             : saveHead ? `${saveHead}; ${resaveWords}` : `${answeredPasses} saves in a row left ${resaveWords}`;
-          const unanswered = left.unansweredGuilds > 0;
+          const unanswered = left.unansweredGuilds > 0 || unansweredFiles > 0;
           const drops = unanswered ? 'which drops every change not stored' : 'which drops them';
           const saved = unanswered ? 'they are saved or found stored' : 'they are saved';
           const earlier = askedEarlier ? `; a restart this process asked for earlier may still stop it, ${drops}` : '';

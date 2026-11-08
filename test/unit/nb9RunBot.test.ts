@@ -59,7 +59,7 @@ vi.mock('../../src/bot/internalSetup/utils/premiumManager', async orig => ({ ...
 vi.mock('../../src/bot/internalSetup/utils/moduleAutoUpdater', () => ({ startModuleAutoUpdater: () => undefined }));
 vi.mock('../../src/bot/internalSetup/utils/moduleLoader', () => ({ ModuleLoader: class { async loadAllModules() { return []; } } }));
 vi.mock('../../src/bot/internalSetup/utils/moduleRegistry', () => ({
-  getModuleRegistry: () => ({ setClient: () => undefined, getStats: () => ({ total: 0, byCategory: {} }) }),
+  getModuleRegistry: () => ({ setClient: () => undefined, getStats: () => ({ total: 0, byCategory: {} }), getAllModules: () => [] }),
 }));
 vi.mock('../../src/bot/internalSetup/utils/configManager', async orig => ({ ...(await orig<any>()), ensureConfigPopulated: () => undefined }));
 vi.mock('../../src/bot/internalSetup/utils/dataBackends/boot', async orig => ({

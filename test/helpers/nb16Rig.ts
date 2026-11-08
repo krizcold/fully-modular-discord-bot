@@ -139,7 +139,7 @@ export async function catalogSnapshot(q: Queryable): Promise<Record<string, unkn
 }
 
 // G12 leaves out a sequence value only nextval moves; claim_seq is also moved by setval.
-const NEXTVAL_ONLY = ['guild_append_seq'];
+const NEXTVAL_ONLY = ['guild_append_seq', 'shared_rev_seq'];
 
 /** Invariant 2: last_value and is_called of every sequence of smdb_data but those only nextval moves. */
 export async function sequenceValues(q: Queryable): Promise<Record<string, unknown>> {

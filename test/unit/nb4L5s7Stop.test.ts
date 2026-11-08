@@ -114,7 +114,7 @@ vi.mock('../../src/bot/internalSetup/utils/moduleRegistry', () => ({
 vi.mock('../../src/bot/internalSetup/utils/moduleEventManager', () => ({
   getModuleEventManager: () => ({ setClient: () => undefined, registerListener: () => undefined, getListenerCount: () => 0 }),
 }));
-vi.mock('../../src/bot/internalSetup/utils/configManager', () => ({ ensureConfigPopulated: () => undefined }));
+vi.mock('../../src/bot/internalSetup/utils/configManager', () => ({ ensureConfigPopulated: () => undefined, getConfigProperty: () => undefined }));
 vi.mock('../../src/bot/internalSetup/utils/maintenance', () => ({
   decideBoot: async () => ({ mode: 'normal' }),
   installMaintenanceGate: () => undefined,

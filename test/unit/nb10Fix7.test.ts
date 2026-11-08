@@ -244,7 +244,10 @@ describe('due migrations are read again before each one, and a stop ends the run
 });
 
 describe('a partial answer names what was saved and asks for a reload (ruling)', () => {
-  it('a grant stopped during the pause names premium-tiers.json and asks for no retry', async () => {
+  // NB6 decision 63 (sheet 2606-2608): the grant's line and notice go out with the save before the pause, so the stop
+  // during the pause leaves nothing unsaved and the op answers ok (NB10 answered partial, its grant line written after
+  // the pause). The partial texts stay pinned by the next row.
+  it('a grant stopped during the pause answers ok: its save before the pause stored the grant and both lines', async () => {
     writePremium({ [G]: { active: paidSub('sA', 'pA', 'low', 'patreon'), paused: [] } });
     const pause = gate();
     getPaymentRegistry().register({
@@ -259,11 +262,11 @@ describe('a partial answer names what was saved and asks for a reload (ruling)',
     pause.open();
     const reply: any = await answer;
     (getPremiumManager() as any).stopped = null;
-    expect(reply).toMatchObject({ ok: false, partial: true, answer: 'node-stopping' });
-    expect(reply.error).toContain('The bot is restarting, so your change was not saved in full.');
-    expect(reply.error).toMatch(/What was saved: [^.]*premium-tiers\.json/);
-    expect(reply.error).toContain('Reload to see it before you try again: trying again could apply the saved part twice.');
-    expect(reply.error).not.toContain('Please try again');
+    expect(reply).toMatchObject({ ok: true, result: true });
+    expect(reply.error).toBeUndefined();
+    await settleQueue();
+    expect(jsonOf(PREMIUM).subscriptions[G].active.source).toBe('manual');
+    expect(linesOf(AUDIT).map(l => l.action)).toEqual(['subscription.grant.manual', 'subscription.pause']);
   });
 
   it('ends every partial answer with the reload sentence, held, pending and unavailable included (NB10-R10-T3)', () => {

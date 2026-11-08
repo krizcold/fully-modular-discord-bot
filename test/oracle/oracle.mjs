@@ -7,6 +7,7 @@
  *            answer logged as ACKED, HELD, REFUSED or UNKNOWN
  *   read     the run's docs through one node's app read path (a copy)
  *   fleet    the control facts the checker needs, from one node
+ *   mirror   one machine's mirror files of the run's shared files (a copy)
  *   cleanup  deletes the run's docs once the checker has judged them
  * Node 18+, node: imports only, so it runs from a checkout or piped into any
  * node image on a host. check.mjs judges the logs and copies.
@@ -44,6 +45,67 @@ export const hotKey = (/** @type {string} */ run, /** @type {number} */ k) => `$
 export const fileId = (/** @type {string} */ key) => `${MODULE}/${key}`;
 // Hot docs test ordering, not payload size; unique docs carry the large payloads.
 const HOT_MAX_SIZE = 256;
+
+/**
+ * A shared file the writer may name (NB6): a .json file under /data/global as the operator route names it, a module
+ * folder and a file name, so the id goes into a path and a SQL literal unchanged.
+ */
+export const SHARED_ID = /^(?:[A-Za-z0-9_-][A-Za-z0-9_.-]*\/)?[A-Za-z0-9_-][A-Za-z0-9_.-]*\.json$/;
+/** The shared_docs key of a shared file id. @param {string} id */
+export const sharedKey = id => `global/${id}`;
+
+/**
+ * The run's shared file ids: those the start lines name and those the logs sent.
+ * @param {any[][]} logs
+ */
+export function sharedIdsOf(logs) {
+  /** @type {Set<string>} */
+  const ids = new Set();
+  for (const events of logs) {
+    for (const e of events) {
+      if (e.t === 'start' && Array.isArray(e.settings?.shared)) for (const id of e.settings.shared) ids.add(String(id));
+      if (e.t === 'shared-send') ids.add(String(e.key));
+    }
+  }
+  for (const id of ids) if (!SHARED_ID.test(id)) throw new Error(`the logs name a shared file id that is not one: ${id}`);
+  return [...ids].sort();
+}
+
+/**
+ * The database listing of the run's shared files, one {"k": id, "b": body in base64} line per shared_docs row under
+ * `psql -At`: the input check.mjs takes as --shared-db. The body goes as base64, so a pipe that decodes text chunk by
+ * chunk cannot split a character.
+ * @param {string[]} ids
+ */
+export function sharedDumpSql(ids) {
+  if (ids.length === 0) throw new Error('the logs name no shared file');
+  for (const id of ids) if (!SHARED_ID.test(id)) throw new Error(`${id} is not a shared file id`);
+  const keys = ids.map(id => `'${sharedKey(id)}'`).join(', ');
+  return `SELECT json_build_object('k', substr(key, 8), 'b', encode(body, 'base64')) FROM smdb_data.shared_docs WHERE key IN (${keys}) ORDER BY key`;
+}
+
+/**
+ * The state of one machine's mirror file of a shared file: absent, present with its content's hash (a body that is not
+ * JSON is a version no writer made), or an error.
+ * @param {string} file
+ * @returns {DocState}
+ */
+export function mirrorState(file) {
+  /** @type {Buffer} */
+  let bytes;
+  try {
+    bytes = fs.readFileSync(file);
+  } catch (error) {
+    const code = /** @type {{ code?: string }} */ (error).code;
+    if (code === 'ENOENT') return { s: 'absent' };
+    return { s: 'error', err: errText(error) };
+  }
+  try {
+    return presentState(JSON.parse(bytes.toString('utf8')));
+  } catch {
+    return { s: 'present', h: `unparseable:${createHash('sha256').update(bytes).digest('hex')}` };
+  }
+}
 
 /**
  * The database listing of one run, one {"k": filename, "d": doc} line per
@@ -136,8 +198,13 @@ const DEFINITE_REFUSALS = [
   'delete not accepted',
   'guild data is not ready',
   'Data file not found',
-  // NB7 invariant 2: a request-route answer holding it is a change no process applied.
+  // NB7 invariant 2: a request-route answer holding it is a change no process applied. It also holds NB6's
+  // "nothing was saved" answers of decisions 13, 16 and 28, given before anything was stored.
   'nothing was',
+  // NB6 decisions 6 and 26 with T22: a shared save the flush refused because another machine stored the file after this one
+  // read it. The period leaves out the "not saved in full" form, which another write of the answer may have applied.
+  'while your change was being saved, so your change was not saved.',
+  'after your change read it, so your change was not saved.',
 ];
 
 /**
@@ -372,15 +439,19 @@ const WRITE_USAGE = `oracle.mjs write --run ID --guild ID --lane NAME=URL [--lan
   [--duration S (1800, 0 = until stopped)] [--rate REQUESTS_PER_S (1.5, per lane, reads included)]
   [--hot N (3)] [--hot-ratio R (0.3)] [--delete-ratio R (0.1)] [--read-every N (5 writes, 0 = never)]
   [--max-size CHARS (8000)] [--max-body BYTES (10000)] [--seed N] [--marks FILE] [--marks-every MS (50)] [--burst X (4)]
-  [--limiter CAPACITY/MS (${LIMITER}) | off] [--timeout MS (20000)] [--log FILE (- = stdout, the default; may repeat)]`;
+  [--limiter CAPACITY/MS (${LIMITER}) | off] [--timeout MS (20000)] [--log FILE (- = stdout, the default; may repeat)]
+  [--shared ID (a global file such as module/file.json; may repeat)] [--shared-ratio R (0.2 with --shared)]`;
 
 /** @param {string[]} argv */
 async function write(argv) {
   const a = parseArgs(argv, {
     run: 'one', guild: 'one', lane: 'many', duration: 'one', rate: 'one', hot: 'one', 'hot-ratio': 'one',
     'delete-ratio': 'one', 'read-every': 'one', 'max-size': 'one', 'max-body': 'one', seed: 'one', marks: 'one',
-    'marks-every': 'one', burst: 'one', limiter: 'one', timeout: 'one', log: 'many',
+    'marks-every': 'one', burst: 'one', limiter: 'one', timeout: 'one', log: 'many', shared: 'many', 'shared-ratio': 'one',
   });
+  for (const id of a.shared) if (!SHARED_ID.test(id)) throw new Error(`--shared ${id}: name a .json file under /data/global as module/file.json or file.json`);
+  /** @type {string[]} */
+  const sharedIds = [...new Set(/** @type {string[]} */ (a.shared))];
   if (!RUN_ID.test(a.run ?? '')) throw new Error('--run must be 1 to 24 of a-z and 0-9');
   checkGuild(a.guild);
   if (a.lane.length === 0) throw new Error('at least one --lane NAME=URL is needed');
@@ -406,8 +477,9 @@ async function write(argv) {
   const timeoutMs = num(a.timeout, 'timeout', 20000);
   const marksEvery = Math.max(1, num(a['marks-every'], 'marks-every', 50));
   const seed = a.seed !== undefined ? Math.floor(num(a.seed, 'seed', 0)) : Math.floor(Math.random() * 2 ** 31);
+  const sharedRatio = sharedIds.length > 0 ? num(a['shared-ratio'], 'shared-ratio', 0.2) : 0;
   if (rate <= 0) throw new Error('--rate must be above 0');
-  if (hotRatio + deleteRatio > 1) throw new Error('--hot-ratio plus --delete-ratio must stay at or under 1');
+  if (hotRatio + deleteRatio + sharedRatio > 1) throw new Error('--hot-ratio, --delete-ratio and --shared-ratio together must stay at or under 1');
   // One bucket per node: lanes that target the same node share its limit.
   /** @type {Map<string, Bucket>} */
   const buckets = new Map();
@@ -441,12 +513,20 @@ async function write(argv) {
   let seq = 0;
   /** @type {string[]} */
   const openWindows = [];
+  /** @type {Record<string, any>} */
   const counts = { ACKED: 0, HELD: 0, REFUSED: 0, UNKNOWN: 0, reads: 0, readErrors: 0 };
+  // The shared writes' own counts: the guild checks count only the guild lines.
+  /** @type {Record<string, number>} */
+  const sharedCounts = { ACKED: 0, HELD: 0, REFUSED: 0, UNKNOWN: 0, reads: 0, readErrors: 0 };
+  if (sharedIds.length > 0) counts.shared = sharedCounts;
 
   const startLine = {
     t: 'start', v: LOG_VERSION, run, guild, module: MODULE, seed, startedAt: new Date().toISOString(),
     lanes: lanes.map((/** @type {{ name: string, base: string }} */ l) => ({ name: l.name, route: 'operator', base: l.base })),
-    settings: { duration, rate, hotCount, hotRatio, deleteRatio, readEvery, maxSize, maxBody, burst, limiter: limiterSpec, timeoutMs, marksEvery },
+    settings: {
+      duration, rate, hotCount, hotRatio, deleteRatio, readEvery, maxSize, maxBody, burst, limiter: limiterSpec, timeoutMs, marksEvery,
+      ...(sharedIds.length > 0 ? { shared: sharedIds, sharedRatio } : {}),
+    },
   };
   writeAll(sink => ({ ...startLine, sink }));
 
@@ -530,11 +610,52 @@ async function write(argv) {
     return state;
   };
 
+  /**
+   * One shared write (NB6): the file is read through the lane's node, and the new content names the hash of what was
+   * read (`prev`) and goes with the read's sha as loadedSha, the base the bot compares before it stores. The checker
+   * follows the chain of `prev` links.
+   * @param {{ name: string, base: string }} lane @param {string} key @param {number} c @param {() => number} rand
+   * @returns {Promise<Answer | 'skipped' | null>} null when stopped, 'skipped' when the read gave no base to build on
+   */
+  const sharedWrite = async (lane, key, c, rand) => {
+    if (!(await ready(lane))) return null;
+    const readId = ++seq;
+    const at0 = clock();
+    const r = await call('GET', `${lane.base}/api/config/data/get?file=${encodeURIComponent(key)}`, undefined, timeoutMs, cut.signal);
+    if (r.status === 429) buckets.get(lane.base)?.empty();
+    const ok = r.status === 200 && r.body && r.body.success === true && typeof r.body.sha === 'string';
+    sharedCounts.reads += 1;
+    if (!ok) {
+      sharedCounts.readErrors += 1;
+      emit({ t: 'shared-read', id: readId, lane: lane.name, key, at0, at1: clock(), s: 'error', err: r.err ?? `${r.status} ${r.body && r.body.error ? String(r.body.error).slice(0, 200) : ''}`.trim() });
+      return 'skipped';
+    }
+    const exists = r.body.exists !== false;
+    const prev = exists ? hashOf(r.body.data) : null;
+    emit({ t: 'shared-read', id: readId, lane: lane.name, key, at0, at1: clock(), s: exists ? 'present' : 'absent', ...(prev ? { h: prev } : {}), sha: r.body.sha });
+    const content = { run, lane: lane.name, kind: 's', key, c, prev, pad: padding(rand, Math.min(maxSize, HOT_MAX_SIZE)) };
+    const bytes = () => Buffer.byteLength(JSON.stringify({ file: key, data: content, loadedSha: r.body.sha }));
+    while (bytes() > maxBody && content.pad.length > 0) content.pad = Array.from(content.pad).slice(0, Math.floor(Array.from(content.pad).length * 0.9)).join('');
+    if (!(await ready(lane))) return null;
+    const id = ++seq;
+    // Logged whole: the checker follows `prev` and a person can put a version back.
+    emit({ t: 'shared-send', id, lane: lane.name, key, c, h: hashOf(content), prev, base: r.body.sha, size: canonical(content).length, content, at: clock() });
+    const w = await call('POST', `${lane.base}/api/config/data/update`, { file: key, data: content, loadedSha: r.body.sha }, timeoutMs, cut.signal);
+    if (w.status === 429) buckets.get(lane.base)?.empty();
+    const answer = classifyAnswer(w.status, w.body);
+    sharedCounts[answer.cls] += 1;
+    const err = w.err ?? (w.body && typeof w.body.error === 'string' ? w.body.error.slice(0, 200) : undefined);
+    emit({ t: 'shared-ans', id, at: clock(), status: w.status, cls: answer.cls, definite: answer.definite, err, date: w.date });
+    return answer;
+  };
+
   /** @param {{ name: string, base: string, index: number }} lane */
   const runLane = async lane => {
     const rand = prng((seed ^ Math.imul(lane.index + 1, 0x9e3779b1)) >>> 0);
     /** @type {Map<string, number>} */
     const hotCounters = new Map();
+    /** @type {Map<string, number>} */
+    const sharedCounters = new Map();
     /** @type {string[]} */
     const deletable = [];
     /** @type {string[]} */
@@ -571,6 +692,12 @@ async function write(argv) {
           const content = fit(key, { run, lane: lane.name, kind: 'h', key, c, pad: padding(rand, Math.min(maxSize, HOT_MAX_SIZE)) });
           if ((await send(lane, { op: 'write', kind: 'h', key, c, content })) === null) break;
           hotCounters.set(key, c);
+        } else if (sharedIds.length > 0 && pick >= deleteRatio + hotRatio && pick < deleteRatio + hotRatio + sharedRatio) {
+          const key = sharedIds[Math.floor(rand() * sharedIds.length)];
+          const c = (sharedCounters.get(key) ?? 0) + 1;
+          const answer = await sharedWrite(lane, key, c, rand);
+          if (answer === null) break;
+          if (answer !== 'skipped') sharedCounters.set(key, c);
         } else {
           const key = uniqueKey(run, lane.name, n + 1);
           const content = fit(key, { run, lane: lane.name, kind: 'u', key, c: n + 1, pad: padding(rand, maxSize) });
@@ -770,6 +897,31 @@ async function fleet(argv) {
   }
 }
 
+/**
+ * One machine's mirror files of the run's shared files, read from its data folder (NB6): the input check.mjs takes as
+ * --mirror. Run it on the machine, with its /data mounted read-only, after the bound the checker names.
+ * @param {string[]} argv
+ */
+async function mirror(argv) {
+  const a = parseArgs(argv, { log: 'many', data: 'one', name: 'one', out: 'one' });
+  if (a.log.length === 0 || !a.data || !a.name || !a.out) throw new Error('mirror needs --log, --data (the machine\'s /data), --name and --out');
+  const logs = a.log.map((/** @type {string} */ f) => parseLog(fs.readFileSync(f, 'utf8')));
+  const runs = new Set(logs.flatMap((/** @type {any[]} */ events) => events.filter(e => e.t === 'start').map(e => e.run)));
+  if (runs.size !== 1) throw new Error('the logs must hold exactly one run');
+  const ids = sharedIdsOf(logs);
+  if (ids.length === 0) throw new Error('the logs name no shared file');
+  const emit = openOut(a.out);
+  emit({ t: 'copy', v: LOG_VERSION, kind: 'mirror', name: a.name, run: [...runs][0], at: new Date().toISOString(), keys: ids.length });
+  let errors = 0;
+  for (const id of ids) {
+    const state = mirrorState(path.join(a.data, 'global', ...id.split('/')));
+    if (state.s === 'error') errors += 1;
+    emit({ k: id, ...state });
+  }
+  console.error(`read ${ids.length} shared files from ${a.name}'s mirror: ${errors} unreadable`);
+  if (errors > 0) process.exitCode = 1;
+}
+
 /** @param {string[]} argv */
 async function cleanup(argv) {
   const a = parseArgs(argv, { log: 'many', target: 'one', limiter: 'one', timeout: 'one' });
@@ -848,6 +1000,12 @@ async function sql(argv) {
     process.stdout.write(`${reshardSql()}\n`);
     return;
   }
+  if (argv[0] === 'shared') {
+    const r = parseArgs(argv.slice(1), { log: 'many' });
+    if (r.log.length === 0) throw new Error('sql shared needs --log');
+    process.stdout.write(`${sharedDumpSql(sharedIdsOf(r.log.map((/** @type {string} */ f) => parseLog(fs.readFileSync(f, 'utf8')))))}\n`);
+    return;
+  }
   if (argv[0] === 'requests') {
     const r = parseArgs(argv.slice(1), { log: 'many' });
     const { run, guild } = keysFromLogs(r.log);
@@ -924,13 +1082,15 @@ oracle.mjs sql ownership       the psql query that lists the claim sequence and 
 oracle.mjs sql claims          the psql query that lists shard_claims
 oracle.mjs sql reshard         the psql query that lists the reshard attempt, its old rows and meta 'shard_count'
 oracle.mjs sql requests --log FILE  the psql query that lists the run's rows of guild_requests
+oracle.mjs sql shared --log FILE    the psql query that lists the run's shared files in smdb_data.shared_docs
+oracle.mjs mirror --log FILE [--log FILE ...] --data DIR --name MACHINE --out FILE  one machine's mirror files of the run's shared files
 oracle.mjs bite --log FILE     the bite test's two tamperings, as SQL
 oracle.mjs cleanup --log FILE [--log FILE ...] --target URL [--limiter SPEC]`;
 
 /** @param {string[]} argv */
 export async function main(argv) {
   const [command, ...rest] = argv;
-  const commands = { write, read, fleet, sql, bite, cleanup };
+  const commands = { write, read, fleet, sql, mirror, bite, cleanup };
   const fn = /** @type {Record<string, (argv: string[]) => Promise<void>>} */ (commands)[command ?? ''];
   if (!fn) {
     console.error(USAGE);

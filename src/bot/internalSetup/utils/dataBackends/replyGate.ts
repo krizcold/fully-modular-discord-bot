@@ -14,13 +14,13 @@ import {
   TextDisplayBuilder,
   type Client,
 } from 'discord.js';
+import { getNodeName } from '../../fleet/nodeName';
 import { getConfigProperty } from '../configManager';
-import { confirmWrite, isStopping } from '../dataManager';
+import { commitOwed, confirmWrite, isStopping } from '../dataManager';
 import { parseButtonCustomId, parseDropdownCustomId, parseModalCustomId } from '../panel/panelCustomIds';
 import { declaresOwnOutcomes } from './dataContract';
 import { droppedByDeposition, fileTicketState } from './fileBackend';
-import { commitAnswerOwed } from './workingSet';
-import { currentLedger, currentModule, installInteractionLedgers, landed, ledgerOf, openLedger, runInLedger, type LedgerCause, type LedgerTicket, type WriteLedger } from './writeLedger';
+import { currentLedger, currentModule, installInteractionLedgers, landed, ledgerKeyOf, ledgerOf, openLedger, runInLedger, type LedgerCause, type LedgerTicket, type WriteLedger } from './writeLedger';
 
 /** From the interaction's emit to the gate's own defer. Discord's 3 s also pays the gateway's delivery and the callback. */
 export const ACK_MS = 2000;
@@ -31,13 +31,22 @@ export type TruthAnswer = 'pending' | 'held' | 'deposed' | 'unavailable' | Ledge
 
 // Worst first.
 const RANK: TruthAnswer[] = [
-  'unstorable', 'node-stopping', 'maintenance', 'guild-fenced', 'deposed', 'writer-lost', 'database-unreachable',
+  'unstorable', 'node-stopping', 'maintenance', 'guild-fenced', 'deposed', 'changed-elsewhere', 'writer-lost', 'database-unreachable',
   'database-backlog', 'frozen', 'not-ready', 'storage-failing', 'io', 'unavailable', 'held', 'pending',
 ];
 const worst = (answers: TruthAnswer[]): TruthAnswer => answers.reduce((a, b) => (RANK.indexOf(b) < RANK.indexOf(a) ? b : a));
 
-/** partial: another write in the same response's ledgers was accepted, so "not saved in full". */
-export function truthText(answer: TruthAnswer, partial: boolean): string {
+/**
+ * T22: the version a 'changed-elsewhere' refusal met, stored by a machine (null: this machine) at a time, or deleted
+ * since the refused change read the data.
+ */
+export type ChangedBy = { machine: string | null; at: Date } | 'deleted';
+
+/**
+ * partial: another write in the same response's ledgers was accepted, so "not saved in full". changed: what a
+ * 'changed-elsewhere' refusal met, when the flush read it.
+ */
+export function truthText(answer: TruthAnswer, partial: boolean, changed?: ChangedBy): string {
   const notSaved = partial ? 'not saved in full' : 'not saved';
   const inFull = partial ? ' in full' : '';
   // The exit drain may give up on a held or pending write and the process exits, so no retry is promised.
@@ -54,6 +63,10 @@ export function truthText(answer: TruthAnswer, partial: boolean): string {
     case 'guild-fenced':
     case 'deposed':
       return `Another bot process took over this server's data, so your change was ${notSaved}. Please try again in a moment.`;
+    case 'changed-elsewhere':
+      if (changed === 'deleted') return `This data was deleted after your change read it, so your change was ${notSaved}. Reload to see the current values, then try again.`;
+      if (changed) return `This data was changed ${changed.machine === null ? 'on this machine' : `on ${changed.machine}`} at ${changed.at.toISOString()} after your change read it, so your change was ${notSaved}. Reload to see the current values, then try again.`;
+      return `Another machine changed this data while your change was being saved, so your change was ${notSaved}. Reload to see the current values, then try again.`;
     case 'writer-lost':
       return `Another process took over the bot's data files, so your change was ${notSaved}. Please try again in a moment.`;
     case 'database-unreachable': {
@@ -114,7 +127,7 @@ export interface RefusedDoc {
 /** The verdict's accepted writes when it was taken: none, all landed, or some not yet. */
 export type AcceptedWrites = 'none' | 'saved' | 'unconfirmed';
 
-type Verdict = { ok: true } | { ok: false; answer: TruthAnswer; partial: boolean; failed: Failure[]; refused?: RefusedDoc[]; accepted?: AcceptedWrites };
+type Verdict = { ok: true } | { ok: false; answer: TruthAnswer; partial: boolean; failed: Failure[]; refused?: RefusedDoc[]; accepted?: AcceptedWrites; changed?: ChangedBy };
 
 /** A refused document, by its refusal's stamp; rewritten: a whole rewrite of it was recorded later in the union. */
 interface Refused {
@@ -135,7 +148,18 @@ interface Pending {
   landedBefore: boolean;
 }
 
-const keyOf = (ticket: LedgerTicket): object => (ticket.kind === 'file' ? ticket.record : ticket.set);
+const keyOf = (ticket: LedgerTicket): object => ledgerKeyOf(ticket);
+
+/** A row op the flush refused: none of its writes is stored. */
+const rowRefused = (ticket: LedgerTicket): boolean => ticket.kind === 'row' && ticket.op.state === 'refused';
+
+/** T22's facts of a refused row ticket: the writer machine (null when it is this one) and time, or 'deleted'. */
+function changedByOf(ticket: LedgerTicket): ChangedBy | undefined {
+  if (ticket.kind !== 'row' || ticket.op.refusal?.cause !== 'changed-elsewhere') return undefined;
+  const { by, at } = ticket.op.refusal;
+  if (by === undefined || at === undefined) return 'deleted';
+  return { machine: by === getNodeName() ? null : by, at };
+}
 
 function pendingIn(ledgers: WriteLedger[]): Pending {
   const tickets = ledgers.flatMap(ledger => ledger.tickets()).map(entry => entry.ticket);
@@ -157,7 +181,7 @@ async function judge(pending: Pending, waitMs = CONFIRM_MS): Promise<Verdict> {
     const verdict: Verdict = {
       ok: false,
       answer,
-      partial: pending.tickets.some(ticket => landed(ticket) || !(ticket.kind === 'file' && droppedByDeposition(ticket.record) && fileTicketState(ticket) === 'open')),
+      partial: pending.tickets.some(ticket => landed(ticket) || !(rowRefused(ticket) || (ticket.kind === 'file' && droppedByDeposition(ticket.record) && fileTicketState(ticket) === 'open'))),
       failed: pending.refused.map(r => ({ refusal: refusalKey(r) })),
     };
     // The operator's answer to a write the bot cannot store names every refused document and the accepted writes' state.
@@ -174,10 +198,12 @@ async function judge(pending: Pending, waitMs = CONFIRM_MS): Promise<Verdict> {
   const confirmed = await Promise.all(first.map((answer, i) => {
     if (answer !== 'held') return answer;
     const ticket = pending.unlanded[i];
-    return confirmWrite(ticket, 0).then(now => (now === 'pending' && !(ticket.kind === 'ws' && commitAnswerOwed(ticket)) ? 'held' as const : now), () => 'unavailable' as const);
+    return confirmWrite(ticket, 0).then(now => (now === 'pending' && !commitOwed(ticket) ? 'held' as const : now), () => 'unavailable' as const);
   }));
   const answers = confirmed.map((answer, i): TruthAnswer | 'ok' => {
     const ticket = pending.unlanded[i];
+    // A row op the flush refused answers its refusal's cause, as a refusal recorded at the accept does (D1).
+    if (answer === 'refused') return ticket.kind === 'row' && ticket.op.refusal ? ticket.op.refusal.cause : 'io';
     // Only a line the deposition stopped before any of its bytes reached the file is known not saved.
     return answer === 'unavailable' && ticket.kind === 'file' && droppedByDeposition(ticket.record) && fileTicketState(ticket) === 'open' ? 'writer-lost' : answer;
   });
@@ -188,16 +214,18 @@ async function judge(pending: Pending, waitMs = CONFIRM_MS): Promise<Verdict> {
   // NB13 C6: a write of unknown fate beside a worse answer may be stored, so the change is not saved in full.
   const partial = answers.some(a => a === 'ok') || pending.tickets.length > pending.unlanded.length || pending.landedBefore
     || bad.some(a => a === 'unavailable' && a !== answer);
+  const changed = answer === 'changed-elsewhere' ? pending.unlanded.map(changedByOf).find(c => c !== undefined) : undefined;
   return {
     ok: false,
     answer,
     partial,
     failed: failed.map(ticket => ({ key: keyOf(ticket), seq: ticket.seq })),
+    ...(changed !== undefined ? { changed } : {}),
   };
 }
 
 /** A synthetic entry's verdict (BT-4): ok only when every write in its ledgers landed and none was refused. */
-export type WritesVerdict = { ok: true } | { ok: false; answer: TruthAnswer; partial: boolean; refused?: RefusedDoc[]; accepted?: AcceptedWrites };
+export type WritesVerdict = { ok: true } | { ok: false; answer: TruthAnswer; partial: boolean; refused?: RefusedDoc[]; accepted?: AcceptedWrites; changed?: ChangedBy };
 
 /**
  * The verdict over these ledgers within CONFIRM_MS. After each ok judgement they are read again, so a write recorded
@@ -515,7 +543,7 @@ export function installReplyGate(interaction: object, ledger: WriteLedger): void
       if (name === 'editReply') return fetchMessage.call(target, targetOf(options));
       if (name === 'followUp') return undefined;
     }
-    const text = truthText(verdict.answer, verdict.partial);
+    const text = truthText(verdict.answer, verdict.partial, verdict.changed);
     const inPlace = name === 'reply'
       || (name === 'update' && componentEphemeral)
       || (name === 'editReply' && onOriginal(targetOf(options)) && shown.ephemeral);
@@ -812,7 +840,7 @@ export function gateCommandCallback(command: { callback?: unknown; _moduleName?:
             if (method === 'followUp') return undefined;
             return typeof target.fetchReply === 'function' ? (target.fetchReply as () => unknown).call(target) : undefined;
           }
-          const text = truthText(verdict.answer, verdict.partial);
+          const text = truthText(verdict.answer, verdict.partial, verdict.changed);
           const allowedMentions = { parse: [] };
           let payload: Record<string, unknown> = { content: text };
           if (method === 'editReply') {

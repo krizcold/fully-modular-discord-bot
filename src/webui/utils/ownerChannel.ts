@@ -11,8 +11,8 @@ import { ownerChannelFromFile, ownerChannelOf, type OwnerChannelValue } from '..
 import { channelCause, postInPlace } from '../../utils/ownerMessages';
 import type { RunningMigration } from '../../bot/internalSetup/utils/dataMigration';
 import {
-  CHOOSING_REFUSAL, STARTING_REFUSAL, chooseNow, getWebuiDataReader, resolveWebuiDatabase, unreachableReason,
-  webuiChildCase, webuiReportCount, type WebuiResolution,
+  CHOOSING_REFUSAL, chooseNow, getWebuiDataReader, resolveWebuiDatabase, unreachableReason, webuiChildCase,
+  webuiFirstCheck, webuiReportCount, webuiSecondCheck, type WebuiCheckRefusal, type WebuiResolution,
 } from './webuiDataReader';
 
 const SETTING_APP = 'smdb-webui-setting';
@@ -169,44 +169,23 @@ const migrationText = (running: RunningMigration) => `A data migration is runnin
 const cantUse = (reason: string) => `The setting is kept in the bot's main database, which the web panel cannot use now (${reason}); nothing was changed`;
 const confirming = (reason: string) => `The setting is kept in the bot's main database, which the bot process is still confirming (${reason}); nothing was changed`;
 
-/** The bot process's report, as both checks read it: a refusal, or null when it lets the entry through. */
-function reportRefusal(entry: string | null): RouteAnswer | null {
-  const current = webuiChildCase();
-  if (current.kind === 'starting') return refused(503, cantUse(STARTING_REFUSAL));
-  if (current.kind !== 'reported') return null;
-  const report = current.report;
-  if (report.url === null) return refused(503, cantUse(report.reason ?? CHOOSING_REFUSAL));
-  if (report.held) return refused(503, confirming(report.reason ?? ''));
-  if (entry !== null && report.url !== entry) {
-    return refused(503, cantUse(`a check of the databases made now picks ${showEntry(entry)}, while the bot process uses ${showEntry(report.url)}`));
-  }
-  return null;
-}
+const checkRefused = (check: WebuiCheckRefusal): RouteAnswer => refused(503, check.held ? confirming(check.refusal) : cantUse(check.refusal));
 
 /** The first check, before the test post, on what is known then. */
 function firstCheck(host: OwnerChannelHost, postgres: boolean): RouteAnswer | null {
   const running = host.migrationRunning();
   if (running) return refused(409, migrationText(running));
   if (!postgres) return null;
-  const report = reportRefusal(null);
-  if (report) return report;
-  const current = webuiChildCase();
-  if (current.kind === 'none' || current.kind === 'maintenance') {
-    const own = resolveWebuiDatabase();
-    if ('refusal' in own) return refused(503, cantUse(own.refusal));
-  }
-  return null;
+  const check = webuiFirstCheck();
+  return check ? checkRefused(check) : null;
 }
 
 /** The second check, once chooseNow() answered, right before the write. */
 function secondCheck(host: OwnerChannelHost, choice: WebuiResolution, countAtStart: number): RouteAnswer | { entry: string } {
   const running = host.migrationRunning();
   if (running) return refused(409, migrationText(running));
-  if ('refusal' in choice) return refused(503, cantUse(choice.refusal));
-  const report = reportRefusal(choice.entry);
-  if (report) return report;
-  if (webuiReportCount() !== countAtStart) return refused(503, cantUse('the bot process reported a change of its database during the check'));
-  return { entry: choice.entry };
+  const check = webuiSecondCheck(choice, countAtStart);
+  return 'refusal' in check ? checkRefused(check) : { entry: check.entry };
 }
 
 /** What changed while the write was on the wire, in the words of the can't-confirm answer. */

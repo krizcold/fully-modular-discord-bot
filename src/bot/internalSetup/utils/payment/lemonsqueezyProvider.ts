@@ -20,7 +20,7 @@
 
 import * as crypto from 'crypto';
 import { PROVIDER_FETCH_MS } from './paymentTypes';
-import { loadCredentials } from '@/utils/envLoader';
+import { providerCredentials } from '@/utils/envLoader';
 import { getPaymentRegistry } from './paymentRegistry';
 import type {
   PaymentProvider,
@@ -103,7 +103,7 @@ export class LemonSqueezyProvider implements PaymentProvider {
   readonly capabilities = CAPABILITIES;
 
   isConfigured(): boolean {
-    const c = loadCredentials();
+    const c = providerCredentials('lemonsqueezy');
     return !!(c.LEMONSQUEEZY_API_KEY && c.LEMONSQUEEZY_STORE_ID && c.LEMONSQUEEZY_WEBHOOK_SECRET);
   }
 
@@ -134,7 +134,7 @@ export class LemonSqueezyProvider implements PaymentProvider {
   }
 
   async initiatePurchase(opts: InitiateOpts): Promise<InitiateResult> {
-    const c = loadCredentials();
+    const c = providerCredentials('lemonsqueezy');
     if (!c.LEMONSQUEEZY_API_KEY || !c.LEMONSQUEEZY_STORE_ID) {
       throw new Error('Lemon Squeezy not configured');
     }
@@ -187,7 +187,7 @@ export class LemonSqueezyProvider implements PaymentProvider {
   }
 
   async validateCoupon(code: string, _variantId?: string): Promise<ProviderCouponValidation> {
-    const c = loadCredentials();
+    const c = providerCredentials('lemonsqueezy');
     if (!c.LEMONSQUEEZY_STORE_ID) throw new Error('Lemon Squeezy not configured');
     const data = await this.api<{ data: any[] }>('GET',
       `/discounts?filter[store_id]=${encodeURIComponent(c.LEMONSQUEEZY_STORE_ID)}&filter[code]=${encodeURIComponent(code)}`);
@@ -263,7 +263,7 @@ export class LemonSqueezyProvider implements PaymentProvider {
    * raw body using LEMONSQUEEZY_WEBHOOK_SECRET.
    */
   async handleWebhook(rawBody: Buffer, signature: string, headers: Record<string, string>): Promise<void> {
-    const c = loadCredentials();
+    const c = providerCredentials('lemonsqueezy');
     if (!c.LEMONSQUEEZY_WEBHOOK_SECRET) throw new Error('Webhook secret not configured');
     const expected = crypto.createHmac('sha256', c.LEMONSQUEEZY_WEBHOOK_SECRET).update(rawBody).digest('hex');
     const provided = (signature || headers['x-signature'] || '').toLowerCase();
@@ -406,7 +406,7 @@ export class LemonSqueezyProvider implements PaymentProvider {
   }
 
   private async apiRaw(method: string, path: string, body?: any): Promise<Response> {
-    const c = loadCredentials();
+    const c = providerCredentials('lemonsqueezy');
     if (!c.LEMONSQUEEZY_API_KEY) throw new Error('Lemon Squeezy not configured');
     const init: RequestInit = {
       method,

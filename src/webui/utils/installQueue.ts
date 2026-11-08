@@ -1,7 +1,8 @@
 import { EventEmitter } from 'events';
-import { getAppStoreManager } from '../../bot/internalSetup/utils/appStoreManager';
+import { getAppStoreManager, type PublishedChange } from '../../bot/internalSetup/utils/appStoreManager';
 import { componentConfigPath, readConfigFile, writeConfigFile } from '../../bot/internalSetup/utils/appStoreConfigFile';
-import type { BotManager } from '../botManager';
+import { resolveDataBackend } from '../../utils/envLoader';
+import { dropStagedFolder, inStoreWrite, notAppliedText, type BotManager, type ModuleApplyAnswer } from '../botManager';
 
 export type JobKind = 'install' | 'uninstall';
 
@@ -27,13 +28,15 @@ export interface InstallJob {
   loadError?: string;
   unloaded?: boolean;   // uninstall: hot-unload result
   skipped?: boolean;    // idempotent no-op
+  /** On a Postgres bot, the answer of the bot's apply when it is not today's success (NB6 decision 61). */
+  message?: string;
 }
 
 export type CancelResult =
   | { ok: true; job: InstallJob }
   | { ok: false; reason: 'not-found' | 'already-running' };
 
-function cleanupComponentConfig(moduleName: string): void {
+async function cleanupComponentConfig(moduleName: string): Promise<void> {
   try {
     const read = readConfigFile(componentConfigPath());
     if (!read.ok) {
@@ -49,7 +52,7 @@ function cleanupComponentConfig(moduleName: string): void {
         cleaned = true;
       }
     }
-    if (cleaned) writeConfigFile(componentConfigPath(), config);
+    if (cleaned) await writeConfigFile(componentConfigPath(), config, read.sha);
   } catch (error) {
     console.error(`[AppStore] Kept the component toggles of ${moduleName}: the cleanup write failed:`, error);
   }
@@ -186,6 +189,7 @@ export class InstallQueue extends EventEmitter {
   }
 
   private async runInstall(job: InstallJob, manager: ReturnType<typeof getAppStoreManager>): Promise<void> {
+    await this.storeDocsFirst();
     if (manager.isModuleInstalled(job.moduleName)) {
       job.status = 'completed';
       job.loaded = true;
@@ -200,10 +204,15 @@ export class InstallQueue extends EventEmitter {
     }
 
     if (job.credentials && typeof job.credentials === 'object') {
-      manager.saveCredentials(job.moduleName, job.credentials);
+      const credentials = job.credentials;
+      await inStoreWrite(() => manager.saveCredentialsAwaited(job.moduleName, credentials));
     }
 
-    await manager.installModule(job.moduleName, job.repoId);
+    const installed = await manager.installModule(job.moduleName, job.repoId);
+    if (typeof installed === 'object') {
+      this.complete(job, await this.applied(installed));
+      return;
+    }
 
     let loaded = false;
     let loadError: string | undefined;
@@ -225,6 +234,7 @@ export class InstallQueue extends EventEmitter {
   }
 
   private async runUninstall(job: InstallJob, manager: ReturnType<typeof getAppStoreManager>): Promise<void> {
+    await this.storeDocsFirst();
     if (!manager.isModuleInstalled(job.moduleName)) {
       job.status = 'completed';
       job.unloaded = true;
@@ -234,7 +244,13 @@ export class InstallQueue extends EventEmitter {
       return;
     }
 
-    await manager.uninstallModule(job.moduleName);
+    const uninstalled = await manager.uninstallModule(job.moduleName);
+    if (typeof uninstalled === 'object') {
+      const answer = await this.applied(uninstalled);
+      await inStoreWrite(() => cleanupComponentConfig(job.moduleName));
+      this.complete(job, answer);
+      return;
+    }
 
     let unloaded = false;
     if (this.botManager) {
@@ -246,10 +262,38 @@ export class InstallQueue extends EventEmitter {
       }
     }
 
-    cleanupComponentConfig(job.moduleName);
+    await cleanupComponentConfig(job.moduleName);
 
     job.status = 'completed';
     job.unloaded = unloaded;
+    job.finishedAt = Date.now();
+    this.emit('completed', this.redact(job));
+  }
+
+  /** Decision 31: with no bot child the job first brings the App Store docs up to the rows; a failure fails the job. */
+  private async storeDocsFirst(): Promise<void> {
+    if (resolveDataBackend() !== 'postgres' || !this.botManager) return;
+    const refused = await this.botManager.storeDocsFirst();
+    if (refused) throw new Error(refused.error);
+  }
+
+  /** Decisions 44 and 61: a landed publish or uninstall is applied by the bot child; with no BotManager, as no child. */
+  private async applied(change: PublishedChange): Promise<ModuleApplyAnswer> {
+    if (this.botManager) return this.botManager.applyModule(change);
+    if (change.staged) dropStagedFolder(change.staged);
+    return { outcome: 'not-running', loaded: false, error: null, text: notAppliedText(change.operation, change.module, change.version ?? '', 'not-running') };
+  }
+
+  /** The job's results from the apply: loaded and loadError for an install, unloaded for an uninstall, and its text. */
+  private complete(job: InstallJob, answer: ModuleApplyAnswer): void {
+    job.status = 'completed';
+    if (job.kind === 'install') {
+      job.loaded = answer.outcome === 'applied' || answer.outcome === 'loaded' ? answer.loaded : false;
+      if (answer.outcome === 'failed' && answer.error) job.loadError = answer.error;
+    } else {
+      job.unloaded = answer.outcome === 'applied' && answer.unloadFailed === undefined;
+    }
+    if (answer.text) job.message = answer.text;
     job.finishedAt = Date.now();
     this.emit('completed', this.redact(job));
   }

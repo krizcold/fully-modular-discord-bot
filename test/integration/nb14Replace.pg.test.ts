@@ -437,9 +437,9 @@ describe('the sweep and the keep time', () => {
   });
 });
 
-describe('version 8', () => {
-  it('a database of version 7 is refused (C19)', async () => {
-    expect(SCHEMA_VERSION).toBe(8);
+describe('version 9', () => {
+  it('a database of version 8 is refused (C19)', async () => {
+    expect(SCHEMA_VERSION).toBe(9);
     await direct.query('CREATE DATABASE nb14v7');
     const user = encodeURIComponent(container.getUsername());
     const password = encodeURIComponent(container.getPassword());
@@ -449,7 +449,7 @@ describe('version 8', () => {
     await waitReady(first);
     await first.stop();
     const v7 = new Pool({ connectionString: url, max: 1 });
-    await v7.query(`UPDATE smdb_data.meta SET value = '{"v":7}' WHERE key = 'schema_version'`);
+    await v7.query(`UPDATE smdb_data.meta SET value = '{"v":8}' WHERE key = 'schema_version'`);
     await v7.end();
     const lines: string[] = [];
     const capture = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
@@ -461,7 +461,7 @@ describe('version 8', () => {
     try {
       const until = Date.now() + 30_000;
       while (!lines.some(l => l.includes('schema-mismatch')) && Date.now() < until) await sleep(100);
-      expect(lines).toContain('[PostgresBackend] schema-mismatch: smdb_data.meta schema_version is {"v":7}, expected {"v":8}; refusing to serve');
+      expect(lines).toContain('[PostgresBackend] schema-mismatch: smdb_data.meta schema_version is {"v":8}, expected {"v":9}; refusing to serve');
       expect(second.servesData()).toBe(false);
     } finally {
       await second.stop();

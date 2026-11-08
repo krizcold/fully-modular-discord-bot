@@ -9,8 +9,20 @@ export function getLoadFailures(): string[] {
   return [...failures];
 }
 
+const heldBack = new Set<string>();
+
+/** Names a module this machine holds back (decision 87); the orphan sweep refuses to run while any is recorded. */
+export function recordHeldBack(module: string): void {
+  heldBack.add(module);
+}
+
+export function getHeldBack(): string[] {
+  return [...heldBack];
+}
+
 export function clearLoadFailures(): void {
   failures.clear();
+  heldBack.clear();
 }
 
 let reloadsInFlight = 0;

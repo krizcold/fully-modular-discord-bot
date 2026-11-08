@@ -36,18 +36,21 @@ import { holderWords, readWriterHolder } from './bot/internalSetup/utils/writerL
 
 /** The populate as a local op: it holds the data files' lock at most 8 s plus a flush, and main() does not wait for it. */
 function populateConfig(botManager: BotManager): void {
+  let unchanged = false;
   void botManager.runLocalOp('config.json populate', () => runSealed('console', null, null, async ledger => {
-    if (ensureConfigPopulated() === 'left') {
+    const populated = ensureConfigPopulated();
+    if (populated === 'left') {
       return carryWrites({ ok: false, code: 'invalid', error: 'config.json cannot be read or parsed; left it as it is. Fix the file, then restart.' }, writesOf(ledger));
     }
+    unchanged = populated === 'unchanged';
     const verdict = await verdictOf([ledger]);
     return carryWrites(verdict.ok
       ? { ok: true }
-      : { ok: false, code: 'unconfirmed', answer: verdict.answer, partial: verdict.partial, error: truthText(verdict.answer, verdict.partial) }, writesOf(ledger));
+      : { ok: false, code: 'unconfirmed', answer: verdict.answer, partial: verdict.partial, error: truthText(verdict.answer, verdict.partial, verdict.changed) }, writesOf(ledger));
   })).then(answer => {
     const take = answer?.lockTake;
     if (answer?.ok) {
-      console.log('[Main] config.json populate: saved');
+      console.log(unchanged ? '[Main] config.json populate: every key is present; nothing written' : '[Main] config.json populate: saved');
     } else if (take) {
       console.log(`[Main] Skipped populating config.json: ${populateTakeCause(take)}`);
     } else if (answer?.code === 'held-elsewhere' || answer?.code === 'starting') {
@@ -63,7 +66,7 @@ function populateConfig(botManager: BotManager): void {
 
 async function main() {
   // Outside a change the web UI applies itself, this process writes no data file.
-  setSharedWriteGate(() => inLocalOp());
+  setSharedWriteGate(absPath => inLocalOp(absPath));
   console.log('='.repeat(60));
   console.log('  Discord Bot with Web-UI');
   console.log('='.repeat(60));

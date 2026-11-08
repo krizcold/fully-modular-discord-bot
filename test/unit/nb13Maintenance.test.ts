@@ -162,7 +162,7 @@ describe('5.4, 5.5, 5.6 and 5.9: the leave and the migration texts', () => {
     const at = /nb13f2-\d+\.jsonl$/;
     stub.shortWrite(at, text => text.length - 1, 1);
     stub.failWrite(at, 'ENOSPC', 10_000);
-    appendData(name, { scope: 'global', category: 'm' }, 'x\n');
+    appendData(name, { scope: 'global', category: 'fleet' }, 'x\n');
     await vi.waitFor(() => expect(stub.writes.some(w => w.text.endsWith('x\n') && w.accepted > 0)).toBe(true), { timeout: 5000 });
     try {
       startLeave('The hook says running');

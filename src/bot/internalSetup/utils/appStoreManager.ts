@@ -20,6 +20,16 @@ import { ensureDir, getModulesDir, getSourceModulesDir, getBuildModulesDir, getM
 import { dataPath } from '../../../utils/dataRoot';
 import { takeAutoSnapshot } from '@/utils/autoSnapshot';
 import { ProcessLock, processStart } from './processLock';
+import { deleteRawAtomicTracked, writeRawAtomicTracked } from './dataManager';
+import { truthText, type TruthAnswer } from './dataBackends/replyGate';
+import { getNodeName } from '../fleet/nodeName';
+import {
+  awaitStoreTicket, landStoreDoc, latestRowTicket, rowMainTag, rowOutcome, rowsOnDataPool, sharedKeyOf, shaOf, STORE_MUTEX_MS, updatedBy,
+  rowBackend, useStoreLanding, type RowRefusal, type RowTicket,
+} from './sharedStore';
+import { readStoreRecord } from './sharedRecords';
+import { credentialsKeyOf, INSTALLED_KEY, moduleRelRefusal, publishModule, unpublishModule, type ModuleSaveAnswer } from './sharedModules';
+import type { ApplyLater, PublisherAnswer } from './moduleApply';
 
 /**
  * Find a Dev module whose manifest name matches. Installing a store module
@@ -245,6 +255,366 @@ function releaseStoreLock(): void {
   storeLock.release();
 }
 
+/** Runs a synchronous section under the store lock: decision 53's landing block, a config file's read and queue. */
+export function withStoreLock<T>(fn: () => T): T {
+  acquireStoreLock();
+  try {
+    return fn();
+  } finally {
+    releaseStoreLock();
+  }
+}
+
+// ============================================================================
+// THE STORE MUTEX (NB6 decisions 36 and 61)
+// ============================================================================
+
+/** A hold of the store mutex; release hands it to the next waiter. */
+export interface StoreMutexHold {
+  release(): void;
+}
+
+/**
+ * In-process, first in first out. Every App Store section that awaits on a Postgres bot holds it; inside it each
+ * synchronous part takes the store lock and releases it before the next await.
+ */
+class StoreMutex {
+  private held = false;
+  private readonly waiters: Array<(hold: StoreMutexHold) => void> = [];
+
+  /** A hold, or null when the wait passed boundMs (the caller is out of the line then). */
+  acquire(boundMs: number = STORE_MUTEX_MS): Promise<StoreMutexHold | null> {
+    if (!this.held) {
+      this.held = true;
+      return Promise.resolve(this.hold());
+    }
+    return new Promise(resolve => {
+      const grant = (hold: StoreMutexHold) => {
+        clearTimeout(timer);
+        resolve(hold);
+      };
+      const timer = setTimeout(() => {
+        const at = this.waiters.indexOf(grant);
+        if (at >= 0) this.waiters.splice(at, 1);
+        resolve(null);
+      }, boundMs);
+      timer.unref?.();
+      this.waiters.push(grant);
+    });
+  }
+
+  private hold(): StoreMutexHold {
+    let released = false;
+    return {
+      release: () => {
+        if (released) return;
+        released = true;
+        const next = this.waiters.shift();
+        if (next) next(this.hold());
+        else this.held = false;
+      },
+    };
+  }
+}
+
+export const storeMutex = new StoreMutex();
+
+/** The store mutex for an App Store section: a wait over 60 s answers lockBusyError's text. */
+export async function takeStoreMutex(): Promise<StoreMutexHold> {
+  const hold = await storeMutex.acquire();
+  if (!hold) throw lockBusyError();
+  return hold;
+}
+
+useStoreLanding({ acquire: boundMs => storeMutex.acquire(boundMs), locked: withStoreLock });
+
+// ============================================================================
+// THE APP STORE DOCS ON A POSTGRES BOT (NB6 decisions 28, 51 and 53)
+// ============================================================================
+
+/** Decision 28: how long a section waits for its write's ticket, past the web UI session's 35 s query_timeout. */
+export const STORE_TICKET_MS = 40_000;
+
+/** An App Store doc's answer other than today's success: 409, 500, or 202 when the database has not answered yet. */
+export class StoreWriteError extends Error {
+  /** by: for a 409, the machine that stored the version this change met. */
+  constructor(readonly status: 202 | 409 | 500, message: string, readonly by?: string) {
+    super(message);
+    this.name = 'StoreWriteError';
+  }
+}
+
+/** The file's path below /data/global/appstore/, as the answers and logs name it. */
+export function storeFileName(file: string): string {
+  return path.relative(APPSTORE_DIR, file).split(path.sep).join('/');
+}
+
+/** On a Postgres bot the App Store docs are shared keys (decision 28); a JSON bot writes them as files. */
+export function isSharedStoreDoc(file: string): boolean {
+  return sharedKeyOf(file) !== null;
+}
+
+/** The sha of a file's bytes, 'absent' for none; a file that cannot be read refuses the write (StoreWriteError 500). */
+export function storeFileSha(file: string): string {
+  try {
+    return shaOf(fs.readFileSync(file));
+  } catch (error: any) {
+    if (error?.code === 'ENOENT') return 'absent';
+    throw new StoreWriteError(500, `${storeFileName(file)} could not be read (${error instanceof Error ? error.message : String(error)}), so nothing was saved.`);
+  }
+}
+
+/** A write queued with its ticket, or refused at the accept with the cause. */
+export type StoreQueued = { file: string; ticket: RowTicket } | { file: string; refused: string };
+
+/**
+ * Decision 28: queues the shared write of an App Store doc (null deletes it) with the sha of the bytes its section read
+ * as base, so it is its own op (decision 51). Null when a delete has nothing to delete.
+ */
+export function queueStoreDoc(file: string, text: string | null, base: string): StoreQueued | null {
+  if (text === null) {
+    const deleted = deleteRawAtomicTracked(file, { baseSha: base });
+    if (!deleted.accepted) return deleted.cause === 'absent' ? null : { file, refused: deleted.cause ?? 'io' };
+  } else {
+    const written = writeRawAtomicTracked(file, text, { baseSha: base });
+    if (!written.accepted) return { file, refused: written.cause };
+  }
+  return { file, ticket: latestRowTicket(sharedKeyOf(file)!)! };
+}
+
+/** T15 and decision 28's line: a store write no reply waits for logs its refusal. */
+export function watchStoreDoc(queued: StoreQueued): void {
+  const name = storeFileName(queued.file);
+  if ('refused' in queued) {
+    console.error(`[AppStoreManager] ${name} was not saved: ${queued.refused}`);
+    return;
+  }
+  void rowOutcome(queued.ticket).then(outcome => {
+    if (typeof outcome !== 'object') return;
+    console.error(`[AppStoreManager] ${name} was not saved: ${refusalWords(outcome.refused)}`);
+  });
+}
+
+function refusalWords(refusal: RowRefusal): string {
+  if (refusal.cause !== 'changed-elsewhere') return refusal.reason ?? refusal.cause;
+  if (refusal.by === undefined || refusal.at === undefined) return 'it changed after this write read it';
+  const by = refusal.by === getNodeName() ? 'this machine' : refusal.by;
+  return `it changed after this write read it (saved by ${by} at ${refusal.at.toISOString()})`;
+}
+
+/**
+ * Decision 28's answers for a section that holds the store mutex: waits up to 40 s for the ticket (decision 53's block
+ * runs in this hold) and resolves when it landed; otherwise throws StoreWriteError with the 409, 500 or 202 text.
+ * what names the change in the 202 text, name the file in the 409 text.
+ */
+export async function awaitStoreDoc(queued: StoreQueued, what: string, boundMs: number = STORE_TICKET_MS, name: string = storeFileName(queued.file)): Promise<void> {
+  if ('refused' in queued) throw new StoreWriteError(500, truthText(queued.refused as TruthAnswer, false));
+  const outcome = await awaitStoreTicket(queued.ticket, boundMs);
+  if (outcome === 'landed') return;
+  if (outcome === 'open' || outcome === 'unconfirmed') {
+    const op = queued.ticket.op;
+    const cause = op.lostCause ?? op.cause ?? `no answer within ${Math.round(boundMs / 1000)} s`;
+    throw new StoreWriteError(202, `Can't confirm that the ${what} change was saved: the database has not answered yet (${cause}). Reload the App Store tab in a minute to see whether it was.`);
+  }
+  const refusal = outcome.refused;
+  if (refusal.cause !== 'changed-elsewhere') throw new StoreWriteError(500, truthText(refusal.cause, false));
+  if (refusal.by === undefined || refusal.at === undefined) throw new StoreWriteError(409, truthText('changed-elsewhere', false, 'deleted'));
+  throw new StoreWriteError(409, `${name} was changed on ${refusal.by} at ${refusal.at.toISOString()} while this change was being made; nothing was saved. Reload the App Store tab to see the current values.`, refusal.by);
+}
+
+// ============================================================================
+// MODULES ON A POSTGRES BOT (NB6 decisions 15, 35, 42, 44 and 61)
+// ============================================================================
+
+/**
+ * updateModule's answer. On a Postgres bot a stored update carries `published`, and in the bot `applied` (44, 91);
+ * `unconfirmed` marks 35's can't confirm text, and `changedElsewhere` a refusal because installed.json changed on another
+ * machine (409).
+ */
+export interface ModuleUpdateResult {
+  success: boolean;
+  newVersion?: string;
+  error?: string;
+  unconfirmed?: true;
+  changedElsewhere?: true;
+  /** With changedElsewhere: whether the module's own entry changed, was removed or only other modules' did, or the read's error. */
+  elsewhere?: ElsewhereChange;
+  published?: PublishedChange;
+  applied?: PublisherAnswer;
+}
+
+/** by: the machine that stored the version the refused update met, null when the refusal does not name one. */
+export type ElsewhereChange = ({ kind: 'module' | 'other' | 'removed' } | { kind: 'unread'; error: string }) & { by: string | null };
+
+const STORED_DOC_SQL = 'SELECT body, sha FROM smdb_data.shared_docs WHERE key = $1';
+const STORED_MODULES_SQL = 'SELECT module, sha, version, updated_by FROM smdb_data.shared_modules';
+
+/** After a changed-elsewhere refusal: whether the stored installed.json entry or module row of moduleName differs from the update's start. */
+async function elsewhereChange(moduleName: string, started: { version: string; sha: string | null }, by: string | null): Promise<ElsewhereChange> {
+  try {
+    const backend = rowBackend();
+    if (!backend?.sharedSelect) return { kind: 'unread', error: 'no database', by };
+    const doc = (await backend.sharedSelect(STORED_DOC_SQL, [INSTALLED_KEY], 10_000)).rows[0];
+    const body = doc ? (Buffer.isBuffer(doc.body) ? doc.body.toString('utf8') : String(doc.body ?? '')) : '{"modules":{}}';
+    const entry = JSON.parse(body)?.modules?.[moduleName];
+    if (!entry) return { kind: 'removed', by };
+    if (entry.version !== started.version) return { kind: 'module', by };
+    if (started.sha !== null) {
+      const row = (await backend.sharedSelect(STORED_MODULES_SQL, [], 10_000)).rows.find((r: any) => r.module === moduleName);
+      if (!row || String(row.sha) !== started.sha) return { kind: 'module', by };
+    }
+    return { kind: 'other', by };
+  } catch (error) {
+    return { kind: 'unread', error: error instanceof Error ? error.message : String(error), by };
+  }
+}
+
+const MIB = 1024 * 1024;
+/** Decision 15's limits on a bot whose data is in a database. */
+export const MODULE_MAX_BYTES = 64 * MIB;
+export const MODULE_FILE_MAX_BYTES = 16 * MIB;
+
+type ModuleOperation = 'install' | 'update' | 'uninstall';
+
+const pastOf = (operation: ModuleOperation): string => (operation === 'install' ? 'installed' : operation === 'update' ? 'updated' : 'uninstalled');
+
+/** Staged folders a publish of this process holds; the pass never deletes one of them (decision 35). */
+const stagedFolders = new Set<string>();
+
+export function stagedHeld(): ReadonlySet<string> {
+  return stagedFolders;
+}
+
+/** A change whose publish or uninstall the database stored. */
+export interface PublishedChange {
+  module: string;
+  operation: ModuleOperation;
+  version: string | null;
+  /** The module sha the rows hold now; 'absent' after an uninstall. */
+  to: string;
+  /** The main tag the change was stored under, the apply's `tag`. */
+  tag: string | null;
+  updatedBy: string;
+  /** In the web UI, the staged folder its caller hands to the bot's `module:apply` (44); null in the bot. */
+  staged: string | null;
+  /** In the bot, the apply's outcome and the answer for it (61); null in the web UI, which applies through the bot. */
+  applied: PublisherAnswer | null;
+}
+
+interface Staged {
+  dir: string;
+  version: string;
+  body: string;
+  base: string;
+  moduleInfo: StoreModuleInfo;
+}
+
+const mib = (bytes: number): string => `${(Math.ceil((bytes / MIB) * 10) / 10).toFixed(1)} MiB`;
+
+/** Decision 15's limits as 42 words them, over the files copyDirectory would copy. */
+function sizeRefusal(module: string, dir: string, operation: ModuleOperation): string | null {
+  let total = 0;
+  let largest = { rel: '', size: -1 };
+  const walk = (at: string, rel: string) => {
+    for (const entry of fs.readdirSync(at, { withFileTypes: true })) {
+      const abs = path.join(at, entry.name);
+      const r = rel ? `${rel}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) {
+        walk(abs, r);
+        continue;
+      }
+      const size = fs.statSync(abs).size;
+      total += size;
+      if (size > largest.size) largest = { rel: r, size };
+    }
+  };
+  walk(dir, '');
+  const done = pastOf(operation);
+  if (total > MODULE_MAX_BYTES) return `${module} is ${mib(total)}, over the 64 MiB a module can have on a bot whose data is in a database; it was not ${done}`;
+  if (largest.size > MODULE_FILE_MAX_BYTES) {
+    return `${module} has a file over 16 MiB (${largest.rel}, ${mib(largest.size)}), which a bot whose data is in a database cannot keep; it was not ${done}`;
+  }
+  return null;
+}
+
+/** The first file of the folder whose path the migration's rule refuses, so a stored module can always be moved. */
+function filePathRefusal(module: string, dir: string, operation: ModuleOperation): string | null {
+  const walk = (at: string, rel: string): string | null => {
+    for (const entry of fs.readdirSync(at, { withFileTypes: true }).sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))) {
+      const r = rel ? `${rel}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) {
+        const inner = walk(path.join(at, entry.name), r);
+        if (inner) return inner;
+        continue;
+      }
+      const cause = moduleRelRefusal(r);
+      if (cause) return `${module} was not ${pastOf(operation)}: its file ${r} cannot be stored for every machine (${cause}), so nothing was changed.`;
+    }
+    return null;
+  };
+  return walk(dir, '');
+}
+
+/** Decision 35 step 2: the staged files on disk before their sha is taken. */
+function fsyncTree(dir: string): void {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const abs = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      fsyncTree(abs);
+      continue;
+    }
+    const fd = fs.openSync(abs, 'r+');
+    try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  }
+  if (process.platform === 'win32') return;
+  const fd = fs.openSync(dir, 'r');
+  try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+}
+
+function dropStaged(dir: string): void {
+  stagedFolders.delete(path.resolve(dir));
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+/** Decision 42's texts for a publish or an uninstall that stored nothing, and 35's and T10's when that is unknown. */
+function notStored(operation: ModuleOperation, module: string, answer: Exclude<ModuleSaveAnswer, { kind: 'committed' }>): StoreWriteError {
+  const done = pastOf(operation);
+  switch (answer.kind) {
+    case 'refused':
+      if (answer.cause === 'writer-lost') return new StoreWriteError(500, `${module} was not ${done}: another process took over the bot's data files`);
+      if (answer.by === undefined || answer.at === undefined) return new StoreWriteError(409, truthText('changed-elsewhere', false, 'deleted'));
+      return new StoreWriteError(409, `${module} was not ${done}: the list of installed modules was changed on ${answer.by} at ${answer.at.toISOString()} while this ran. Try again.`, answer.by);
+    case 'failed':
+      return new StoreWriteError(500, `${module} was not ${done}: ${answer.cause}`);
+    case 'unknown':
+      return new StoreWriteError(202, `Can't confirm whether ${module} was ${done}: the database did not answer the save (${answer.cause}). The App Store tab shows the result once it does.`);
+  }
+}
+
+/** A stored change whose landing or apply threw here: the database holds it, and a later pass applies it (E1). */
+function notAppliedYet(operation: ModuleOperation, module: string, version: string, error: unknown, later: ApplyLater): PublisherAnswer {
+  const cause = error instanceof Error ? error.message : String(error);
+  let text: string;
+  if (operation === 'uninstall') {
+    const when = later.kind === 'start' ? "it removes it after the bot's next start" : 'it tries again at the next pass';
+    text = `${module} is uninstalled for every machine, but this machine could not remove it yet (${cause}); ${when}.`;
+  } else {
+    const when = later.kind === 'start'
+      ? `it applies the database's current version of ${module} after the bot's next start`
+      : later.kind === 'after' ? `it tries again after ${new Date(later.at).toISOString()}` : 'it tries again at the next pass';
+    text = `${module} ${version} is saved for every machine, but this machine could not apply it yet (${cause}); ${when}.`;
+  }
+  return { outcome: 'deferred', reason: null, error: cause, loaded: false, text };
+}
+
+async function applyLaterHere(module: string): Promise<ApplyLater> {
+  try {
+    return (await import('./moduleApply')).applyLaterOf(module);
+  } catch {
+    return { kind: 'pass' };
+  }
+}
+
 function fileStamp(file: string): string {
   try {
     const st = fs.statSync(file);
@@ -294,20 +664,22 @@ function isInstalledConfig(value: any): value is InstalledConfig {
     && typeof value.modules === 'object' && !Array.isArray(value.modules);
 }
 
-function readJsonStrict<T>(file: string, valid: (value: any) => value is T): { state: FileState; value?: T; error?: string } {
-  let raw: string;
+/** sha: the sha of the bytes read (decision 28's base), 'absent' for a missing file, 'unreadable' when none were read. */
+function readJsonStrict<T>(file: string, valid: (value: any) => value is T): { state: FileState; sha: string; value?: T; error?: string } {
+  let bytes: Buffer;
   try {
-    raw = fs.readFileSync(file, 'utf-8');
+    bytes = fs.readFileSync(file);
   } catch (error: any) {
-    if (error?.code === 'ENOENT') return { state: 'missing' };
-    return { state: 'unreadable', error: error?.message ?? String(error) };
+    if (error?.code === 'ENOENT') return { state: 'missing', sha: 'absent' };
+    return { state: 'unreadable', sha: 'unreadable', error: error?.message ?? String(error) };
   }
+  const sha = shaOf(bytes);
   try {
-    const parsed = JSON.parse(raw);
-    if (!valid(parsed)) return { state: 'unreadable', error: 'unexpected shape' };
-    return { state: 'read', value: parsed };
+    const parsed = JSON.parse(bytes.toString('utf-8'));
+    if (!valid(parsed)) return { state: 'unreadable', sha, error: 'unexpected shape' };
+    return { state: 'read', sha, value: parsed };
   } catch (error: any) {
-    return { state: 'unreadable', error: error?.message ?? String(error) };
+    return { state: 'unreadable', sha, error: error?.message ?? String(error) };
   }
 }
 
@@ -458,10 +830,16 @@ export class AppStoreManager {
   private installedState: FileState = 'missing';
   private reposStamp = '';
   private installedStamp = '';
+  /** The sha of the installed.json bytes last read: the base of a publish or an uninstall (decisions 15 and 35). */
+  private installedSha = 'absent';
   /** True while this instance holds the store lock and read the file under it. */
   private reposFresh = false;
   private installedFresh = false;
   private asideStamps: Set<string> = new Set();
+  /** The sha of the repos.json bytes last read: the base of its next shared write (decision 28). */
+  private reposSha = 'absent';
+  /** The shared write the last section queued, taken by the section that awaits or watches it. */
+  private queued: StoreQueued | null = null;
 
   constructor() {
     this.reposConfig = structuredClone(DEFAULT_REPOS_CONFIG);
@@ -472,6 +850,7 @@ export class AppStoreManager {
   /**
    * Load configuration from disk. Only a missing file counts as empty; an
    * unreadable one is copied aside and blocks every write until it reads again.
+   * On a Postgres bot the pass owns the module folders, so the reconcile does not run (decision 33).
    */
   load(): void {
     try {
@@ -480,15 +859,63 @@ export class AppStoreManager {
       ensureDir(CACHE_DIR);
       this.readRepos();
       this.readInstalled();
-      this.locked(() => {
+      this.unawaited(() => this.locked(() => {
         this.readRepos();
         this.readInstalled();
         if (this.reposState === 'missing') this.saveRepos();
-        this.reconcileInstalledModules();
-      });
+        if (!isSharedStoreDoc(INSTALLED_CONFIG_PATH)) this.reconcileInstalledModules();
+      }));
     } catch (error) {
       console.error('[AppStoreManager] Failed to load config:', error);
     }
+  }
+
+  /** Runs a section whose shared write no reply waits for: a refusal is logged (decision 28, T15). */
+  private unawaited<T>(fn: () => T): T {
+    try {
+      return fn();
+    } finally {
+      const queued = this.takeQueued();
+      if (queued) watchStoreDoc(queued);
+    }
+  }
+
+  /**
+   * Decision 28 on a Postgres bot: the section runs inside the store mutex, its synchronous part under the store lock,
+   * and its shared write's ticket is awaited (StoreWriteError for an answer other than success).
+   */
+  private async awaited<T>(what: string, fn: () => T): Promise<T> {
+    const hold = await takeStoreMutex();
+    try {
+      let result: T;
+      try {
+        result = fn();
+      } catch (error) {
+        const queued = this.takeQueued();
+        if (queued) watchStoreDoc(queued);
+        throw error;
+      }
+      const queued = this.takeQueued();
+      if (queued) await awaitStoreDoc(queued, what);
+      return result;
+    } finally {
+      hold.release();
+    }
+  }
+
+  private takeQueued(): StoreQueued | null {
+    const queued = this.queued;
+    this.queued = null;
+    return queued;
+  }
+
+  /** Queues a shared write of an App Store doc with its base; the caller's section awaits or watches it. */
+  private queueShared(file: string, text: string | null, base: string): boolean {
+    const queued = queueStoreDoc(file, text, base);
+    if (!queued) return true;
+    if (this.queued) watchStoreDoc(this.queued);
+    this.queued = queued;
+    return !('refused' in queued);
   }
 
   /** Run a synchronous section under the cross-process store lock. */
@@ -538,6 +965,7 @@ export class AppStoreManager {
     const result = readJsonStrict(REPOS_CONFIG_PATH, isReposConfig);
     this.reposState = result.state;
     this.reposStamp = stamp;
+    this.reposSha = result.sha;
     if (result.state === 'read') {
       this.reposConfig = result.value!;
     } else if (result.state === 'missing') {
@@ -554,6 +982,7 @@ export class AppStoreManager {
     const result = readJsonStrict(INSTALLED_CONFIG_PATH, isInstalledConfig);
     this.installedState = result.state;
     this.installedStamp = stamp;
+    this.installedSha = result.sha;
     if (result.state === 'read') {
       this.installedConfig = result.value!;
     } else if (result.state === 'missing') {
@@ -649,6 +1078,16 @@ export class AppStoreManager {
       return false;
     }
     try {
+      if (isSharedStoreDoc(REPOS_CONFIG_PATH)) {
+        // Decision 53: only the in-memory body changes; the landing block writes the file, and the next read takes it.
+        const queued = this.queueShared(REPOS_CONFIG_PATH, JSON.stringify(this.reposConfig, null, 2), this.reposSha);
+        if (!queued) {
+          this.readRepos();
+          return false;
+        }
+        this.reposStamp = 'queued';
+        return true;
+      }
       writeJsonAtomic(REPOS_CONFIG_PATH, this.reposConfig);
       this.reposState = 'read';
       this.reposStamp = fileStamp(REPOS_CONFIG_PATH);
@@ -701,7 +1140,7 @@ export class AppStoreManager {
   }
 
   /**
-   * Add a new repository
+   * Add a new repository. On a Postgres bot the change is queued and not awaited; addRepositoryAwaited awaits it.
    */
   addRepository(
     name: string,
@@ -709,6 +1148,18 @@ export class AppStoreManager {
     branch: string = 'main',
     githubToken?: string
   ): AppStoreRepository {
+    const repo = this.newRepository(name, url, branch, githubToken);
+    return this.unawaited(() => this.addRepositoryLocked(repo));
+  }
+
+  /** addRepository with decision 28's answers: it resolves once the change is stored and the file holds it. */
+  async addRepositoryAwaited(name: string, url: string, branch: string = 'main', githubToken?: string): Promise<AppStoreRepository> {
+    if (!isSharedStoreDoc(REPOS_CONFIG_PATH)) return this.addRepository(name, url, branch, githubToken);
+    const repo = this.newRepository(name, url, branch, githubToken);
+    return this.awaited('repository list', () => this.addRepositoryLocked(repo));
+  }
+
+  private newRepository(name: string, url: string, branch: string, githubToken?: string): AppStoreRepository {
     const normalized = this.normalizeGitUrl(url);
 
     // Use branch extracted from URL if user didn't specify one explicitly
@@ -726,7 +1177,7 @@ export class AppStoreManager {
       throw new Error(`Invalid branch name: ${branchValidation.error}`);
     }
 
-    const repo: AppStoreRepository = {
+    return {
       id: crypto.randomUUID(),
       name,
       url: normalized.url,
@@ -735,7 +1186,9 @@ export class AppStoreManager {
       enabled: true,
       lastRefreshed: null
     };
+  }
 
+  private addRepositoryLocked(repo: AppStoreRepository): AppStoreRepository {
     return this.locked(() => {
       this.readRepos();
       this.requireReposReadable();
@@ -752,6 +1205,18 @@ export class AppStoreManager {
    * or the file could not be read or written.
    */
   updateRepository(id: string, updates: Partial<AppStoreRepository>): boolean {
+    this.validateUpdates(updates);
+    return this.unawaited(() => this.updateRepositoryLocked(id, updates));
+  }
+
+  /** updateRepository with decision 28's answers. */
+  async updateRepositoryAwaited(id: string, updates: Partial<AppStoreRepository>): Promise<boolean> {
+    if (!isSharedStoreDoc(REPOS_CONFIG_PATH)) return this.updateRepository(id, updates);
+    this.validateUpdates(updates);
+    return this.awaited('repository list', () => this.updateRepositoryLocked(id, updates));
+  }
+
+  private validateUpdates(updates: Partial<AppStoreRepository>): void {
     // Validate URL if being updated
     if (updates.url) {
       const urlValidation = validateRepoUrl(updates.url);
@@ -767,7 +1232,9 @@ export class AppStoreManager {
         throw new Error(`Invalid branch name: ${branchValidation.error}`);
       }
     }
+  }
 
+  private updateRepositoryLocked(id: string, updates: Partial<AppStoreRepository>): boolean {
     return this.locked(() => {
       this.readRepos();
       if (this.reposState === 'unreadable') return false;
@@ -788,6 +1255,16 @@ export class AppStoreManager {
    * Remove a repository
    */
   removeRepository(id: string): boolean {
+    return this.unawaited(() => this.removeRepositoryLocked(id));
+  }
+
+  /** removeRepository with decision 28's answers. */
+  async removeRepositoryAwaited(id: string): Promise<boolean> {
+    if (!isSharedStoreDoc(REPOS_CONFIG_PATH)) return this.removeRepository(id);
+    return this.awaited('repository list', () => this.removeRepositoryLocked(id));
+  }
+
+  private removeRepositoryLocked(id: string): boolean {
     return this.locked(() => {
       this.readRepos();
       if (this.reposState === 'unreadable') return false;
@@ -1139,49 +1616,12 @@ export class AppStoreManager {
    * Install a module from the store. The clone is rescanned, copied and its
    * HEAD read under the store lock, and the record keeps the copied version.
    */
-  async installModule(moduleName: string, repoId: string): Promise<boolean> {
+  async installModule(moduleName: string, repoId: string): Promise<boolean | PublishedChange> {
+    if (isSharedStoreDoc(INSTALLED_CONFIG_PATH)) return this.installModuleShared(moduleName, repoId);
     return this.lockedAsync(() => {
-      this.readRepos();
-      this.readInstalled();
-      this.requireInstalledReadable();
-
-      const repo = this.getRepository(repoId);
-      if (!repo) {
-        throw new Error(`Repository ${repoId} not found`);
-      }
-
-      const cacheDir = path.join(CACHE_DIR, repoId);
-      let moduleInfo: StoreModuleInfo | undefined;
-      if (fs.existsSync(path.join(cacheDir, '.git'))) {
-        const scanned = this.scanForModules(cacheDir, repo);
-        this.moduleCache.set(repoId, scanned);
-        moduleInfo = scanned.find(m => m.manifest.name === moduleName);
-      }
-
-      if (!moduleInfo) {
-        console.log(`[AppStoreManager] Module ${moduleName} not in cache, refreshing repository...`);
-        try {
-          moduleInfo = this.refreshRepositoryLocked(repoId).find(m => m.manifest.name === moduleName);
-        } catch (refreshError) {
-          console.error(`[AppStoreManager] Failed to refresh repository:`, refreshError);
-        }
-      }
-
-      if (!moduleInfo) {
-        throw new Error(`Module ${moduleName} not found in repository ${repo.name}`);
-      }
-
+      const moduleInfo = this.installChecks(moduleName, repoId);
       const sourceTargetDir = path.join(getSourceModulesDir(), moduleName);
       const buildTargetDir = path.join(getBuildModulesDir(), moduleName);
-      const runtimeTargetDir = path.join(getModulesDir(), moduleName);
-
-      if (this.installedConfig.modules[moduleName] || fs.existsSync(sourceTargetDir) || fs.existsSync(runtimeTargetDir)) {
-        throw new Error(`Module ${moduleName} is already installed`);
-      }
-
-      if (findDevModuleWithName(moduleName)) {
-        throw new Error(`Module ${moduleName} conflicts with a Dev module of the same name. Remove or rename the Dev module first.`);
-      }
 
       takeAutoSnapshot(`install ${moduleName}`);
 
@@ -1225,11 +1665,183 @@ export class AppStoreManager {
     });
   }
 
+  /** Today's checks of an install, under the store lock; answers the clone's module. */
+  private installChecks(moduleName: string, repoId: string): StoreModuleInfo {
+    this.readRepos();
+    this.readInstalled();
+    this.requireInstalledReadable();
+
+    const repo = this.getRepository(repoId);
+    if (!repo) {
+      throw new Error(`Repository ${repoId} not found`);
+    }
+
+    const cacheDir = path.join(CACHE_DIR, repoId);
+    let moduleInfo: StoreModuleInfo | undefined;
+    if (fs.existsSync(path.join(cacheDir, '.git'))) {
+      const scanned = this.scanForModules(cacheDir, repo);
+      this.moduleCache.set(repoId, scanned);
+      moduleInfo = scanned.find(m => m.manifest.name === moduleName);
+    }
+
+    if (!moduleInfo) {
+      console.log(`[AppStoreManager] Module ${moduleName} not in cache, refreshing repository...`);
+      try {
+        moduleInfo = this.refreshRepositoryLocked(repoId).find(m => m.manifest.name === moduleName);
+      } catch (refreshError) {
+        console.error(`[AppStoreManager] Failed to refresh repository:`, refreshError);
+      }
+    }
+
+    if (!moduleInfo) {
+      throw new Error(`Module ${moduleName} not found in repository ${repo.name}`);
+    }
+
+    const sourceTargetDir = path.join(getSourceModulesDir(), moduleName);
+    const runtimeTargetDir = path.join(getModulesDir(), moduleName);
+
+    if (this.installedConfig.modules[moduleName] || fs.existsSync(sourceTargetDir) || fs.existsSync(runtimeTargetDir)) {
+      throw new Error(`Module ${moduleName} is already installed`);
+    }
+
+    if (findDevModuleWithName(moduleName)) {
+      throw new Error(`Module ${moduleName} conflicts with a Dev module of the same name. Remove or rename the Dev module first.`);
+    }
+    return moduleInfo;
+  }
+
+  /**
+   * Decision 35 step 1 under the store lock: the size limits, the clone's module folder copied to a staged folder, and
+   * installed.json's new body with the sha of the bytes read under the lock as its base.
+   */
+  private stage(operation: 'install' | 'update', moduleName: string, moduleInfo: StoreModuleInfo, entryOf: (version: string) => InstalledModule): Staged {
+    const refusal = sizeRefusal(moduleName, moduleInfo.repoPath, operation) ?? filePathRefusal(moduleName, moduleInfo.repoPath, operation);
+    if (refusal) throw new Error(refusal);
+    const dir = path.join(getSourceModulesDir(), `.incoming-${moduleName}-${Date.now()}`);
+    stagedFolders.add(path.resolve(dir));
+    try {
+      this.copyDirectory(moduleInfo.repoPath, dir);
+      const version = readManifestVersion(dir);
+      const next: InstalledConfig = structuredClone(this.installedConfig);
+      next.modules[moduleName] = entryOf(version);
+      return { dir, version, body: JSON.stringify(next, null, 2), base: this.installedSha, moduleInfo };
+    } catch (error) {
+      dropStaged(dir);
+      throw error;
+    }
+  }
+
+  /** Decision 35 step 2, outside the lock: the staged files synced, then one publish of them with installed.json. */
+  private async publishStaged(operation: 'install' | 'update', moduleName: string, s: Staged): Promise<ModuleSaveAnswer> {
+    try {
+      fsyncTree(s.dir);
+      return await publishModule(moduleName, s.dir, s.body, s.base, { operation, version: s.version });
+    } catch (error) {
+      dropStaged(s.dir);
+      throw error;
+    }
+  }
+
+  /**
+   * After the publish or the uninstall answered (35, 44, 61): stored nothing, the staged folder is deleted and the answer
+   * is 42's, 35's or T10's text. Stored: installed.json's mirror and its store record entry (with the credentials doc's
+   * removal for an uninstall) under the store lock; then in the bot the apply inside the caller's hold, whose outcome
+   * the answer carries. The web UI applies through the bot (`module:apply`), so it hands the staged folder on. Once
+   * stored, a throw of the landing or the apply answers the stored change; landStoreDoc's retry or the pass writes it.
+   */
+  private async landPublished(operation: ModuleOperation, moduleName: string, s: Staged | null, body: string, answer: ModuleSaveAnswer, hold: StoreMutexHold): Promise<PublishedChange> {
+    if (answer.kind !== 'committed') {
+      if (s) dropStaged(s.dir);
+      throw notStored(operation, moduleName, answer);
+    }
+    const tag = rowMainTag();
+    const version = s?.version ?? null;
+    let landError: unknown = null;
+    try {
+      this.locked(() => {
+        landStoreDoc(INSTALLED_KEY, Buffer.from(body, 'utf8'), answer.installedSha, tag);
+        if (operation === 'uninstall') landStoreDoc(credentialsKeyOf(moduleName), null, 'absent', tag);
+        this.readInstalled();
+      });
+    } catch (error) {
+      landError = error;
+    }
+    for (const [, modules] of this.moduleCache) {
+      for (const info of modules) {
+        if (info.manifest.name !== moduleName) continue;
+        info.installed = operation !== 'uninstall';
+        info.installedVersion = version ?? undefined;
+      }
+    }
+    const change: PublishedChange = { module: moduleName, operation, version, to: answer.sha, tag, updatedBy: updatedBy(), staged: s?.dir ?? null, applied: null };
+    if (!rowsOnDataPool()) {
+      if (s) stagedFolders.delete(path.resolve(s.dir));
+      return change;
+    }
+    try {
+      if (landError !== null) throw landError;
+      const { applyModuleChange, publisherAnswer } = await import('./moduleApply');
+      const result = await applyModuleChange({
+        module: moduleName, to: answer.sha, source: s?.dir ?? 'rows', displaced: 'backups', reason: operation, tag, version, updatedBy: change.updatedBy,
+      }, hold);
+      change.applied = publisherAnswer(operation, moduleName, version ?? '', result);
+    } catch (error) {
+      change.applied = notAppliedYet(operation, moduleName, version ?? '', error, await applyLaterHere(moduleName));
+    } finally {
+      if (s) dropStaged(s.dir);
+      change.staged = null;
+    }
+    return change;
+  }
+
+  /** Decision 35 on a Postgres bot: stage under the store lock, publish outside it, then land and apply, all in one hold. */
+  private async installModuleShared(moduleName: string, repoId: string): Promise<PublishedChange> {
+    const hold = await takeStoreMutex();
+    try {
+      const s = this.locked(() => {
+        const moduleInfo = this.installChecks(moduleName, repoId);
+        takeAutoSnapshot(`install ${moduleName}`);
+        const commitHash = this.getRepoCacheCommit(repoId) || undefined;
+        return this.stage('install', moduleName, moduleInfo, version => ({
+          name: moduleName, version, installedFrom: repoId, installedAt: new Date().toISOString(), commitHash,
+        }));
+      });
+      const answer = await this.publishStaged('install', moduleName, s);
+      return await this.landPublished('install', moduleName, s, s.body, answer, hold);
+    } finally {
+      hold.release();
+    }
+  }
+
+  /** Decision 35's uninstall on a Postgres bot: the checks under the lock, the unpublish outside it, then the removal. */
+  private async uninstallModuleShared(moduleName: string): Promise<PublishedChange> {
+    const hold = await takeStoreMutex();
+    try {
+      const prepared = this.locked(() => {
+        this.readInstalled();
+        this.requireInstalledReadable();
+        if (!this.installedConfig.modules[moduleName]) {
+          throw new Error(`Module ${moduleName} is not installed`);
+        }
+        const dirs = [getSourceModulesDir(), getBuildModulesDir(), getModulesDir()].map(dir => path.join(dir, moduleName));
+        if (dirs.some(dir => fs.existsSync(dir))) takeAutoSnapshot(`uninstall ${moduleName}`);
+        const next: InstalledConfig = structuredClone(this.installedConfig);
+        delete next.modules[moduleName];
+        return { body: JSON.stringify(next, null, 2), base: this.installedSha };
+      });
+      const answer = await unpublishModule(moduleName, prepared.body, prepared.base);
+      return await this.landPublished('uninstall', moduleName, null, prepared.body, answer, hold);
+    } finally {
+      hold.release();
+    }
+  }
+
   /**
    * Uninstall a module. The record goes first, so a failed save changes
    * nothing and a failed delete leaves folders the next reconcile removes.
    */
-  async uninstallModule(moduleName: string): Promise<boolean> {
+  async uninstallModule(moduleName: string): Promise<boolean | PublishedChange> {
+    if (isSharedStoreDoc(INSTALLED_CONFIG_PATH)) return this.uninstallModuleShared(moduleName);
     return this.lockedAsync(() => {
       this.readInstalled();
       this.requireInstalledReadable();
@@ -1374,15 +1986,31 @@ export class AppStoreManager {
   // ============================================================================
 
   /**
-   * Save credentials for a module
+   * Save credentials for a module. On a Postgres bot the change is queued and not awaited; saveCredentialsAwaited
+   * awaits it.
    */
   saveCredentials(moduleName: string, credentials: Record<string, string>): boolean {
+    return this.unawaited(() => this.saveCredentialsNow(moduleName, credentials));
+  }
+
+  /** saveCredentials with decision 28's answers, under the store lock. */
+  async saveCredentialsAwaited(moduleName: string, credentials: Record<string, string>): Promise<boolean> {
+    const credPath = path.join(CREDENTIALS_DIR, `${moduleName}.json`);
+    if (!isSharedStoreDoc(credPath)) return this.saveCredentials(moduleName, credentials);
+    return this.awaited(`credentials of ${moduleName}`, () => this.saveCredentialsNow(moduleName, credentials));
+  }
+
+  private saveCredentialsNow(moduleName: string, credentials: Record<string, string>): boolean {
     try {
       ensureDir(CREDENTIALS_DIR);
       const credPath = path.join(CREDENTIALS_DIR, `${moduleName}.json`);
+      if (isSharedStoreDoc(credPath)) {
+        return this.locked(() => this.queueShared(credPath, JSON.stringify(credentials, null, 2), storeFileSha(credPath)));
+      }
       fs.writeFileSync(credPath, JSON.stringify(credentials, null, 2));
       return true;
     } catch (error) {
+      if (error instanceof StoreWriteError) throw error;
       console.error(`[AppStoreManager] Failed to save credentials for ${moduleName}:`, error);
       return false;
     }
@@ -1406,16 +2034,32 @@ export class AppStoreManager {
   }
 
   /**
-   * Delete credentials for a module
+   * Delete credentials for a module. On a Postgres bot the delete is queued and not awaited; deleteCredentialsAwaited
+   * awaits it.
    */
   deleteCredentials(moduleName: string): boolean {
+    return this.unawaited(() => this.deleteCredentialsNow(moduleName));
+  }
+
+  /** deleteCredentials with decision 28's answers, under the store lock. */
+  async deleteCredentialsAwaited(moduleName: string): Promise<boolean> {
+    const credPath = path.join(CREDENTIALS_DIR, `${moduleName}.json`);
+    if (!isSharedStoreDoc(credPath)) return this.deleteCredentials(moduleName);
+    return this.awaited(`credentials of ${moduleName}`, () => this.deleteCredentialsNow(moduleName));
+  }
+
+  private deleteCredentialsNow(moduleName: string): boolean {
     try {
       const credPath = path.join(CREDENTIALS_DIR, `${moduleName}.json`);
+      if (isSharedStoreDoc(credPath)) {
+        return this.locked(() => this.queueShared(credPath, null, storeFileSha(credPath)));
+      }
       if (fs.existsSync(credPath)) {
         fs.unlinkSync(credPath);
       }
       return true;
     } catch (error) {
+      if (error instanceof StoreWriteError) throw error;
       console.error(`[AppStoreManager] Failed to delete credentials for ${moduleName}:`, error);
       return false;
     }
@@ -1626,7 +2270,7 @@ export class AppStoreManager {
    * Runs under the store lock against the record on disk, so a module the
    * other process uninstalled is never copied back.
    */
-  async updateModule(moduleName: string): Promise<{ success: boolean; newVersion?: string; error?: string }> {
+  async updateModule(moduleName: string): Promise<ModuleUpdateResult> {
     // Prevent concurrent updates to the same module
     if (this.updatesInProgress.has(moduleName)) {
       return { success: false, error: `Update already in progress for ${moduleName}` };
@@ -1634,6 +2278,13 @@ export class AppStoreManager {
 
     // Mark update as in progress
     this.updatesInProgress.add(moduleName);
+    if (isSharedStoreDoc(INSTALLED_CONFIG_PATH)) {
+      try {
+        return await this.updateModuleShared(moduleName);
+      } finally {
+        this.updatesInProgress.delete(moduleName);
+      }
+    }
 
     const sourceDir = path.join(getSourceModulesDir(), moduleName);
     const buildDir = path.join(getBuildModulesDir(), moduleName);
@@ -1773,19 +2424,72 @@ export class AppStoreManager {
   }
 
   /**
+   * Decision 35's update on a Postgres bot: today's checks and the clone refresh under the store lock, the staged copy,
+   * the publish outside the lock, then the apply in the bot; none of updateModule's own backup, remove, copy or
+   * rollback runs (44).
+   */
+  private async updateModuleShared(moduleName: string): Promise<ModuleUpdateResult> {
+    let hold: StoreMutexHold;
+    let started: { version: string; sha: string | null } | null = null;
+    try {
+      hold = await takeStoreMutex();
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+    try {
+      const prepared = this.locked((): Staged | ModuleUpdateResult => {
+        this.readRepos();
+        this.readInstalled();
+        this.requireInstalledReadable();
+        const installed = this.installedConfig.modules[moduleName];
+        if (!installed) return { success: false, error: `Module ${moduleName} is not installed` };
+        const record = readStoreRecord();
+        started = { version: installed.version, sha: record.ok ? record.record.modules[moduleName]?.sha ?? null : null };
+        const repo = this.getRepository(installed.installedFrom);
+        if (!repo) return { success: false, error: `Repository ${installed.installedFrom} not found` };
+        if (!fs.existsSync(path.join(getSourceModulesDir(), moduleName))) {
+          return { success: false, error: `Module ${moduleName} has no files where it was installed, so it was not updated. Reinstall it from the App Store.` };
+        }
+        const moduleInfo = this.refreshRepositoryLocked(repo.id).find(m => m.manifest.name === moduleName);
+        if (!moduleInfo) return { success: false, error: `Module ${moduleName} no longer exists in repository` };
+        if (this.compareVersions(installed.version, moduleInfo.manifest.version) >= 0) return { success: true, newVersion: installed.version };
+        takeAutoSnapshot(`update ${moduleName}`);
+        const commitHash = this.getRepoCacheCommit(repo.id) || undefined;
+        return this.stage('update', moduleName, moduleInfo, version => ({
+          name: moduleName, version, installedFrom: repo.id, installedAt: new Date().toISOString(), commitHash,
+        }));
+      });
+      if ('success' in prepared) return prepared;
+      const answer = await this.publishStaged('update', moduleName, prepared);
+      const change = await this.landPublished('update', moduleName, prepared, prepared.body, answer, hold);
+      return { success: true, newVersion: prepared.version, published: change, ...(change.applied ? { applied: change.applied } : {}) };
+    } catch (error) {
+      if (error instanceof StoreWriteError && error.status === 202) return { success: false, error: error.message, unconfirmed: true };
+      if (error instanceof StoreWriteError && error.status === 409) {
+        const by = error.by ?? null;
+        const elsewhere: ElsewhereChange = started ? await elsewhereChange(moduleName, started, by) : { kind: 'module', by };
+        return { success: false, error: error.message, changedElsewhere: true, elsewhere };
+      }
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
+    } finally {
+      hold.release();
+    }
+  }
+
+  /**
    * Update all modules that have available updates
    */
   async updateAllModules(): Promise<{
     success: boolean;
-    updated: Array<{ moduleName: string; oldVersion: string; newVersion: string }>;
-    failed: Array<{ moduleName: string; error: string }>;
+    updated: Array<{ moduleName: string; oldVersion: string; newVersion: string; applied?: PublisherAnswer; published?: PublishedChange }>;
+    failed: Array<{ moduleName: string; error: string; unconfirmed?: true; changedElsewhere?: true; elsewhere?: ElsewhereChange }>;
     checkErrors: Array<{ moduleName: string; error: string }>;
     skipped: Array<{ moduleName: string; reason: string }>;
   }> {
     const result = {
       success: true,
-      updated: [] as Array<{ moduleName: string; oldVersion: string; newVersion: string }>,
-      failed: [] as Array<{ moduleName: string; error: string }>,
+      updated: [] as Array<{ moduleName: string; oldVersion: string; newVersion: string; applied?: PublisherAnswer; published?: PublishedChange }>,
+      failed: [] as Array<{ moduleName: string; error: string; unconfirmed?: true; changedElsewhere?: true; elsewhere?: ElsewhereChange }>,
       checkErrors: [] as Array<{ moduleName: string; error: string }>,
       skipped: [] as Array<{ moduleName: string; reason: string }>
     };
@@ -1808,12 +2512,16 @@ export class AppStoreManager {
         result.updated.push({
           moduleName: moduleUpdate.moduleName,
           oldVersion,
-          newVersion: updateResult.newVersion
+          newVersion: updateResult.newVersion,
+          ...(updateResult.applied ? { applied: updateResult.applied } : {}),
+          ...(updateResult.published ? { published: updateResult.published } : {})
         });
       } else if (!updateResult.success) {
         result.failed.push({
           moduleName: moduleUpdate.moduleName,
-          error: updateResult.error || 'Unknown error'
+          error: updateResult.error || 'Unknown error',
+          ...(updateResult.unconfirmed ? { unconfirmed: true as const } : {}),
+          ...(updateResult.changedElsewhere ? { changedElsewhere: true as const, ...(updateResult.elsewhere ? { elsewhere: updateResult.elsewhere } : {}) } : {})
         });
         result.success = false;
       } else {

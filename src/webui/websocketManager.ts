@@ -109,6 +109,7 @@ export interface AppStoreInstallJobData {
   loaded?: boolean;
   unloaded?: boolean;
   skipped?: boolean;
+  message?: string;
 }
 
 /**

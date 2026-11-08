@@ -33,7 +33,7 @@ import {
   type SaveMark,
   type WriteTicket,
 } from '../../src/bot/internalSetup/utils/dataManager';
-import { landed, openLedger, runInLedger, runSealed } from '../../src/bot/internalSetup/utils/dataBackends/writeLedger';
+import { landed, openLedger, runInLedger, runSealed, type LedgerTicket } from '../../src/bot/internalSetup/utils/dataBackends/writeLedger';
 import { verdictOf } from '../../src/bot/internalSetup/utils/dataBackends/replyGate';
 import { FakeStore, tokenFor, type FlushMode } from '../helpers/fakeStore';
 import { freezeGuildWrites, unfreezeGuildWrites } from '../helpers/freezeGuild';
@@ -164,7 +164,7 @@ describe('confirmSaved over a working set, the state x exit table', () => {
     const guildId = freshGuild();
     const before = saveMark();
     const manager = { confirm: () => Promise.reject(new Error('the confirm failed')) };
-    noteScopeTicket(guildId, { kind: 'ws', manager, set: { landedSeq: 0 }, guildId, seq: 1 } as unknown as WriteTicket);
+    noteScopeTicket(guildId, { kind: 'ws', manager, set: { landedSeq: 0 }, guildId, seq: 1 } as unknown as LedgerTicket);
     expect(await answer(confirmSaved(guildId, { since: before, deadlineMs: 1000 }), 1000)).toBe('unavailable');
   });
 
@@ -650,7 +650,7 @@ async function runScope(ops: ScopeOp[]): Promise<void> {
       return confirmSaved(guildId, { since, deadlineMs: deadline }).then(outcome => {
         if (outcome !== 'ok') return;
         for (const { stamp, ticket } of accepted) {
-          if (stamp > since.stamp && stamp <= calledAt) expect(landed(ticket), `a write stamped ${stamp}, asked since ${since.stamp}, answered ok`).toBe(true);
+          if (stamp > since.stamp && stamp <= calledAt) expect(landed(ticket as LedgerTicket), `a write stamped ${stamp}, asked since ${since.stamp}, answered ok`).toBe(true);
         }
       });
     };
@@ -796,11 +796,11 @@ describe('review round 1: refused writes, the hold, since and pruning', () => {
     const first = saveMark().stamp + 1;
     for (let i = 0; i < LOST_MARKS_PER_SCOPE + 1; i++) {
       const set = { landedSeq: 0 };
-      noteScopeTicket(guildId, { kind: 'ws', manager: {}, set, guildId, seq: 1 } as unknown as WriteTicket);
+      noteScopeTicket(guildId, { kind: 'ws', manager: {}, set, guildId, seq: 1 } as unknown as LedgerTicket);
       setLeft(set);
     }
     const fenced = { landedSeq: 0, state: 'fenced' };
-    noteScopeTicket(guildId, { kind: 'ws', manager: {}, set: fenced, guildId, seq: 1 } as unknown as WriteTicket);
+    noteScopeTicket(guildId, { kind: 'ws', manager: {}, set: fenced, guildId, seq: 1 } as unknown as LedgerTicket);
     setLeft(fenced);
     expect(pendingFor(guildId, first - 1).pruned).toBe(true);
     expect(await answer(confirmSaved(guildId, { since: at(first - 1), deadlineMs: 0 }), 0)).toBe('deposed');
@@ -810,7 +810,7 @@ describe('review round 1: refused writes, the hold, since and pruning', () => {
     const guildId = freshGuild();
     const since = saveMark();
     const fenced = { landedSeq: 0, state: 'fenced' };
-    noteScopeTicket(guildId, { kind: 'ws', manager: {}, set: fenced, guildId, seq: 1 } as unknown as WriteTicket);
+    noteScopeTicket(guildId, { kind: 'ws', manager: {}, set: fenced, guildId, seq: 1 } as unknown as LedgerTicket);
     setLeft(fenced);
     noteScopeRefusal(guildId, `guild:${guildId}:m/a.json`);
     expect(await answer(confirmSaved(guildId, { since, deadlineMs: 0 }), 0)).toBe('refused');
@@ -865,7 +865,7 @@ describe('absent deletes', () => {
     if (first.outcome !== 'deleted') throw new Error(`the delete was not accepted: ${first.outcome}`);
     const again = deleteDataTracked('log.jsonl', options);
     if (again.outcome !== 'absent' || !again.ticket) throw new Error(`the delete did not find the tombstone: ${again.outcome}`);
-    expect(again.ticket.seq).toBe(first.ticket.seq);
+    expect((again.ticket as LedgerTicket).seq).toBe((first.ticket as LedgerTicket).seq);
     expect(await answer(confirmWrite(again.ticket, 0), 0)).toBe('pending');
   });
 });

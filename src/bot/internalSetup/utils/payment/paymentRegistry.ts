@@ -13,7 +13,7 @@
 import { EventEmitter } from 'events';
 import * as fs from 'fs';
 import * as path from 'path';
-import type { PaymentProvider, ProviderEvent } from './paymentTypes';
+import type { PaymentProvider, ProviderEvent, SubscriptionReader, SubscriptionView, WalkBatch } from './paymentTypes';
 import { isMaintenanceBoot } from '../maintenanceGate';
 import { sharedWritesGatedHere } from '../dataManager';
 
@@ -82,6 +82,33 @@ export class PaymentProviderRegistry extends EventEmitter {
       throw new Error(`[Data] A payment event (${event.type}) was raised in the web UI process outside a change it applies; the bot process handles payment events while it runs`);
     }
     this.emit('provider.event', event);
+  }
+
+  private reader: SubscriptionReader | null = null;
+
+  /** PremiumManager's constructor sets its reader; null removes it (NB6 decisions 84, 94 and 102). */
+  setSubscriptionReader(reader: SubscriptionReader | null): void {
+    this.reader = reader;
+  }
+
+  subscriptionReaderReady(): boolean {
+    return this.reader !== null && this.reader.ready();
+  }
+
+  readSubscription(providerId: string, guildId: string, providerSubId: string): SubscriptionView | null {
+    return this.reader?.read(providerId, guildId, providerSubId) ?? null;
+  }
+
+  subscriptionReaderSha(): string | null {
+    return this.reader?.sha() ?? null;
+  }
+
+  /** The Dummy tick's walk events, as one batch (NB6 decision 110). */
+  emitWalkBatch(batch: WalkBatch): void {
+    if (sharedWritesGatedHere()) {
+      throw new Error('[Data] A payment event (provider.walk-batch) was raised in the web UI process outside a change it applies; the bot process handles payment events while it runs');
+    }
+    this.emit('provider.walk-batch', batch);
   }
 
   /** Tear down all providers; used in tests / process shutdown. */

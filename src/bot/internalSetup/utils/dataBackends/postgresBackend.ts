@@ -33,7 +33,7 @@ import type {
   RetireOutcome,
 } from './backend';
 
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 9;
 const PROVISION_VERDICT_POLL_MS = 250;
 const PARTITION_COUNT = 32;
 const MAX_ROWS_PER_STATEMENT = 200;
@@ -65,14 +65,14 @@ export function provisionSeedRows(s: string): string[] {
   ];
 }
 
-/** provisionDdl without its seed rows: the 20 statements that make the schema. */
+/** provisionDdl without its seed rows: the 28 statements that make the schema. */
 export function provisionSchemaDdl(s: string): string[] {
   const seeds = new Set(provisionSeedRows(s));
   return provisionDdl(s).filter(stmt => !seeds.has(stmt));
 }
 
 // Any change here bumps SCHEMA_VERSION; the boot refuses a stored schema that differs.
-/** The schema's 22 statements, rendered for a schema name (smdb_data, or the scratch copy the boot compares with). */
+/** The schema's 30 statements, rendered for a schema name (smdb_data, or the scratch copy the boot compares with). */
 export function provisionDdl(s: string): string[] {
   const [clockSeed, reshardSeed] = provisionSeedRows(s);
   return [
@@ -219,6 +219,56 @@ export function provisionDdl(s: string): string[] {
   )`,
   `CREATE INDEX IF NOT EXISTS guild_requests_pending_idx ON ${s}.guild_requests (for_process, created_at) WHERE state = 'pending'`,
   `CREATE INDEX IF NOT EXISTS guild_requests_applying_idx ON ${s}.guild_requests (claim_batch) WHERE state = 'applying'`,
+  `CREATE SEQUENCE IF NOT EXISTS ${s}.shared_rev_seq`,
+  `CREATE TABLE IF NOT EXISTS ${s}.shared_docs (
+    key         text        PRIMARY KEY,
+    body        bytea       NOT NULL,
+    sha         text        NOT NULL,
+    rev         bigint      NOT NULL,
+    updated_at  timestamptz NOT NULL DEFAULT now(),
+    updated_by  text        NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS ${s}.shared_lines (
+    key         text        NOT NULL,
+    id          uuid        PRIMARY KEY,
+    seq         bigint      NOT NULL DEFAULT nextval('${s}.shared_rev_seq'),
+    line        bytea       NOT NULL,
+    created_at  timestamptz NOT NULL DEFAULT now()
+  )`,
+  `CREATE INDEX IF NOT EXISTS shared_lines_key_seq ON ${s}.shared_lines (key, seq)`,
+  `CREATE TABLE IF NOT EXISTS ${s}.shared_modules (
+    module      text        PRIMARY KEY,
+    sha         text        NOT NULL,
+    rev         bigint      NOT NULL,
+    version     text,
+    file_count  integer     NOT NULL,
+    bytes       bigint      NOT NULL,
+    updated_at  timestamptz NOT NULL DEFAULT now(),
+    updated_by  text        NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS ${s}.shared_module_files (
+    module      text        NOT NULL,
+    rel         text        NOT NULL,
+    bytes       bytea       NOT NULL,
+    mode        integer     NOT NULL,
+    PRIMARY KEY (module, rel)
+  )`,
+  `CREATE TABLE IF NOT EXISTS ${s}.shared_module_status (
+    module      text        NOT NULL,
+    node_id     text        NOT NULL,
+    node_name   text        NOT NULL,
+    sha         text        NOT NULL,
+    state       text        NOT NULL CHECK (state IN ('applied', 'failed')),
+    error       text,
+    at          timestamptz NOT NULL DEFAULT now(),
+    process_id  text        NOT NULL,
+    seq         bigint      NOT NULL,
+    PRIMARY KEY (module, node_id)
+  )`,
+  `CREATE TABLE IF NOT EXISTS ${s}.shared_ops (
+    id  uuid        PRIMARY KEY,
+    at  timestamptz NOT NULL DEFAULT now()
+  )`,
   ];
 }
 
@@ -330,7 +380,7 @@ type AlertEvent = 'outage' | 'recovered' | 'deposed';
 const ASK_DATABASE_TIMEOUT_MS = 5_000;
 
 /** An error as the held log names it: its SQLSTATE when it has one, then its message. */
-function describeFailure(error: unknown): { detail: string; code?: string } {
+export function describeFailure(error: unknown): { detail: string; code?: string } {
   const code = error && typeof error === 'object' ? (error as { code?: unknown }).code : undefined;
   const message = error instanceof Error ? error.message : String(error);
   return typeof code === 'string' && /^[0-9A-Z]{5}$/.test(code) ? { detail: `SQLSTATE ${code}: ${message}`, code } : { detail: message };
@@ -484,6 +534,68 @@ class OwnStateRefusal extends Error {
 function operationDetail(refusal: OwnStateRefusal): string {
   return refusal.phase === 'latched' ? `${refusal.detail}; this process does not write to it` : refusal.detail;
 }
+
+/** NB6 D5: shared transactions and module fetch reads on the wire at once, each also holding a place of the flush gate. */
+const SHARED_PLACES = 4;
+/** NB6 D6: the server bound of a landing check's BEGIN, lock and SELECT, which share one ANSWER_BOUND_MS deadline. */
+export const CHECK_STATEMENT_MS = 30_000;
+/** NB6 C4: a module fetch read's client bound over its server bound. */
+const READ_CLIENT_MARGIN_MS = 10_000;
+
+/** NB6 C4 and D6: one statement of a shared transaction. */
+export interface SharedStatement<S = unknown> {
+  text: string;
+  values: unknown[];
+  /**
+   * Called synchronously with the statement's answer: the statements it answers are sent next, and a stop ends the
+   * transaction with ROLLBACK.
+   */
+  next?: (res: QueryResult) => SharedStatement<S>[] | { stop: S } | void;
+}
+
+export interface SharedTxSpec<S = unknown> {
+  /** D6: the lock and the landing SELECT for an op holding unknown ids, sent after BEGIN under one 40 s deadline; null for none. */
+  check: SharedStatement[] | null;
+  /** Built synchronously: before BEGIN with null when check is null, else with the check's answers. 'landed' rolls back. */
+  statements(checkRows: QueryResult[] | null): SharedStatement<S>[] | 'landed' | { stop: S };
+  /** Called as COMMIT goes out (the op's COMMIT is on the wire from then). */
+  onCommitSent?: () => void;
+  /**
+   * D6: publishModule's and unpublishModule's landing check, run at once on a new client when COMMIT's answer is lost,
+   * while this transaction still holds its places.
+   */
+  checkAtOnce?: SharedStatement[];
+}
+
+/** A 57014: the statement's size, how long it ran and the server bound it ran under. */
+export interface SharedTimeout {
+  bytes: number;
+  elapsedMs: number;
+  boundMs: number;
+  atBound: boolean;
+}
+
+export type SharedFailure = { detail: string; code?: string; timeout?: SharedTimeout };
+
+export type SharedTxOutcome<S = unknown> =
+  | { kind: 'committed'; results: QueryResult[] }
+  /** The check found an earlier attempt: rolled back. */
+  | { kind: 'landed' }
+  | { kind: 'stopped'; value: S }
+  /** C6: this backend's own state refused it before COMMIT was sent; nothing was committed. */
+  | { kind: 'refused'; phase: 'latched' | 'held'; detail: string }
+  /** Nothing was committed: the connect, the check (no answer), a statement, or the statements' build failed. */
+  | ({ kind: 'failed'; step: 'connect' | 'check' | 'statements' | 'build' } & SharedFailure)
+  /**
+   * COMMIT was sent and its answer was lost, or came after the latch rose. checked: the at-once check's answers, null
+   * when it got none; absent without checkAtOnce.
+   */
+  | { kind: 'unknown'; detail?: string; code?: string; landedOn?: string; checked?: QueryResult[] | null };
+
+export type SharedReadOutcome =
+  | { kind: 'read'; rows: any[] }
+  | { kind: 'refused'; phase: 'latched' | 'held'; detail: string }
+  | ({ kind: 'failed'; step: 'connect' | 'statements' } & SharedFailure);
 
 /** Client timeouts of statements whose caller's own deadline was at most their answer bound (I5 case (a)). */
 const deadlineCuts = new WeakSet<object>();
@@ -768,6 +880,9 @@ export class PostgresBackend implements DataBackend {
   // The flush gate: at most FLUSH_WIRE_MAX flushes hold a client at once, the rest wait first in, first out.
   private flushesOnWire = 0;
   private readonly flushWaiters: Array<() => void> = [];
+  // NB6 D5: at most SHARED_PLACES of those places hold shared work; the rest of it waits first in, first out.
+  private sharedOnWire = 0;
+  private readonly sharedWaiters: Array<() => void> = [];
 
   private readonly markerStoreId: () => string | null;
 
@@ -1831,6 +1946,260 @@ export class PostgresBackend implements DataBackend {
     ).finally(give);
   }
 
+  // ==========================================================================
+  // SHARED TRANSACTIONS (NB6 C4, C5, C6, D5, D6, E1)
+  // ==========================================================================
+
+  /** The shared places and flush places taken now. */
+  sharedPlacesInUse(): { shared: number; flush: number } {
+    return { shared: this.sharedOnWire, flush: this.flushesOnWire };
+  }
+
+  /** A shared place, then a flush place, both queued at the call, so shared work and guild flushes start in call order. */
+  private takeSharedPlaces(): Promise<void> {
+    if (this.sharedOnWire < SHARED_PLACES && this.sharedWaiters.length === 0) {
+      this.sharedOnWire += 1;
+      return this.takeFlushPlace();
+    }
+    return new Promise<void>(resolve => { this.sharedWaiters.push(() => resolve(this.takeFlushPlace())); });
+  }
+
+  private giveSharedPlaces(): void {
+    this.giveFlushPlace();
+    const next = this.sharedWaiters.shift();
+    if (next) next();
+    else this.sharedOnWire -= 1;
+  }
+
+  /**
+   * One shared transaction on the data pool. With no check, its statements are built before BEGIN, which carries
+   * `SET LOCAL statement_timeout = flushBoundMs(largest)`; with a check, BEGIN carries the check's 30 s and the bound
+   * follows the check's answers. Statements carry no client bound and COMMIT carries ANSWER_BOUND_MS. Both places are
+   * given back when it ends; only the at-once check of a lost COMMIT keeps them until it ends.
+   */
+  async sharedTx<S>(spec: SharedTxSpec<S>): Promise<SharedTxOutcome<S>> {
+    let planned: SharedStatement<S>[] | null = null;
+    if (spec.check === null) {
+      const plan = sharedPlan(() => spec.statements(null));
+      if (!Array.isArray(plan)) return plan;
+      planned = plan;
+    }
+    await this.takeSharedPlaces();
+    try {
+      return await this.sharedTxOnWire(spec, planned);
+    } finally {
+      this.giveSharedPlaces();
+    }
+  }
+
+  private async sharedTxOnWire<S>(spec: SharedTxSpec<S>, planned: SharedStatement<S>[] | null): Promise<SharedTxOutcome<S>> {
+    let lease: DataLease;
+    try {
+      lease = await this.checkout();
+    } catch (error) {
+      if (error instanceof OwnStateRefusal) return { kind: 'refused', phase: error.phase, detail: operationDetail(error) };
+      this.noteFailure(error);
+      return { kind: 'failed', step: 'connect', ...describeFailure(error) };
+    }
+    let destroy = false;
+    let released = false;
+    let commitSent = false;
+    let step: 'check' | 'statements' = spec.check === null ? 'statements' : 'check';
+    // The query on the wire: when it was sent, its size and the server bound in force for it.
+    let sent = { at: performance.now(), bytes: 0, bound: CHECK_STATEMENT_MS };
+    let boundMs = CHECK_STATEMENT_MS;
+    const send = (text: string, values: unknown[] = [], bound = boundMs) => {
+      sent = { at: performance.now(), bytes: statementBytes(text, values), bound };
+      return this.sendOn(lease, text, values, null);
+    };
+    const results: QueryResult[] = [];
+    try {
+      let queue: SharedStatement<S>[];
+      if (spec.check === null) {
+        queue = planned!;
+        boundMs = flushBoundMs(largestStatement(queue));
+        await send(`BEGIN; SET LOCAL statement_timeout = ${boundMs}`, [], STATEMENT_TIMEOUT_MS);
+      } else {
+        const deadline = monoNow() + BigInt(ANSWER_BOUND_MS) * 1_000_000n;
+        const ask = (text: string, values: unknown[] = []) => {
+          sent = { at: performance.now(), bytes: statementBytes(text, values), bound: CHECK_STATEMENT_MS };
+          return this.sendOn(lease, text, values, ANSWER_BOUND_MS, Math.max(1, msLeft(deadline)));
+        };
+        await ask(`BEGIN; SET LOCAL statement_timeout = ${CHECK_STATEMENT_MS}`);
+        const checkRows: QueryResult[] = [];
+        for (const st of spec.check) checkRows.push(await ask(st.text, st.values));
+        step = 'statements';
+        const plan = sharedPlan(() => spec.statements(checkRows));
+        if (!Array.isArray(plan)) {
+          destroy = !(await this.rollbackShared(lease));
+          if (plan.kind === 'landed') this.noteSuccess();
+          return plan;
+        }
+        queue = plan;
+        boundMs = flushBoundMs(largestStatement(queue));
+        await send(`SET LOCAL statement_timeout = ${boundMs}`, [], CHECK_STATEMENT_MS);
+      }
+      let boundBytes = largestStatement(queue);
+      while (queue.length > 0) {
+        const st = queue.shift()!;
+        const oversize = oversizeFailure(st);
+        const bytes = statementBytes(st.text, st.values);
+        if (oversize) {
+          destroy = !(await this.rollbackShared(lease));
+          return oversize;
+        }
+        if (bytes > boundBytes) {
+          boundBytes = bytes;
+          boundMs = flushBoundMs(bytes);
+          await send(`SET LOCAL statement_timeout = ${boundMs}`);
+        }
+        const res = await send(st.text, st.values);
+        results.push(res);
+        if (!st.next) continue;
+        let after: ReturnType<NonNullable<SharedStatement<S>['next']>>;
+        try {
+          after = st.next(res);
+        } catch (error) {
+          destroy = !(await this.rollbackShared(lease));
+          return { kind: 'failed', step: 'build', detail: error instanceof Error ? error.message : String(error) };
+        }
+        if (Array.isArray(after)) queue.unshift(...after);
+        else if (after) {
+          destroy = !(await this.rollbackShared(lease));
+          return { kind: 'stopped', value: after.stop };
+        }
+      }
+      sent = { at: performance.now(), bytes: statementBytes('COMMIT', []), bound: boundMs };
+      await this.sendOn(lease, 'COMMIT', [], ANSWER_BOUND_MS, Infinity, () => {
+        commitSent = true;
+        spec.onCommitSent?.();
+      });
+      if (lease.epoch !== this.epoch) {
+        // NB5: an answer after this process stopped writing there confirms nothing.
+        const landedOn = this.address(lease.entry);
+        this.releaseLease(lease, false);
+        released = true;
+        return { kind: 'unknown', landedOn, ...(spec.checkAtOnce ? { checked: await this.checkAtOnce(spec.checkAtOnce, lease.epoch) } : {}) };
+      }
+      this.noteSuccess();
+      return { kind: 'committed', results };
+    } catch (error) {
+      const failedAt = performance.now();
+      destroy = true;
+      // Set by the COMMIT's onPass, which the compiler does not follow.
+      const committing = (commitSent as boolean) === true;
+      const refusal = this.ownRefusal(lease, error);
+      if (refusal && !committing) return { kind: 'refused', phase: refusal.phase, detail: operationDetail(refusal) };
+      if (committing && (refusal !== null || commitMayHaveLanded(error))) {
+        this.releaseLease(lease, true);
+        released = true;
+        const checked = spec.checkAtOnce ? { checked: await this.checkAtOnce(spec.checkAtOnce, lease.epoch) } : {};
+        this.noteFailure(error);
+        return { kind: 'unknown', ...describeFailure(error), ...checked };
+      }
+      await this.rollbackQuiet(lease, error);
+      this.noteFailure(error);
+      const timeout = (error as { code?: unknown } | null)?.code === '57014'
+        ? { timeout: { bytes: sent.bytes, elapsedMs: failedAt - sent.at, boundMs: sent.bound, atBound: failedAt - sent.at >= sent.bound } }
+        : {};
+      return { kind: 'failed', step, ...describeFailure(error), ...timeout };
+    } finally {
+      if (!released) this.releaseLease(lease, destroy);
+    }
+  }
+
+  /** A ROLLBACK under the answer bound; false when it was not answered, so the client is destroyed. */
+  private async rollbackShared(lease: DataLease): Promise<boolean> {
+    try {
+      await this.sendOn(lease, 'ROLLBACK', [], ANSWER_BOUND_MS);
+      return true;
+    } catch (error) {
+      this.noteFailure(error);
+      return false;
+    }
+  }
+
+  /**
+   * D6: a publish's landing check on a new client, in the transaction's database epoch: BEGIN with the 30 s server
+   * bound, then the check, under one ANSWER_BOUND_MS deadline. Null when it got no answer.
+   */
+  private async checkAtOnce(check: SharedStatement[], epoch: number): Promise<QueryResult[] | null> {
+    if (this.poolEpoch !== epoch) return null;
+    let lease: DataLease;
+    try {
+      lease = await this.checkout();
+    } catch (error) {
+      this.noteFailure(error);
+      return null;
+    }
+    let destroy = false;
+    const deadline = monoNow() + BigInt(ANSWER_BOUND_MS) * 1_000_000n;
+    const ask = (text: string, values: unknown[] = []) => this.sendOn(lease, text, values, ANSWER_BOUND_MS, Math.max(1, msLeft(deadline)));
+    try {
+      await ask(`BEGIN; SET LOCAL statement_timeout = ${CHECK_STATEMENT_MS}`);
+      const rows: QueryResult[] = [];
+      for (const st of check) rows.push(await ask(st.text, st.values));
+      destroy = !(await this.rollbackShared(lease));
+      this.noteSuccess();
+      return rows;
+    } catch (error) {
+      destroy = true;
+      this.noteFailure(error);
+      return null;
+    } finally {
+      this.releaseLease(lease, destroy);
+    }
+  }
+
+  /**
+   * C4: one module fetch SELECT in its own `BEGIN READ ONLY` transaction under the server bound of a 4 MiB statement,
+   * each query with a client bound of that plus 10 s. It takes a shared place and a flush place, as sharedTx does.
+   */
+  async sharedRead(text: string, values: unknown[]): Promise<SharedReadOutcome> {
+    await this.takeSharedPlaces();
+    try {
+      return await this.sharedReadOnWire(text, values);
+    } finally {
+      this.giveSharedPlaces();
+    }
+  }
+
+  private async sharedReadOnWire(text: string, values: unknown[]): Promise<SharedReadOutcome> {
+    let lease: DataLease;
+    try {
+      lease = await this.checkout();
+    } catch (error) {
+      if (error instanceof OwnStateRefusal) return { kind: 'refused', phase: error.phase, detail: operationDetail(error) };
+      this.noteFailure(error);
+      return { kind: 'failed', step: 'connect', ...describeFailure(error) };
+    }
+    const boundMs = flushBoundMs(FLUSH_STATEMENT_BYTES);
+    const clientMs = boundMs + READ_CLIENT_MARGIN_MS;
+    let destroy = false;
+    let sentAt = performance.now();
+    try {
+      await this.sendOn(lease, `BEGIN READ ONLY; SET LOCAL statement_timeout = ${boundMs}`, [], clientMs);
+      sentAt = performance.now();
+      const res = await this.sendOn(lease, text, values, clientMs);
+      destroy = !(await this.rollbackShared(lease));
+      this.noteSuccess();
+      return { kind: 'read', rows: res.rows };
+    } catch (error) {
+      const failedAt = performance.now();
+      destroy = true;
+      const refusal = this.ownRefusal(lease, error);
+      if (refusal) return { kind: 'refused', phase: refusal.phase, detail: operationDetail(refusal) };
+      await this.rollbackQuiet(lease, error);
+      this.noteFailure(error);
+      const timeout = (error as { code?: unknown } | null)?.code === '57014'
+        ? { timeout: { bytes: statementBytes(text, values), elapsedMs: failedAt - sentAt, boundMs, atBound: failedAt - sentAt >= boundMs } }
+        : {};
+      return { kind: 'failed', step: 'statements', ...describeFailure(error), ...timeout };
+    } finally {
+      this.releaseLease(lease, destroy);
+    }
+  }
+
   async retireGuild(guildId: string, reason: string, token: FenceToken, deadline: bigint | null = null): Promise<RetireOutcome> {
     if (this.refusedWithoutClaim('retire', guildId, token)) return { ok: false, reason: 'no-claim' };
     if (deadline !== null && msLeft(deadline) < STATEMENT_FLOOR_MS) return { ok: false, reason: 'out-of-time' };
@@ -2149,6 +2518,18 @@ export class PostgresBackend implements DataBackend {
     }
   }
 
+  /** NB6 decisions 11 and 49: one read of the mirror pass under its own client bound; it takes no flush place (C5). */
+  async sharedSelect(text: string, values: unknown[], boundMs: number): Promise<QueryResult> {
+    try {
+      const res = await this.leaseQuery(text, values, boundMs);
+      this.noteSuccess();
+      return res;
+    } catch (error) {
+      this.noteFailure(error);
+      throw error;
+    }
+  }
+
   /** J2: a read whose answer can be large, on a lease the latch can cut, with no client bound. */
   private async readLong(text: string, values: unknown[]): Promise<QueryResult> {
     let lease: DataLease | undefined;
@@ -2172,11 +2553,45 @@ export class PostgresBackend implements DataBackend {
 // MODULE-PRIVATE SQL BUILDERS
 // ============================================================================
 
-/** The UTF-8 size of a statement's text and values, as it goes over the wire. */
-function statementBytes(text: string, values: unknown[]): number {
-  let bytes = Buffer.byteLength(text);
-  for (const v of values) if (v !== null && v !== undefined) bytes += Buffer.byteLength(String(v));
+/** The size of a statement's text and values as it goes over the wire: UTF-8, and a Buffer's raw bytes. */
+export function statementBytes(text: string, values: unknown[]): number {
+  return Buffer.byteLength(text) + valueBytes(values);
+}
+
+function valueBytes(values: unknown[]): number {
+  let bytes = 0;
+  for (const v of values) if (v !== null && v !== undefined) bytes += Buffer.isBuffer(v) ? v.length : Buffer.byteLength(String(v));
   return bytes;
+}
+
+export function largestStatement(statements: SharedStatement<unknown>[]): number {
+  let largest = 0;
+  for (const st of statements) largest = Math.max(largest, statementBytes(st.text, st.values));
+  return largest;
+}
+
+/** NB6 C4: no statement carries more than FLUSH_STATEMENT_BYTES of values. */
+export function oversizeFailure(st: SharedStatement<unknown>): { kind: 'failed'; step: 'build'; detail: string } | null {
+  const bytes = valueBytes(st.values);
+  if (bytes <= FLUSH_STATEMENT_BYTES) return null;
+  return { kind: 'failed', step: 'build', detail: `a statement carries ${bytes} bytes of values, over the ${FLUSH_STATEMENT_BYTES} a statement may carry; it was not sent` };
+}
+
+/** A shared transaction's statements as built, or the outcome that ends it before they are sent. */
+export function sharedPlan<S>(build: () => SharedStatement<S>[] | 'landed' | { stop: S }): SharedStatement<S>[] | SharedTxOutcome<S> {
+  let plan: SharedStatement<S>[] | 'landed' | { stop: S };
+  try {
+    plan = build();
+  } catch (error) {
+    return { kind: 'failed', step: 'build', detail: error instanceof Error ? error.message : String(error) };
+  }
+  if (plan === 'landed') return { kind: 'landed' };
+  if (!Array.isArray(plan)) return { kind: 'stopped', value: plan.stop };
+  for (const st of plan) {
+    const oversize = oversizeFailure(st);
+    if (oversize) return oversize;
+  }
+  return plan;
 }
 
 interface Statement {

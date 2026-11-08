@@ -45,9 +45,10 @@ const RETYPE: Record<string, { sql: string; shown: string }> = {
   boolean: { sql: 'text', shown: 'text' },
   'timestamp with time zone': { sql: 'timestamp', shown: 'timestamp without time zone' },
   uuid: { sql: 'text', shown: 'text' },
+  bytea: { sql: 'text', shown: 'text' },
 };
 const DOC_RETYPE = { sql: 'jsonb', shown: 'jsonb' };
-const DEFAULT_FOR: Record<string, string> = { text: `'x'`, integer: '7', bigint: '7', boolean: 'true', 'timestamp with time zone': 'now()', uuid: 'gen_random_uuid()' };
+const DEFAULT_FOR: Record<string, string> = { text: `'x'`, integer: '7', bigint: '7', boolean: 'true', 'timestamp with time zone': 'now()', uuid: 'gen_random_uuid()', bytea: `'\\x00'::bytea` };
 
 // Changes Postgres refuses, with the SQLSTATE it answers.
 const SKIP: Record<string, string> = {
@@ -171,6 +172,31 @@ const EXTRAS: Record<string, Extras> = {
     }],
   },
   'identify_slots.bucket drop': { pk: true },
+  // NB6's shared tables, written from schema 9's DDL by the rules above; the next run confirms them.
+  'shared_docs.key drop': { pk: true },
+  'shared_docs.rev retype': TO_NUMERIC,
+  'shared_lines.id drop': { pk: true },
+  'shared_lines.key drop': { indexes: ['shared_lines_key_seq'] },
+  'shared_lines.seq drop': { indexes: ['shared_lines_key_seq'] },
+  'shared_lines.id retype': TO_TEXT,
+  'shared_lines.seq retype': TO_NUMERIC,
+  'shared_modules.module drop': { pk: true },
+  'shared_modules.rev retype': TO_NUMERIC,
+  'shared_modules.bytes retype': TO_NUMERIC,
+  'shared_module_files.module drop': { pk: true },
+  'shared_module_files.rel drop': { pk: true },
+  'shared_module_status.module drop': { pk: true },
+  'shared_module_status.node_id drop': { pk: true },
+  'shared_module_status.state drop': { constraints: ['shared_module_status_state_check'] },
+  'shared_module_status.seq retype': TO_NUMERIC,
+  'shared_module_status.state retype': {
+    sentences: [{
+      rel: 'shared_module_status', aspect: ASPECT.constraint, sub: 'shared_module_status_state_check',
+      text: "smdb_data.shared_module_status constraint shared_module_status_state_check is CHECK (((state)::text = ANY (ARRAY['applied'::text, 'failed'::text]))), where this bot's schema has CHECK ((state = ANY (ARRAY['applied'::text, 'failed'::text])))",
+    }],
+  },
+  'shared_ops.id drop': { pk: true },
+  'shared_ops.id retype': TO_TEXT,
   'reshard.id drop': { pk: true, constraints: ['reshard_id_check'] },
   'reshard.attempt retype': TO_TEXT,
   'reshard.method drop': { constraints: ['reshard_method_check'] },

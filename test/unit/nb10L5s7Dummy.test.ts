@@ -16,6 +16,7 @@ const h = vi.hoisted(() => ({
 vi.mock('../../src/bot/internalSetup/utils/dataManager', () => ({
   DataBackendUnavailableError: class extends Error { causeKey = 'io'; },
   onWriterTake: () => undefined,
+  onSharedApplied: () => () => undefined,
   readRawStrict: () => { h.reads++; return h.raw; },
   saveDataTracked: (_f: string, _o: unknown, data: unknown) => {
     h.saves.push(JSON.parse(JSON.stringify(data)));
@@ -23,6 +24,7 @@ vi.mock('../../src/bot/internalSetup/utils/dataManager', () => ({
   },
 }));
 vi.mock('../../src/bot/internalSetup/utils/dataBackends/writeLedger', () => ({
+  currentLedger: () => undefined,
   markRetried: (doc: string) => { h.retried.push(doc); },
   outsideLedgers: (fn: () => unknown) => fn(),
   recordRefusal: (cause: string, doc: string) => { h.refusals.push([cause, doc]); },
@@ -37,7 +39,13 @@ vi.mock('../../src/bot/internalSetup/utils/premiumManager', () => ({
   stopWords: (k: string) => `stop words ${k}`,
 }));
 vi.mock('../../src/bot/internalSetup/utils/payment/paymentRegistry', () => ({
-  getPaymentRegistry: () => ({ emitEvent: (e: any) => { h.events.push(e); } }),
+  getPaymentRegistry: () => ({
+    emitEvent: (e: any) => { h.events.push(e); },
+    subscriptionReaderReady: () => !h.replaying,
+    subscriptionReaderSha: () => null,
+    readSubscription: () => null,
+    emitWalkBatch: (b: any) => { h.events.push(...b.events); },
+  }),
 }));
 vi.mock('../../src/bot/internalSetup/utils/maintenanceGate', () => ({ isMaintenanceGateClosed: () => false }));
 vi.mock('../../src/bot/internalSetup/utils/writerLock', () => ({ writerLockDepth: () => 0 }));

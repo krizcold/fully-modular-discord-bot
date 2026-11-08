@@ -579,11 +579,20 @@ async function handleUpdateAllModules(context: PanelContext): Promise<PanelRespo
       // Step 1: Download module updates via AppStoreManager
       const result = await triggerAllModuleUpdates();
 
-      if (result.totalUpdated > 0) {
-        console.log(`[UpdateManagerPanel] Downloaded ${result.totalUpdated} module update(s), hot-reloading...`);
+      // On a Postgres bot each update was applied inside updateModule (NB6 decision 44): its answer, and no second reload
+      const applied = result.updated.filter(u => u.applied);
+      for (const u of applied) {
+        if (u.applied!.text) console.warn(`[UpdateManagerPanel] ${u.applied!.text}`);
+      }
+      const loaded = applied.filter(u => u.applied!.outcome === 'applied').length;
+      if (loaded > 0) console.log(`[UpdateManagerPanel] Hot-reloaded ${loaded} module(s)`);
+
+      const toReload = result.updated.filter(u => !u.applied);
+      if (toReload.length > 0) {
+        console.log(`[UpdateManagerPanel] Downloaded ${toReload.length} module update(s), hot-reloading...`);
 
         // Step 2: Hot-reload the updated modules
-        const updatedNames = result.updated.map((u: any) => u.moduleName);
+        const updatedNames = toReload.map(u => u.moduleName);
         if (updatedNames.length > 0 && context.client) {
           const reloadResult = await reloadModules(context.client, updatedNames);
           if (reloadResult.success) {
@@ -680,7 +689,10 @@ async function handleUpdateSingleModule(context: PanelContext, moduleName: strin
       // Step 1: Download module update
       const result = await triggerModuleUpdate(moduleName);
 
-      if (result.success) {
+      if (result.success && result.applied) {
+        if (result.applied.text) console.warn(`[UpdateManagerPanel] ${result.applied.text}`);
+        else console.log(`[UpdateManagerPanel] Hot-reloaded ${moduleName}`);
+      } else if (result.success) {
         console.log(`[UpdateManagerPanel] Downloaded ${moduleName} update, hot-reloading...`);
 
         // Step 2: Hot-reload the module
@@ -692,6 +704,8 @@ async function handleUpdateSingleModule(context: PanelContext, moduleName: strin
             console.warn(`[UpdateManagerPanel] Hot-reload failed for ${moduleName}: ${reloadResult.error}`);
           }
         }
+      } else if (result.unconfirmed) {
+        console.warn(`[UpdateManagerPanel] ${result.error}`);
       } else {
         console.error(`[UpdateManagerPanel] Failed to update ${moduleName}: ${result.error}`);
       }

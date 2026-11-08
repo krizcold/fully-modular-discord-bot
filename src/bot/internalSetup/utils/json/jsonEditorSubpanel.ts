@@ -26,6 +26,7 @@ import {
   buildJsonUploadModal,
   canEditInModal,
 } from './jsonPanelUtils';
+import { EDITOR_BASE_GONE_TEXT, editorSaveOptions, noteEditorBase } from '../panel/editorBase';
 
 const MAX_EDIT_SIZE = 4000;
 const MAX_PREVIEW_LENGTH = 1200;
@@ -82,8 +83,10 @@ export interface JsonEditorConfig {
   infoLines?: string[];
   /** Function to get current data */
   getData: () => any;
-  /** Function to save data (can be async) */
-  saveData: (data: any) => void | Promise<void>;
+  /** Function to save data (can be async); options carry the base of the body the editor showed (NB6 decision 50) */
+  saveData: (data: any, options: { baseSha?: string }) => void | Promise<void>;
+  /** The file the editor shows: its view and edit modal remember its base, and a submit saves over that base only */
+  baseFile?: string;
   /** Validation options for JSON parsing */
   validationOptions?: JsonValidationOptions;
   /** Template/example shown when data is empty */
@@ -151,6 +154,7 @@ export function buildJsonEditorView(
   context: PanelContext
 ): ContainerBuilder {
   const data = config.getData();
+  if (config.baseFile !== undefined) noteEditorBase(context.userId, config.panelId, config.baseFile);
   const fileExists = config.fileExists ?? (data !== null);
   const isEmpty = isDataEmpty(data);
   const hasData = fileExists && !isEmpty;
@@ -333,6 +337,7 @@ export async function handleJsonEditorButton(
   switch (parsed.action) {
     case ACTIONS.EDIT: {
       const data = config.getData();
+      if (config.baseFile !== undefined) noteEditorBase(context.userId, config.panelId, config.baseFile);
       const editData = isDataEmpty(data) && config.template ? config.template : data;
 
       const modal = buildJsonEditModal({
@@ -410,9 +415,11 @@ export async function handleJsonEditorModal(
 
       const refusal = config.validate?.(result.data);
       if (refusal) return showErrorAndReturnView(refusal, config, context);
+      const options = saveOptions(config, context);
+      if (!options) return showErrorAndReturnView(EDITOR_BASE_GONE_TEXT, config, context);
 
       try {
-        await config.saveData(result.data);
+        await config.saveData(result.data, options);
       } catch (error) {
         return showErrorAndReturnView(`Save failed: ${error instanceof Error ? error.message : 'Unknown error'}`, config, context);
       }
@@ -429,9 +436,11 @@ export async function handleJsonEditorModal(
 
       const uploadRefusal = config.validate?.(uploadResult.data);
       if (uploadRefusal) return showErrorAndReturnView(uploadRefusal, config, context);
+      const uploadOptions = saveOptions(config, context);
+      if (!uploadOptions) return showErrorAndReturnView(EDITOR_BASE_GONE_TEXT, config, context);
 
       try {
-        await config.saveData(uploadResult.data);
+        await config.saveData(uploadResult.data, uploadOptions);
       } catch (error) {
         return showErrorAndReturnView(`Save failed: ${error instanceof Error ? error.message : 'Unknown error'}`, config, context);
       }
@@ -442,6 +451,11 @@ export async function handleJsonEditorModal(
     default:
       return null;
   }
+}
+
+/** The options a submit saves with; null when the editor's base is gone (T14). */
+function saveOptions(config: JsonEditorConfig, context: PanelContext): { baseSha?: string } | null {
+  return config.baseFile === undefined ? {} : editorSaveOptions(context.userId, config.panelId, config.baseFile);
 }
 
 function savedConfig(config: JsonEditorConfig): JsonEditorConfig {

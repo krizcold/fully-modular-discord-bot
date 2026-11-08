@@ -25,7 +25,7 @@ vi.mock('../../src/bot/internalSetup/utils/payment/paymentRegistry', async orig 
   return {
     ...(await orig<any>()),
     getPaymentRegistry: () => ({
-      on: (_type: string, fn: (e: any) => void) => { reg.listeners.push(fn); },
+      on: (type: string, fn: (e: any) => void) => { if (type === 'provider.event') reg.listeners.push(fn); },
       off: () => undefined,
       list: () => [patreon],
       startTickers: () => undefined,

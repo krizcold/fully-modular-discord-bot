@@ -102,7 +102,7 @@ export async function handleInvoke(data: InvokePayload): Promise<Record<string, 
   };
   if (!verdict.ok) {
     // The truth leads; the command's own error is kept beside it.
-    answer.error = verdict.answer === 'unstorable' ? operatorRefusalText(verdict) : truthText(verdict.answer, verdict.partial);
+    answer.error = verdict.answer === 'unstorable' ? operatorRefusalText(verdict) : truthText(verdict.answer, verdict.partial, verdict.changed);
     answer.truth = verdict.answer;
     if (verdict.answer === 'pending' || verdict.answer === 'held') answer.pending = true;
     if (outcome && 'error' in outcome) answer.handlerError = outcome.error;

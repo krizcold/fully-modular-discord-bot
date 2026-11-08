@@ -39,11 +39,24 @@ describe('the drain', () => {
     }
   });
 
-  it('does not wait for queued global paths', async () => {
+  // sheets/NB6.md:1130-1131 (decision 39) amends sheets/NB3.md:935-936.
+  it('a global path sharedKeyFor names holds the drain and is named when its flush keeps failing', async () => {
     const glob = dataPath('global', 'mod', 'g.json');
     const undo = failFlushes(glob);
     try {
       saveDataTracked('g.json', { scope: 'global', category: 'mod' }, { g: 1 });
+      expect(await drainGuildWrites(500)).toEqual([glob]);
+    } finally {
+      undo();
+      await flushAll();
+    }
+  });
+
+  it('does not wait for a global path local to the machine', async () => {
+    const local = dataPath('global', 'metrics', 'totals.json');
+    const undo = failFlushes(local);
+    try {
+      saveDataTracked('totals.json', { scope: 'global', category: 'metrics' }, { t: 1 });
       const started = Date.now();
       expect(await drainGuildWrites(3000)).toEqual([]);
       expect(Date.now() - started).toBeLessThan(2500);

@@ -3,7 +3,8 @@
 
 import * as path from 'path';
 import { dataPath } from '../../../utils/dataRoot';
-import { isStopping, readRawStrict, writeRawAtomic } from './dataManager';
+import { providerCredentialsPath, PROVIDER_CREDENTIALS_FILE, resolveDataBackend } from '../../../utils/envLoader';
+import { baseOf, isStopping, readRawStrict, writeRawAtomic } from './dataManager';
 import { ROOT_CONFIG_PATH } from './configManager';
 import { isInternalGlobalRel } from './configDiscovery';
 import { applyOperatorGlobalRead, shaOfRaw, CHANGED_SINCE_OPEN_TEXT, CHANGED_TEXT, type GlobalDataReadRequest } from './ipcDataHandler';
@@ -16,17 +17,18 @@ export { deposedText } from './writerLock';
 import { getPremiumManager, invalidatePremiumCache, MigrationBusy, settlePremiumInstalls } from './premiumManager';
 import { getPaymentRegistry } from './payment/paymentRegistry';
 import { invalidateDummyCaches } from './payment/dummyProvider';
+import { refreshShared, sharedBootCause, sharedBootCauseLocal, sharedBootDone } from './sharedMirror';
 
 export interface SharedOpRequest {
   op: string;
   args?: any;
 }
 
-export type SharedOpCode = 'invalid' | 'maintenance' | 'held-elsewhere' | 'changed' | 'changed-since-open' | 'unconfirmed' | 'failed';
+export type SharedOpCode = 'invalid' | 'maintenance' | 'held-elsewhere' | 'changed' | 'changed-since-open' | 'unconfirmed' | 'failed' | 'starting';
 
 export type SharedOpReply =
   | { ok: true; result?: unknown }
-  | { ok: false; code: SharedOpCode; error: string; answer?: TruthAnswer; partial?: boolean; result?: unknown; stopping?: boolean };
+  | { ok: false; code: SharedOpCode; error: string; status?: number; answer?: TruthAnswer; partial?: boolean; result?: unknown; stopping?: boolean };
 
 export const PROVIDER_SENTENCE = "A payment provider call this change made may already have taken effect; check the provider's dashboard.";
 
@@ -87,7 +89,8 @@ export function globalTarget(req: GlobalDataReadRequest): string | null {
 }
 
 class OpRefusal extends Error {
-  constructor(readonly code: SharedOpCode, message: string) {
+  /** status: the HTTP status the route answers, when it is not the code's. */
+  constructor(readonly code: SharedOpCode, message: string, readonly status?: number) {
     super(message);
   }
 }
@@ -175,6 +178,43 @@ function setGlobalModuleConfig(args: { moduleName?: unknown; partial?: unknown; 
   throw new OpRefusal('invalid', 'expectSha is required');
 }
 
+/**
+ * NB6 decision 57 with 28's answers: a built-in provider's keys in the credentials doc (null clears one), on the bytes
+ * this process holds as base; it waits up to 40 s for the op. Run by the bot while it runs and by the web UI's local
+ * chain while it does not, so one process writes the doc's mirror (decision 25).
+ */
+async function saveProviderCredentials(args: { providerId?: unknown; changes?: unknown }): Promise<void> {
+  const changes = args?.changes;
+  if (typeof args?.providerId !== 'string' || !changes || typeof changes !== 'object' || Array.isArray(changes)) {
+    throw new OpRefusal('invalid', 'providerId and changes are required');
+  }
+  const providerId = args.providerId;
+  const { awaitStoreDoc, queueStoreDoc, StoreWriteError } = await import('./appStoreManager');
+  const file = providerCredentialsPath();
+  try {
+    let doc: Record<string, unknown> = {};
+    let base: string;
+    try {
+      const text = readRawStrict(file);
+      base = baseOf(file);
+      if (text !== null) doc = JSON.parse(text);
+    } catch (error) {
+      const cause = error instanceof Error ? error.message : String(error);
+      throw new StoreWriteError(500, `${PROVIDER_CREDENTIALS_FILE} cannot be read, so the keys of ${providerId} were not saved: ${cause}${cause.endsWith('.') ? '' : '.'}`);
+    }
+    if (!doc || typeof doc !== 'object' || Array.isArray(doc)) {
+      throw new StoreWriteError(500, `${PROVIDER_CREDENTIALS_FILE} holds no object, so the keys of ${providerId} were not saved.`);
+    }
+    const held = doc[providerId];
+    const entry = { ...(held && typeof held === 'object' && !Array.isArray(held) ? held : {}), ...(changes as Record<string, string | null>) };
+    const queued = queueStoreDoc(file, JSON.stringify({ ...doc, [providerId]: entry }, null, 2), base);
+    if (queued) await awaitStoreDoc(queued, `credentials of ${providerId}`, undefined, PROVIDER_CREDENTIALS_FILE);
+  } catch (error) {
+    if (!(error instanceof StoreWriteError)) throw error;
+    throw new OpRefusal(error.status === 409 ? 'changed' : error.status === 202 ? 'unconfirmed' : 'failed', error.message, error.status);
+  }
+}
+
 const registry = new Map<string, OpFn>();
 registry.set('global.write', globalWrite);
 registry.set('payment.webhook', paymentWebhook);
@@ -191,6 +231,7 @@ registry.set('premium.setGlobalModuleConfig', setGlobalModuleConfig);
 for (const method of DUMMY_METHODS) {
   registry.set(`dummy.${method}`, (args: { args?: unknown[] }) => dummyProvider()[method](...(Array.isArray(args?.args) ? args.args : [])));
 }
+registry.set('provider.saveCredentials', saveProviderCredentials);
 
 export function isRegisteredOp(op: string): boolean {
   return registry.has(op);
@@ -221,16 +262,49 @@ export function partialEndingIn(text: unknown): string | null {
   return at.length > 0 ? text.slice(Math.min(...at)) : null;
 }
 
-/** NB13 D4: a path is named saved only when the listed tickets hold a landed one of it and none of it not landed. */
+/**
+ * NB13 D4: a path is named saved only when the listed tickets hold a landed one of it and none of it not landed. A row
+ * ticket names its shared key's file under /data/global.
+ */
 function landedNames(ledger: WriteLedger): string[] {
-  const files = ledger.tickets().map(entry => entry.ticket).filter(ticket => ticket.kind === 'file') as Array<{ path: string } & Parameters<typeof landed>[0]>;
-  const open = new Set(files.filter(ticket => !landed(ticket)).map(ticket => ticket.path));
-  return [...new Set(files.filter(ticket => landed(ticket) && !open.has(ticket.path)).map(ticket => path.basename(ticket.path)))];
+  const tickets = ledger.tickets().map(entry => entry.ticket);
+  const named: Array<{ id: string; name: string; landed: boolean }> = [];
+  for (const ticket of tickets) {
+    if (ticket.kind === 'file') named.push({ id: `file:${ticket.path}`, name: path.basename(ticket.path), landed: landed(ticket) });
+    else if (ticket.kind === 'row') named.push({ id: `row:${ticket.key}`, name: ticket.key.replace(/^global\//, ''), landed: landed(ticket) });
+  }
+  const open = new Set(named.filter(n => !n.landed).map(n => n.id));
+  return [...new Set(named.filter(n => n.landed && !open.has(n.id)).map(n => n.name))];
 }
 
 /** A partial answer drops its closing "Please ..." request and ends with partialEnding. */
 export function partialText(text: string, ledger: WriteLedger): string {
   return `${text.replace(/ Please [^.]*\.$/, '')} ${partialEnding(landedNames(ledger))}`;
+}
+
+/** The shared files a premium, Dummy or payment op reads: premium's and the Dummy provider's state. */
+const PREMIUM_KEYS = ['global/premium-tiers.json', 'global/payment-providers/dummy/state.json'];
+
+const unreachableText = (cause: string): string =>
+  `Can't reach the database to read the current premium settings (${cause}); nothing was saved. Try again in a moment.`;
+const localWriteText = (cause: string): string =>
+  `This machine could not write its copy of the current premium settings (${cause}), so nothing was saved. Check this machine's disk, then try again.`;
+
+/**
+ * NB6 decisions 13 and 40: before a premium, Dummy or payment op, the files it reads are brought up to the rows and
+ * the events journal is read, each within 10 s; the refusal text when either fails, else null. A JSON bot reads none.
+ */
+async function refreshBeforeOp(): Promise<string | null> {
+  if (resolveDataBackend() !== 'postgres') return null;
+  const pass = { end: Promise.resolve() };
+  const refreshed = await refreshShared(PREMIUM_KEYS, end => { pass.end = end; });
+  if (!refreshed.ok) {
+    // A mirror moved aside before the bound is still written: the op answers once its pass ends, inside the chain's lock.
+    await pass.end;
+    return refreshed.local ? localWriteText(refreshed.cause) : unreachableText(refreshed.cause);
+  }
+  const journal = await getPremiumManager().readSharedJournal(false);
+  return journal.ok ? null : unreachableText(journal.cause);
 }
 
 /** Applies one op in this process: the lock check, the op inside its own sealed ledger, and the verdict over it. */
@@ -241,6 +315,8 @@ export async function applySharedOp(req: SharedOpRequest): Promise<SharedOpReply
   const fn = registry.get(op);
   if (!fn) return carryWrites({ ok: false, code: 'invalid', error: `unknown op ${op || '(none)'}` }, NO_WRITES);
   if (op.startsWith('premium.') || op.startsWith('dummy.') || op.startsWith('payment.')) {
+    const unreachable = await refreshBeforeOp();
+    if (unreachable) return carryWrites({ ok: false, code: 'failed', error: unreachable }, NO_WRITES);
     const refusal = cacheRefusal(op);
     if (refusal) return carryWrites({ ok: false, code: 'failed', error: refusal }, NO_WRITES);
   }
@@ -258,7 +334,7 @@ export async function applySharedOp(req: SharedOpRequest): Promise<SharedOpReply
           code: 'unconfirmed' as const,
           answer: verdict.answer,
           partial: verdict.partial,
-          error: withProviderSentence(op, verdict.partial ? partialText(truthText(verdict.answer, true), ledger) : truthText(verdict.answer, false)),
+          error: withProviderSentence(op, verdict.partial ? partialText(truthText(verdict.answer, true, verdict.changed), ledger) : truthText(verdict.answer, false, verdict.changed)),
           result,
           ...(isStopping() ? { stopping: true } : {}),
         };
@@ -268,12 +344,33 @@ export async function applySharedOp(req: SharedOpRequest): Promise<SharedOpReply
     });
     return carryWrites(reply, writes);
   } catch (error) {
-    if (error instanceof OpRefusal) return carryWrites({ ok: false, code: error.code, error: error.code === 'unconfirmed' ? withProviderSentence(op, error.message) : error.message }, writes);
+    if (error instanceof OpRefusal) {
+      const status = error.status !== undefined ? { status: error.status } : {};
+      return carryWrites({ ok: false, code: error.code, ...status, error: error.code === 'unconfirmed' ? withProviderSentence(op, error.message) : error.message }, writes);
+    }
     if (error instanceof WebhookRejected) return carryWrites({ ok: false, code: 'invalid', error: error.message }, writes);
     if (error instanceof MigrationBusy) return carryWrites({ ok: false, code: 'changed', error: error.message }, writes);
     // A throw of its own leaves the op's writes off its reply: the local chain answers it can't confirm.
     return { ok: false, code: 'failed', error: withProviderSentence(op, error instanceof Error ? error.message : String(error)) };
   }
+}
+
+/**
+ * T38 (C24, D9): the child's answer before bootShared ended; cause is the last failed try's, null while none failed;
+ * local when that cause is this machine's own write of the shared files (R5-B2).
+ */
+export function sharedStartingText(type: 'shared:op' | 'data:global-read', cause: string | null, local = false): string {
+  const saved = type === 'shared:op' ? '; nothing was saved' : '';
+  if (cause === null) return `The bot is starting and is bringing the shared files up to date from the database${saved}. Try again in a moment.`;
+  return local
+    ? `The bot is waiting for this machine to write the shared files (${cause})${saved}. Check this machine's disk, then try again.`
+    : `The bot is waiting for the database (${cause}) before it brings the shared files up to date${saved}. Try again once the database answers.`;
+}
+
+/** C24: a Postgres bot serves shared ops and global reads once bootShared ended; a maintenance boot never runs it. */
+function startingReply(type: 'shared:op' | 'data:global-read'): SharedOpReply | null {
+  if (isMaintenanceBoot() || sharedBootDone()) return null;
+  return { ok: false, code: 'starting', error: sharedStartingText(type, sharedBootCause(), sharedBootCauseLocal()) };
 }
 
 let handlerInstalled = false;
@@ -288,7 +385,10 @@ export function setupSharedOpsIPC(): void {
     if ((type !== 'shared:op' && type !== 'data:global-read') || !requestId) return;
     let reply: unknown;
     try {
-      if (type === 'shared:op') {
+      const starting = startingReply(type);
+      if (starting) {
+        reply = starting;
+      } else if (type === 'shared:op') {
         reply = await applySharedOp((data || {}) as SharedOpRequest);
       } else {
         reply = maintenanceIpcRefusal(type) ?? applyOperatorGlobalRead((data || {}) as GlobalDataReadRequest);

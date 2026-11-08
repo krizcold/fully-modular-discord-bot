@@ -18,9 +18,9 @@ import { setBackendKind } from '../helpers/backendKind';
 import { endPool } from '../helpers/endPool';
 import { takeShard } from '../helpers/pgClaims';
 import { poolFor, startPostgres } from '../helpers/postgres';
-import { FAKE_SCHEMA, startFakeApp, type DeleteFault, type WriteFault } from '../oracle/fakeApp';
+import { FAKE_SCHEMA, SHARED_UPSERT, shaOfText, startFakeApp, syncMirror, writeMirror, type DeleteFault, type WriteFault } from '../oracle/fakeApp';
 import { dbCopy, parseRequests } from '../oracle/judge.mjs';
-import { biteStatements, claimsSql, dumpSql, hashOf, ownershipSql, parseLog, requestsSql } from '../oracle/oracle.mjs';
+import { biteStatements, claimsSql, dumpSql, hashOf, ownershipSql, parseLog, requestsSql, sharedDumpSql, sharedKey } from '../oracle/oracle.mjs';
 
 // The oracle end to end: the writer, the app-path reader, the fleet reader and
 // the checker run as child processes against fake nodes on real
@@ -1053,4 +1053,109 @@ describe('NB7 test 12: changes sent to the machine that runs the guild, its hold
     expect(b.code).toBe(1);
     expect(b.result.verdicts.map((v: any) => `${v.v} ${v.key}`).sort()).toEqual([`FALSE-ANSWER ${untrue.key}`, `TWICE ${twice.key}`].sort());
   }, 420_000);
+});
+
+describe('NB6: the shared files of a Postgres bot of two machines', () => {
+  const SHARED = 'oracle/s1.json';
+  const SEED = JSON.stringify({ seed: 1 }, null, 2);
+  const shared = ['--shared', SHARED, '--shared-ratio', '1', '--hot-ratio', '0', '--delete-ratio', '0', '--read-every', '0', '--limiter', 'off', '--rate', '10'];
+
+  // The row and both machines' mirrors start on one version, as after a pass.
+  async function seedShared(folders: string[]): Promise<void> {
+    await pool.query(SHARED_UPSERT, [sharedKey(SHARED), Buffer.from(SEED, 'utf8'), shaOfText(SEED), 'seed']);
+    for (const folder of folders) writeMirror(folder, SHARED, SEED);
+  }
+
+  async function copies(run: string, log: string, folders: [string, string][]): Promise<string[]> {
+    const guild = await dump('test', run, `${run}-db.jsonl`);
+    const rows = await dumpQuery('test', sharedDumpSql([SHARED]), `${run}-shared.jsonl`);
+    const args = ['--log', log, '--db', `db=${guild}`, '--shared-db', `shared=${rows}`, '--shared-bound', '0', '--no-fleet', '--k', '0'];
+    for (const [name, folder] of folders) {
+      const out = file(`${run}-${name}-${Math.random().toString(36).slice(2)}.mirror.jsonl`);
+      const r = await runNode([ORACLE, 'mirror', '--log', log, '--data', folder, '--name', name, '--out', out]);
+      expect(r.code).toBe(0);
+      args.push('--mirror', out);
+    }
+    return args;
+  }
+
+  it('passes saves each machine compared, and names a mirror or a row put back to an older version', async () => {
+    const ma = file('nb6a');
+    const mb = file('nb6b');
+    await seedShared([ma, mb]);
+    const a = await startFakeApp({ pools: [pool], sharedMirror: ma });
+    const b = await startFakeApp({ pools: [pool], sharedMirror: mb });
+    // Each machine's pass, faster than the bot's so the lanes meet each other's versions.
+    const pass = setInterval(() => { void syncMirror(pool, ma, [SHARED]); void syncMirror(pool, mb, [SHARED]); }, 50);
+    let log = '';
+    try {
+      log = await write('nb6s', [`a=${a.url}`, `b=${b.url}`], ['--duration', BACKSTOP_S, '--marks', file('nb6s-marks.txt'), ...shared], async l => {
+        await until([l], ([e]) => e.filter(x => x.t === 'shared-ans' && x.cls === 'ACKED').length >= 6);
+      }, file('nb6s-marks.txt'));
+    } finally {
+      clearInterval(pass);
+      await a.close();
+      await b.close();
+    }
+    await syncMirror(pool, ma, [SHARED]);
+    await syncMirror(pool, mb, [SHARED]);
+    const events = parseLog(fs.readFileSync(log, 'utf8'));
+    const answers = new Map(events.filter(e => e.t === 'shared-ans').map(e => [e.id, e]));
+    // A save another machine's change refused is a change no machine applied.
+    for (const e of answers.values()) if (e.cls === 'REFUSED') expect(e.definite).toBe(true);
+    const clean = await check(await copies('nb6s', log, [['ma', ma], ['mb', mb]]));
+    expect(clean.result.verdicts).toEqual([]);
+    expect(clean.result.inconclusive).toEqual([]);
+    expect(clean.code).toBe(0);
+
+    const stored = (await pool.query('SELECT body FROM smdb_data.shared_docs WHERE key = $1', [sharedKey(SHARED)])).rows[0].body.toString('utf8');
+    const older = events.find(e => e.t === 'shared-send' && answers.get(e.id)?.cls === 'ACKED' && hashOf(e.content) !== hashOf(JSON.parse(stored)));
+    expect(older).toBeDefined();
+    writeMirror(mb, SHARED, JSON.stringify(older.content, null, 2));
+    const staleMirror = await check(await copies('nb6s', log, [['ma', ma], ['mb', mb]]));
+    expect(staleMirror.code).toBe(1);
+    expect(staleMirror.result.verdicts.map((v: any) => `${v.v} ${v.copy}`).sort()).toEqual(['SHARED-FORK ma,mb', 'SHARED-LOST mb']);
+
+    writeMirror(mb, SHARED, stored);
+    await pool.query('UPDATE smdb_data.shared_docs SET body = $2 WHERE key = $1', [sharedKey(SHARED), Buffer.from(JSON.stringify(older.content, null, 2), 'utf8')]);
+    const staleRow = await check(await copies('nb6s', log, [['ma', ma], ['mb', mb]]));
+    expect(staleRow.code).toBe(1);
+    expect(staleRow.result.verdicts.map((v: any) => `${v.v} ${v.copy}`)).toEqual(['SHARED-LOST shared']);
+  }, 120_000);
+
+  it('names SHARED-OVERWRITE when the machines store saves over versions they were not built on', async () => {
+    const ma = file('nb6c');
+    const mb = file('nb6d');
+    await seedShared([ma, mb]);
+    // No compare and no pass: each machine builds on its own copy, and both first saves were built on the seed.
+    const a = await startFakeApp({ pools: [pool], sharedMirror: ma, sharedCompare: false });
+    const b = await startFakeApp({ pools: [pool], sharedMirror: mb, sharedCompare: false });
+    let log = '';
+    try {
+      log = await write('nb6o', [`a=${a.url}`, `b=${b.url}`], ['--duration', BACKSTOP_S, '--marks', file('nb6o-marks.txt'), ...shared], async l => {
+        await until([l], ([e]) => new Set(e.filter(x => x.t === 'shared-ans' && x.cls === 'ACKED')
+          .map(x => e.find(s => s.t === 'shared-send' && s.id === x.id)?.lane)).size === 2);
+      }, file('nb6o-marks.txt'));
+    } finally {
+      await a.close();
+      await b.close();
+    }
+    await syncMirror(pool, ma, [SHARED]);
+    await syncMirror(pool, mb, [SHARED]);
+    const r = await check(await copies('nb6o', log, [['ma', ma], ['mb', mb]]));
+    expect(r.code).toBe(1);
+    expect(r.result.verdicts.map((v: any) => v.v)).toContain('SHARED-OVERWRITE');
+    expect(r.result.verdicts.find((v: any) => v.v === 'SHARED-OVERWRITE').key).toBe(SHARED);
+  }, 120_000);
+
+  it('takes a listing that keeps multi-byte text and a body that is not JSON whole', async () => {
+    const text = JSON.stringify({ t: 'é漢🙂 "q" \ end' }, null, 2);
+    await pool.query(SHARED_UPSERT, [sharedKey('oracle/s2.json'), Buffer.from(text, 'utf8'), shaOfText(text), 'test']);
+    await pool.query(SHARED_UPSERT, [sharedKey('oracle/s3.json'), Buffer.from([0xff, 0x00, 0x41]), 'x', 'test']);
+    const listing = fs.readFileSync(await dumpQuery('test', sharedDumpSql(['oracle/s2.json', 'oracle/s3.json']), 'nb6-listing.jsonl'), 'utf8');
+    const rows = listing.split('\n').filter(l => l.trim() !== '').map(l => JSON.parse(l));
+    expect(rows.map(r => r.k)).toEqual(['oracle/s2.json', 'oracle/s3.json']);
+    expect(Buffer.from(rows[0].b, 'base64').toString('utf8')).toBe(text);
+    expect([...Buffer.from(rows[1].b, 'base64')]).toEqual([0xff, 0x00, 0x41]);
+  });
 });

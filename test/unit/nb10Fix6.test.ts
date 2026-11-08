@@ -26,7 +26,6 @@ import { getPremiumManager, resetPremiumManager } from '../../src/bot/internalSe
 import { getPaymentRegistry } from '../../src/bot/internalSetup/utils/payment/paymentRegistry';
 import { DummyProvider } from '../../src/bot/internalSetup/utils/payment/dummyProvider';
 import { applySharedOp } from '../../src/bot/internalSetup/utils/sharedOps';
-import { truthText } from '../../src/bot/internalSetup/utils/dataBackends/replyGate';
 import { sharedOpFailure } from '../../src/webui/routes/hopFailure';
 import { releaseWriterLock, writerLockDepth, writerLockPath } from '../../src/bot/internalSetup/utils/writerLock';
 import { freshWriterLock, resetForks } from '../helpers/nb10Rig';
@@ -90,7 +89,10 @@ describe("expire now with the Dummy provider, whose own event removes the subscr
 });
 
 describe("an install that pauses the active subscription saves before the provider's pause (D2)", () => {
-  it('a stop during the pause answers not saved in full, never plain not saved, and the store holds the grant once', async () => {
+  // NB6 decision 63 (sheet 2606-2608): the grant's line and notice go out with the save before the pause, so a stop
+  // during the pause leaves nothing of the op unsaved and the op answers ok (NB10 answered partial: its grant line was
+  // written after the pause).
+  it('a stop during the pause answers ok: the save before the pause took the grant line, and the store holds the grant once', async () => {
     writePremium({ [G]: { active: paidSub('sA', 'pA', 'low', 'patreon'), paused: [] } });
     const pause = gate();
     const pauses: string[] = [];
@@ -106,17 +108,17 @@ describe("an install that pauses the active subscription saves before the provid
     const onDisk = jsonOf(PREMIUM).subscriptions[G];
     expect(onDisk.active.source).toBe('manual');
     expect(onDisk.paused.map((p: any) => p.id)).toEqual(['sA']);
-    expect(linesOf(AUDIT).map(l => l.action)).toEqual(['subscription.pause']);
+    expect(linesOf(AUDIT).map(l => l.action)).toEqual(['subscription.grant.manual', 'subscription.pause']);
     (getPremiumManager() as any).stopped = 'stopping';
     pause.open();
     const reply: any = await answer;
-    expect(reply.ok).toBe(false);
-    expect(reply.partial).toBe(true);
-    expect(reply.error).not.toContain(truthText(reply.answer, false));
+    expect(reply).toMatchObject({ ok: true, result: true });
+    expect(reply.partial).toBeUndefined();
     (getPremiumManager() as any).stopped = null;
     await settleQueue();
     const subs = jsonOf(PREMIUM).subscriptions[G];
     expect([subs.active, ...subs.paused].filter((s: any) => s.source === 'manual')).toHaveLength(1);
+    expect(linesOf(AUDIT).map(l => l.action)).toEqual(['subscription.grant.manual', 'subscription.pause']);
   });
 });
 

@@ -16,9 +16,21 @@ export interface FakeStore {
   ownerChannel?: string;
   /** Row 1 of the reshard table, written by provisioning's seed. */
   reshardSeeded?: boolean;
+  /** NB6's shared tables (absent: no rows); bodies, lines and file bytes are bytes. */
+  docs?: Row[];
+  lines?: Row[];
+  modules?: Row[];
+  moduleFiles?: Row[];
+  /** A store of a version before NB6's: it has no shared tables. */
+  noShared?: boolean;
 }
 
 const sha = (s: string) => createHash('sha256').update(Buffer.from(s, 'utf8')).digest('hex');
+const shaBytes = (b: Uint8Array) => createHash('sha256').update(b).digest('hex');
+/** The values' bytes as node-postgres sends them: a Buffer's length, else its UTF-8 text. */
+const valueBytes = (params: any[]) => params.reduce((n, v) => n + (v === null || v === undefined ? 0 : Buffer.isBuffer(v) ? v.length : Buffer.byteLength(String(v))), 0);
+/** The rows of a multi-row VALUES insert: the parameters, width at a time. */
+const groups = (params: any[], width: number) => Array.from({ length: params.length / width }, (_, i) => params.slice(i * width, i * width + width));
 const clone = (m: Map<string, FakeStore>) => new Map([...m].map(([k, v]) => [k, structuredClone(v)]));
 const pgError = (code: string, message: string) => Object.assign(new Error(message), { code, severity: 'ERROR' });
 
@@ -47,6 +59,10 @@ export class FakeDb {
   /** Reads of the role's other sessions so far; beforeSessionRead runs before each, so a test can add or drop a session for one read. */
   sessionReads = 0;
   beforeSessionRead: ((read: number) => void) | null = null;
+  /** shared_rev_seq: the revs of shared docs and modules and the seq of shared lines. */
+  revSeq = 1;
+  /** The values' bytes of each shared insert, in order. */
+  paramBytes: Array<{ sql: string; bytes: number }> = [];
 
   backendOf(app: string, nth: number): { pid: number; started: string } {
     const key = `${app}#${nth}`;
@@ -251,6 +267,8 @@ export class FakeClient {
       s.reshardSeeded = true;
       return { rows: [], command: 'INSERT', rowCount };
     }
+    const shared = this.sharedAnswer(sql, params);
+    if (shared) return shared;
     // No shard claims are modelled: the rename aside (NB4 decision 25) finds none.
     if (/to_regclass\('smdb_data\.shard_claims'\)/.test(sql)) return { rows: [{ present: false }] };
     if (/INSERT INTO smdb_data\.meta .*'owner_channel'/.test(sql)) {
@@ -332,5 +350,83 @@ export class FakeClient {
       return { rows: [...this.store().append].sort((a, b) => a.seq - b.seq).map(r => ({ ...r })) };
     }
     throw new Error(`fakePg: no answer scripted for: ${sql}`);
+  }
+
+  /**
+   * The shared tables of a store; a store of an earlier version answers 42P01. A read of a store with no rows answers
+   * empty tables and leaves the store as it is; only a write adds them.
+   */
+  private sharedOf(write = false): Required<Pick<FakeStore, 'docs' | 'lines' | 'modules' | 'moduleFiles'>> {
+    const s = this.store();
+    if (s.noShared) throw pgError('42P01', 'relation "smdb_data.shared_docs" does not exist');
+    if (!write) return { docs: s.docs ?? [], lines: s.lines ?? [], modules: s.modules ?? [], moduleFiles: s.moduleFiles ?? [] };
+    s.docs ??= [];
+    s.lines ??= [];
+    s.modules ??= [];
+    s.moduleFiles ??= [];
+    return s as Required<Pick<FakeStore, 'docs' | 'lines' | 'modules' | 'moduleFiles'>>;
+  }
+
+  /** NB6's migration statements on the shared tables (dataMigration.ts); null for any other statement. */
+  private sharedAnswer(sql: string, params: any[]): { rows: Row[]; command?: string; rowCount?: number } | null {
+    if (/to_regclass\('smdb_data\.shared_docs'\)/.test(sql)) return { rows: [{ present: !this.store().noShared }] };
+    if (/AS shared_rows$/.test(sql)) {
+      const t = this.sharedOf();
+      return { rows: [{ shared_rows: t.docs.length + t.lines.length + t.modules.length }] };
+    }
+    if (/^INSERT INTO smdb_data\.shared_docs \(key, body, sha, rev, updated_by\) VALUES/.test(sql)) {
+      this.db.paramBytes.push({ sql, bytes: valueBytes(params) });
+      const t = this.sharedOf(true);
+      for (const [key, body, digest, by] of groups(params, 4)) {
+        if (t.docs.some(d => d.key === key)) throw pgError('23505', 'duplicate key value violates unique constraint "shared_docs_pkey"');
+        t.docs.push({ key, body: Buffer.from(body), sha: digest, rev: this.db.revSeq++, updated_by: by });
+      }
+      return { rows: [], command: 'INSERT' };
+    }
+    if (/^INSERT INTO smdb_data\.shared_lines \(key, id, line\) VALUES/.test(sql)) {
+      this.db.paramBytes.push({ sql, bytes: valueBytes(params) });
+      const t = this.sharedOf(true);
+      for (const [key, id, line] of groups(params, 3)) t.lines.push({ key, id, seq: this.db.revSeq++, line: Buffer.from(line) });
+      return { rows: [], command: 'INSERT' };
+    }
+    if (/^INSERT INTO smdb_data\.shared_modules \(module, sha, rev, version, file_count, bytes, updated_by\) VALUES/.test(sql)) {
+      this.db.paramBytes.push({ sql, bytes: valueBytes(params) });
+      const [module, digest, version, count, bytes, by] = params;
+      this.sharedOf(true).modules.push({ module, sha: digest, rev: this.db.revSeq++, version, file_count: Number(count), bytes: String(bytes), updated_by: by });
+      return { rows: [], command: 'INSERT' };
+    }
+    if (/^INSERT INTO smdb_data\.shared_module_files \(module, rel, bytes, mode\) VALUES/.test(sql)) {
+      this.db.paramBytes.push({ sql, bytes: valueBytes(params) });
+      const t = this.sharedOf(true);
+      for (const [module, rel, bytes, mode] of groups(params, 4)) t.moduleFiles.push({ module, rel, bytes: Buffer.from(bytes), mode: Number(mode) });
+      return { rows: [], command: 'INSERT' };
+    }
+    if (sql === 'SELECT key FROM smdb_data.shared_docs') return { rows: this.sharedOf().docs.map(d => ({ key: d.key })) };
+    if (sql === 'SELECT DISTINCT key FROM smdb_data.shared_lines') return { rows: [...new Set(this.sharedOf().lines.map(l => l.key))].map(key => ({ key })) };
+    if (sql === 'SELECT module, version FROM smdb_data.shared_modules') return { rows: this.sharedOf().modules.map(m => ({ module: m.module, version: m.version ?? null })) };
+    if (sql === 'SELECT body FROM smdb_data.shared_docs WHERE key = $1') {
+      return { rows: this.sharedOf().docs.filter(d => d.key === params[0]).map(d => ({ body: Buffer.from(d.body) })) };
+    }
+    if (sql === 'SELECT line FROM smdb_data.shared_lines WHERE key = $1 ORDER BY seq') {
+      return { rows: this.sharedOf().lines.filter(l => l.key === params[0]).sort((a, b) => a.seq - b.seq).map(l => ({ line: Buffer.from(l.line) })) };
+    }
+    if (sql === 'SELECT rel, mode, bytes FROM smdb_data.shared_module_files WHERE module = $1 ORDER BY rel') {
+      return {
+        rows: this.sharedOf().moduleFiles.filter(f => f.module === params[0]).sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0))
+          .map(f => ({ rel: f.rel, mode: f.mode, bytes: Buffer.from(f.bytes) })),
+      };
+    }
+    if (sql === "SELECT key, sha, encode(sha256(body), 'hex') AS h FROM smdb_data.shared_docs") {
+      return { rows: this.sharedOf().docs.map(d => ({ key: d.key, sha: d.sha, h: shaBytes(d.body) })) };
+    }
+    if (/string_agg\(line/.test(sql) && /WHERE key = \$1$/.test(sql)) {
+      const lines = this.sharedOf().lines.filter(l => l.key === params[0]).sort((a, b) => a.seq - b.seq);
+      return { rows: [{ h: shaBytes(Buffer.concat(lines.flatMap(l => [Buffer.from(l.line), Buffer.from('\n')]))) }] };
+    }
+    if (sql === 'SELECT module, sha FROM smdb_data.shared_modules') return { rows: this.sharedOf().modules.map(m => ({ module: m.module, sha: m.sha })) };
+    if (sql === "SELECT rel, encode(sha256(bytes), 'hex') AS h FROM smdb_data.shared_module_files WHERE module = $1") {
+      return { rows: this.sharedOf().moduleFiles.filter(f => f.module === params[0]).map(f => ({ rel: f.rel, h: shaBytes(f.bytes) })) };
+    }
+    return null;
   }
 }

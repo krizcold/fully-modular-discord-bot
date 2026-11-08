@@ -3,7 +3,8 @@ import { createHash } from 'crypto';
 import { getConfigFileMetadata } from './configDiscovery';
 import type { ConfigFileMetadata } from './configDiscovery';
 import { dataPath } from '../../../utils/dataRoot';
-import { loadData, readRaw, readRawStrict, saveDataTracked, writeRawAtomicTracked, type SaveTracked } from './dataManager';
+import { loadData, readRaw, readRawStrict, saveDataTracked, updateRawTracked, writeRawAtomicTracked, type SaveTracked } from './dataManager';
+import { sharedKeyOf } from './sharedStore';
 import type { ModuleConfigSchema, ConfigFieldSchema } from '../../types/moduleTypes';
 
 // Use dist/bot/config.json in production, src/bot/config.json in development
@@ -47,10 +48,11 @@ const MAIN_CONFIG_SCHEMA: Record<string, any> = {
  * Behavior:
  * - Adds missing properties from schema with defaults
  * - Preserves existing user-configured values
- * - Removes orphaned properties not in schema
+ * - Removes orphaned properties not in schema on a JSON bot; a Postgres bot keeps them (another machine's image may
+ *   know them) and writes nothing when nothing is added ('unchanged')
  * - Works for both development and production environments
  */
-export function ensureConfigPopulated(): 'written' | 'left' | 'refused' {
+export function ensureConfigPopulated(): 'written' | 'unchanged' | 'left' | 'refused' {
   // Read existing config (if exists)
   let existingConfig: Record<string, any> = {};
   // A file that exists but cannot be read or parsed holds the operator's values: it is left as it is.
@@ -72,6 +74,8 @@ export function ensureConfigPopulated(): 'written' | 'left' | 'refused' {
       return 'left';
     }
   }
+
+  if (sharedKeyOf(rootConfigPath) !== null) return populateShared(existingConfig);
 
   // Build fully populated config
   const populatedConfig: Record<string, any> = {};
@@ -107,6 +111,38 @@ export function ensureConfigPopulated(): 'written' | 'left' | 'refused' {
     return 'refused';
   }
   console.log(`[ConfigManager] Config synchronized with schema (${addedCount} added, ${preservedCount} preserved, ${orphanedKeys.length} removed)`);
+  return 'written';
+}
+
+const ownKey = (o: object, key: string): boolean => Object.prototype.hasOwnProperty.call(o, key);
+
+/** The populate's update: each schema key the stored value lacks, with its default; every other key kept. */
+function addSchemaKeys(current: unknown): Record<string, any> {
+  if (!current || typeof current !== 'object' || Array.isArray(current)) throw new TypeError('config.json does not hold a JSON object');
+  const next: Record<string, any> = { ...(current as Record<string, any>) };
+  for (const [property, defaultValue] of Object.entries(MAIN_CONFIG_SCHEMA)) {
+    if (!ownKey(next, property)) next[property] = structuredClone(defaultValue);
+  }
+  return next;
+}
+
+/** NB6 decision 34: on a Postgres bot the populate is an update of the root config's row that only adds keys. */
+function populateShared(existingConfig: Record<string, any>): 'written' | 'unchanged' | 'refused' {
+  const schemaKeys = Object.keys(MAIN_CONFIG_SCHEMA);
+  const added = schemaKeys.filter(key => !ownKey(existingConfig, key)).length;
+  const unknown = Object.keys(existingConfig).filter(key => !ownKey(MAIN_CONFIG_SCHEMA, key));
+  const kept = unknown.length > 0 ? `; kept ${unknown.length} keys this version does not know: ${unknown.join(', ')}` : '';
+  const line = `[ConfigManager] Config synchronized with schema (${added} added, ${schemaKeys.length - added} preserved${kept})`;
+  if (added === 0) {
+    console.log(line);
+    return 'unchanged';
+  }
+  const synced = updateRawTracked(rootConfigPath, {}, addSchemaKeys);
+  if (!synced.accepted) {
+    console.error(`[ConfigManager] config.json was not synchronized with the schema (${synced.reason ?? synced.cause}); it was left as it was`);
+    return 'refused';
+  }
+  console.log(line);
   return 'written';
 }
 
@@ -314,19 +350,20 @@ export class ConfigWriteRefused extends Error {
   }
 }
 
-function writeConfigText(absPath: string, data: any): void {
-  const written = writeRawAtomicTracked(absPath, JSON.stringify(data, null, 2));
+function writeConfigText(absPath: string, data: any, baseSha: string | undefined): void {
+  const written = writeRawAtomicTracked(absPath, JSON.stringify(data, null, 2), baseSha === undefined ? {} : { baseSha });
   if (!written.accepted) throw new ConfigWriteRefused(written);
 }
 
 /**
  * Save global config file (main config.json or discovered module data files); throws ConfigWriteRefused when the
- * write was refused.
+ * write was refused. baseSha: the sha of the body the editor showed (NB6 decision 50), on a Postgres bot.
  */
-export function saveGlobalConfig(filename: string, data: any): void {
+export function saveGlobalConfig(filename: string, data: any, options: { baseSha?: string } = {}): void {
+  const { baseSha } = options;
   if (filename === 'config.json') {
     // Root config lives outside the guild/global namespaces.
-    writeConfigText(rootConfigPath, data);
+    writeConfigText(rootConfigPath, data, baseSha);
     console.log(`[ConfigManager] Saved global config: ${rootConfigPath}`);
     return;
   }
@@ -334,14 +371,14 @@ export function saveGlobalConfig(filename: string, data: any): void {
   // For discovered module data files
   const metadata = getConfigFileMetadata(filename);
   if (metadata && metadata.moduleName) {
-    const saved = saveDataTracked(filename, { scope: 'global', category: metadata.moduleName }, data);
+    const saved = saveDataTracked(filename, { scope: 'global', category: metadata.moduleName, ...(baseSha === undefined ? {} : { baseSha }) }, data);
     if (saved.outcome === 'refused') throw new ConfigWriteRefused(saved);
     if (saved.outcome !== 'saved') throw new ConfigWriteRefused({ cause: saved.outcome });
     console.log(`[ConfigManager] Saved config: ${dataPath('global', metadata.moduleName, filename)}`);
     return;
   }
   if (metadata && metadata.path) {
-    writeConfigText(metadata.path, data);
+    writeConfigText(metadata.path, data, baseSha);
     console.log(`[ConfigManager] Saved config: ${metadata.path}`);
     return;
   }

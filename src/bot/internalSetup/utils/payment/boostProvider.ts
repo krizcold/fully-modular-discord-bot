@@ -40,7 +40,7 @@
  */
 
 import type { Client } from 'discord.js';
-import { loadCredentials } from '@/utils/envLoader';
+import { providerCredentials } from '@/utils/envLoader';
 import { getPaymentRegistry } from './paymentRegistry';
 import { isMaintenanceGateClosed } from '../maintenanceGate';
 import type {
@@ -102,7 +102,7 @@ export class ServerBoostingProvider implements PaymentProvider {
 
   isConfigured(): boolean {
     if (!this.client) return false;
-    const c = loadCredentials();
+    const c = providerCredentials('boost');
     return !!(c.BOOST_TARGET_GUILD_ID && /^[0-9]{17,20}$/.test(c.BOOST_TARGET_GUILD_ID));
   }
 
@@ -129,7 +129,7 @@ export class ServerBoostingProvider implements PaymentProvider {
   }
 
   async initiatePurchase(_opts: InitiateOpts): Promise<InitiateResult> {
-    const c = loadCredentials();
+    const c = providerCredentials('boost');
     const targetMention = c.BOOST_TARGET_GUILD_ID ? ` (server id: ${c.BOOST_TARGET_GUILD_ID})` : '';
     return {
       clientHandoff: {
@@ -187,7 +187,7 @@ export class ServerBoostingProvider implements PaymentProvider {
    */
   private async tick(): Promise<void> {
     if (!this.client || isMaintenanceGateClosed()) return;
-    const c = loadCredentials();
+    const c = providerCredentials('boost');
     const targetId = c.BOOST_TARGET_GUILD_ID;
     if (!targetId) return;
 

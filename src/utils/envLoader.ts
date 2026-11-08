@@ -358,6 +358,123 @@ export function writeEnvDataBackend(value: DataBackendKind): void {
   if (readEnvFileDataBackend() !== value) throw new Error(`${envPath} does not read back DATA_BACKEND=${value}`);
 }
 
+/** The keys of each built-in payment provider that the credentials doc may hold (NB6 decision 57). */
+const BUILTIN_PROVIDER_KEYS: Record<string, (key: string) => boolean> = {
+  stripe: key => key.startsWith('STRIPE_'),
+  paypal: key => key.startsWith('PAYPAL_'),
+  patreon: key => key.startsWith('PATREON_'),
+  lemonsqueezy: key => key.startsWith('LEMONSQUEEZY_'),
+  discord: key => key === 'DISCORD_APPLICATION_ID',
+  boost: key => key === 'BOOST_TARGET_GUILD_ID',
+};
+
+/** Whether the credentials doc holds this key of this provider: a built-in provider's own key (decision 57). */
+export function providerDocKey(providerId: string, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(BUILTIN_PROVIDER_KEYS, providerId) && BUILTIN_PROVIDER_KEYS[providerId](key);
+}
+
+/** The credentials doc under /data/global: `{ "<providerId>": { "<KEY>": "<value>" | null } }`. */
+export const PROVIDER_CREDENTIALS_FILE = 'payment-providers/credentials.json';
+
+export function providerCredentialsPath(): string {
+  return dataPath('global', ...PROVIDER_CREDENTIALS_FILE.split('/'));
+}
+
+/**
+ * Reads a file as the data facade holds it: undefined when the path is no shared doc on this bot (a JSON bot), null
+ * when there is none, the text otherwise; throws when it cannot be read. Set by dataManager.ts when it loads.
+ */
+export type SharedDocReader = (absPath: string) => string | null | undefined;
+
+let sharedDocReader: SharedDocReader | null = null;
+
+export function useSharedDocReader(read: SharedDocReader | null): void {
+  sharedDocReader = read;
+}
+
+const causeOf = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+/** `provider` names the provider when the cause is in its own entry, so only its keys read as not set. */
+type DocEntry = { entry: Record<string, string | null> } | { unread: string; provider?: string };
+
+/** The provider's entry of the doc: undefined when it has none, the cause when the doc or the entry cannot be read. */
+function docEntry(read: SharedDocReader, providerId: string): DocEntry | undefined {
+  let raw: string | null | undefined;
+  try {
+    raw = read(providerCredentialsPath());
+  } catch (error) {
+    return { unread: causeOf(error) };
+  }
+  if (raw === undefined || raw === null) return undefined;
+  let doc: unknown;
+  try {
+    doc = JSON.parse(raw);
+  } catch (error) {
+    return { unread: causeOf(error) };
+  }
+  if (typeof doc !== 'object' || doc === null || Array.isArray(doc)) return { unread: 'it holds no object' };
+  if (!Object.prototype.hasOwnProperty.call(doc, providerId)) return undefined;
+  const entry = (doc as Record<string, unknown>)[providerId];
+  if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) return { unread: `the entry of ${providerId} is not an object`, provider: providerId };
+  for (const value of Object.values(entry)) {
+    if (value !== null && typeof value !== 'string') return { unread: `a key of ${providerId} holds no text`, provider: providerId };
+  }
+  return { entry: entry as Record<string, string | null> };
+}
+
+/** The doc's entry for a built-in provider on this bot; undefined on a JSON bot, for a custom provider, or with no entry. */
+function providerEntry(providerId: string): DocEntry | undefined {
+  if (!Object.prototype.hasOwnProperty.call(BUILTIN_PROVIDER_KEYS, providerId)) return undefined;
+  if (sharedDocReader) return docEntry(sharedDocReader, providerId);
+  return resolveDataBackend() === 'postgres' ? { unread: 'this process has not loaded the data layer' } : undefined;
+}
+
+const loggedUnread = new Set<string>();
+
+const unreadWords = (read: { unread: string; provider?: string }): string =>
+  `${PROVIDER_CREDENTIALS_FILE} cannot be read${read.provider ? ` for ${read.provider}` : ''} (${read.unread})`;
+
+/**
+ * Why the credentials doc cannot be read for this provider's keys ("<file> cannot be read (<cause>)", or "... cannot
+ * be read for <provider> (<cause>)" for a cause in its own entry), or null when it can (or the provider reads none of
+ * them from it): the premium tab says it can't confirm whether those keys are set.
+ */
+export function providerCredentialsUnread(providerId: string): string | null {
+  const read = providerEntry(providerId);
+  return read && 'unread' in read ? unreadWords(read) : null;
+}
+
+/**
+ * The credentials a payment provider reads (NB6 decision 57, owner question 2's answer (a)): loadCredentials(), and on
+ * a Postgres bot, for the six built-in providers, each of the provider's own keys that the credentials doc holds wins
+ * (null means not set). A doc that cannot be read leaves those keys not set, so no key cleared there is taken from
+ * /data/.env. Custom providers and a JSON bot read the environment alone.
+ */
+export function providerCredentials(providerId: string): BotCredentials {
+  const credentials = loadCredentials();
+  if (!Object.prototype.hasOwnProperty.call(BUILTIN_PROVIDER_KEYS, providerId)) return credentials;
+  const owns = BUILTIN_PROVIDER_KEYS[providerId];
+  const read = providerEntry(providerId);
+  if (read !== undefined && 'unread' in read) {
+    const words = unreadWords(read);
+    if (!loggedUnread.has(words)) {
+      loggedUnread.add(words);
+      const whose = read.provider ? `the keys of ${read.provider}` : "the built-in providers' keys";
+      console.error(`[Payment] ${words}; ${whose} read as not set until it can be read`);
+    }
+    for (const key of Object.keys(credentials)) {
+      if (owns(key)) credentials[key] = undefined;
+    }
+    return credentials;
+  }
+  if (read === undefined) return credentials;
+  for (const [key, value] of Object.entries(read.entry)) {
+    if (!owns(key)) continue;
+    credentials[key] = value === null || isPlaceholderValue(value) ? undefined : value;
+  }
+  return credentials;
+}
+
 /**
  * Validates bot credentials
  */

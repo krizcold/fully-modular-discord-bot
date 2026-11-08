@@ -18,10 +18,37 @@ import { resolveClientApplication } from './clientApplication';
 import { LoadedModule } from '../../types/moduleTypes';
 import { maintenanceIpcRefusal } from './maintenance';
 import { componentConfigPath, getLastAppliedDisabledCommands, readConfigFile, setLastAppliedDisabledCommands } from './appStoreConfigFile';
+import { onSharedApplied } from './dataManager';
+
+const componentConfigKey = 'global/appstore/component-config.json';
 
 let clientRef: Client | null = null;
 
 let lastAppliedDisabled: Record<string, false> | null = null;
+
+// NB6 decision 62: the event and panel keys this process last applied as disabled; null before the boot applied a set.
+let appliedDisabled: Record<string, false> | null = null;
+
+// One chain per `<module>:<type>:<name>`, so a local toggle and the shared hook of one key run one after the other.
+const toggleChains = new Map<string, Promise<void>>();
+
+function chainToggle(key: string, run: () => Promise<void>): Promise<void> {
+  const next = (toggleChains.get(key) ?? Promise.resolve()).then(run).catch(() => undefined);
+  toggleChains.set(key, next);
+  void next.finally(() => { if (toggleChains.get(key) === next) toggleChains.delete(key); });
+  return next;
+}
+
+const isEventOrPanel = (key: string): boolean => {
+  const type = key.split(':')[1];
+  return key.split(':').length >= 3 && (type === 'event' || type === 'panel');
+};
+
+function eventAndPanelKeys(set: Record<string, false>): Record<string, false> {
+  const out: Record<string, false> = {};
+  for (const key of Object.keys(set)) if (isEventOrPanel(key)) out[key] = false;
+  return out;
+}
 
 /**
  * Read component-config.json and return disabled entries; on a read error, the last applied entries.
@@ -53,11 +80,40 @@ function recordAppliedToggle(moduleName: string, componentType: string, name: st
     setLastAppliedDisabledCommands(next);
     return;
   }
-  if (!lastAppliedDisabled) return;
   const key = `${moduleName}:${componentType}:${name}`;
-  const next = { ...lastAppliedDisabled };
+  if (appliedDisabled && isEventOrPanel(key)) appliedDisabled = withKey(appliedDisabled, key, enabled);
+  if (!lastAppliedDisabled) return;
+  lastAppliedDisabled = withKey(lastAppliedDisabled, key, enabled);
+}
+
+function withKey(set: Record<string, false>, key: string, enabled: boolean): Record<string, false> {
+  const next = { ...set };
   if (enabled) delete next[key]; else next[key] = false;
-  lastAppliedDisabled = next;
+  return next;
+}
+
+/**
+ * NB6 decisions 55 and 62: once the applier wrote component-config.json from another machine's row, each event and
+ * panel whose state differs from the set this process last applied is toggled to match, on its key's chain. Commands
+ * are left alone: their list on Discord is one per application, and the machine whose route ran the toggle changed it.
+ */
+export function reapplyComponentToggles(): Promise<void> {
+  if (!appliedDisabled) return Promise.resolve();
+  const now = eventAndPanelKeys(loadDisabledComponents());
+  const before = appliedDisabled;
+  const runs: Promise<void>[] = [];
+  for (const key of [...new Set([...Object.keys(before), ...Object.keys(now)])]) {
+    const enabled = !(key in now);
+    if (enabled === !(key in before)) continue;
+    const [moduleName, componentType, ...rest] = key.split(':');
+    const name = rest.join(':');
+    runs.push(chainToggle(key, async () => {
+      const result = componentType === 'event' ? await toggleEvent(moduleName, name, enabled) : await togglePanel(moduleName, name, enabled);
+      // A toggle that failed leaves the key as it was applied, so the next hook tries it again.
+      if (result.success && appliedDisabled) appliedDisabled = withKey(appliedDisabled, key, enabled);
+    }));
+  }
+  return Promise.all(runs).then(() => undefined);
 }
 
 /**
@@ -215,7 +271,10 @@ async function togglePanel(
 
 // ─── IPC Setup ───
 
+let unhook: (() => void) | null = null;
+
 export function setupToggleIPCHandlers(client: Client): void {
+  unhook ??= onSharedApplied(componentConfigKey, () => { void reapplyComponentToggles(); });
   if (!process.send) {
     console.warn('[IPCToggleHandler] process.send not available');
     return;
@@ -223,8 +282,6 @@ export function setupToggleIPCHandlers(client: Client): void {
 
   clientRef = client;
   console.log('[IPCToggleHandler] Setting up IPC handlers for component toggle');
-
-  const toggleChains = new Map<string, Promise<void>>();
 
   process.on('message', (message: any) => {
     if (!message || typeof message !== 'object') return;
@@ -238,10 +295,7 @@ export function setupToggleIPCHandlers(client: Client): void {
       return;
     }
 
-    const key = `${data?.module}:${data?.componentType}:${data?.name}`;
-    const run = (toggleChains.get(key) ?? Promise.resolve()).then(() => applyToggle(requestId, data));
-    toggleChains.set(key, run);
-    run.finally(() => { if (toggleChains.get(key) === run) toggleChains.delete(key); });
+    void chainToggle(`${data?.module}:${data?.componentType}:${data?.name}`, () => applyToggle(requestId, data));
   });
 }
 
@@ -325,6 +379,7 @@ export async function applyComponentToggleState(
  */
 export function applyAllDisabledStatesOnBoot(): void {
   const disabled = loadDisabledComponents();
+  appliedDisabled = eventAndPanelKeys(disabled);
   let count = 0;
 
   for (const key of Object.keys(disabled)) {

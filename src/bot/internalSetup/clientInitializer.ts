@@ -27,8 +27,14 @@ import { startPremiumTickers } from './utils/premiumManager';
 import { startModuleAutoUpdater } from './utils/moduleAutoUpdater';
 import { loadCredentials } from '../../utils/envLoader';
 import { bootShards, getLeaseRuntime, getShardClaims } from './fleet/shardBoot';
-import { guildRequestsStopStep, startGuildRequestSweep } from './fleet/guildRequests';
+import { guildRequestsStopStep, requestGuildRequestPass, startGuildRequestSweep } from './fleet/guildRequests';
+import { bootShared, startSharedPass, stopSharedPass } from './utils/sharedMirror';
+import {
+  applyOfStart, applyTails, bootStartOf, closeWindow, endStart, INITIALIZER_LATE_MS, INITIALIZER_WAIT_MS, markLate, onModuleCode, openStarts, openWindow,
+  startEndFailed, type ModuleStart,
+} from './utils/moduleCrashes';
 import { stoppedServing } from './utils/servingGate';
+import { beginBootApplies, bootCompileModules, bootLoadCheck, recoverModuleApplies, setModuleApplyClient } from './utils/moduleApply';
 import { getIngestService } from './ingest/ingestService';
 import { installReplyGate } from './utils/dataBackends/replyGate';
 import { ModuleLoader } from './utils/moduleLoader';
@@ -113,15 +119,17 @@ let loadedModules: LoadedModule[] = [];
 /**
  * Load all modules using ModuleLoader and extract intents
  */
-async function loadModules(client: Client): Promise<number[]> {
+export async function loadModules(client: Client): Promise<number[]> {
   console.log('[ModuleLoader] Loading modules...');
 
   // Module auto-update is now handled by the periodic scheduler (moduleAutoUpdater)
   // started after the client is ready. No one-shot sync on boot.
 
   try {
-    const moduleLoader = new ModuleLoader(client);
-    loadedModules = await moduleLoader.loadAllModules();
+    const moduleLoader = new ModuleLoader(client, { onModuleCode });
+    const loaded = await moduleLoader.loadAllModules();
+    // NB6 45 (6): on Postgres each module this boot applied is checked before its intents are read.
+    loadedModules = getGuildDataBackend() instanceof PostgresBackend ? await bootLoadCheck(client, loaded) : loaded;
 
     // Extract intents from all loaded modules
     const moduleIntents = new Set<number>();
@@ -155,7 +163,7 @@ async function loadModules(client: Client): Promise<number[]> {
  * Register module commands and events.
  * Event handlers are tracked via ModuleEventManager for clean removal on hot-reload.
  */
-function registerModuleComponents(client: Client) {
+export function registerModuleComponents(client: Client) {
   console.log('[ModuleLoader] Registering module components...');
 
   const eventManager = getModuleEventManager();
@@ -389,12 +397,137 @@ async function loadEventHandlers(client: Client) {
 }
 
 
+type HandlerMaps = { b: Set<unknown>; m: Set<unknown>; d: Set<unknown>; r: Set<unknown>; rr: Set<unknown> };
+
+function handlerSnapshot(client: Client): HandlerMaps {
+  const c = client as any;
+  return {
+    b: new Set(Array.from(c.buttonHandlers?.keys() ?? [])),
+    m: new Set(Array.from(c.modalHandlers?.keys() ?? [])),
+    d: new Set(Array.from(c.dropdownHandlers?.keys() ?? [])),
+    r: new Set(Array.from(c.reactionHandlers?.keys() ?? [])),
+    rr: new Set(Array.from(c.reactionRemoveHandlers?.keys() ?? [])),
+  };
+}
+
+/** Files the handlers registered since `before` under the module (the handler-id bookkeeping). */
+function fileNewHandlers(client: Client, mod: LoadedModule, before: HandlerMaps): void {
+  const c = client as any;
+  const bNew = (Array.from(c.buttonHandlers?.keys() ?? []) as string[]).filter(k => !before.b.has(k));
+  const mNew = (Array.from(c.modalHandlers?.keys() ?? []) as string[]).filter(k => !before.m.has(k));
+  const dNew = (Array.from(c.dropdownHandlers?.keys() ?? []) as string[]).filter(k => !before.d.has(k));
+  const rNew = (Array.from(c.reactionHandlers?.keys() ?? []) as string[]).filter(k => !before.r.has(k));
+  const rrNew = (Array.from(c.reactionRemoveHandlers?.keys() ?? []) as string[]).filter(k => !before.rr.has(k));
+  for (const id of bNew) { const info = c.buttonHandlers.get(id); if (info) info._moduleName = mod.manifest.name; }
+  for (const id of mNew) { const info = c.modalHandlers.get(id); if (info) info._moduleName = mod.manifest.name; }
+  for (const id of dNew) { const info = c.dropdownHandlers.get(id); if (info) info._moduleName = mod.manifest.name; }
+  for (const id of rNew) { const info = c.reactionHandlers.get(id); if (info) info._moduleName = mod.manifest.name; }
+  for (const id of rrNew) { const infos = c.reactionRemoveHandlers.get(id); if (infos) for (const info of infos) info._moduleName = mod.manifest.name; }
+  const existing = mod.registeredInteractionIds ?? { buttons: [], modals: [], dropdowns: [] };
+  mod.registeredInteractionIds = {
+    buttons: [...existing.buttons, ...bNew],
+    modals: [...existing.modals, ...mNew],
+    dropdowns: [...existing.dropdowns, ...dNew]
+  };
+  const existingReactions = (mod as any).registeredReactionIds ?? { reactions: [], reactionRemoves: [] };
+  (mod as any).registeredReactionIds = {
+    reactions: [...existingReactions.reactions, ...rNew],
+    reactionRemoves: [...existingReactions.reactionRemoves, ...rrNew]
+  };
+}
+
+const initializerLine = (name: string) => `[Initializer] Error running initialize function for module: ${name}`;
+const commandName = (command: any): string => command?.name || 'Unnamed Module';
+
 /**
- * Runs all collected initialize functions.
+ * A module's boot turn (decisions 67, 78, 82, 89, 99 and 105) in its start's window: the snapshot, each initializer
+ * called with its promise kept, the bookkeeping, then the promises awaited up to 60 s. All settled: the start ends
+ * there. Past 60 s: T27, the next turn begins, and a task nothing awaits ends the start when they settle or at 10
+ * minutes from the turn's begin (T29).
  */
-function runInitializers(client: Client) {
+async function bootTurn(client: Client, mod: LoadedModule, cmds: any[], start: ModuleStart): Promise<void> {
+  const name = mod.manifest.name;
+  if (cmds.length === 0) {
+    await endStart(start, 'ok');
+    return;
+  }
+  const kept: Array<{ command: string; promise: Promise<unknown> }> = [];
+  openWindow(start);
+  try {
+    const before = handlerSnapshot(client);
+    for (const command of cmds) {
+      if (start.turnAt === null) start.turnAt = Date.now();
+      try {
+        const returned: unknown = command.initialize(client);
+        if (returned && typeof (returned as PromiseLike<unknown>).then === 'function') kept.push({ command: commandName(command), promise: Promise.resolve(returned) });
+      } catch (error) {
+        console.error(initializerLine(commandName(command)), error);
+      }
+    }
+    fileNewHandlers(client, mod, before);
+  } catch (error) {
+    closeWindow(start);
+    if (!applyOfStart(start)) console.error(initializerLine(name), error);
+    await endStart(start, { rejected: error });
+    return;
+  }
+  const settled = Promise.allSettled(kept.map(k => k.promise));
+  const rejectionOf = (results: PromiseSettledResult<unknown>[]) => {
+    const at = results.findIndex(r => r.status === 'rejected');
+    return at < 0 ? null : { command: kept[at].command, reason: (results[at] as PromiseRejectedResult).reason };
+  };
+  let timer: NodeJS.Timeout | undefined;
+  const bound = new Promise<'bound'>(resolve => {
+    timer = setTimeout(() => resolve('bound'), INITIALIZER_WAIT_MS);
+  });
+  const outcome = await Promise.race([settled, bound]);
+  clearTimeout(timer);
+  if (outcome !== 'bound') {
+    closeWindow(start);
+    const rejected = rejectionOf(outcome);
+    if (rejected && !applyOfStart(start)) console.error(initializerLine(rejected.command), rejected.reason);
+    await endStart(start, rejected ? { rejected: rejected.reason } : 'ok');
+    return;
+  }
+  const tails = applyTails(start);
+  console.warn(`[Initializer] ${name}'s initializers did not finish within 60 s; the bot goes on with the other modules and waits up to 10 minutes for them${tails.t27}`);
+  closeWindow(start);
+  markLate(start);
+  const lateAt = (start.turnAt ?? Date.now()) + INITIALIZER_LATE_MS;
+  void (async () => {
+    try {
+      let lateTimer: NodeJS.Timeout | undefined;
+      const lateBound = new Promise<'bound'>(resolve => {
+        lateTimer = setTimeout(() => resolve('bound'), Math.max(0, lateAt - Date.now()));
+        lateTimer.unref?.();
+      });
+      const late = await Promise.race([settled, lateBound]);
+      clearTimeout(lateTimer);
+      if (late === 'bound') {
+        console.warn(`[Initializer] ${name}'s initializers did not finish within 10 minutes; the bot counts ${name} as started${tails.t29}`);
+        void settled.then(results => {
+          const rejected = rejectionOf(results);
+          if (rejected) console.error(initializerLine(rejected.command), rejected.reason);
+        });
+        await endStart(start, 'bound');
+        return;
+      }
+      const rejected = rejectionOf(late);
+      if (rejected && !applyOfStart(start)) console.error(initializerLine(rejected.command), rejected.reason);
+      await endStart(start, rejected ? { rejected: rejected.reason } : 'ok');
+    } catch (error) {
+      startEndFailed(start, error);
+    }
+  })();
+}
+
+/**
+ * Runs the collected initializers: the unattributed ones first, as before; then every module the registry holds gets
+ * its turn, one module at a time, in its boot start's window when the boot loop handed it one (decisions 67, 78, 99
+ * and 105). A module whose boot start is gone runs its initializers as before, with no window or bound.
+ */
+export async function runInitializers(client: Client): Promise<void> {
   console.log(`[Initializer] Running initialization for ${modulesToInitialize.length} modules...`);
-  if (modulesToInitialize.length === 0) { return; }
 
   const registry = getModuleRegistry();
   const loadedModules = registry.getAllModules();
@@ -421,61 +554,38 @@ function runInitializers(client: Client) {
     try {
       command.initialize(client);
     } catch (error) {
-      console.error(`[Initializer] Error running initialize function for module: ${moduleName}`, error);
+      console.error(initializerLine(moduleName), error);
     }
   }
 
   for (const mod of loadedModules) {
-    const cmds = byModule.get(mod.manifest.name);
-    if (!cmds || cmds.length === 0) continue;
-
-    const c = client as any;
-    const bBefore = new Set(Array.from(c.buttonHandlers?.keys() ?? []));
-    const mBefore = new Set(Array.from(c.modalHandlers?.keys() ?? []));
-    const dBefore = new Set(Array.from(c.dropdownHandlers?.keys() ?? []));
-    const rBefore = new Set(Array.from(c.reactionHandlers?.keys() ?? []));
-    const rrBefore = new Set(Array.from(c.reactionRemoveHandlers?.keys() ?? []));
-
+    const cmds = byModule.get(mod.manifest.name) ?? [];
+    const handed = bootStartOf(mod.manifest.name);
+    if (handed && openStarts.get(mod.manifest.name) === handed) {
+      await bootTurn(client, mod, cmds, handed);
+      continue;
+    }
+    if (cmds.length === 0) continue;
+    const before = handlerSnapshot(client);
     for (const command of cmds) {
-      const moduleName = command?.name || 'Unnamed Module';
       try {
         command.initialize(client);
       } catch (error) {
-        console.error(`[Initializer] Error running initialize function for module: ${moduleName}`, error);
+        console.error(initializerLine(commandName(command)), error);
       }
     }
-
-    const bAfter = Array.from(c.buttonHandlers?.keys() ?? []) as string[];
-    const mAfter = Array.from(c.modalHandlers?.keys() ?? []) as string[];
-    const dAfter = Array.from(c.dropdownHandlers?.keys() ?? []) as string[];
-    const rAfter = Array.from(c.reactionHandlers?.keys() ?? []) as string[];
-    const rrAfter = Array.from(c.reactionRemoveHandlers?.keys() ?? []) as string[];
-    const bNew = bAfter.filter(k => !bBefore.has(k));
-    const mNew = mAfter.filter(k => !mBefore.has(k));
-    const dNew = dAfter.filter(k => !dBefore.has(k));
-    const rNew = rAfter.filter(k => !rBefore.has(k));
-    const rrNew = rrAfter.filter(k => !rrBefore.has(k));
-    for (const id of bNew) { const info = c.buttonHandlers.get(id); if (info) info._moduleName = mod.manifest.name; }
-    for (const id of mNew) { const info = c.modalHandlers.get(id); if (info) info._moduleName = mod.manifest.name; }
-    for (const id of dNew) { const info = c.dropdownHandlers.get(id); if (info) info._moduleName = mod.manifest.name; }
-    for (const id of rNew) { const info = c.reactionHandlers.get(id); if (info) info._moduleName = mod.manifest.name; }
-    for (const id of rrNew) { const infos = c.reactionRemoveHandlers.get(id); if (infos) for (const info of infos) info._moduleName = mod.manifest.name; }
-    const existing = mod.registeredInteractionIds ?? { buttons: [], modals: [], dropdowns: [] };
-    mod.registeredInteractionIds = {
-      buttons: [...existing.buttons, ...bNew],
-      modals: [...existing.modals, ...mNew],
-      dropdowns: [...existing.dropdowns, ...dNew]
-    };
-    const existingReactions = (mod as any).registeredReactionIds ?? { reactions: [], reactionRemoves: [] };
-    (mod as any).registeredReactionIds = {
-      reactions: [...existingReactions.reactions, ...rNew],
-      reactionRemoves: [...existingReactions.reactionRemoves, ...rrNew]
-    };
+    fileNewHandlers(client, mod, before);
   }
 
   console.log(`[Initializer] Initialization complete.`);
 }
 
+
+/** Tests: the modules this process loaded and the initializers it collected. */
+export function _resetBootModules(): void {
+  loadedModules = [];
+  modulesToInitialize.length = 0;
+}
 
 /** The normal boot. */
 export async function main(): Promise<void> {
@@ -540,6 +650,16 @@ export async function runBot(opts: RunBotOptions): Promise<void> {
   // Every shard runs in this process.
   const fleet = taken ? await bootShards({ taken }) : await bootShards();
 
+  // NB6 decision 14, C25 and D4: the populate builds on the root config's row, so the shared files come first.
+  if (backend instanceof PostgresBackend) addStopStep(stopSharedPass);
+  // NB6 45 (1) and (3): the applies a stop cut off are put back first; the boot pass's applies stop after their swap.
+  if (backend instanceof PostgresBackend) {
+    recoverModuleApplies();
+    beginBootApplies();
+  }
+  if ((await bootShared()) === 'stopped') return new Promise<never>(() => undefined);
+  if (backend instanceof PostgresBackend) await bootCompileModules();
+
   // PHASE 0: Ensure config.json is fully populated with schema
   console.log('[Bot] Synchronizing config.json with schema...');
   ensureConfigPopulated();
@@ -549,6 +669,7 @@ export async function runBot(opts: RunBotOptions): Promise<void> {
 
   // PHASE 1: Load modules and extract intents
   const moduleIntents = await loadModules(tempClient);
+  if (backend instanceof PostgresBackend) startSharedPass({ guildRequests: requestGuildRequestPass });
 
   // PHASE 2: Collect intents from internal framework events
   const internalEventsDirRelative = path.join(scanRoot, 'bot', 'internalSetup', 'events');
@@ -610,6 +731,7 @@ export async function runBot(opts: RunBotOptions): Promise<void> {
 
   // Set client on registry for unload context
   getModuleRegistry().setClient(client);
+  if (backend instanceof PostgresBackend) setModuleApplyClient(client);
 
   // PHASE 5: Register module components
   registerModuleComponents(client);
@@ -638,10 +760,17 @@ export async function runBot(opts: RunBotOptions): Promise<void> {
       const rBefore = new Set(Array.from(c.reactionHandlers?.keys() ?? []));
       const rrBefore = new Set(Array.from(c.reactionRemoveHandlers?.keys() ?? []));
 
-      for (const panel of module.panels) {
-        panelManager.registerPanel(panel);
-        modulePanelCount++;
-        console.log(`[Bot] Registered panel '${panel.id}' from module '${module.manifest.displayName}'`);
+      const handed = bootStartOf(module.manifest.name);
+      const start = handed && openStarts.get(module.manifest.name) === handed ? handed : null;
+      if (start) openWindow(start);
+      try {
+        for (const panel of module.panels) {
+          panelManager.registerPanel(panel);
+          modulePanelCount++;
+          console.log(`[Bot] Registered panel '${panel.id}' from module '${module.manifest.displayName}'`);
+        }
+      } finally {
+        if (start) closeWindow(start);
       }
 
       const bAfter = Array.from(c.buttonHandlers?.keys() ?? []) as string[];
@@ -706,8 +835,8 @@ export async function runBot(opts: RunBotOptions): Promise<void> {
       return;
     }
 
-    // Run all module initializers (after client is ready)
-    runInitializers(client);
+    // Run all module initializers (after client is ready), one module at a time
+    await runInitializers(client);
 
     // Log module statistics
     const registry = getModuleRegistry();

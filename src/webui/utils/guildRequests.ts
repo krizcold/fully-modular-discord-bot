@@ -66,7 +66,6 @@ export const NB7_TEXTS = {
   withdrawn: (name: string, saved: string) => `The database did not confirm that the change was sent to ${name}, so it was withdrawn; nothing was ${saved}. Try again in a moment.`,
   stoppedServing: (name: string, saved: string) => `On ${name}: the bot stopped serving this server before it applied the change; nothing was ${saved}. Try again in a moment.`,
   unapplied: (name: string, saved: string) => `${name} did not apply the change; nothing was ${saved}. Try again in a moment.`,
-  twin: (name: string) => `The module's global config on ${name} differs from this machine's, so this server's overrides cannot be worked out here; nothing was saved. Save it from the web panel on ${name}, or make the module's global config the same on both machines.`,
   heldNotice: (name: string) => `This server runs on ${name}: this was read from the database, and a change ${name} has not saved yet is not in it.`,
   noHolderNotice: "No machine runs this server's shard right now: this was read from the database.",
   readLookupFailed: (cause: string) => `This machine's bot does not run this server, and the database could not be read to find the one that does (${cause}); nothing was changed. Try again in a moment.`,
@@ -642,7 +641,6 @@ function holderAnswer(req: Followed, text: unknown, sender: (r: Record<string, u
   const saved = OP_WORDS[req.op];
   if (reply.code === 'not-held') return sender({ code: 'not-taken', error: NB7_TEXTS.stoppedServing(req.name, saved) });
   if (reply.code === 'not-taken' && reply.unapplied === true) return sender({ code: 'not-taken', error: NB7_TEXTS.unapplied(req.name, saved) });
-  if (reply.code === 'changed' && reply.which === 'twin') return sender({ code: 'changed', status: 409, error: NB7_TEXTS.twin(req.name) });
   return { ...reply, servedBy: req.name };
 }
 

@@ -28,6 +28,33 @@ const DIST_PATH = '/app/dist';
 const APPLIED_VERSION_PATH = path.join(DATA_ROOT, 'applied-version.json');
 const BACKUPS_PATH = path.join(DATA_ROOT, 'backups');
 
+const MODULES_SKIPPED_TEXT = "[Rollback] The App Store modules in this backup were not restored: this bot keeps its modules in its database, or its data backend could not be read. The App Store tab installs only the version each module's repository holds now.";
+const NOTHING_RESTORED_TEXT = '[Rollback] Nothing was restored: this backup holds only App Store modules, and this bot keeps its modules in its database, or its data backend could not be read.';
+
+/**
+ * The bot's data backend as the bot reads DATA_BACKEND: its environment, then /data/.env; empty or 'file' is 'file'.
+ * null when it cannot be read (an unreadable .env, a value the bot refuses).
+ */
+function dataBackend() {
+  let raw = process.env.DATA_BACKEND;
+  if (raw === undefined || raw.trim() === '') {
+    let text;
+    try {
+      text = fs.readFileSync(path.join(DATA_ROOT, '.env'), 'utf-8');
+    } catch (error) {
+      return error && error.code === 'ENOENT' ? 'file' : null;
+    }
+    try {
+      raw = require('dotenv').parse(text).DATA_BACKEND;
+    } catch {
+      return null;
+    }
+  }
+  const value = (raw || '').trim().toLowerCase();
+  if (value === '' || value === 'file') return 'file';
+  return value === 'postgres' ? 'postgres' : null;
+}
+
 /**
  * Copy directory recursively
  */
@@ -89,6 +116,7 @@ function restoreSubdir(backupSubdir, targetDir, label) {
  * @param {Object} snapshot - Snapshot info with path and version
  * @param {string} snapshot.path - Path to backup directory (/data/backups/backup-<ts>)
  * @param {string} [snapshot.version] - Version string for logging
+ * @returns {boolean} false when nothing was restored
  */
 function performRollback(snapshot) {
   if (!snapshot || !snapshot.path) {
@@ -122,8 +150,19 @@ function performRollback(snapshot) {
     throw new Error(`Backup is corrupted (missing custom and appstore-modules): ${backupPath}`);
   }
 
+  // NB6 decision 32: a Postgres bot keeps its modules in the database; an unknown backend is treated the same way.
+  const modulesInDatabase = fs.existsSync(backupAppstore) && dataBackend() !== 'file';
+  if (modulesInDatabase && !fs.existsSync(backupCustom)) {
+    console.error(NOTHING_RESTORED_TEXT);
+    return false;
+  }
+
   restoreSubdir(backupCustom, CUSTOM_PATH, 'custom');
-  restoreSubdir(backupAppstore, APPSTORE_MODULES_PATH, 'appstore-modules');
+  if (modulesInDatabase) {
+    console.log(MODULES_SKIPPED_TEXT);
+  } else {
+    restoreSubdir(backupAppstore, APPSTORE_MODULES_PATH, 'appstore-modules');
+  }
 
   // Clear ephemeral build outputs and the applied-version marker so the next
   // boot's buildId compare in start.sh rebuilds /app/build and /app/dist from
@@ -338,7 +377,7 @@ function main(args) {
       }
       console.log(`[Rollback] Chosen backup: ${describeBackup(chosen)}`);
       try {
-        performRollback(chosen);
+        if (!performRollback(chosen)) return 1;
       } catch (error) {
         console.error(`[Rollback] Refused: ${error.message}`);
         return 1;

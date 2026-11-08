@@ -23,7 +23,7 @@ import {
   confirmFile,
   existsOnDisk,
   readFileUtf8,
-  readRaw,
+  readRaw as readRawFile,
   guildDirExists,
   guildHasQueuedOps,
   guildFailingWrite,
@@ -41,7 +41,36 @@ import {
   guildKeyStored,
   noteGuildDelete,
 } from './dataBackends/fileBackend';
-import { keyRefusal, pathKeyOf, sizeRefusal, textRefusal, valueText } from './storableData';
+import { globalKeyRefusal, globalTextRefusal, keyRefusal, pathKeyOf, sizeRefusal, textRefusal, valueText } from './storableData';
+import {
+  dropGlobalKey,
+  forgetGlobalTree,
+  globalPlacement,
+  globalRelOf,
+  isLinesKey,
+  mirrorBytes,
+  noteGlobalKey,
+  configureRowFlush,
+  flushRows,
+  kickRows,
+  ROOT_CONFIG_KEY,
+  rowChange,
+  rowCommitOwed,
+  rowOpsLanded,
+  rowQueue,
+  rowTicketState,
+  shaOf,
+  sharedKeyFor,
+  sharedKeyOf,
+  type CarriedLines,
+  type RowBackend,
+  type RowOp,
+  type RowTicket,
+  type UpdateStep,
+  unconfirmUnansweredRows,
+  webuiSessionsOpen,
+} from './sharedStore';
+import { appendLine } from './sharedLines';
 
 import {
   flushAll as flushAllFiles,
@@ -57,7 +86,7 @@ import {
   flushGuild as flushGuildFiles,
   filesPending,
   flushFailing as flushFailingFiles,
-  readRawStrict,
+  readRawStrict as readRawStrictFile,
   sweepGraveyard as sweepFileGraveyard,
   listGuilds as listGuildDirs,
 } from './dataBackends/fileBackend';
@@ -66,7 +95,7 @@ import type { WsTicket } from './dataBackends/workingSet';
 import type { FileRestoreOutcome, FileTicket } from './dataBackends/fileBackend';
 import { deadlineIn, msLeft } from './dataBackends/postgresBackend';
 import type { DataBackend, FenceToken, LateCommit, ReplacedBatch, RestoreOutcome, RestoreStop, RetireOutcome } from './dataBackends/backend';
-import { resolveDataBackend } from '../../../utils/envLoader';
+import { resolveDataBackend, useSharedDocReader } from '../../../utils/envLoader';
 import { currentLedger, currentSince, recordRefusal, recordTicket } from './dataBackends/writeLedger';
 import { markBarrier, noteScopeRefusal, noteScopeTicket, pendingFor, saveMark, stampOf, type SaveMark } from './dataBackends/scopeRecord';
 import { canonicalGuildKey, GuildKeyError, type GuildKey } from './dataKeys';
@@ -81,8 +110,6 @@ export { DataBackendUnavailableError } from './dataBackends/workingSet';
 export {
   flushFailing,
   getFlushFailures,
-  readRaw,
-  readRawStrict,
   sizeOfGlobalData,
   listGraveyardEntries,
 } from './dataBackends/fileBackend';
@@ -96,7 +123,17 @@ let pgBackend: DataBackend | null = null;
 /** Wired at boot when the deployment's backend is postgres. */
 export function setGuildDataBackend(backend: DataBackend | null): void {
   pgBackend = backend;
+  kickRows();
 }
+
+// NB6: the row queue's flush sends on the data pool and re-runs updates with the accept's checks.
+configureRowFlush({
+  backend: () => (pgBackend && typeof (pgBackend as Partial<RowBackend>).sharedTx === 'function' ? pgBackend as unknown as RowBackend : null),
+  rerun: (what, fn, stored) => rerunUpdate(what, fn, stored),
+});
+
+// NB6 decision 57: the payment providers read the credentials doc as the facade holds it.
+useSharedDocReader(absPath => (sharedKeyOf(absPath) === null ? undefined : readRawStrict(absPath)));
 
 export function getGuildDataBackend(): DataBackend | null {
   return pgBackend;
@@ -150,6 +187,7 @@ export async function flushAll(): Promise<void> {
   const [, leftover] = await Promise.all([
     flushAllFiles(),
     ws ? ws.flushAllDirty() : Promise.resolve([] as string[]),
+    flushRows(),
   ]);
   logDrainLeft('A full flush', leftover);
 }
@@ -194,13 +232,47 @@ function openRenameSection(): () => void {
 
 const pause = (ms: number) => new Promise<void>(resolve => { setTimeout(resolve, Math.max(0, ms)); });
 
-function writesSettled(filesOnly = false): boolean {
-  const ws = filesOnly ? null : getWorkingSet();
-  return queuedFileWrites() === 0 && (!ws || ws.writesSettled());
+/**
+ * C6: the row ops this process holds. unsaved: queued or on the wire with no unknown id; unanswered: holding an unknown
+ * id with no attempt on the wire. An op whose mirror write is pending is in the database and counts in neither.
+ */
+function rowOpsHeld(): { unsaved: RowOp[]; unanswered: RowOp[]; onTheWire: boolean } {
+  const unsaved: RowOp[] = [];
+  const unanswered: RowOp[] = [];
+  let onTheWire = false;
+  for (const key of rowQueue.keys()) {
+    for (const op of rowQueue.ops(key)) {
+      if (op.state === 'wire') onTheWire = true;
+      if ((op.state === 'queued' || op.state === 'wire') && op.unknown.length === 0) unsaved.push(op);
+      else if (op.state === 'queued' && op.unknown.length > 0) unanswered.push(op);
+    }
+  }
+  return { unsaved, unanswered, onTheWire };
 }
 
-const landedFlushes = () => fileFlushesLanded() + (getWorkingSet()?.landedFlushes() ?? 0);
-const flushOnTheWire = (filesOnly = false) => fileFlushOnTheWire() || (!filesOnly && (getWorkingSet()?.flushOnTheWire() ?? false));
+/** The mirror paths of the row ops not stored, beside the file queue's unsaved paths in the held log. */
+export function unsavedRowPaths(): string[] {
+  return rowOpsHeld().unsaved.map(op => op.path);
+}
+
+/** The row ops holding a save the database did not answer, which may have landed, with no check on the wire. */
+export function unansweredRowOps(): number {
+  return rowOpsHeld().unanswered.length;
+}
+
+/** Decision 39: no op in the row queue, stored or not, and no web UI session's mark (S3's wait in the web UI process). */
+export function sharedWritesSettled(): boolean {
+  return rowQueue.keys().length === 0 && webuiSessionsOpen() === 0;
+}
+
+// Row ops are database writes: while latched (filesOnly) they are left out, as the working set is.
+function writesSettled(filesOnly = false): boolean {
+  const ws = filesOnly ? null : getWorkingSet();
+  return queuedFileWrites() === 0 && (!ws || ws.writesSettled()) && (filesOnly || sharedWritesSettled());
+}
+
+const landedFlushes = () => fileFlushesLanded() + (getWorkingSet()?.landedFlushes() ?? 0) + rowOpsLanded();
+const flushOnTheWire = (filesOnly = false) => fileFlushOnTheWire() || (!filesOnly && ((getWorkingSet()?.flushOnTheWire() ?? false) || rowOpsHeld().onTheWire));
 
 // A pass flushes what is queued when it starts: a write accepted during it and
 // a flush already on the wire are the next pass's, and the pause hands a flush
@@ -224,7 +296,7 @@ async function drainUntilSettled(deadline: number, progress: { at: number; lande
     if (held) pgBackend!.confirmNow?.();
     const ws = filesOnly ? null : getWorkingSet();
     await Promise.race([
-      Promise.all([flushAllFiles(), ws ? ws.flushAllDirty() : null]).catch(() => undefined),
+      Promise.all([flushAllFiles(), ws ? ws.flushAllDirty() : null, filesOnly ? null : flushRows()]).catch(() => undefined),
       pause(deadline - Date.now()),
     ]);
     if (writesSettled(filesOnly)) return;
@@ -256,9 +328,10 @@ export function drainForExit(boundMs: number): Promise<void> {
         await Promise.allSettled([...restoreRenameSections]);
         await drainUntilSettled(deadline, progress);
         logDrainLeft('Shutdown drain', getWorkingSet()?.dirtyGuildIds() ?? []);
-        const files = queuedFileWrites();
+        const files = queuedFileWrites() + rowOpsHeld().unsaved.length;
         if (files > 0) console.warn(`[Data] Shutdown drain left ${files} file(s) with queued writes`);
       } finally {
+        unconfirmUnansweredRows('the bot process stopped before the database answered a check');
         failReplacedTriesAtExit();
         // A loss whose leave never ended logs what it dropped here.
         for (const line of getWorkingSet()?.takeDropLines() ?? []) console.error(line);
@@ -274,19 +347,22 @@ export function isExitDraining(): boolean {
 }
 
 /**
- * Maintenance's save: flushes the working set and the queued file writes until nothing is held, nothing lands for the
- * drain's give-up window, or boundMs passes. Unlike the exit drain it closes nothing. Answers what is still held.
+ * Maintenance's save: flushes the working set, the row ops and the queued file writes until nothing is held, nothing
+ * lands for the drain's give-up window, or boundMs passes. Unlike the exit drain it closes nothing. Answers what is
+ * still held.
  */
 export async function saveHeldWrites(boundMs: number): Promise<HeldCounts> {
   await drainUntilSettled(Date.now() + boundMs, { at: Date.now(), landed: landedFlushes() });
   const ws = getWorkingSet();
   const unanswered = ws?.unansweredGuilds() ?? { all: [], only: [] };
+  const rows = rowOpsHeld();
   return {
     unsavedGuilds: (ws?.dirtyGuildIds() ?? []).filter(guildId => !unanswered.only.includes(guildId)).length,
-    unsavedFiles: unsavedFileWrites(),
+    unsavedFiles: unsavedFileWrites() + rows.unsaved.length,
     unansweredGuilds: unanswered.all.length,
     unconfirmedFiles: unconfirmedFiles(),
     ...((ws?.resaveGuilds().length ?? 0) > 0 ? { resaveGuilds: ws!.resaveGuilds().length } : {}),
+    ...(rows.unanswered.length > 0 ? { unansweredFiles: rows.unanswered.length } : {}),
   };
 }
 
@@ -453,11 +529,12 @@ export function beginStop(deposed = false): Promise<void> {
 
 // The web UI process installs the shared gate (none in the bot process): outside a change it applies itself, every
 // file write of that process is refused, sessions excepted. A process another one deposed closes every shared write.
-let sharedWriteGate: (() => boolean) | null = null;
+let sharedWriteGate: ((absPath?: string) => boolean) | null = null;
 let sharedWritesLost = false;
 const SESSIONS_DIR = path.resolve(DATA_ROOT, '_sessions') + path.sep;
 
-export function setSharedWriteGate(gate: (() => boolean) | null): void {
+/** gate answers whether this context may write absPath; with no path, whether it may write shared files at all. */
+export function setSharedWriteGate(gate: ((absPath?: string) => boolean) | null): void {
   sharedWriteGate = gate;
 }
 
@@ -504,7 +581,7 @@ function sharedRefusal(absPath: string): 'writer-lost' | 'not-ready' | null {
     console.error(`[Data] Write of ${absPath} refused: another process took the data files`);
     return 'writer-lost';
   }
-  if (sharedWriteGate && !sharedWriteGate()) {
+  if (sharedWriteGate && !sharedWriteGate(absPath)) {
     console.error(`[Data] Write of ${absPath} refused: the web UI process writes data files only inside a change it applies itself (the bot process applies writes while it runs)`);
     return 'not-ready';
   }
@@ -521,6 +598,7 @@ export function onWriterTake(step: () => void): void {
 /** Clears what this process knows of the shared files' contents; run by the writer lock at each take. */
 export function forgetSharedFileKnowledge(): void {
   forgetDurableFiles();
+  forgetGlobalTree();
   for (const step of writerTakeSteps) {
     try {
       step();
@@ -575,9 +653,37 @@ export function listGuildDataFiles(guildId: string, category?: string): string[]
  * document landing counts for it, and other writes of the guild still queued
  * do not.
  */
-export async function confirmWrite(ticket: WriteTicket, deadlineMs: number): Promise<'ok' | 'pending' | 'held' | 'deposed' | 'unavailable'> {
+export async function confirmWrite(ticket: WriteTicket, deadlineMs: number): Promise<'ok' | 'pending' | 'held' | 'deposed' | 'unavailable' | 'refused'> {
   if (ticket.kind === 'file') return confirmFile(ticket, deadlineMs);
+  if (ticket.kind === 'row') return confirmRow(ticket, deadlineMs);
   return ticket.manager.confirm(ticket, deadlineMs);
+}
+
+/**
+ * NB6 D1: a row ticket waits until its op settles, a try of the op ends without an outcome (before the call or during
+ * the wait), or the deadline. 'refused' is the flush's refusal (its cause is on the op). An op still open after a try
+ * ended without an outcome answers 'pending' while one of its attempts may be stored, else 'held'; at the deadline,
+ * 'pending'.
+ */
+async function confirmRow(ticket: RowTicket, deadlineMs: number): Promise<'ok' | 'pending' | 'held' | 'unavailable' | 'refused'> {
+  const end = performance.now() + deadlineMs;
+  for (;;) {
+    const state = rowTicketState(ticket);
+    if (state === 'landed') return 'ok';
+    if (state === 'refused') return 'refused';
+    if (state === 'unconfirmed') return 'unavailable';
+    if (ticket.op.triesFailed > 0) return rowCommitOwed(ticket) ? 'pending' : 'held';
+    const left = end - performance.now();
+    if (left <= 0) return 'pending';
+    let timer: NodeJS.Timeout | undefined;
+    await Promise.race([rowChange(ticket), new Promise<void>(resolve => { timer = setTimeout(resolve, left); })]);
+    clearTimeout(timer);
+  }
+}
+
+/** A re-read 'pending' stays pending while a COMMIT that may carry the write owes its answer (NB13 decision 6, D1). */
+export function commitOwed(ticket: WriteTicket): boolean {
+  return (ticket.kind === 'ws' && commitAnswerOwed(ticket)) || (ticket.kind === 'row' && rowCommitOwed(ticket));
 }
 
 export type SaveOutcome = 'ok' | 'pending' | 'held' | 'deposed' | 'unavailable' | 'refused';
@@ -618,14 +724,14 @@ export async function confirmSaved(scope: string, options: { since?: SaveMark; d
   const folder = options.category === undefined
     ? null
     : getDataDirectory(scope === 'global' ? { scope: 'global', category: options.category } : { guildId: scope, category: options.category }) + path.sep;
-  const judged = tickets.filter(ticket => ticket.kind === 'ws' || folder === null || ticket.path.startsWith(folder));
+  const judged = tickets.filter(ticket => ticket.kind === 'ws' || folder === null || (ticket.kind === 'row' ? ticket.op.path : ticket.path).startsWith(folder));
   const first = await Promise.all(judged.map(ticket => confirmWrite(ticket, deadlineMs).catch(() => 'unavailable' as const)));
   // A held write is retried while slower confirms finish, so it is read again when the answer is taken. Its 'pending'
   // stays pending while a COMMIT that may carry it owes its answer.
   const now = await Promise.all(first.map((answer, i) => {
     if (answer !== 'held') return answer;
     const ticket = judged[i];
-    return confirmWrite(ticket, 0).then(again => (again === 'pending' && !(ticket.kind === 'ws' && commitAnswerOwed(ticket)) ? 'held' as const : again), () => 'unavailable' as const);
+    return confirmWrite(ticket, 0).then(again => (again === 'pending' && !commitOwed(ticket) ? 'held' as const : again), () => 'unavailable' as const);
   }));
   // NB13 decision 8: a file line whose sync the disk did not confirm is 'unavailable' for good, also one found so while
   // the confirms above waited.
@@ -647,7 +753,7 @@ export function readGuildDocRaw(guildId: string, module: string, filename: strin
     const key = canonicalGuildKey(module, filename);
     return ws.readDocRaw(guildId, key.module, key.filename);
   }
-  return readRawStrict(guildDocFilePath(guildId, module, filename));
+  return readRawStrictFile(guildDocFilePath(guildId, module, filename));
 }
 
 function guildDocFilePath(guildId: string, module: string, filename: string): string {
@@ -742,6 +848,24 @@ export interface DataOptions {
    * Example: 'giveaways', 'responses', 'users'
    */
   category?: string;
+
+  /**
+   * The sha of the bytes this write was built on, for a shared key on a Postgres bot (NB6 decision 22): the write is
+   * stored only over that version. Ignored elsewhere.
+   */
+  baseSha?: string;
+
+  /**
+   * Lines of a lines key the save's op stores in its own transaction (NB6 decision 47: premium's audit lines), on a
+   * Postgres bot only; the caller writes them itself elsewhere.
+   */
+  lines?: CarriedLines;
+
+  /**
+   * Other shared keys this write was built on, with the sha each had then (null: no row), on a Postgres bot only (NB6
+   * decision 102): the write is stored only while each still has that sha.
+   */
+  check?: Record<string, string | null>;
 }
 
 /**
@@ -810,6 +934,11 @@ function refuseGuildWhileGated(options: DataOptions): void {
   if ((options.scope || 'guild') === 'guild') refuseWhileGated();
 }
 
+/** NB6 decision 19: the migration lock refuses a write of a shared key on a Postgres bot as it refuses a guild write. */
+function refuseSharedWhileGated(filename: string, options: DataOptions): void {
+  if (options.scope === 'global' && sharedKeyOf(getDataFilePath(filename, options))) refuseWhileGated();
+}
+
 // ============================================================================
 // OWNER INFO (the fence token source)
 // ============================================================================
@@ -848,7 +977,7 @@ function guildIdToShardId(guildId: string, shardCount: number): number {
 
 export type RawWriteTracked =
   | { accepted: true }
-  | { accepted: false; cause: 'unstorable' | 'storage-failing' | 'io' | 'not-ready' | 'writer-lost'; reason?: string };
+  | { accepted: false; cause: 'unstorable' | 'storage-failing' | 'database-backlog' | 'io' | 'not-ready' | 'writer-lost'; reason?: string };
 
 /** A path under a numeric guild folder: the guild and the key in path form, relative to that folder. */
 function guildRawKey(absPath: string): { guildId: string; key: string } | null {
@@ -871,18 +1000,31 @@ function storableRawRefusal(absPath: string, contents: string): RawRefused | nul
   if (typeof contents !== 'string') return refuseRaw(absPath, 'unstorable', 'the text is not a string');
   const tooLarge = sizeRefusal(contents);
   if (tooLarge) return refuseRaw(absPath, 'unstorable', tooLarge);
+  const rel = globalRelOf(absPath);
+  if (rel !== null || sharedKeyFor(absPath) === ROOT_CONFIG_KEY) {
+    const refusal = globalTextRefusal(contents) ?? (rel === null ? null : globalKeyRefusal(rel, 'save'));
+    return refusal ? refuseRaw(absPath, 'unstorable', refusal) : null;
+  }
   const guild = guildRawKey(absPath);
   if (!guild) return null;
   const refusal = textRefusal(contents, 'text') ?? keyRefusal(guild.key, 'save');
   return refusal ? refuseRaw(absPath, 'unstorable', refusal) : null;
 }
 
+/** Rule P for a raw write under /data/global, against the global keys. */
+function globalRawCollision(absPath: string): RawRefused | null {
+  const rel = globalRelOf(absPath);
+  const collision = rel === null ? null : globalPlacement(rel);
+  return collision ? refuseRaw(absPath, 'unstorable', collision.reason) : null;
+}
+
 /**
- * The rules a write of contents to an absolute path meets, for a process that is not the file's writer: S, and under
- * a guild folder T, K and P read only. It changes nothing on disk; the writer checks again under its lock.
+ * The rules a write of contents to an absolute path meets, for a process that is not the file's writer: S; under a
+ * guild folder T, K and P read only; under /data/global and for the root config T, K and P. It changes nothing on
+ * disk; the writer checks again under its lock.
  */
 export function rawCheckRefusal(absPath: string, contents: string): RawRefused | null {
-  const refused = storableRawRefusal(absPath, contents);
+  const refused = storableRawRefusal(absPath, contents) ?? globalRawCollision(absPath);
   if (refused) return refused;
   const guild = guildRawKey(absPath);
   if (!guild) return null;
@@ -891,12 +1033,13 @@ export function rawCheckRefusal(absPath: string, contents: string): RawRefused |
 }
 
 /**
- * The rules a write of contents to an absolute path meets (S, and under a guild folder T, K and P), queuing nothing:
- * the refusal, recorded and logged as the write's would be, or null when the write may go ahead. Rule P removes a
- * keyless folder in the way, so only the writer calls this.
+ * The rules a write of contents to an absolute path meets (S; under a guild folder T, K and P; under /data/global and
+ * for the root config T, K and P), queuing nothing: the refusal, recorded and logged as the write's would be, or null
+ * when the write may go ahead. Rule P removes a keyless folder in the way under a guild folder, so only the writer
+ * calls this.
  */
 export function rawWriteRefusal(absPath: string, contents: string): RawRefused | null {
-  const refused = storableRawRefusal(absPath, contents);
+  const refused = storableRawRefusal(absPath, contents) ?? globalRawCollision(absPath);
   if (refused) return refused;
   const guild = guildRawKey(absPath);
   if (!guild) return null;
@@ -905,13 +1048,19 @@ export function rawWriteRefusal(absPath: string, contents: string): RawRefused |
   return null;
 }
 
+/** The base of a write without a caller base: what the facade holds for the file now (decision 22). */
+function rowBase(absPath: string, baseSha: string | undefined): { sha: string; caller: boolean } {
+  return baseSha === undefined ? { sha: baseOf(absPath), caller: false } : { sha: baseSha, caller: true };
+}
+
 /** Queue an atomic write to an absolute path, answering why it was refused; throws once the exit drain has closed. */
-export function writeRawAtomicTracked(absPath: string, contents: string): RawWriteTracked {
+export function writeRawAtomicTracked(absPath: string, contents: string, options: { baseSha?: string } = {}): RawWriteTracked {
   if (closedForExit) {
     recordRefusal('node-stopping', `file:${absPath}`);
     throw new DataBackendUnavailableError('node-stopping');
   }
-  if (isGuildDataPath(absPath)) refuseWhileGated();
+  const rowKey = sharedKeyOf(absPath);
+  if (isGuildDataPath(absPath) || rowKey) refuseWhileGated();
   if (rawRefusedWhileHeld(absPath)) return { accepted: false, cause: 'not-ready' };
   const shared = sharedRefusal(absPath);
   if (shared) {
@@ -920,10 +1069,21 @@ export function writeRawAtomicTracked(absPath: string, contents: string): RawWri
   }
   const refused = rawWriteRefusal(absPath, contents);
   if (refused) return refused;
+  const rel = globalRelOf(absPath);
+  if (rowKey) {
+    if (rowQueue.closed()) {
+      recordRefusal('database-backlog', `file:${absPath}`);
+      return { accepted: false, cause: 'database-backlog' };
+    }
+    recordTicket(rowQueue.accept(rowKey, absPath, { body: Buffer.from(contents, 'utf8') }, rowBase(absPath, options.baseSha)), `file:${absPath}`);
+    if (rel !== null) noteGlobalKey(rel);
+    return { accepted: true };
+  }
   const guild = guildRawKey(absPath);
   const accepted = writeRawAtomicFile(absPath, contents);
   if (accepted) {
     if (guild) noteGuildWrite(guild.guildId, guild.key);
+    if (rel !== null) noteGlobalKey(rel);
     recordTicket(fileTicket(absPath), `file:${absPath}`);
     return { accepted: true };
   }
@@ -937,27 +1097,137 @@ export function writeRawAtomic(absPath: string, contents: string): boolean {
   return writeRawAtomicTracked(absPath, contents).accepted;
 }
 
-/** Queue an atomic delete of an absolute path (false: nothing to delete); refused once the exit drain has closed. */
-export function deleteRawAtomic(absPath: string): boolean {
+/**
+ * An update of a shared key's JSON text on a Postgres bot (NB6 decision 34): fn gets a private copy of the value held
+ * now (defaultValue's when there is none) and returns the new value, which is written as the facade writes JSON; the
+ * flush re-runs fn on the stored value when another machine stored a newer one. fn must be synchronous and write no
+ * data; a throw from it reaches the caller and nothing is queued. A path that is no shared key on this bot throws.
+ */
+export function updateRawTracked(absPath: string, defaultValue: unknown, fn: (current: any) => unknown): RawWriteTracked {
   if (closedForExit) {
     recordRefusal('node-stopping', `file:${absPath}`);
     throw new DataBackendUnavailableError('node-stopping');
   }
-  if (isGuildDataPath(absPath)) refuseWhileGated();
-  if (rawRefusedWhileHeld(absPath)) return false;
+  const rowKey = sharedKeyOf(absPath);
+  if (!rowKey) throw new TypeError(`[Data] ${absPath} is not a shared key on this bot, so it has no raw update`);
+  refuseWhileGated();
+  if (rawRefusedWhileHeld(absPath)) return { accepted: false, cause: 'not-ready' };
   const shared = sharedRefusal(absPath);
   if (shared) {
     recordRefusal(shared, `file:${absPath}`);
-    return false;
+    return { accepted: false, cause: shared };
+  }
+  let current: unknown;
+  let base: string;
+  try {
+    const entry = rowQueue.entryOf(rowKey);
+    const bytes = entry ? entry.body : mirrorBytes(absPath);
+    current = bytes === null ? structuredClone(defaultValue) : JSON.parse(bytes.toString('utf8'));
+    base = bytes === null ? 'absent' : shaOf(bytes);
+  } catch (error) {
+    return refuseRaw(absPath, 'io', `the stored text could not be read whole (${error instanceof Error ? error.message : String(error)})`);
+  }
+  let next: unknown;
+  try {
+    next = runUpdateFn(absPath, fn, current);
+  } catch (error) {
+    if (error instanceof UpdateFnError) throw error.error;
+    throw error;
+  }
+  const value = valueText(next);
+  if (!value.ok) return refuseRaw(absPath, 'unstorable', value.reason);
+  const refused = rawWriteRefusal(absPath, value.text);
+  if (refused) return refused;
+  if (rowQueue.closed()) {
+    recordRefusal('database-backlog', `file:${absPath}`);
+    return { accepted: false, cause: 'database-backlog' };
+  }
+  recordTicket(rowQueue.accept(rowKey, absPath, { body: Buffer.from(value.text, 'utf8'), update: { fn, defaultValue } }, { sha: base, caller: false }), `file:${absPath}`);
+  const rel = globalRelOf(absPath);
+  if (rel !== null) noteGlobalKey(rel);
+  return { accepted: true };
+}
+
+/** Queue an atomic delete of an absolute path (false: nothing to delete); refused once the exit drain has closed. */
+export function deleteRawAtomic(absPath: string, options: { baseSha?: string } = {}): boolean {
+  return deleteRawAtomicTracked(absPath, options).accepted;
+}
+
+/** deleteRawAtomic with why nothing was queued: 'absent' when there was nothing to delete, else the refusal's cause. */
+export function deleteRawAtomicTracked(absPath: string, options: { baseSha?: string } = {}): { accepted: boolean; cause?: string } {
+  if (closedForExit) {
+    recordRefusal('node-stopping', `file:${absPath}`);
+    throw new DataBackendUnavailableError('node-stopping');
+  }
+  const rowKey = sharedKeyOf(absPath);
+  if (isGuildDataPath(absPath) || rowKey) refuseWhileGated();
+  if (rawRefusedWhileHeld(absPath)) return { accepted: false, cause: 'not-ready' };
+  const shared = sharedRefusal(absPath);
+  if (shared) {
+    recordRefusal(shared, `file:${absPath}`);
+    return { accepted: false, cause: shared };
+  }
+  const rel = globalRelOf(absPath);
+  if (rowKey) {
+    const entry = rowQueue.entryOf(rowKey);
+    if (!(entry ? entry.body !== null : existsOnDisk(absPath))) return { accepted: false, cause: 'absent' };
+    if (rowQueue.closed()) {
+      recordRefusal('database-backlog', `file:${absPath}`);
+      return { accepted: false, cause: 'database-backlog' };
+    }
+    recordTicket(rowQueue.accept(rowKey, absPath, { body: null }, rowBase(absPath, options.baseSha)), `file:${absPath}`);
+    if (rel !== null) dropGlobalKey(rel);
+    return { accepted: true };
   }
   const accepted = deleteRawAtomicFile(absPath);
+  if (accepted && rel !== null) dropGlobalKey(rel);
   // A delete still queued for the path has not landed: it answers for this one.
   if (accepted || getPending(absPath)?.op === 'delete') recordTicket(fileTicket(absPath), `file:${absPath}`);
   else {
     const cause = lastRawRefusal();
     if (cause) recordRefusal(cause, `file:${absPath}`);
+    return { accepted, ...(cause ? { cause } : {}) };
   }
-  return accepted;
+  return { accepted };
+}
+
+/** What this process holds for a shared key ahead of its mirror: the text (null for a delete), or undefined for nothing. */
+function rowHeld(absPath: string): string | null | undefined {
+  const key = sharedKeyOf(absPath);
+  const entry = key ? rowQueue.entryOf(key) : undefined;
+  if (!entry) return undefined;
+  return entry.body === null ? null : entry.body.toString('utf8');
+}
+
+/** A file's text: this process's row op of it first, then its queued write, then the disk; null when absent or unreadable. */
+export function readRaw(absPath: string): string | null {
+  const held = rowHeld(absPath);
+  return held === undefined ? readRawFile(absPath) : held;
+}
+
+/** readRaw for a caller that must tell absent from unreadable: a read error other than absence throws. */
+export function readRawStrict(absPath: string): string | null {
+  const held = rowHeld(absPath);
+  return held === undefined ? readRawStrictFile(absPath) : held;
+}
+
+/**
+ * The sha of the bytes the facade holds for a file now (NB6 decisions 22 and 50): this process's row op or queued
+ * write first, then the disk; 'absent' for none, 'unreadable' when the file cannot be read.
+ */
+export function baseOf(absPath: string): string {
+  const key = sharedKeyOf(absPath);
+  const entry = key ? rowQueue.entryOf(key) : undefined;
+  if (entry) return entry.body === null ? 'absent' : shaOf(entry.body);
+  const pending = key ? undefined : getPending(absPath);
+  if (pending?.op === 'delete') return 'absent';
+  if (pending?.op === 'write') return shaOf(Buffer.from(pending.content, 'utf8'));
+  try {
+    const bytes = mirrorBytes(absPath);
+    return bytes === null ? 'absent' : shaOf(bytes);
+  } catch {
+    return 'unreadable';
+  }
 }
 
 /** The ticket for the raw op still queued on this path, taken right after writeRawAtomic or deleteRawAtomic; none once it landed. */
@@ -996,6 +1266,8 @@ export function loadData<T = any>(
     getMetricsCollector().recordIO('read', options.scope === 'global' ? null : options.guildId ?? null, options.category ?? null);
 
     // Read-your-writes: a queued op is authoritative over disk.
+    const held = rowHeld(filePath);
+    if (held !== undefined) return held === null ? defaultValue : JSON.parse(held);
     const pending = getPending(filePath);
     if (pending) {
       if (pending.op === 'delete') return defaultValue;
@@ -1017,7 +1289,7 @@ export function loadData<T = any>(
 }
 
 /** One accepted write, as confirmWrite answers for it. */
-export type WriteTicket = WsTicket | FileTicket;
+export type WriteTicket = WsTicket | FileTicket | RowTicket;
 
 /**
  * Why a write was refused without a throw: its guild's working set is not ready (or not in this process), storage
@@ -1056,6 +1328,28 @@ function storableKey(filename: string, options: DataOptions, kind?: 'save' | 'ap
 
 const isRefused = (value: GuildKey | Refused): value is Refused => 'outcome' in value;
 
+/** A global-scope write's path and its key below /data/global (null outside it) after rule K, or its refusal. */
+function storableGlobal(filename: string, options: DataOptions, kind: 'save' | 'append'): { file: string; rel: string | null } | Refused {
+  const file = getDataFilePath(filename, options);
+  const rel = globalRelOf(file);
+  const refusal = rel === null ? null : globalKeyRefusal(rel, kind);
+  return refusal ? unstorable(filename, options, refusal) : { file, rel };
+}
+
+/** Rule P for a global-scope write against the global keys; null when it fits. */
+function placeGlobal(filename: string, options: DataOptions, rel: string | null): Refused | null {
+  const collision = rel === null ? null : globalPlacement(rel);
+  return collision ? unstorable(filename, options, collision.reason) : null;
+}
+
+/** An update's part of a row op: its fn, and the sha of the bytes readForUpdate gave it. */
+interface RowUpdate {
+  step: UpdateStep;
+  base: string;
+}
+
+const rowTicketOf = (op: RowOp): RowTicket => ({ kind: 'row', key: op.key, op, seq: op.writes });
+
 /** Rule P on the file route, before anything is queued or a folder made; null when the write may go ahead. */
 function placeOnFiles(filename: string, options: DataOptions, key: GuildKey): Refused | null {
   const placement = placeGuildWrite(options.guildId ?? '', pathKeyOf(key.module, key.filename));
@@ -1092,9 +1386,10 @@ function recorded<R extends SaveTracked | AppendTracked | DeleteTracked>(doc: st
     throw error;
   }
   const outcome: SaveTracked | AppendTracked | DeleteTracked = result;
-  if ('ticket' in outcome && outcome.ticket) {
-    recordTicket(outcome.ticket, whole ? doc : undefined);
-    noteScopeTicket(scope, outcome.ticket, whole ? doc : undefined);
+  const ticket = 'ticket' in outcome ? outcome.ticket : undefined;
+  if (ticket) {
+    recordTicket(ticket, whole ? doc : undefined);
+    noteScopeTicket(scope, ticket, whole ? doc : undefined);
   } else if (outcome.outcome === 'frozen' || outcome.outcome === 'refused') {
     if (outcome.outcome === 'frozen') recordRefusal('frozen', doc);
     else recordRefusal(outcome.cause, doc, outcome.reason);
@@ -1125,7 +1420,7 @@ export function saveDataTracked<T = any>(filename: string, options: DataOptions,
   return recorded(docOf(filename, options), scopeOf(options), true, () => acceptSave(filename, options, data));
 }
 
-function acceptSave<T>(filename: string, options: DataOptions, data: T): SaveTracked {
+function acceptSave<T>(filename: string, options: DataOptions, data: T, update?: RowUpdate): SaveTracked {
   refuseInsideUpdate();
   if (filename.endsWith('.jsonl')) {
     throw new TypeError(`[Data] ${filename} is an append-only file; write it with appendData. The value was not saved`);
@@ -1133,11 +1428,14 @@ function acceptSave<T>(filename: string, options: DataOptions, data: T): SaveTra
   if (closedForExit) throw new DataBackendUnavailableError('node-stopping');
   refuseInMaintenance(options);
   refuseGuildWhileGated(options);
+  refuseSharedWhileGated(filename, options);
   if (guildWriteClosed(options, 'Write')) return { outcome: 'refused', cause: 'not-ready' };
   if (refusedWhileHeld(options, 'Write') || refusedBeforeRestore(options, 'Write')) return { outcome: 'refused', cause: 'not-ready' };
   const guildScope = (options.scope || 'guild') === 'guild';
   const checked = guildScope ? storableKey(filename, options, 'save') : null;
   if (checked && isRefused(checked)) return checked;
+  const global = guildScope ? null : storableGlobal(filename, options, 'save');
+  if (global && 'outcome' in global) return global;
   const value = valueText(data);
   if (!value.ok) return unstorable(filename, options, value.reason);
   const tooLarge = sizeRefusal(value.text);
@@ -1168,8 +1466,18 @@ function acceptSave<T>(filename: string, options: DataOptions, data: T): SaveTra
     const scope = options.scope || 'guild';
     const shared = sharedRefusal(filePath);
     if (shared) return { outcome: 'refused', cause: shared };
-    const placed = checked ? placeOnFiles(filename, options, checked as GuildKey) : null;
+    const placed = checked ? placeOnFiles(filename, options, checked as GuildKey) : placeGlobal(filename, options, global?.rel ?? null);
     if (placed) return placed;
+
+    const rowKey = sharedKeyOf(filePath);
+    if (rowKey) {
+      if (rowQueue.closed()) throw new DataBackendUnavailableError('database-backlog');
+      const base = update ? { sha: update.base, caller: false } : { ...rowBase(filePath, options.baseSha), ...(options.check ? { check: options.check } : {}) };
+      const ticket = rowQueue.accept(rowKey, filePath, { body: Buffer.from(content, 'utf8'), update: update?.step, ...(options.lines ? { lines: options.lines } : {}) }, base);
+      if (global?.rel) noteGlobalKey(global.rel);
+      getMetricsCollector().recordIO('write', null, options.category ?? null);
+      return { outcome: 'saved', ticket };
+    }
 
     // Ensure the dir synchronously so the guild dir exists the moment the save
     // is accepted.
@@ -1177,6 +1485,7 @@ function acceptSave<T>(filename: string, options: DataOptions, data: T): SaveTra
 
     enqueueWrite(filePath, content);
     if (checked) noteGuildWrite(options.guildId ?? '', pathKeyOf((checked as GuildKey).module, (checked as GuildKey).filename));
+    if (global?.rel) noteGlobalKey(global.rel);
     const ticket = fileTicket(filePath);
     getMetricsCollector().recordIO('write', scope === 'global' ? null : options.guildId ?? null, options.category ?? null);
 
@@ -1207,7 +1516,8 @@ class UpdateFnError {
   constructor(readonly error: unknown) {}
 }
 
-type UpdateRead = { status: 'absent' } | { status: 'present'; value: unknown } | { status: 'refused'; cause: 'not-ready' | 'io' };
+/** base: for a shared key, the sha of the bytes read ('absent' for none), which the row op is built on. */
+type UpdateRead = { status: 'absent'; base?: string } | { status: 'present'; value: unknown; base?: string } | { status: 'refused'; cause: 'not-ready' | 'io' };
 
 /** The stored document read whole, or why it cannot be: a default stands in only for a document that is absent. */
 function readForUpdate(filename: string, options: DataOptions): UpdateRead {
@@ -1231,6 +1541,13 @@ function readForUpdate(filename: string, options: DataOptions): UpdateRead {
     }
     const filePath = getDataFilePath(filename, options);
     getMetricsCollector().recordIO('read', options.scope === 'global' ? null : options.guildId ?? null, options.category ?? null);
+    const rowKey = sharedKeyOf(filePath);
+    if (rowKey) {
+      const entry = rowQueue.entryOf(rowKey);
+      const bytes = entry ? entry.body : mirrorBytes(filePath);
+      if (bytes === null) return { status: 'absent', base: 'absent' };
+      return { status: 'present', value: JSON.parse(bytes.toString('utf8')), base: shaOf(bytes) };
+    }
     const pending = getPending(filePath);
     if (pending?.op === 'delete') return { status: 'absent' };
     if (pending?.op === 'write') return { status: 'present', value: JSON.parse(pending.content) };
@@ -1239,7 +1556,7 @@ function readForUpdate(filename: string, options: DataOptions): UpdateRead {
       return { status: 'refused', cause: 'io' };
     }
     // A folder at the key's name, or a file at one of its folders, under a guild folder is no document: the save's rule P removes or refuses it.
-    const stored = readRawStrict(filePath);
+    const stored = readRawStrictFile(filePath);
     if (stored === null) return { status: 'absent' };
     return { status: 'present', value: JSON.parse(stored) };
   } catch (error) {
@@ -1255,15 +1572,28 @@ function acceptUpdate<T>(filename: string, options: DataOptions, defaultValue: T
   }
   if (closedForExit) throw new DataBackendUnavailableError('node-stopping');
   refuseInMaintenance(options);
+  refuseSharedWhileGated(filename, options);
   if (guildWriteClosed(options, 'Update')) return { outcome: 'refused', cause: 'not-ready' };
   if (refusedWhileHeld(options, 'Update') || refusedBeforeRestore(options, 'Update')) return { outcome: 'refused', cause: 'not-ready' };
   if ((options.scope || 'guild') === 'guild') {
     const checked = storableKey(filename, options, 'save');
     if (isRefused(checked)) return checked;
+  } else {
+    const global = storableGlobal(filename, options, 'save');
+    if ('outcome' in global) return global;
   }
   const read = readForUpdate(filename, options);
   if (read.status === 'refused') return { outcome: 'refused', cause: read.cause };
   const current = (read.status === 'present' ? read.value : structuredClone(defaultValue)) as T;
+  const next = runUpdateFn(filename, fn, current);
+  return acceptSave(filename, options, next, read.base === undefined ? undefined : { step: { fn, defaultValue }, base: read.base });
+}
+
+/**
+ * Runs an update's fn on current inside an update frame and applies its checks in order: a throw (carried as
+ * UpdateFnError), a data write inside fn, a promise, undefined. Answers fn's result.
+ */
+function runUpdateFn(what: string, fn: (current: any) => unknown, current: unknown): unknown {
   const frame = { nested: false };
   insideUpdate = frame;
   let next: unknown;
@@ -1278,7 +1608,7 @@ function acceptUpdate<T>(filename: string, options: DataOptions, defaultValue: T
   if (thenable) {
     try {
       (next as PromiseLike<unknown>).then(undefined, error => {
-        console.error(`[Data] An async update function for ${filename} failed after it was refused:`, error);
+        console.error(`[Data] An async update function for ${what} failed after it was refused:`, error);
       });
     } catch { /* a then that throws leaves nothing pending */ }
   }
@@ -1287,7 +1617,34 @@ function acceptUpdate<T>(filename: string, options: DataOptions, defaultValue: T
   if (thenable) {
     throw new TypeError('[Data] The update function returned a promise; it must return the new value without awaiting. The update was not saved');
   }
-  return acceptSave(filename, options, next);
+  return next;
+}
+
+export type UpdateRerun = { ok: true; text: string; value: unknown } | { ok: false; cause: 'changed-elsewhere'; reason: string };
+
+/**
+ * The flush's re-run of an update's fn on the stored value (NB6 decision 5, C11): the accept's checks in their order,
+ * then NB12's value rules. A failure refuses the op 'changed-elsewhere' with decision 5's text; what names the module
+ * or file.
+ */
+export function rerunUpdate(what: string, fn: (current: any) => unknown, stored: unknown): UpdateRerun {
+  const refused = (error: string): UpdateRerun => ({
+    ok: false,
+    cause: 'changed-elsewhere',
+    reason: `${what}: the update could not be applied to the newer version another machine saved (${error})`,
+  });
+  let next: unknown;
+  try {
+    next = runUpdateFn(what, fn, stored);
+  } catch (error) {
+    const thrown = error instanceof UpdateFnError ? error.error : error;
+    return refused(thrown instanceof Error ? thrown.message : String(thrown));
+  }
+  const value = valueText(next);
+  if (!value.ok) return refused(value.reason);
+  const tooLarge = sizeRefusal(value.text);
+  if (tooLarge) return refused(tooLarge);
+  return { ok: true, text: value.text, value: next };
 }
 
 /**
@@ -1332,11 +1689,15 @@ function acceptAppend(filename: string, options: DataOptions, line: string): App
   if (closedForExit) throw new DataBackendUnavailableError('node-stopping');
   refuseInMaintenance(options);
   refuseGuildWhileGated(options);
+  refuseSharedWhileGated(filename, options);
   if (guildWriteClosed(options, 'Append')) return { outcome: 'refused', cause: 'not-ready' };
   if (refusedWhileHeld(options, 'Append') || refusedBeforeRestore(options, 'Append')) return { outcome: 'refused', cause: 'not-ready' };
-  const checked = (options.scope || 'guild') === 'guild' ? storableKey(filename, options, 'append') : null;
+  const guildScope = (options.scope || 'guild') === 'guild';
+  const checked = guildScope ? storableKey(filename, options, 'append') : null;
   if (checked && isRefused(checked)) return checked;
-  const textRefused = textRefusal(line) ?? sizeRefusal(line);
+  const global = guildScope ? null : storableGlobal(filename, options, 'append');
+  if (global && 'outcome' in global) return global;
+  const textRefused = (global?.rel != null ? globalTextRefusal(line, 'line') : textRefusal(line)) ?? sizeRefusal(line);
   if (textRefused) return unstorable(filename, options, textRefused);
   try {
     const wsGuild = wsRouted(options);
@@ -1363,12 +1724,22 @@ function acceptAppend(filename: string, options: DataOptions, line: string): App
     const scope = options.scope || 'guild';
     const shared = sharedRefusal(filePath);
     if (shared) return { outcome: 'refused', cause: shared };
-    const placed = checked ? placeOnFiles(filename, options, checked as GuildKey) : null;
+    const placed = checked ? placeOnFiles(filename, options, checked as GuildKey) : placeGlobal(filename, options, global?.rel ?? null);
     if (placed) return placed;
+    // NB6 decision 8: a lines key on a Postgres bot is one shared_lines row a line, with no file.
+    const linesKey = checked ? null : sharedKeyOf(filePath);
+    if (linesKey !== null && isLinesKey(linesKey)) {
+      if (rowQueue.closed()) throw new DataBackendUnavailableError('database-backlog');
+      const ticket = appendLine(linesKey, line.endsWith('\n') ? line.slice(0, -1) : line);
+      if (global?.rel) noteGlobalKey(global.rel);
+      getMetricsCollector().recordIO('write', null, options.category ?? null);
+      return { outcome: 'appended', ticket };
+    }
     ensureDirectory(dir);
 
     enqueueAppend(filePath, line);
     if (checked) noteGuildWrite(options.guildId ?? '', pathKeyOf((checked as GuildKey).module, (checked as GuildKey).filename));
+    if (global?.rel) noteGlobalKey(global.rel);
     const ticket = fileTicket(filePath);
     getMetricsCollector().recordIO('write', scope === 'global' ? null : options.guildId ?? null, options.category ?? null);
     return { outcome: 'appended', ticket };
@@ -1395,6 +1766,8 @@ export function dataExists(filename: string, options: DataOptions): boolean {
     return getWorkingSet()?.exists(wsGuild, key.module, key.filename) ?? false;
   }
   const filePath = getDataFilePath(filename, options);
+  const held = rowHeld(filePath);
+  if (held !== undefined) return held !== null;
   const pending = getPending(filePath);
   if (pending) {
     if (pending.op === 'delete') return false;
@@ -1425,6 +1798,7 @@ function acceptDelete(filename: string, options: DataOptions): DeleteTracked {
   if (closedForExit) throw new DataBackendUnavailableError('node-stopping');
   refuseInMaintenance(options);
   refuseGuildWhileGated(options);
+  refuseSharedWhileGated(filename, options);
   if (guildWriteClosed(options, 'Delete')) return { outcome: 'refused', cause: 'not-ready' };
   if (refusedWhileHeld(options, 'Delete') || refusedBeforeRestore(options, 'Delete')) return { outcome: 'refused', cause: 'not-ready' };
   try {
@@ -1454,6 +1828,20 @@ function acceptDelete(filename: string, options: DataOptions): DeleteTracked {
     const filePath = getDataFilePath(filename, options);
     const shared = sharedRefusal(filePath);
     if (shared) return { outcome: 'refused', cause: shared };
+    const rel = options.scope === 'global' ? globalRelOf(filePath) : null;
+
+    const rowKey = sharedKeyOf(filePath);
+    if (rowKey) {
+      const entry = rowQueue.entryOf(rowKey);
+      if (!(entry ? entry.body !== null : existsOnDisk(filePath))) {
+        console.log(`[DataManager] File not found for deletion: ${filePath}`);
+        return entry ? { outcome: 'absent', ticket: rowTicketOf(entry) } : { outcome: 'absent' };
+      }
+      if (rowQueue.closed()) throw new DataBackendUnavailableError('database-backlog');
+      const ticket = rowQueue.accept(rowKey, filePath, { body: null }, rowBase(filePath, options.baseSha));
+      if (rel !== null) dropGlobalKey(rel);
+      return { outcome: 'deleted', ticket };
+    }
 
     const pending = getPending(filePath);
     const guildKey = (options.scope || 'guild') === 'guild' ? guildKeyOf(filename, options) : null;
@@ -1472,6 +1860,7 @@ function acceptDelete(filename: string, options: DataOptions): DeleteTracked {
     // write cannot resurrect the file).
     enqueueDelete(filePath);
     if (guildKey) noteGuildDelete(options.guildId ?? '', pathKeyOf(guildKey.module, guildKey.filename));
+    if (rel !== null) dropGlobalKey(rel);
     const ticket = fileTicket(filePath);
     console.log(`[DataManager] Deleted ${filePath}`);
     return { outcome: 'deleted', ticket };
@@ -2352,4 +2741,32 @@ export function deleteModuleData(
  */
 export function deleteGlobalModuleData(filename: string, moduleName: string): boolean {
   return deleteData(filename, { scope: 'global', category: moduleName });
+}
+
+// ============================================================================
+// HOOKS AFTER A SHARED KEY IS APPLIED (NB6 decision 9)
+// ============================================================================
+
+const sharedAppliedHooks = new Set<{ prefix: string; fn: (key: string) => void }>();
+
+/**
+ * Runs fn(key) each time this machine's applier writes or removes the mirror of a shared key starting with keyPrefix
+ * from another version stored in the database (a cache drops what it loaded). Answers a function that removes it.
+ */
+export function onSharedApplied(keyPrefix: string, fn: (key: string) => void): () => void {
+  const hook = { prefix: keyPrefix, fn };
+  sharedAppliedHooks.add(hook);
+  return () => { sharedAppliedHooks.delete(hook); };
+}
+
+/** The applier's call after a mirror change: each hook whose prefix the key starts with; a throw is logged. */
+export function runSharedAppliedHooks(key: string): void {
+  for (const hook of [...sharedAppliedHooks]) {
+    if (!key.startsWith(hook.prefix)) continue;
+    try {
+      hook.fn(key);
+    } catch (error) {
+      console.error(`[Shared] A step run after ${key} was brought up to date failed:`, error);
+    }
+  }
 }

@@ -359,7 +359,7 @@ describe('decision 14 with decision 23: the place', () => {
     });
     try {
       resolveWebuiDatabase();
-      await vi.waitFor(() => expect(resolveWebuiDatabase()).toEqual({ entry: ENTRY }));
+      await vi.waitFor(() => expect(resolveWebuiDatabase()).toEqual({ entry: ENTRY, tag: '1:M' }));
       _setOwnerChannelDeps({
         readRow: async () => {
           const resolved = resolveWebuiDatabase();

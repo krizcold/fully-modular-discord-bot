@@ -76,10 +76,6 @@ describe('sendHopReply with servedBy', () => {
   ] as const)('%s with noAnswer %s: 503 no-answer naming the machine', (what, cause, text) => {
     expect(answer({ ok: false, code: 'no-answer', noAnswer: cause, servedBy: 'BRAVO', sender: true }, what)).toEqual({ status: 503, body: { success: false, code: 'no-answer', error: text, servedBy: 'BRAVO' } });
   });
-
-  it('a twin that differs on the holder: 409 with decision 11\'s text', () => {
-    expect(answer({ ok: false, code: 'changed', status: 409, error: NB7_TEXTS.twin('BRAVO'), servedBy: 'BRAVO', sender: true })).toEqual({ status: 409, body: { success: false, error: "The module's global config on BRAVO differs from this machine's, so this server's overrides cannot be worked out here; nothing was saved. Save it from the web panel on BRAVO, or make the module's global config the same on both machines.", servedBy: 'BRAVO' } });
-  });
 });
 
 describe('the guild delete text after no answer (NB5 H7, H8)', () => {
@@ -216,7 +212,7 @@ describe('every NB7 text', () => {
     NB7_TEXTS.stoppedServing(name, saved),
     NB7_TEXTS.unapplied(name, saved),
   ]);
-  const unknown = [NB7_TEXTS.twin(name), NB7_TEXTS.heldNotice(name), NB7_TEXTS.noHolderNotice, NB7_TEXTS.readLookupFailed('x')];
+  const unknown = [NB7_TEXTS.heldNotice(name), NB7_TEXTS.noHolderNotice, NB7_TEXTS.readLookupFailed('x')];
 
   it('is ASCII with no long dash', () => {
     for (const text of [...all, ...unknown]) {

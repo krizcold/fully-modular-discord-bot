@@ -41,7 +41,7 @@ describe('an append after a line cut short', () => {
     await flushAll();
     expect(fs.readFileSync(audit, 'utf8')).toBe(`{"cut":\n${L(1)}\n`);
     const { getPremiumManager } = await import('../../src/bot/internalSetup/utils/premiumManager');
-    expect(getPremiumManager().readAuditEntries({ action: 'nb10.tail' }).entries).toEqual([JSON.parse(L(1))]);
+    expect((await getPremiumManager().readAuditEntries({ action: 'nb10.tail' })).entries).toEqual([JSON.parse(L(1))]);
   });
 
   it('an append to an absent file or an empty one writes no leading newline', async () => {

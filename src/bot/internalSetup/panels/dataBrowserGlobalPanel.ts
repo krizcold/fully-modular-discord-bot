@@ -14,7 +14,9 @@ import {
   SectionBuilder,
 } from 'discord.js';
 import { PanelOptions, PanelContext, PanelResponse } from '../../types/panelTypes';
-import { loadGlobalData, saveGlobalData } from '../utils/dataManager';
+import { loadGlobalData, saveData } from '../utils/dataManager';
+import { EDITOR_BASE_GONE_TEXT, editorSaveOptions } from '../utils/panel/editorBase';
+import { dataPath } from '../../../utils/dataRoot';
 import { discoverGlobalDataFiles } from '../utils/configDiscovery';
 import { createV2Response, V2Colors } from '../utils/panel/v2';
 import {
@@ -54,6 +56,11 @@ function getFileIcon(file: DataFileMetadata, data: any): string {
   return '📄';
 }
 
+/** The file a global data key is saved to. */
+function globalFilePath(fileKey: string): string {
+  return dataPath('global', fileKey);
+}
+
 function showError(message: string): PanelResponse {
   const container = new ContainerBuilder()
     .setAccentColor(V2Colors.danger)
@@ -87,7 +94,8 @@ function createEditorConfig(
     title: `${icon} ${metadata?.name || displayName}`,
     infoLines,
     getData: () => loadGlobalData(fileKey, null),
-    saveData: (data) => { saveGlobalData(fileKey, data); },
+    saveData: (data, options) => { saveData(fileKey, { scope: 'global', ...options }, data); },
+    baseFile: globalFilePath(fileKey),
     template: metadata?.template,
     reload: () => createEditorConfig(fileKey, metadata && { ...metadata, exists: loadGlobalData(fileKey, null) !== null }),
     fileExists: metadata?.exists ?? (loadGlobalData(fileKey, null) !== null),
@@ -255,8 +263,11 @@ const dataBrowserGlobalPanel: PanelOptions = {
         return showError('Delete cancelled. You must type DELETE to confirm.');
       }
 
+      const options = editorSaveOptions(context.userId, PANEL_ID, globalFilePath(fileKey));
+      if (!options) return showError(EDITOR_BASE_GONE_TEXT);
+
       try {
-        saveGlobalData(fileKey, null);
+        saveData(fileKey, { scope: 'global', ...options }, null);
       } catch (error) {
         return showError(`Delete failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
       }

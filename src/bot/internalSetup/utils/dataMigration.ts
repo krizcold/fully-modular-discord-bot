@@ -5,15 +5,18 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { createHash } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { DATA_ROOT, dataPath } from '../../../utils/dataRoot';
 import { atomicWriteFileSync } from './atomicWrite';
 import { canonicalGuildKey, isCanonicalGuildKey } from './dataKeys';
-import { decodeStorable, fold, keyRefusal, KeyTree, pathKeyOf } from './storableData';
+import { decodeStorable, fold, globalKeyRefusal, keyRefusal, KeyTree, pathKeyOf } from './storableData';
 import {
   MARKER_FILE, MIGRATION_FILE, STORES_FILE, readDataFacts, writeMarkerStrict,
-  type BackendStateMarker, type DataFacts, type JournalAddress, type MigrationCounts, type MigrationJournal, type MigrationStage,
+  type BackendStateMarker, type DataFacts, type JobCounts, type JournalAddress, type MigrationCounts, type MigrationJournal, type MigrationStage,
 } from './dataBackends/recognitionGuard';
+import { isLinesKey, mirrorPathOf, ROOT_CONFIG_KEY, sharedKeyFor } from './sharedStore';
+import { moduleRelRefusal, moduleShaOf } from './sharedModules';
+import { getSourceModulesDir } from './pathHelpers';
 import {
   credentialsReadError, isContainerPinned, loadCredentials, readEnvFileDataBackend, resetDataBackendCache, writeEnvDataBackend,
   type DataBackendKind,
@@ -45,6 +48,11 @@ const KEEPALIVES = '-c tcp_keepalives_idle=30 -c tcp_keepalives_interval=10 -c t
 const WEBUI_READER_APP = 'smdb-webui-reader';
 const MIGRATE_APP = 'smdb-migrate:';
 const GUILD_TABLES = 'smdb_data.guild_data, smdb_data.guild_append, smdb_data.guild_data_graveyard, smdb_data.guild_ownership';
+/** NB6 decision 39: the shared tables the SHARE lock and the retirement's ACCESS EXCLUSIVE lock also name. */
+const SHARED_TABLES = 'smdb_data.shared_docs, smdb_data.shared_lines, smdb_data.shared_modules, smdb_data.shared_module_files, smdb_data.shared_ops';
+const SOURCE_TABLES = `${GUILD_TABLES}, ${SHARED_TABLES}`;
+const SHARED_WAIT_MS = 40_000;
+const SHARED_WAIT_TEXT = 'A change to the shared files is still being saved; run the migration once it ends';
 const OLD_STORE_NOT_RETIRED = 'The old store was not retired; nothing was switched';
 const ENV_UNFINISHED = 'The switch is made; run the migration again to finish the env';
 const LOGIN_REFUSED = "The database refused the bot's login";
@@ -92,6 +100,8 @@ export interface MigrationHost {
   migrationBotState(): { ok: true } | { ok: false; error: string };
   /** No owner channel setting write is in flight (NB5 decision 16): S3 waits for it before S4 reads. */
   ownerChannelWriteSettled(): boolean;
+  /** NB6 decision 39: no shared write of this process waits to be stored and no web UI session's mark is set. */
+  sharedWritesSettled(): boolean;
 }
 
 export interface PgSession {
@@ -118,6 +128,12 @@ export interface ServiceOptions {
   probeBoundMs?: number;
   /** How long S3 waits for an owner channel setting write in flight (default 20 s). */
   ownerChannelWaitMs?: number;
+  /** How long S3 waits for the shared writes of this process (default 40 s). */
+  sharedWaitMs?: number;
+  /** The root config's file (default the bot's, configManager.ts's ROOT_CONFIG_PATH). */
+  rootConfigPath?: string;
+  /** The folder of the App Store modules' sources (default getSourceModulesDir()). */
+  sourceModulesDir?: string;
 }
 
 export interface MigrationAnswer {
@@ -368,7 +384,7 @@ function fitsBigint(id: string): boolean {
 // ============================================================================
 
 /** Walks one folder: calls onFile for each regular file (rel with '/'); returns how many it found. Strict. */
-async function walkFolder(dir: string, rel: string, leftOut: string[], onFile: (rel: string, bytes: Buffer, full: string) => void): Promise<number> {
+async function walkFolder(dir: string, rel: string, leftOut: string[], onFile: (rel: string, bytes: Buffer, full: string, st: fs.Stats) => void, keepTmp = false): Promise<number> {
   let names: Buffer[];
   try {
     names = await fs.promises.readdir(dir, { encoding: 'buffer' }) as unknown as Buffer[];
@@ -395,12 +411,12 @@ async function walkFolder(dir: string, rel: string, leftOut: string[], onFile: (
       throw new Refusal(`${full} is neither a regular file nor a folder`);
     }
     if (st.isDirectory()) {
-      const inner = await walkFolder(full, childRel, leftOut, onFile);
+      const inner = await walkFolder(full, childRel, leftOut, onFile, keepTmp);
       if (inner === 0) leftOut.push(full);
       found += inner;
       continue;
     }
-    if (name.endsWith('.tmp')) {
+    if (name.endsWith('.tmp') && !keepTmp) {
       leftOut.push(full);
       continue;
     }
@@ -410,7 +426,7 @@ async function walkFolder(dir: string, rel: string, leftOut: string[], onFile: (
     } catch (error) {
       throw new Refusal(`${full} cannot be read: ${message(error)}`);
     }
-    onFile(childRel, bytes, full);
+    onFile(childRel, bytes, full, st);
     found += 1;
   }
   return found;
@@ -598,11 +614,17 @@ export async function moveEarlierStaging(root: string, superseded: string, curre
   return moved;
 }
 
+/** The names in a staging folder that hold the data of no guild (NB6 C8); they are placed item by item. */
+const SHARED_STAGED = new Set(['config.json', 'global', 'appstore-modules']);
+
 /**
  * Moves the stale guild folders and graveyard entries of root into superseded, then the staged ones into place guild
- * by guild. Every target is checked before the first move: a target that exists refuses with nothing moved.
+ * by guild. With shared targets, also every file and module folder of the data of no guild there now (NB6 C8: the
+ * root config, each shared file under /data/global, each module folder installed.json lists) goes to superseded and
+ * the staged ones take their places, so the placed set is the staged set; the files of one machine stay. Every target
+ * is checked before the first move: a target that exists refuses with nothing moved.
  */
-export async function placeStaged(root: string, staging: string, superseded: string, onBegin?: () => void): Promise<void> {
+export async function placeStaged(root: string, staging: string, superseded: string, onBegin?: () => void, shared?: SharedTargets): Promise<void> {
   const stale: Array<[string, string]> = [];
   for (const name of await fs.promises.readdir(root)) {
     const full = path.join(root, name);
@@ -615,12 +637,21 @@ export async function placeStaged(root: string, staging: string, superseded: str
   }
   const incoming: Array<[string, string]> = [];
   for (const name of await fs.promises.readdir(staging)) {
-    if (name === '_graveyard') continue;
+    if (name === '_graveyard' || SHARED_STAGED.has(name)) continue;
     incoming.push([path.join(staging, name), path.join(root, name)]);
   }
   const stagedGraves = path.join(staging, '_graveyard');
   if (fs.existsSync(stagedGraves)) {
     for (const name of await fs.promises.readdir(stagedGraves)) incoming.push([path.join(stagedGraves, name), path.join(graveRoot, name)]);
+  }
+  if (shared) {
+    const target = (u: SharedUnit, into: SharedTargets) => {
+      if (u.kind === 'module') return path.join(into.modules, u.module);
+      return u.key === ROOT_CONFIG_KEY ? into.rootConfig : path.join(into.global, ...u.key.slice('global/'.length).split('/'));
+    };
+    const aside: SharedTargets = { rootConfig: path.join(superseded, 'config.json'), global: path.join(superseded, 'global'), modules: path.join(superseded, 'appstore-modules') };
+    for (const u of await listJsonShared({ ...shared, listed: 'installed' }, [])) stale.push([u.kind === 'module' ? u.dir! : u.full!, target(u, aside)]);
+    for (const u of await listJsonShared(stagedPlaces(staging), [])) incoming.push([u.kind === 'module' ? u.dir! : u.full!, target(u, shared)]);
   }
   for (const [, to] of stale) if (fs.existsSync(to)) throw new Refusal(`${to} exists; nothing was moved`);
   const staleSources = new Set(stale.map(([from]) => path.resolve(from)));
@@ -633,17 +664,23 @@ export async function placeStaged(root: string, staging: string, superseded: str
     await fs.promises.rename(from, to);
   }
   if (incoming.some(([, to]) => to.startsWith(graveRoot + path.sep))) await fs.promises.mkdir(graveRoot, { recursive: true });
-  for (const [from, to] of incoming) await fs.promises.rename(from, to);
+  for (const [from, to] of incoming) {
+    await fs.promises.mkdir(path.dirname(to), { recursive: true });
+    await fs.promises.rename(from, to);
+  }
   await syncFolder(root);
   await fs.promises.rm(staging, { recursive: true, force: true });
 }
 
-/** Lands the web UI process's queued guild writes; answers the guild paths still queued when the bound passes. */
+/**
+ * Lands the web UI process's queued guild writes and, on a JSON source, its queued writes of a file a shared key names
+ * (NB6 decision 39); answers those paths still queued when the bound passes.
+ */
 export async function drainGuildWrites(boundMs = DRAIN_BOUND_MS): Promise<string[]> {
   const deadline = Date.now() + boundMs;
   for (;;) {
     await flushAll();
-    const stuck = queuedFilePaths().filter(isGuildDataPath);
+    const stuck = queuedFilePaths().filter(p => isGuildDataPath(p) || sharedKeyFor(p) !== null);
     if (stuck.length === 0) return [];
     if (Date.now() >= deadline) return stuck;
     await new Promise(resolve => { setTimeout(resolve, 100); });
@@ -1187,21 +1224,28 @@ interface Tally {
   copied: Map<string, string>;
   /** The copied items' and the shadow rows' hashes. */
   all: Map<string, string>;
-  counts: MigrationCounts;
+  /** The shared units' hashes (NB6 decision 19): a doc's, a lines key's, each module file's and each module's sha. */
+  shared: Map<string, string>;
+  counts: JobCounts;
   graves: SnapGrave[];
   guilds: string[];
   leftOut: string[];
   shadowNotes: string[];
   shadowUnits: SourceUnit[];
-  /** Each stream copied with a newline added: "<module>/<filename> of <guild or graveyard entry>". */
+  /** Each stream copied with a newline added: "<module>/<filename> of <guild or graveyard entry>", or a lines key. */
   closedTails: string[];
 }
 
-async function tallySource(read: UnitReader): Promise<Tally> {
-  const t: Tally = {
-    copied: new Map(), all: new Map(), counts: { documents: 0, appendFiles: 0, graveyardEntries: 0, bytes: 0 },
+function emptyTally(): Tally {
+  return {
+    copied: new Map(), all: new Map(), shared: new Map(),
+    counts: { documents: 0, appendFiles: 0, graveyardEntries: 0, bytes: 0, sharedDocs: 0, sharedLines: 0, modules: 0, moduleFiles: 0, sharedBytes: 0 },
     graves: [], guilds: [], leftOut: [], shadowNotes: [], shadowUnits: [], closedTails: [],
   };
+}
+
+async function tallySource(read: UnitReader): Promise<Tally> {
+  const t = emptyTally();
   t.leftOut = await read(async (part, unit) => {
     for (const [k, h] of snapshotHashes(part, false)) t.copied.set(k, h);
     for (const [k, h] of snapshotHashes(part, true)) t.all.set(k, h);
@@ -1298,6 +1342,435 @@ async function readBackPg(session: PgSession): Promise<{ hashes: Map<string, str
   }
   const owners = await session.query('SELECT guild_id FROM smdb_data.guild_ownership');
   return { hashes, graves: [...graves.values()], owners: owners.rows.map(r => String(r.guild_id)) };
+}
+
+// ============================================================================
+// THE DATA OF NO GUILD (NB6 decisions 19, 39 and 40; C8, C12; D2)
+// ============================================================================
+
+/** One unit of the data of no guild: a doc key, a lines key or a module. A unit of a JSON tree names its file or folder. */
+export type SharedUnit =
+  | { kind: 'doc'; key: string; full?: string }
+  | { kind: 'lines'; key: string; full?: string }
+  | { kind: 'module'; module: string; dir?: string; version?: string | null };
+
+export interface SharedFile {
+  /** The path inside the module's folder, '/'-separated. */
+  rel: string;
+  bytes: Buffer;
+  mode: number;
+}
+
+/** One shared unit read whole: the most the job holds in memory at a time (a doc, one lines key or one module). */
+export type SharedPart =
+  | { kind: 'doc'; key: string; bytes: Buffer }
+  | { kind: 'lines'; key: string; lines: Buffer[]; closedTail?: boolean }
+  | { kind: 'module'; module: string; version: string | null; files: SharedFile[] };
+
+/** Where a JSON tree keeps the data of no guild. */
+export interface SharedTargets {
+  rootConfig: string;
+  global: string;
+  modules: string;
+}
+
+/** A JSON tree's shared places; 'installed' takes the module folders installed.json lists, 'all' every folder (a staging). */
+export interface SharedPlaces extends SharedTargets {
+  listed: 'installed' | 'all';
+}
+
+const SHARED_WHERE = "the database's shared files";
+const NEWLINE = Buffer.from('\n');
+const REV = "nextval('smdb_data.shared_rev_seq')";
+const DOCS_INSERT = 'INSERT INTO smdb_data.shared_docs (key, body, sha, rev, updated_by)';
+const LINES_INSERT = 'INSERT INTO smdb_data.shared_lines (key, id, line)';
+const MODULE_INSERT = 'INSERT INTO smdb_data.shared_modules (module, sha, rev, version, file_count, bytes, updated_by)';
+const FILES_INSERT = 'INSERT INTO smdb_data.shared_module_files (module, rel, bytes, mode)';
+const LINES_HASH_SQL = "SELECT encode(sha256(string_agg(line || decode('0a', 'hex'), decode('', 'hex') ORDER BY seq)), 'hex') AS h FROM smdb_data.shared_lines WHERE key = $1";
+const SHARED_PRESENT_SQL = "SELECT to_regclass('smdb_data.shared_docs') IS NOT NULL AND to_regclass('smdb_data.shared_lines') IS NOT NULL "
+  + "AND to_regclass('smdb_data.shared_modules') IS NOT NULL AND to_regclass('smdb_data.shared_module_files') IS NOT NULL "
+  + "AND to_regclass('smdb_data.shared_ops') IS NOT NULL AS present";
+const SHARED_ROWS_SQL = 'SELECT ((SELECT count(*) FROM smdb_data.shared_docs) + (SELECT count(*) FROM smdb_data.shared_lines) '
+  + '+ (SELECT count(*) FROM smdb_data.shared_modules))::int AS shared_rows';
+
+const sharedId = (...parts: string[]) => JSON.stringify(parts);
+const byText = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+const valueBytes = (v: unknown) => (v === null || v === undefined ? 0 : Buffer.isBuffer(v) ? v.length : Buffer.byteLength(String(v)));
+
+/** The shared key of a path below /data/global/; null for decision 2's files of one machine. */
+function globalKey(rel: string): string | null {
+  return sharedKeyFor(path.join(DATA_ROOT, 'global', ...rel.split('/')));
+}
+
+/** The shared tables are there (a store of an earlier version has none). */
+async function sharedTablesPresent(session: PgSession): Promise<boolean> {
+  return (await session.query(SHARED_PRESENT_SQL)).rows[0]?.present === true;
+}
+
+/** A folder's entry names, each valid UTF-8 (NB3's strict walk). */
+async function strictNames(dir: string): Promise<string[]> {
+  let raw: Buffer[];
+  try {
+    raw = await fs.promises.readdir(dir, { encoding: 'buffer' }) as unknown as Buffer[];
+  } catch (error) {
+    throw new Refusal(`The folder ${dir} cannot be read: ${message(error)}`);
+  }
+  return raw.map(name => {
+    try {
+      return new TextDecoder('utf-8', { fatal: true }).decode(name);
+    } catch {
+      throw new Refusal(`A file name under ${dir} is not valid UTF-8`);
+    }
+  });
+}
+
+async function lstatOrNull(full: string): Promise<fs.Stats | null> {
+  try {
+    return await fs.promises.lstat(full);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return null;
+    throw new Refusal(`${full} cannot be read: ${message(error)}`);
+  }
+}
+
+async function readFileStrict(full: string): Promise<Buffer> {
+  try {
+    return await fs.promises.readFile(full);
+  } catch (error) {
+    throw new Refusal(`${full} cannot be read: ${message(error)}`);
+  }
+}
+
+/** The files under a global folder, one unit each; the files of one machine are not visited. Answers how many it found. */
+async function listGlobal(dir: string, rel: string, leftOut: string[], units: SharedUnit[]): Promise<number> {
+  let found = 0;
+  for (const name of await strictNames(dir)) {
+    const childRel = rel ? `${rel}/${name}` : name;
+    const key = globalKey(childRel);
+    if (key === null) continue;
+    const full = path.join(dir, name);
+    const st = await lstatStrict(full);
+    if (st.isSymbolicLink() || (!st.isFile() && !st.isDirectory())) throw new Refusal(`${full} is neither a regular file nor a folder`);
+    if (st.isDirectory()) {
+      const inner = await listGlobal(full, childRel, leftOut, units);
+      if (inner === 0) leftOut.push(full);
+      found += inner;
+      continue;
+    }
+    if (name.endsWith('.tmp')) {
+      leftOut.push(full);
+      continue;
+    }
+    const refusal = globalKeyRefusal(childRel);
+    if (refusal) throw new Refusal(`The key ${key} of ${full}: ${refusal}; nothing was written`);
+    units.push({ kind: isLinesKey(key) ? 'lines' : 'doc', key, full });
+    found += 1;
+  }
+  return found;
+}
+
+/** The module folders of a JSON tree: those installed.json lists, or every folder of a staging. */
+async function listModuleFolders(p: SharedPlaces, leftOut: string[]): Promise<SharedUnit[]> {
+  let listed: Array<[string, string | null]>;
+  if (p.listed === 'installed') {
+    const file = path.join(p.global, 'appstore', 'installed.json');
+    if (!(await lstatOrNull(file))) return [];
+    let modules: unknown;
+    try {
+      modules = (JSON.parse((await readFileStrict(file)).toString('utf8')) as { modules?: unknown })?.modules ?? {};
+    } catch (error) {
+      if (error instanceof Refusal) throw error;
+      throw new Refusal(`${file} cannot be read: ${message(error)}`);
+    }
+    if (!modules || typeof modules !== 'object' || Array.isArray(modules)) throw new Refusal(`${file} cannot be read: it holds no list of modules`);
+    listed = Object.entries(modules as Record<string, { version?: unknown } | null>)
+      .map(([name, m]) => [name, typeof m?.version === 'string' ? m.version : null]);
+  } else {
+    if (!(await lstatOrNull(p.modules))) return [];
+    listed = (await strictNames(p.modules)).map(name => [name, null]);
+  }
+  const units: SharedUnit[] = [];
+  for (const [module, version] of listed) {
+    const dir = path.join(p.modules, module);
+    if (/[\\/]/.test(module) || globalKeyRefusal(module)) {
+      leftOut.push(dir);
+      continue;
+    }
+    const st = await lstatOrNull(dir);
+    if (!st) {
+      leftOut.push(dir);
+      continue;
+    }
+    if (st.isSymbolicLink() || !st.isDirectory()) throw new Refusal(NOT_A_FOLDER(dir));
+    units.push({ kind: 'module', module, dir, version });
+  }
+  return units;
+}
+
+/** The docs and lines keys in key order, then the modules in name order. */
+function orderShared(units: SharedUnit[]): SharedUnit[] {
+  const nameOf = (u: SharedUnit) => (u.kind === 'module' ? u.module : u.key);
+  const inOrder = (list: SharedUnit[]) => list.sort((a, b) => byText(nameOf(a), nameOf(b)));
+  return [...inOrder(units.filter(u => u.kind !== 'module')), ...inOrder(units.filter(u => u.kind === 'module'))];
+}
+
+async function listJsonShared(p: SharedPlaces, leftOut: string[]): Promise<SharedUnit[]> {
+  const units: SharedUnit[] = [];
+  const config = await lstatOrNull(p.rootConfig);
+  if (config?.isDirectory()) leftOut.push(p.rootConfig);
+  else if (config) {
+    if (config.isSymbolicLink() || !config.isFile()) throw new Refusal(`${p.rootConfig} is neither a regular file nor a folder`);
+    units.push({ kind: 'doc', key: ROOT_CONFIG_KEY, full: p.rootConfig });
+  }
+  const global = await lstatOrNull(p.global);
+  if (global) {
+    if (global.isSymbolicLink() || !global.isDirectory()) throw new Refusal(NOT_A_FOLDER(p.global));
+    await listGlobal(p.global, '', leftOut, units);
+  }
+  units.push(...await listModuleFolders(p, leftOut));
+  return orderShared(units);
+}
+
+/** Why a key of the database's shared files cannot be a file of this bot, or null. */
+function sharedKeyRefusal(key: string, kind: 'doc' | 'lines'): string | null {
+  if (key === ROOT_CONFIG_KEY) return kind === 'lines' ? 'an appended file must end in .jsonl' : null;
+  if (!key.startsWith('global/')) return 'it names no file of the data of no guild';
+  const rel = key.slice('global/'.length);
+  const refusal = globalKeyRefusal(rel, kind === 'lines' ? 'append' : 'save');
+  if (refusal) return refusal;
+  return globalKey(rel) === key ? null : 'it names a file each machine keeps for itself';
+}
+
+async function listPgShared(session: PgSession): Promise<SharedUnit[]> {
+  const docs = new Set((await session.query('SELECT key FROM smdb_data.shared_docs')).rows.map(r => String(r.key)));
+  const lines = new Set((await session.query('SELECT DISTINCT key FROM smdb_data.shared_lines')).rows.map(r => String(r.key)));
+  const modules = (await session.query('SELECT module, version FROM smdb_data.shared_modules')).rows;
+  const tree = new KeyTree();
+  for (const key of [...new Set([...docs, ...lines])].sort(byText)) {
+    if (docs.has(key) && lines.has(key)) throw new Refusal(`The key ${key} of ${SHARED_WHERE} is both a document and a stream; nothing was written`);
+    const refusal = sharedKeyRefusal(key, docs.has(key) ? 'doc' : 'lines');
+    if (refusal) throw new Refusal(`The key ${key} of ${SHARED_WHERE}: ${refusal}; nothing was written`);
+    const collision = key === ROOT_CONFIG_KEY ? null : tree.add(key.slice('global/'.length));
+    if (collision) throw new Refusal(`The key ${key} of ${SHARED_WHERE}: ${collision.reason}; nothing was written`);
+  }
+  const units: SharedUnit[] = [...docs].map(key => ({ kind: 'doc' as const, key }));
+  units.push(...[...lines].map(key => ({ kind: 'lines' as const, key })));
+  for (const r of modules) {
+    const module = String(r.module);
+    const refusal = /[\\/]/.test(module) ? 'a module is named by one folder name' : globalKeyRefusal(module);
+    if (refusal) throw new Refusal(`The key ${module} of ${SHARED_WHERE}: ${refusal}; nothing was written`);
+    units.push({ kind: 'module', module, version: r.version === null || r.version === undefined ? null : String(r.version) });
+  }
+  return orderShared(units);
+}
+
+/** The shared units of a source, without reading them: a JSON tree's files and folders, or a session's rows (C8). */
+export async function listSharedUnits(source: SharedPlaces | PgSession, leftOut: string[]): Promise<SharedUnit[]> {
+  return 'query' in source ? listPgShared(source) : listJsonShared(source, leftOut);
+}
+
+/** A stream's bytes as lines: NB13's closing newline added when it lacks one, then split at each "\n". */
+function linesOf(bytes: Buffer): { lines: Buffer[]; closedTail?: boolean } {
+  const closed = closeTail('append', bytes);
+  const lines: Buffer[] = [];
+  let start = 0;
+  for (let at = closed.bytes.indexOf(0x0a); at >= 0; at = closed.bytes.indexOf(0x0a, start)) {
+    lines.push(closed.bytes.subarray(start, at));
+    start = at + 1;
+  }
+  return { lines, ...(closed.closedTail ? { closedTail: true } : {}) };
+}
+
+/** One shared unit read whole: from its file or folder for a JSON tree, from its rows for a session. */
+export async function readSharedUnit(unit: SharedUnit, source: SharedPlaces | PgSession, leftOut: string[] = []): Promise<SharedPart> {
+  if ('query' in source) return readPgShared(source, unit);
+  if (unit.kind === 'doc') return { kind: 'doc', key: unit.key, bytes: await readFileStrict(unit.full!) };
+  if (unit.kind === 'lines') return { kind: 'lines', key: unit.key, ...linesOf(await readFileStrict(unit.full!)) };
+  const files: SharedFile[] = [];
+  await walkFolder(unit.dir!, '', leftOut, (rel, bytes, full, st) => {
+    const refusal = moduleRelRefusal(rel);
+    if (refusal) throw new Refusal(`The key ${unit.module}/${rel} of ${full}: ${refusal}; nothing was written`);
+    files.push({ rel, bytes, mode: st.mode & 0o777 });
+  }, true);
+  return { kind: 'module', module: unit.module, version: unit.version ?? null, files: files.sort((a, b) => byText(a.rel, b.rel)) };
+}
+
+async function readPgShared(session: PgSession, unit: SharedUnit): Promise<SharedPart> {
+  const none = (name: string) => new Refusal(`The database lists ${name}, but its read found no rows`);
+  if (unit.kind === 'doc') {
+    const rows = (await session.query('SELECT body FROM smdb_data.shared_docs WHERE key = $1', [unit.key])).rows;
+    if (rows.length === 0) throw none(unit.key);
+    return { kind: 'doc', key: unit.key, bytes: Buffer.from(rows[0].body) };
+  }
+  if (unit.kind === 'lines') {
+    const rows = (await session.query('SELECT line FROM smdb_data.shared_lines WHERE key = $1 ORDER BY seq', [unit.key])).rows;
+    if (rows.length === 0) throw none(unit.key);
+    return { kind: 'lines', key: unit.key, lines: rows.map(r => Buffer.from(r.line)) };
+  }
+  const rows = (await session.query('SELECT rel, mode, bytes FROM smdb_data.shared_module_files WHERE module = $1 ORDER BY rel', [unit.module])).rows;
+  const files = rows.map(r => {
+    const rel = String(r.rel);
+    const refusal = moduleRelRefusal(rel);
+    if (refusal) throw new Refusal(`The key ${unit.module}/${rel} of ${SHARED_WHERE}: ${refusal}; nothing was written`);
+    return { rel, bytes: Buffer.from(r.bytes), mode: Number(r.mode) & 0o777 };
+  });
+  return { kind: 'module', module: unit.module, version: unit.version ?? null, files: files.sort((a, b) => byText(a.rel, b.rel)) };
+}
+
+/**
+ * A source's shared units in order, each read whole and handed to onPart before the next is read; answers what was
+ * left out. An empty stream is left out: it holds no line to copy.
+ */
+async function eachShared(source: SharedPlaces | PgSession, onPart: (part: SharedPart) => Promise<void> | void): Promise<string[]> {
+  const leftOut: string[] = [];
+  for (const unit of await listSharedUnits(source, leftOut)) {
+    const part = await readSharedUnit(unit, source, leftOut);
+    if (part.kind === 'lines' && part.lines.length === 0) {
+      leftOut.push(unit.kind === 'lines' && unit.full ? unit.full : part.key);
+      continue;
+    }
+    await onPart(part);
+  }
+  return leftOut;
+}
+
+function linesHash(lines: Buffer[]): string {
+  const hash = createHash('sha256');
+  for (const line of lines) hash.update(line).update(NEWLINE);
+  return hash.digest('hex');
+}
+
+/** A shared part into the tally: its hashes and its counts, never its bytes. */
+function addShared(t: Tally, part: SharedPart): void {
+  const c = t.counts;
+  if (part.kind === 'doc') {
+    t.shared.set(sharedId('doc', part.key), sha256(part.bytes));
+    c.sharedDocs += 1;
+    c.sharedBytes += part.bytes.length;
+    return;
+  }
+  if (part.kind === 'lines') {
+    t.shared.set(sharedId('lines', part.key), linesHash(part.lines));
+    c.sharedLines += part.lines.length;
+    c.sharedBytes += part.lines.reduce((n, l) => n + l.length, 0);
+    if (part.closedTail) t.closedTails.push(part.key);
+    return;
+  }
+  const files = part.files.map(f => ({ rel: f.rel, sha: sha256(f.bytes) }));
+  for (const f of files) t.shared.set(sharedId('file', part.module, f.rel), f.sha);
+  t.shared.set(sharedId('module', part.module), moduleShaOf(files));
+  c.modules += 1;
+  c.moduleFiles += files.length;
+  c.sharedBytes += part.files.reduce((n, f) => n + f.bytes.length, 0);
+}
+
+async function tallyShared(t: Tally, source: SharedPlaces | PgSession): Promise<void> {
+  t.leftOut.push(...await eachShared(source, part => addShared(t, part)));
+}
+
+/** A multi-row VALUES insert, one parameter per value, in batches of at most 500 rows and 16 MB of values; a larger row goes alone. */
+export async function insertValues(session: PgSession, head: string, shape: string[], rows: unknown[][], maxBytes = MAX_BATCH_BYTES): Promise<void> {
+  const rowBytes = (row: unknown[]) => row.reduce<number>((n, v) => n + valueBytes(v), 0);
+  let start = 0;
+  while (start < rows.length) {
+    let end = start;
+    let bytes = 0;
+    while (end < rows.length && end - start < INSERT_BATCH) {
+      const size = rowBytes(rows[end]);
+      if (end > start && bytes + size > maxBytes) break;
+      bytes += size;
+      end += 1;
+    }
+    const batch = rows.slice(start, end);
+    let n = 0;
+    const values = batch.map(() => `(${shape.map(s => (s === '$' ? `$${++n}` : s)).join(', ')})`).join(', ');
+    await session.query(`${head} VALUES ${values}`, batch.flat());
+    start = end;
+  }
+}
+
+/** A shared part's rows in the destination's copy transaction (decision 19's S5): rev from the sequence, `updated_by` the job. */
+async function writePgShared(session: PgSession, part: SharedPart, by: string): Promise<void> {
+  if (part.kind === 'doc') {
+    await insertValues(session, DOCS_INSERT, ['$', '$', '$', REV, '$'], [[part.key, part.bytes, sha256(part.bytes), by]]);
+    return;
+  }
+  if (part.kind === 'lines') {
+    await insertValues(session, LINES_INSERT, ['$', '$', '$'], part.lines.map(line => [part.key, randomUUID(), line]));
+    return;
+  }
+  const sha = moduleShaOf(part.files.map(f => ({ rel: f.rel, sha: sha256(f.bytes) })));
+  const bytes = part.files.reduce((n, f) => n + f.bytes.length, 0);
+  await insertValues(session, MODULE_INSERT, ['$', '$', REV, '$', '$', '$', '$'], [[part.module, sha, part.version, part.files.length, bytes, by]]);
+  await insertValues(session, FILES_INSERT, ['$', '$', '$', '$'], part.files.map(f => [part.module, f.rel, f.bytes, f.mode]));
+}
+
+/** A staging's shared places: config.json, global/<rel> and appstore-modules/<module>/ (C8). */
+function stagedPlaces(staging: string): SharedPlaces {
+  return { rootConfig: path.join(staging, 'config.json'), global: path.join(staging, 'global'), modules: path.join(staging, 'appstore-modules'), listed: 'all' };
+}
+
+/** A shared part staged as files, each fsynced; a lines key's rows become one file, each line followed by "\n". */
+async function stageShared(staging: string, part: SharedPart): Promise<void> {
+  const at = (key: string) => (key === ROOT_CONFIG_KEY ? path.join(staging, 'config.json') : path.join(staging, ...key.split('/')));
+  if (part.kind === 'doc') return writeSynced(at(part.key), part.bytes);
+  if (part.kind === 'lines') return writeSynced(at(part.key), Buffer.concat(part.lines.flatMap(line => [line, NEWLINE])));
+  const dir = path.join(staging, 'appstore-modules', part.module);
+  await fs.promises.mkdir(dir, { recursive: true });
+  for (const f of part.files) {
+    const file = path.join(dir, ...f.rel.split('/'));
+    await writeSynced(file, f.bytes);
+    // Windows keeps only the read-only bit of a mode.
+    await fs.promises.chmod(file, f.mode).catch(() => undefined);
+  }
+}
+
+/** Decision 19's text for a shared unit the destination does not hold as the source does. */
+function sharedDiffers(kind: string, name: string, what: string): string {
+  const noun = kind === 'module' || kind === 'file' ? 'module files' : 'shared files';
+  return `The ${noun} read back from the destination differ from the source (${name}: ${what}); nothing was switched`;
+}
+
+function compareShared(expected: Map<string, string>, actual: Map<string, string>): void {
+  const named = (id: string) => {
+    const [kind, ...rest] = JSON.parse(id) as string[];
+    return { kind, name: rest.join('/') };
+  };
+  for (const [id, hash] of expected) {
+    const got = actual.get(id);
+    if (got === hash) continue;
+    const n = named(id);
+    throw new Error(sharedDiffers(n.kind, n.name, got === undefined ? 'missing from the destination' : 'its bytes differ'));
+  }
+  for (const id of actual.keys()) {
+    if (expected.has(id)) continue;
+    const n = named(id);
+    throw new Error(sharedDiffers(n.kind, n.name, 'not in the source'));
+  }
+}
+
+/** The destination's shared rows read back in SQL (decision 19's S6, C12): sha256 of each body, lines key and module file. */
+async function readBackShared(session: PgSession): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  for (const r of (await session.query("SELECT key, sha, encode(sha256(body), 'hex') AS h FROM smdb_data.shared_docs")).rows) {
+    if (r.sha !== r.h) throw new Error(sharedDiffers('doc', String(r.key), 'its stored sha does not match its bytes'));
+    out.set(sharedId('doc', String(r.key)), String(r.h));
+  }
+  // One key per query, so the database sends rows while it hashes a long one.
+  for (const r of (await session.query('SELECT DISTINCT key FROM smdb_data.shared_lines')).rows) {
+    out.set(sharedId('lines', String(r.key)), String((await session.query(LINES_HASH_SQL, [String(r.key)])).rows[0]?.h));
+  }
+  for (const m of (await session.query('SELECT module, sha FROM smdb_data.shared_modules')).rows) {
+    const module = String(m.module);
+    const files = (await session.query("SELECT rel, encode(sha256(bytes), 'hex') AS h FROM smdb_data.shared_module_files WHERE module = $1", [module])).rows
+      .map(f => ({ rel: String(f.rel), sha: String(f.h) }))
+      .sort((a, b) => byText(a.rel, b.rel));
+    for (const f of files) out.set(sharedId('file', module, f.rel), f.sha);
+    const sha = moduleShaOf(files);
+    if (sha !== m.sha) throw new Error(sharedDiffers('module', module, 'its stored sha does not match its files'));
+    out.set(sharedId('module', module), sha);
+  }
+  return out;
 }
 
 // ============================================================================
@@ -1892,7 +2365,9 @@ export class MigrationService {
         `SELECT (SELECT count(*) FROM smdb_data.guild_data)::int AS docs, (SELECT count(*) FROM smdb_data.guild_append)::int AS appends, `
         + `(SELECT count(*) FROM smdb_data.guild_data_graveyard)::int AS graves, (SELECT count(*) FROM smdb_data.guild_ownership)::int AS owners`)).rows[0];
       if (!storeId || !readStoreList().includes(storeId)) {
-        const empty = Number(counts.docs) + Number(counts.appends) + Number(counts.graves) + Number(counts.owners) === 0;
+        const guildRows = Number(counts.docs) + Number(counts.appends) + Number(counts.graves) + Number(counts.owners);
+        const sharedRows = guildRows === 0 && await sharedTablesPresent(main) ? Number((await main.query(SHARED_ROWS_SQL)).rows[0]?.shared_rows ?? 0) : 0;
+        const empty = guildRows + sharedRows === 0;
         throw new Refusal(`The database already holds store ${storeId ?? 'with no id'} in schema smdb_data (${counts.docs} documents, ${counts.appends} streams, `
           + `${counts.graves} graveyard rows, ${counts.owners} ownership rows), which this deployment never served${empty ? '; the schema holds no guild rows, so it can be dropped' : ''}`);
       }
@@ -1903,8 +2378,11 @@ export class MigrationService {
     stage('draining');
     await this.fault('S3');
     await this.waitOwnerChannelWrite();
+    await this.waitSharedWrites();
     const stuck = await drainGuildWrites();
-    if (stuck.length > 0) throw new Refusal(`Guild writes of the web UI are still queued and could not be written: ${stuck.join(', ')}`);
+    if (stuck.length > 0) {
+      throw new Refusal(`${stuck.every(isGuildDataPath) ? 'Guild writes' : 'Writes'} of the web UI are still queued and could not be written: ${stuck.join(', ')}`);
+    }
     await moveEarlierStaging(DATA_ROOT, ctx.superseded);
 
     // S4: the read of the source, one guild or graveyard entry at a time; only keys, hashes and counts are kept.
@@ -1912,17 +2390,20 @@ export class MigrationService {
     await this.fault('S4');
     let tally: Tally;
     let channel: OwnerChannelValue;
+    const places = this.sharedPlaces();
     if (from === 'file') {
       tally = await tallySource(jsonReader(DATA_ROOT));
+      await tallyShared(tally, places);
       channel = ownerChannelFromFile(path.join(DATA_ROOT, OWNER_CHANNEL_NAME));
     } else {
       await main.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
       ctx.mainTx = true;
-      await main.query(`LOCK TABLE ${GUILD_TABLES} IN SHARE MODE`);
+      await main.query(`LOCK TABLE ${SOURCE_TABLES} IN SHARE MODE`);
       await refuseOtherSessions(main, jobId, ctx.sessions);
       const again = await readMetaStoreId(main, 'smdb_data');
       if (again !== ctx.j.sourceStoreId) throw new Refusal(`The database's store changed to ${again ?? 'none'} since the first check (${ctx.j.sourceStoreId})`);
       tally = await tallySource(pgReader(main));
+      await tallyShared(tally, main);
       channel = await ownerChannelRow(main);
     }
     const counts = tally.counts;
@@ -1942,7 +2423,8 @@ export class MigrationService {
       ctx.mainTx = true;
       await main.query(`SELECT pg_advisory_xact_lock(hashtext('smdb_data_bootstrap'))`);
       if (renameDest) {
-        await main.query('LOCK TABLE smdb_data.meta, smdb_data.guild_ownership, smdb_data.guild_data, smdb_data.guild_append, smdb_data.guild_data_graveyard IN ACCESS EXCLUSIVE MODE');
+        const sharedTables = await sharedTablesPresent(main) ? `, ${SHARED_TABLES}` : '';
+        await main.query(`LOCK TABLE smdb_data.meta, smdb_data.guild_ownership, smdb_data.guild_data, smdb_data.guild_append, smdb_data.guild_data_graveyard${sharedTables} IN ACCESS EXCLUSIVE MODE`);
         const again = await readMetaStoreId(main, 'smdb_data');
         if (again !== renameDest) throw new Refusal(`The database's store changed from ${renameDest} to ${again ?? 'none'} since the first check; it was not renamed`);
         await refuseOtherSessions(main, jobId, ctx.sessions);
@@ -1961,11 +2443,13 @@ export class MigrationService {
       const shardCount = Number.parseInt(creds.FLEET_SHARD_COUNT ?? '', 10);
       await jsonReader(DATA_ROOT)(part => writePgItems(main, part));
       await writePgOwners(main, tally.guilds, this.opts.nodeId?.() ?? getNodeId(), Number.isSafeInteger(shardCount) && shardCount > 0 ? shardCount : 1);
+      await eachShared(places, part => writePgShared(main, part, `migration/${jobId}`));
     } else {
       const staging = path.join(DATA_ROOT, `.migrate-${Date.now()}`);
       ctx.staging = staging;
       await fs.promises.mkdir(staging, { recursive: true });
       await pgReader(main)(part => stageSnapshot(part, staging));
+      await eachShared(main, part => stageShared(staging, part));
       if (copiedChannel.kind === 'id') await writeSynced(path.join(staging, OWNER_CHANNEL_NAME), JSON.stringify({ channelId: copiedChannel.id }));
     }
 
@@ -1978,10 +2462,13 @@ export class MigrationService {
       compareGraves(tally.graves, back.graves, 'The copy in the database');
       if ([...back.owners].sort().join(',') !== [...tally.guilds].sort().join(',')) throw new Error('The copy in the database has other ownership rows than the guilds copied');
       if (!sameChannel(await ownerChannelRow(main), copiedChannel)) throw new Error('The owner messages channel in the copy differs from the source');
+      compareShared(tally.shared, await readBackShared(main));
     } else {
       const back = await tallySource(jsonReader(ctx.staging!));
       compareHashes(tally.copied, back.copied, 'The staged copy');
       compareGraves(tally.graves, back.graves, 'The staged copy');
+      await tallyShared(back, stagedPlaces(ctx.staging!));
+      compareShared(tally.shared, back.shared);
       if (!sameChannel(ownerChannelFromFile(path.join(ctx.staging!, OWNER_CHANNEL_NAME)), copiedChannel)) throw new Error('The owner messages channel in the copy differs from the source');
     }
 
@@ -1994,7 +2481,10 @@ export class MigrationService {
       }
     };
     if (from === 'file') {
-      compareHashes(tally.all, (await tallySource(jsonReader(DATA_ROOT))).all, 'The source read a second time');
+      const again = await tallySource(jsonReader(DATA_ROOT));
+      await tallyShared(again, places);
+      compareHashes(tally.all, again.all, 'The source read a second time');
+      compareHashes(tally.shared, again.shared, 'The source read a second time');
       channelAgainDiffers(ownerChannelFromFile(path.join(DATA_ROOT, OWNER_CHANNEL_NAME)));
     } else {
       const second = await this.connect(pgUrl, app, 'job');
@@ -2002,9 +2492,11 @@ export class MigrationService {
         await this.configure(second);
         await second.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
         const again = await tallySource(pgReader(second));
+        await tallyShared(again, second);
         const channelAgain = await ownerChannelRow(second);
         await second.query('ROLLBACK');
         compareHashes(tally.all, again.all, 'The source read a second time');
+        compareHashes(tally.shared, again.shared, 'The source read a second time');
         channelAgainDiffers(channelAgain);
       } finally {
         await closeSession(second, this.closeBound());
@@ -2034,11 +2526,11 @@ export class MigrationService {
           await writeSynced(target, s.bytes);
         }
       }
-      await placeStaged(DATA_ROOT, ctx.staging!, ctx.superseded, () => { ctx.placingBegun = true; });
+      await placeStaged(DATA_ROOT, ctx.staging!, ctx.superseded, () => { ctx.placingBegun = true; }, places);
 
       // S9: the source retired.
       await this.fault('S9');
-      await main.query(`LOCK TABLE ${GUILD_TABLES} IN ACCESS EXCLUSIVE MODE`);
+      await main.query(`LOCK TABLE ${SOURCE_TABLES} IN ACCESS EXCLUSIVE MODE`);
       await main.query(`ALTER SCHEMA smdb_data RENAME TO smdb_superseded_${Date.now()}`);
       stage('retire-source');
       await this.fault('before-retire-commit');
@@ -2069,6 +2561,25 @@ export class MigrationService {
     console.log(`[Migration] Migration ${jobId} (--to ${to}) is done: ${counts.documents} documents, ${counts.appendFiles} streams, ${counts.graveyardEntries} graveyard entries`
       + (tally.leftOut.length > 0 ? `; left out: ${tally.leftOut.join(', ')}` : '')
       + (notes.length > 0 ? `; ${notes.join('; ')}` : ''));
+  }
+
+  /** Where this bot keeps the data of no guild as files: the root config, /data/global and the modules installed.json lists. */
+  private sharedPlaces(): SharedPlaces {
+    return {
+      rootConfig: this.opts.rootConfigPath ?? mirrorPathOf(ROOT_CONFIG_KEY),
+      global: dataPath('global'),
+      modules: this.opts.sourceModulesDir ?? getSourceModulesDir(),
+      listed: 'installed',
+    };
+  }
+
+  /** S3 waits, at most 40 s, until no shared write of this process waits to be stored (NB6 decision 39). */
+  private async waitSharedWrites(): Promise<void> {
+    const until = Date.now() + (this.opts.sharedWaitMs ?? SHARED_WAIT_MS);
+    while (!this.host.sharedWritesSettled()) {
+      if (Date.now() >= until) throw new Refusal(SHARED_WAIT_TEXT);
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
   }
 
   /** S3 waits, at most 20 s, until no owner channel setting write is in flight (NB5 decision 16). */

@@ -136,12 +136,12 @@ function colRow(rel: string, name: string, type: string, notNull: boolean, extra
 const CURRENT = [{ value: JSON.stringify({ v: pg.SCHEMA_VERSION }) }];
 
 /** The frozen schema statements without its seed rows, as the fresh path and the scratch send them. */
-const frozenSchema = () => [...FROZEN_V8_DDL, ...frozenPartitions(true)].filter(s => !s.startsWith('INSERT')).map(s => s.trim());
+const frozenSchema = () => [...FROZEN_V9_DDL, ...frozenPartitions(true)].filter(s => !s.startsWith('INSERT')).map(s => s.trim());
 
 const SEQ_PARAMS = { seq_increment: '1', seq_min: '1', seq_max: '9223372036854775807', seq_cache: '1', seq_cycle: false };
-const PLAIN_TABLES = ['meta', 'guild_ownership', 'shard_claims', 'claim_clock', 'shard_nodes', 'reshard', 'identify_slots', 'guild_data_graveyard', 'guild_requests'];
+const PLAIN_TABLES = ['meta', 'guild_ownership', 'shard_claims', 'claim_clock', 'shard_nodes', 'reshard', 'identify_slots', 'guild_data_graveyard', 'guild_requests', 'shared_docs', 'shared_lines', 'shared_modules', 'shared_module_files', 'shared_module_status', 'shared_ops'];
 const PARTITIONED = ['guild_data', 'guild_append'];
-const SEQUENCES = ['claim_seq', 'guild_append_seq'];
+const SEQUENCES = ['claim_seq', 'guild_append_seq', 'shared_rev_seq'];
 const partitionNames = (t: string) => Array.from({ length: 32 }, (_, i) => [`${t}_p${String(i).padStart(2, '0')}`, i] as const);
 
 /** The relations the fresh path made, as a found list on real Postgres lists them, every privilege held. */
@@ -443,7 +443,7 @@ describe('a fresh database', () => {
     const tail = sent.slice(sent.indexOf('RELEASE SAVEPOINT shape'));
     expect(tail.length).toBe(8);
     expect(FOUND.test(tail[1])).toBe(true);
-    expect(tail.slice(2, 4)).toEqual(FROZEN_V8_DDL.filter(s => s.startsWith('INSERT')).map(s => s.trim()));
+    expect(tail.slice(2, 4)).toEqual(FROZEN_V9_DDL.filter(s => s.startsWith('INSERT')).map(s => s.trim()));
     expect(tail[4]).toMatch(/^INSERT INTO smdb_data\.meta \(key, value\) VALUES \('schema_version', \$1\) ON CONFLICT \(key\) DO NOTHING$/);
     expect(VERSION.test(tail[5])).toBe(true);
     expect(tail[6]).toMatch(/^INSERT INTO smdb_data\.meta \(key, value\) VALUES \('store_id'/);
@@ -459,15 +459,15 @@ describe('a fresh database', () => {
       catalog: madeCatalog,
     });
     await internals(backend).provision();
-    const lines = ['claim_clock', 'guild_append', 'guild_data', 'guild_data_graveyard', 'guild_ownership', 'guild_requests', 'identify_slots', 'meta', 'reshard', 'shard_claims', 'shard_nodes']
+    const lines = ['claim_clock', 'guild_append', 'guild_data', 'guild_data_graveyard', 'guild_ownership', 'guild_requests', 'identify_slots', 'meta', 'reshard', 'shard_claims', 'shard_nodes', 'shared_docs', 'shared_lines', 'shared_module_files', 'shared_module_status', 'shared_modules', 'shared_ops']
       .map(t => `this bot's database role smdb_bot lacks DELETE on smdb_data.${t}`);
     expect(await backend.provisionVerdict()).toEqual({
       state: 'shape',
-      reason: `this bot's database role smdb_bot lacked privileges on the schema it made in the database, so it was rolled back (default privileges or an event trigger take them from new tables): ${lines.slice(0, 5).join('; ')}; and 6 more (the bot's log lists them)`,
+      reason: `this bot's database role smdb_bot lacked privileges on the schema it made in the database, so it was rolled back (default privileges or an event trigger take them from new tables): ${lines.slice(0, 5).join('; ')}; and 12 more (the bot's log lists them)`,
       fix: "Gates stay closed and nothing in the database was changed; as smdb_bot or a superuser, run ALTER DEFAULT PRIVILEGES FOR ROLE smdb_bot GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO smdb_bot; ALTER DEFAULT PRIVILEGES FOR ROLE smdb_bot GRANT USAGE, UPDATE ON SEQUENCES TO smdb_bot (SELECT * FROM pg_default_acl lists what is set), remove any event trigger that revokes privileges on new tables, and restart the bot",
     });
     expect(errors.mock.calls.map(c => String(c[0])).filter(l => l.startsWith('[PostgresBackend] schema'))).toEqual([
-      "[PostgresBackend] schema-mismatch: this bot's database role smdb_bot lacked 11 privilege(s) on the schema it made in the database, so it was rolled back before it was committed (default privileges set with ALTER DEFAULT PRIVILEGES, or an event trigger, take them from new tables); refusing to serve",
+      "[PostgresBackend] schema-mismatch: this bot's database role smdb_bot lacked 17 privilege(s) on the schema it made in the database, so it was rolled back before it was committed (default privileges set with ALTER DEFAULT PRIVILEGES, or an event trigger, take them from new tables); refusing to serve",
       ...lines.map(l => `[PostgresBackend] schema difference: ${l}`),
     ]);
     expect(sent.slice(-3)).toEqual(['RELEASE SAVEPOINT shape', sent[sent.length - 2], 'ROLLBACK']);
@@ -584,8 +584,8 @@ describe('a throw at any statement of the check', () => {
   });
 });
 
-// The schema of SCHEMA_VERSION 8, frozen. A change here means the DDL changed.
-const FROZEN_V8_DDL = [
+// The schema of SCHEMA_VERSION 9, frozen. A change here means the DDL changed.
+const FROZEN_V9_DDL = [
   `CREATE SCHEMA IF NOT EXISTS smdb_data`,
   `CREATE TABLE IF NOT EXISTS smdb_data.meta (
     key        text PRIMARY KEY,
@@ -727,6 +727,56 @@ const FROZEN_V8_DDL = [
   )`,
   `CREATE INDEX IF NOT EXISTS guild_requests_pending_idx ON smdb_data.guild_requests (for_process, created_at) WHERE state = 'pending'`,
   `CREATE INDEX IF NOT EXISTS guild_requests_applying_idx ON smdb_data.guild_requests (claim_batch) WHERE state = 'applying'`,
+  `CREATE SEQUENCE IF NOT EXISTS smdb_data.shared_rev_seq`,
+  `CREATE TABLE IF NOT EXISTS smdb_data.shared_docs (
+    key         text        PRIMARY KEY,
+    body        bytea       NOT NULL,
+    sha         text        NOT NULL,
+    rev         bigint      NOT NULL,
+    updated_at  timestamptz NOT NULL DEFAULT now(),
+    updated_by  text        NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS smdb_data.shared_lines (
+    key         text        NOT NULL,
+    id          uuid        PRIMARY KEY,
+    seq         bigint      NOT NULL DEFAULT nextval('smdb_data.shared_rev_seq'),
+    line        bytea       NOT NULL,
+    created_at  timestamptz NOT NULL DEFAULT now()
+  )`,
+  `CREATE INDEX IF NOT EXISTS shared_lines_key_seq ON smdb_data.shared_lines (key, seq)`,
+  `CREATE TABLE IF NOT EXISTS smdb_data.shared_modules (
+    module      text        PRIMARY KEY,
+    sha         text        NOT NULL,
+    rev         bigint      NOT NULL,
+    version     text,
+    file_count  integer     NOT NULL,
+    bytes       bigint      NOT NULL,
+    updated_at  timestamptz NOT NULL DEFAULT now(),
+    updated_by  text        NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS smdb_data.shared_module_files (
+    module      text        NOT NULL,
+    rel         text        NOT NULL,
+    bytes       bytea       NOT NULL,
+    mode        integer     NOT NULL,
+    PRIMARY KEY (module, rel)
+  )`,
+  `CREATE TABLE IF NOT EXISTS smdb_data.shared_module_status (
+    module      text        NOT NULL,
+    node_id     text        NOT NULL,
+    node_name   text        NOT NULL,
+    sha         text        NOT NULL,
+    state       text        NOT NULL CHECK (state IN ('applied', 'failed')),
+    error       text,
+    at          timestamptz NOT NULL DEFAULT now(),
+    process_id  text        NOT NULL,
+    seq         bigint      NOT NULL,
+    PRIMARY KEY (module, node_id)
+  )`,
+  `CREATE TABLE IF NOT EXISTS smdb_data.shared_ops (
+    id  uuid        PRIMARY KEY,
+    at  timestamptz NOT NULL DEFAULT now()
+  )`,
 ];
 
 function frozenPartitions(ifNotExists: boolean): string[] {
@@ -742,16 +792,16 @@ function frozenPartitions(ifNotExists: boolean): string[] {
 
 const BUMP = 'the DDL changed: bump SCHEMA_VERSION (the boot refuses a stored schema that differs) and update this copy';
 
-describe('the schema of SCHEMA_VERSION 8 (guard)', () => {
-  it("provision()'s 86 statements are today's, text for text", () => {
-    expect(pg.SCHEMA_VERSION, BUMP).toBe(8);
-    expect([...pg.provisionDdl('smdb_data'), ...pg.partitionDdl('smdb_data', true)], BUMP).toEqual([...FROZEN_V8_DDL, ...frozenPartitions(true)]);
+describe('the schema of SCHEMA_VERSION 9 (guard)', () => {
+  it("provision()'s 94 statements are today's, text for text", () => {
+    expect(pg.SCHEMA_VERSION, BUMP).toBe(9);
+    expect([...pg.provisionDdl('smdb_data'), ...pg.partitionDdl('smdb_data', true)], BUMP).toEqual([...FROZEN_V9_DDL, ...frozenPartitions(true)]);
   });
 
   it("provisionStoreInTransaction's statements are today's, text for text", async () => {
     const sent: string[] = [];
     await pg.provisionStoreInTransaction({ query: async (text: string) => { sent.push(text); return { rows: [] }; } });
-    expect(sent.slice(0, -2), BUMP).toEqual(['CREATE SCHEMA smdb_data', ...FROZEN_V8_DDL.slice(1), ...frozenPartitions(false)]);
+    expect(sent.slice(0, -2), BUMP).toEqual(['CREATE SCHEMA smdb_data', ...FROZEN_V9_DDL.slice(1), ...frozenPartitions(false)]);
   });
 
   it('the DDL rendered for another schema names no smdb_data', () => {

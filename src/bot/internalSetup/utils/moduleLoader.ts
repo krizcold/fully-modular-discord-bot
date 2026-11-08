@@ -9,7 +9,10 @@ import {
   ModuleContext
 } from '../../types/moduleTypes';
 import { getModuleRegistry } from './moduleRegistry';
-import { clearLoadFailures, recordLoadFailure } from './loadFailures';
+import { clearLoadFailures, recordHeldBack, recordLoadFailure } from './loadFailures';
+import {
+  bootStartOf, closeWindow, endStart, handToBootTurn, isHeld, openStarts, openWindow, startShaOf, type ModuleStart,
+} from './moduleCrashes';
 import {
   findModuleManifests,
   getModuleInfo,
@@ -20,16 +23,23 @@ import {
   ensureDir
 } from './pathHelpers';
 
+export interface ModuleLoaderOptions {
+  /** Opens each module's start before its code runs, or answers 'skip'; a loader without it counts nothing. */
+  onModuleCode?: (m: { name: string; path: string; version: string }) => ModuleStart | 'skip';
+}
+
 /**
  * ModuleLoader - Discovers, loads, and initializes bot modules
  */
 export class ModuleLoader {
   private client: Client;
   private isProd: boolean;
+  private onModuleCode: ModuleLoaderOptions['onModuleCode'];
 
-  constructor(client: Client) {
+  constructor(client: Client, options: ModuleLoaderOptions = {}) {
     this.client = client;
     this.isProd = process.env.NODE_ENV !== 'development';
+    this.onModuleCode = options.onModuleCode;
   }
 
   /**
@@ -134,6 +144,20 @@ export class ModuleLoader {
       const manifestData = manifests.find(m => m.manifest.name === moduleName);
       if (!manifestData) continue;
 
+      const version = manifestData.manifest.version;
+      const code = this.onModuleCode?.({ name: moduleName, path: manifestData.path, version });
+      if (code === 'skip') {
+        const sha = startShaOf(moduleName);
+        if (sha !== null && isHeld(moduleName, sha)) {
+          recordHeldBack(moduleName);
+          console.error(`[ModuleLoader] ${moduleName} ${version} was not loaded: this machine holds it back after the bot stopped twice while it was starting it (see the App Store tab)`);
+        }
+        continue;
+      }
+      const start = code ?? null;
+      let handed = false;
+      let failure: unknown;
+      if (start) openWindow(start);
       try {
         const module = await this.loadModule(manifestData.manifest, manifestData.path);
         loadedModules.push(module);
@@ -153,19 +177,34 @@ export class ModuleLoader {
         console.log(
           `[ModuleLoader] Loaded module: ${module.manifest.displayName} v${module.manifest.version}`
         );
+        if (start) {
+          handToBootTurn(start);
+          handed = true;
+        }
       } catch (error) {
+        failure = error;
         console.error(`[ModuleLoader] Failed to load module ${moduleName}:`, error);
         recordLoadFailure(moduleName);
+      } finally {
+        if (start) {
+          closeWindow(start);
+          if (!handed) await endStart(start, { failed: failure ?? new Error('the load did not finish') });
+        }
       }
     }
 
     // Call onReady hooks on all modules (all modules are now loaded)
     for (const module of loadedModules) {
       if (module.hooks?.onReady) {
+        const handedStart = this.onModuleCode ? bootStartOf(module.manifest.name) : undefined;
+        const start = handedStart && openStarts.get(module.manifest.name) === handedStart ? handedStart : null;
+        if (start) openWindow(start);
         try {
           await module.hooks.onReady(this.createModuleContext(module));
         } catch (hookError) {
           console.error(`[ModuleLoader] onReady hook failed for ${module.manifest.name}:`, hookError);
+        } finally {
+          if (start) closeWindow(start);
         }
       }
     }

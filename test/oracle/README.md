@@ -5,9 +5,10 @@ every answer. Copies of the run's docs are taken afterwards, and the checker jud
 
 | File | Runs where | What it does |
 |---|---|---|
-| oracle.mjs | the dev box, or a node image on a host | `write`, `read` (a copy through one node's app read path), `fleet` (the control facts), `sql` (the database listing query; `sql ownership` lists the claim sequence and the highest guild_ownership and shard_claims claims for check.mjs `--ownership`; `sql claims` lists the shard_claims rows for check.mjs `--claims`; `sql requests` lists the run's guild_requests rows for check.mjs `--requests`), `bite`, `cleanup` |
+| oracle.mjs | the dev box, or a node image on a host | `write`, `read` (a copy through one node's app read path), `fleet` (the control facts), `sql` (the database listing query; `sql ownership` lists the claim sequence and the highest guild_ownership and shard_claims claims for check.mjs `--ownership`; `sql claims` lists the shard_claims rows for check.mjs `--claims`; `sql requests` lists the run's guild_requests rows for check.mjs `--requests`; `sql shared` lists the run's shared files in shared_docs for check.mjs `--shared-db`), `mirror` (one machine's mirror files of the shared files), `bite`, `cleanup` |
 | check.mjs | the dev box | judges logs and copies; exit 0 PASS, 1 FAIL, 2 INCONCLUSIVE, 64 usage |
 | judge.mjs | (library) | the verdict rules |
+| shared.mjs | (library) | the verdict rules of the shared files (NB6) |
 | model.ts, fakeApp.ts | tests only | the model of a correct store with every check, and a stand-in node on real Postgres with injectable faults |
 
 oracle.mjs and check.mjs need Node 18 or newer and nothing from npm.
@@ -23,7 +24,15 @@ oracle.mjs and check.mjs need Node 18 or newer and nothing from npm.
 - **Hot docs** `<run>-h<k>.json`, written whole by every lane. Each lane keeps its own counter per doc. A hot doc's
   content is logged in full, so `bite` can put an older version back.
 - **Reads** through the lane's own node every `--read-every` writes.
-- Everything is under module `oracle` of the `--guild` guild.
+- Everything is under module `oracle` of the `--guild` guild, except the shared files.
+- **Shared files** (`--shared ID`, NB6; a Postgres bot of two machines): global files, named as the route names them
+  (`module/file.json` under /data/global), which every machine's lane rewrites, a share `--shared-ratio` (0.2) of its
+  operations. A lane first reads the file through its own node (`shared-read`), then sends content that names the
+  hash of what it read (`prev`) with the read's sha as `loadedSha`, the base the bot stores it over and nothing else.
+  The send (`shared-send`, the content logged whole) and its answer (`shared-ans`) are lines of their own, counted
+  under `shared` in the end line, so the guild checks never see them. The route writes only files it lists, so each
+  file must exist on the bot before the run; the run replaces its content, so name files no module reads, or a test
+  module's.
 
 The log has one JSON line per event. A `send` line comes before every request and an `ans` line after it, both stamped
 by this process's monotonic clock:
@@ -71,13 +80,16 @@ answering 500 "An error occurred" from its error handler.
 | LOST | An acknowledged doc is absent, or a hot doc holds a value that an acknowledged later write by another lane should have replaced. |
 | ROLLBACK | A hot doc holds a counter lower than one its own lane had acknowledged. |
 | FORK | Two copies each hold docs the other lacks, or copies named in `--agree` differ. |
-| PHANTOM | A doc is present though its write was refused before applying, or a run doc that no writer sent is present, or a holder took a request row of the run that no writer sent (`--requests`). |
+| PHANTOM | A doc is present though its write was refused before applying, or a run doc that no writer sent is present, or a holder took a request row of the run that no writer sent (`--requests`), or the history of a shared file's version holds a write refused before applying. |
 | HELD-MISSING | A held (202) effect never arrived. |
 | RESURRECTED | A doc is back after its delete was acknowledged. |
 | WRONG-CONTENT | A doc holds bytes that no one wrote to it. |
 | CONTROL | A shard is leased to two live processes at once, a shard in a process's shard table is not leased by that process or is leased by another one, nodes disagree on the shard count, a guild maps to two shards or out of range, one claim is reported on two shards or by two processes, a lease's claim is not the one the shard_claims row of its shard holds for that process (`--claims`), or a live claim is at or above the claim the next take would draw (`--ownership`). Facts are keyed by process id (a JSON bot's by node id). With two sets of control facts, only a CONTROL that both sets show counts. |
 | TWICE | Holders started more than one request row carrying one send (`--requests`): the change was taken twice. |
 | FALSE-ANSWER | A send's answer contradicts its request rows (`--requests`): a 200 with no row the holder answered ok, a 202 with no row it answered accepted, or a refusal given as never applied whose row a holder took and left unanswered or answered as applied. |
+| SHARED-LOST | An acknowledged shared write is not in the history of the version the database row (`--shared-db`) or a machine's mirror (`--mirror`, after the bound) holds: that version's write, the write it was built on, and so on. |
+| SHARED-OVERWRITE | Two acknowledged shared writes were built on one version: at most one of them was stored over the version it read. |
+| SHARED-FORK | Two machines' mirrors of one shared file hold different versions after the bound. |
 
 `(during)` marks a verdict from a read made during the run, judged against what was acknowledged before that read was
 sent.
@@ -87,6 +99,14 @@ How the checker judges:
   compared, so ordering across their lanes goes unjudged [A16]; per-lane checks still apply.
 - **Late landings.** A write that got no answer may land at any time, so it never counts as superseded. A doc that ends
   on such a write after committed ones makes the run inconclusive, because a late landing and a rollback look the same.
+- **Shared files (NB6).** A version's history is followed through `prev`, back to a version no write of the run made
+  (the file as the run found it), so order is judged by content, never by clocks. An answer that may have applied (no
+  answer, a held 202, a refusal not on the list below) is a write that may have landed: it can be on a history, and
+  only acknowledged (200) writes must be. A refusal is one given before anything was stored when its text holds
+  "nothing was" or NB6's two "so your change was not saved." forms (decision 26 and T22: another machine stored the
+  file after this one read it). A mirror is judged only from `--shared-bound` seconds (90) after the last writer's
+  end line, by the copy's own clock against the writer's: decision 11's bound is 60 s for a lost notice, plus the
+  pass's reads. The database row needs no wait: it is the stored version.
 - **Request rows (NB7).** A change sent to the machine that runs the guild is a row of smdb_data.guild_requests that
   the holder takes, applies and answers. A send is matched to its rows by op, key and, for a write, its content's hash.
   A row shows what the holder did: nothing (never taken, or answered `unapplied` or `not-held`, both given before
@@ -111,6 +131,9 @@ The result is FAIL on any verdict. It is INCONCLUSIVE, never PASS, in any of the
   lines may be lost too: repeat the run. A copy of a file cut short in transit looks the same and would raise false
   verdicts, so a copy is judged only once its size matches the writer's own file (step 2);
 - a doc ends on an unanswered write after committed ones;
+- a run with shared files has no `--shared-db` listing, fewer than two mirror copies judged, a mirror copy taken
+  before the bound or that could not read a shared file, a writer log with no end time, or no acknowledged shared
+  write;
 - no control facts were given, or a node gave none (its bot child down or not answering). `--no-fleet` waives this
   only where there is no fleet to check.
 
@@ -141,6 +164,12 @@ fleet.
     line, a missing field) and cover not-held and unapplied answers, deletes, an unparseable reply and rows no writer
     sent.
 - **test/unit/oracleJudge.test.ts** runs those checks against judge.mjs.
+- **test/unit/nb6Oracle.test.ts** holds the shared files: the refusal list against the bot's own texts (`truthText`),
+  each shared verdict on hand-built logs and copies and the cases that may not raise one (a write with no answer, a
+  held write, a refusal that may have applied), each INCONCLUSIVE case, and the writer, `mirror`, `sql shared` and the
+  checker against two stand-in machines over one row store: a run whose saves the machines compared passes, a run
+  whose machines store over any version is SHARED-OVERWRITE, and a mirror put back to an older acknowledged version
+  is SHARED-FORK and SHARED-LOST on that mirror.
 - **test/unit/oracleMutants.test.ts** runs them against 76 mutants of judge.mjs, each breaking one rule. A hand-built
   check must kill each one, so the result does not depend on what the generator draws.
 - **test/integration/oracle.test.ts** runs the tools as child processes against stand-in nodes on real Postgres, and
@@ -171,6 +200,11 @@ fleet.
     stop and the next process's take, or a hand-over and the receiving node's take, between two reads pass, and a
     lease whose claim the table does not hold in both reads, or a shard two processes lease, is named;
   - the test's own database copy fails when psql fails;
+  - NB6: two stand-in machines, each with its mirror folder, store shared saves in shared_docs under the key's
+    advisory lock with the bot's compare; the run passes with `sql shared`'s listing and both machines' `mirror`
+    copies, a mirror put back to an older acknowledged version is SHARED-FORK and SHARED-LOST, a row put back is
+    SHARED-LOST on the listing, machines that store over any version give SHARED-OVERWRITE, and the listing keeps
+    multi-byte text and a body that is not text byte for byte;
   - NB7 test 12: two web UIs (one whose bot runs another shard and answers `not-held`, one whose bot is down) send
     through the real request route to the bot process that holds the guild's shard, which runs the real sweep over
     the real fenced flush. That process is killed after a claim before its apply, after its flush before its answer,
@@ -282,6 +316,17 @@ Guardrails: the secret filter on every read; `ssh <host> ...` with no flag befor
    - Use `--lag` for an async standby.
    - Use `--agree` for copies that must match after the chain settles.
    - Use `--requests NAME=FILE` for the request rows: each send is compared with the rows that carry it.
+   - **Shared files (NB6),** for a run with `--shared` on a Postgres bot of two machines, one lane on each:
+     - the row listing from the serving primary, once the writers have ended, sent to a file as bytes:
+
+           node test/oracle/oracle.mjs sql shared --log <run>.jsonl | ssh contabo-dbot docker exec -i <postgres container> psql -U smdb -d smdb -At > shared.jsonl
+
+     - each machine's mirror, on that machine, at least 90 seconds after the writers' end lines, with its data folder
+       mounted read-only (the bot's /data volume, by its exact name):
+
+           ssh contabo-dbot "docker run --rm -v <bot data volume>:/data:ro -v /root/smdb-oracle:/o node:24-alpine node /o/oracle.mjs mirror --log /o/<run>.copy.jsonl --data /data --name <machine> --out -" > <machine>.mirror.jsonl
+
+     - then add `--shared-db shared=shared.jsonl --mirror <machine-1>.mirror.jsonl --mirror <machine-2>.mirror.jsonl`.
 5. **The bite test, once, before trusting a baseline (VERIFY.md 5.5):** after a short clean run, `oracle.mjs bite --log
    <run>.jsonl` prints two SQL statements for the judged copy's database. Run them, dump the copy again, and check. The
    result must be FAIL, with exactly LOST and ROLLBACK on the named docs. Then run the 30-minute baseline.
@@ -302,6 +347,9 @@ Guardrails: the secret filter on every read; `ssh <host> ...` with no flag befor
     the database's, not what a node serves to modules.
   - Reads that modules make through loadData are not taken one by one, so a value a module saw but never saved goes
     unseen.
+- **Shared files the run makes.** The route writes only global files it lists, so the run cannot create a shared file;
+  it rewrites files that exist, and a file written by hand on one machine of a Postgres bot is moved aside by the next
+  pass. Shared files saved by modules, the App Store's files and module folders are not written by the run.
 - **File mode** [A19]. The operator route cannot create a new file in a file-routed guild (it needs the file to exist
   already), and the database listing does not apply there. A file-mode reader comes before B2 deploys.
 - **Step 1 of VERIFY.md section 5,** the set difference on the existing kill-drill logs. It reads live hosts, so it

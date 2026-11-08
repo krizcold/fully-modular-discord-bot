@@ -7,6 +7,7 @@
 import * as path from 'path';
 import { readRawStrict } from '../../bot/internalSetup/utils/dataManager';
 import { filesPending } from '../../bot/internalSetup/utils/dataBackends/fileBackend';
+import { rowBackend, rowQueue, sharedKeyOf } from '../../bot/internalSetup/utils/sharedStore';
 import { resolveDataBackend } from '../../utils/envLoader';
 import { failureOf } from '../../bot/internalSetup/utils/dataBackends/guildRequestSql';
 import { NB7_TEXTS, remoteReadDoc, runHolderCheck, switchOnNotHeld, type CheckAnswer, type Plan } from './guildRequests';
@@ -100,10 +101,35 @@ export async function readServedGlobal(botManager: BotManager, target: GlobalRea
     ? await botManager.readGlobalData(target.root ? { root: target.root } : { rel: target.rel })
     : { ok: false, code: 'bot-down' };
   if (!reply?.ok) {
-    if (reply?.code === 'bot-down') return readHere(target.path, BOT_DOWN_DISK_NOTICE);
+    if (reply?.code === 'bot-down') {
+      const key = sharedKeyOf(target.path);
+      return key === null ? readHere(target.path, BOT_DOWN_DISK_NOTICE) : readSharedDown(key);
+    }
     return refused(reply, 'Data read failed');
   }
   return combine(target, queuedBefore, reply);
+}
+
+const SHARED_READ_BOUND_MS = 10_000;
+const SHARED_BODY_SQL = 'SELECT body FROM smdb_data.shared_docs WHERE key = $1';
+
+/**
+ * NB6 C21: a shared key on a Postgres bot while the bot is down: this process's row queue entry first, else the row on
+ * the web UI's reader pool (10 s), decoded as readRaw decodes a file; no row reads as none.
+ */
+async function readSharedDown(key: string): Promise<ServedRead> {
+  const entry = rowQueue.entryOf(key);
+  if (entry) return { ok: true, content: entry.body === null ? null : entry.body.toString('utf8'), notice: BOT_DOWN_DATABASE_NOTICE };
+  try {
+    const backend = rowBackend();
+    if (!backend?.sharedSelect) throw new Error("this process has no connection to the bot's database");
+    const row = (await backend.sharedSelect(SHARED_BODY_SQL, [key], SHARED_READ_BOUND_MS)).rows[0];
+    if (!row) return { ok: true, content: null, notice: BOT_DOWN_DATABASE_NOTICE };
+    const body = Buffer.isBuffer(row.body) ? row.body : Buffer.from(String(row.body ?? ''), 'utf8');
+    return { ok: true, content: body.toString('utf8'), notice: BOT_DOWN_DATABASE_NOTICE };
+  } catch (error) {
+    return { ok: false, status: 503, error: `Can't reach the database to read this file (${error instanceof Error ? error.message : String(error)})` };
+  }
 }
 
 /**

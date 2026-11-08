@@ -24,7 +24,7 @@
  */
 
 import { PROVIDER_FETCH_MS } from './paymentTypes';
-import { loadCredentials } from '@/utils/envLoader';
+import { providerCredentials } from '@/utils/envLoader';
 import { getPaymentRegistry } from './paymentRegistry';
 import type {
   PaymentProvider,
@@ -86,7 +86,7 @@ export class DiscordProvider implements PaymentProvider {
   private gatewayHandler: ((payload: any) => void) | null = null;
 
   isConfigured(): boolean {
-    const creds = loadCredentials();
+    const creds = providerCredentials('discord');
     return !!(creds.DISCORD_APPLICATION_ID && creds.DISCORD_TOKEN);
   }
 
@@ -144,7 +144,7 @@ export class DiscordProvider implements PaymentProvider {
    * one variant from our POV).
    */
   private async listSkus(): Promise<DiscordSku[] | null> {
-    const creds = loadCredentials();
+    const creds = providerCredentials('discord');
     if (!creds.DISCORD_APPLICATION_ID) return null;
     const data = await this.api<DiscordSku[]>('GET', `/applications/${creds.DISCORD_APPLICATION_ID}/skus`);
     return Array.isArray(data) ? data : null;
@@ -169,7 +169,7 @@ export class DiscordProvider implements PaymentProvider {
    * fires on the gateway when this completes.
    */
   async cancelSubscription(providerSubId: string, _immediately?: boolean): Promise<void> {
-    const creds = loadCredentials();
+    const creds = providerCredentials('discord');
     if (!creds.DISCORD_APPLICATION_ID) {
       throw new Error('DISCORD_APPLICATION_ID not configured');
     }
@@ -180,7 +180,7 @@ export class DiscordProvider implements PaymentProvider {
   }
 
   async getSubscriptionState(providerSubId: string): Promise<ProviderSubscriptionState | null> {
-    const creds = loadCredentials();
+    const creds = providerCredentials('discord');
     if (!creds.DISCORD_APPLICATION_ID) return null;
     const all = await this.api<DiscordEntitlement[]>(
       'GET',
@@ -198,7 +198,7 @@ export class DiscordProvider implements PaymentProvider {
    * compares this against its records.
    */
   async listSubscriptionsForGuild(guildId: string): Promise<ProviderSubscriptionRef[]> {
-    const creds = loadCredentials();
+    const creds = providerCredentials('discord');
     if (!creds.DISCORD_APPLICATION_ID) return [];
     const all = await this.api<DiscordEntitlement[]>(
       'GET',
@@ -344,7 +344,7 @@ export class DiscordProvider implements PaymentProvider {
   }
 
   private async api<T>(method: 'GET' | 'POST' | 'DELETE', path: string, body?: Record<string, any>): Promise<T | null> {
-    const creds = loadCredentials();
+    const creds = providerCredentials('discord');
     const token = creds.DISCORD_TOKEN;
     if (!token) throw new Error('DISCORD_TOKEN not configured');
 

@@ -184,23 +184,23 @@ describe('C2: each refusal answers its reason and ends in ROLLBACK and one end',
     ['the gate: no CREATE on the database', { found: foundRow({ db_create: false }) }, 'S',
       async () => shape.gateRefusal(await foundList(foundRow({ db_create: false })))!.reason],
     ['schema version {"v":5}', { version: [{ value: '{"v":5}' }] }, 'S',
-      () => 'the database holds schema version {"v":5}, and this bot reads only version 8'],
+      () => 'the database holds schema version {"v":5}, and this bot reads only version 9'],
     ['an empty found list', { found: EMPTY_FOUND }, 'S',
       () => "the database holds no tables in smdb_data, so it holds no copy of this bot's store; a move does not provision a database"],
     ['no version row', { version: [] }, 'S',
       async () => shape.unversionedRefusal(await foundList(foundRow()), { differences: [], counted: 0, total: 0 }).reason],
     ['a column difference', { catalog: graveyardNullable }, 'S',
-      () => "the database's smdb_data differs from this bot's schema (version 8): smdb_data.guild_data_graveyard column reason allows NULL, where this bot's schema has NOT NULL"],
+      () => "the database's smdb_data differs from this bot's schema (version 9): smdb_data.guild_data_graveyard column reason allows NULL, where this bot's schema has NOT NULL"],
     ['a missing INSERT on guild_data', {
       found: insertLacking,
       catalog: (_schema, which) => (which === 'relations' ? [relRow('meta', 'r'), relRow('guild_data', 'p', { partition_key: 'HASH (guild_id)' })] : []),
-    }, 'S', () => "this bot's database role smdb_bot lacks privileges on smdb_data, which matches this bot's schema (version 8): this bot's database role smdb_bot lacks INSERT on smdb_data.guild_data"],
+    }, 'S', () => "this bot's database role smdb_bot lacks privileges on smdb_data, which matches this bot's schema (version 9): this bot's database role smdb_bot lacks INSERT on smdb_data.guild_data"],
     ["the scratch's 42501", {
       fail: sql => (SCRATCH.test(sql) ? Object.assign(new Error('permission denied for database smdb'), { severity: 'ERROR', code: '42501' }) : undefined),
     }, 'S', () => shape.scratchRefusal('42501', 'permission denied for database smdb', 'smdb_bot', 'smdb').reason],
     ['no store_id row, S recorded', { storeId: [] }, 'S', () => shape.storeIdRefusal('S').reason],
     ['no store_id row, none recorded', { storeId: [] }, null,
-      () => "the database's smdb_data matches this bot's schema (version 8) but smdb_data.meta holds no store_id row, and this machine records no store id, so this bot can't confirm whose store it is; a move writes no store id"],
+      () => "the database's smdb_data matches this bot's schema (version 9) but smdb_data.meta holds no store_id row, and this machine records no store id, so this bot can't confirm whose store it is; a move writes no store id"],
     ['store_id "T", S recorded', { storeId: [{ value: '"T"' }] }, 'S',
       () => "the configured database is not the one this deployment's data lives in (store T vs recorded S)"],
     ['store_id 5', { storeId: [{ value: '5' }] }, 'S', () => "its store id can't be read (the stored value is not a JSON string)"],
@@ -220,7 +220,7 @@ describe('C2: each refusal answers its reason and ends in ROLLBACK and one end',
   it('a refusal with differences answers them as details', async () => {
     const s = scripted({ catalog: graveyardNullable });
     expect(await check(s)).toEqual({
-      reason: "the database's smdb_data differs from this bot's schema (version 8): smdb_data.guild_data_graveyard column reason allows NULL, where this bot's schema has NOT NULL",
+      reason: "the database's smdb_data differs from this bot's schema (version 9): smdb_data.guild_data_graveyard column reason allows NULL, where this bot's schema has NOT NULL",
       details: ['smdb_data.guild_data_graveyard column reason allows NULL, where this bot\'s schema has NOT NULL'],
     });
   });
@@ -341,7 +341,7 @@ describe('C6 and C7: useDatabase with the check', () => {
     expect(await backend.useDatabase(W, moveSteps)).toBe(false);
     const differences = extra.map(x => `smdb_data.${x} (table) is not part of this bot's schema`);
     expect(errors.mock.calls.map(c => String(c[0]))).toEqual([
-      `[Database] Not moving to ${showEntry(W)}: the database's smdb_data differs from this bot's schema (version 8): ${differences.slice(0, 5).join('; ')}; and 2 more (the bot's log lists them); this process keeps its unsaved changes and stays stopped`,
+      `[Database] Not moving to ${showEntry(W)}: the database's smdb_data differs from this bot's schema (version 9): ${differences.slice(0, 5).join('; ')}; and 2 more (the bot's log lists them); this process keeps its unsaved changes and stays stopped`,
       ...differences.map(d => `[PostgresBackend] schema difference: ${d}`),
     ]);
     errors.mockClear();

@@ -7,6 +7,8 @@ import { dataPath } from '../../../utils/dataRoot';
 import { ProcessLock, parseHolder, realSeams, type LockHolder, type LockSeams, type TakeResult } from './processLock';
 import { cancelQueued, queuedFilePaths, queuedFileWrites, fileFlushOnTheWire } from './dataBackends/fileBackend';
 import { closeSharedWritesLost, forgetSharedFileKnowledge, isSharedPath, reopenSharedWrites, useWriterLockCheck } from './dataManager';
+import { deposeRows, reopenRows } from './sharedStore';
+import { stopCrashWrites } from './moduleCrashes';
 
 export type WriterRole = 'bot' | 'webui' | 'import';
 
@@ -104,6 +106,7 @@ export function takeWriterLock(): TakeResult {
     deposedBy = null;
     readErrorLogged = null;
     reopenSharedWrites();
+    reopenRows();
     useWriterLockCheck(() => checkWriterLock().kind === 'deposed');
     forgetSharedFileKnowledge();
     startCheck();
@@ -230,9 +233,11 @@ function depose(holder: LockHolder): void {
   if (deposedBy) return;
   deposedBy = holder;
   closeSharedWritesLost();
+  const words = `${holderWords(holder)}, pid ${holder.pid}`;
+  deposeRows(words);
+  if (role === 'bot') stopCrashWrites();
   lock?.drop();
   stopCheck();
-  const words = `${holderWords(holder)}, pid ${holder.pid}`;
   const paths = queuedFilePaths().filter(isSharedPath);
   void cancelQueued(paths, undefined, { freeze: true }).then(results => {
     for (const result of results) {

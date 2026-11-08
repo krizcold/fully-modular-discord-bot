@@ -12,6 +12,7 @@ describe('registeredOps', () => {
       ...PREMIUM_METHODS.filter(m => m !== 'setGlobalModuleConfig').map(m => `premium.${m}`),
       'premium.setGlobalModuleConfig',
       ...DUMMY_METHODS.map(m => `dummy.${m}`),
+      'provider.saveCredentials',
     ];
     const ops = registeredOps();
     expect(ops).toEqual(expected);

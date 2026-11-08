@@ -26,7 +26,7 @@
 
 import * as crypto from 'crypto';
 import { PROVIDER_FETCH_MS } from './paymentTypes';
-import { loadCredentials } from '@/utils/envLoader';
+import { providerCredentials } from '@/utils/envLoader';
 import type {
   PaymentProvider,
   ProviderCapabilities,
@@ -66,7 +66,7 @@ export class PatreonProvider implements PaymentProvider {
   readonly capabilities = CAPABILITIES;
 
   isConfigured(): boolean {
-    const c = loadCredentials();
+    const c = providerCredentials('patreon');
     // WEBUI_BASE_URL is required because we hand it to Patreon as the OAuth
     // redirect_uri; without it we'd fall back to a placeholder URL Patreon
     // never accepts and the link flow would silently fail at the consent
@@ -115,7 +115,7 @@ export class PatreonProvider implements PaymentProvider {
   }
 
   async initiatePurchase(opts: InitiateOpts): Promise<InitiateResult> {
-    const c = loadCredentials();
+    const c = providerCredentials('patreon');
     if (!this.isConfigured()) throw new Error('Patreon not configured');
     const redirectUri = `${c.WEBUI_BASE_URL}/guild/api/subscriptions/patreon/callback`;
     const state = this.signState({
@@ -144,7 +144,7 @@ export class PatreonProvider implements PaymentProvider {
    * covers the JSON bytes so altering any field invalidates it.
    */
   private signState(payload: Record<string, any>): string {
-    const c = loadCredentials();
+    const c = providerCredentials('patreon');
     const secret = c.PATREON_CLIENT_SECRET || '';
     const json = Buffer.from(JSON.stringify(payload), 'utf-8');
     const sig = crypto.createHmac('sha256', secret).update(json).digest();
@@ -154,7 +154,7 @@ export class PatreonProvider implements PaymentProvider {
   private verifyState(state: string): Record<string, any> {
     const dot = state.indexOf('.');
     if (dot < 0) throw new Error('State is unsigned');
-    const c = loadCredentials();
+    const c = providerCredentials('patreon');
     const secret = c.PATREON_CLIENT_SECRET || '';
     const jsonB64 = state.slice(0, dot);
     const sigB64 = state.slice(dot + 1);
@@ -171,7 +171,7 @@ export class PatreonProvider implements PaymentProvider {
   async fetchVariant(variantId: string): Promise<OfferingVariant | null> {
     if (!variantId.startsWith(VARIANT_PREFIX)) return null;
     const tierId = variantId.slice(VARIANT_PREFIX.length);
-    const c = loadCredentials();
+    const c = providerCredentials('patreon');
     if (!c.PATREON_CAMPAIGN_ID) return null;
     // Patreon tiers under a campaign:
     const campaign = await this.api<any>('GET',
@@ -218,7 +218,7 @@ export class PatreonProvider implements PaymentProvider {
     variantId: string;
     state: ProviderSubscriptionState;
   }> {
-    const c = loadCredentials();
+    const c = providerCredentials('patreon');
     if (!query.code || !query.state) throw new Error('Missing code or state in Patreon callback');
     let parsedState: any;
     try {
@@ -317,7 +317,7 @@ export class PatreonProvider implements PaymentProvider {
     // identity scope. For now this method exists for completeness; the
     // fetchVariant path falls back to returning the wired data alone if
     // the API is unavailable.
-    const c = loadCredentials();
+    const c = providerCredentials('patreon');
     if (!c.PATREON_CREATOR_ACCESS_TOKEN) return null;
     const res = await fetch(`${PATREON_API}${path}`, {
       signal: AbortSignal.timeout(PROVIDER_FETCH_MS),

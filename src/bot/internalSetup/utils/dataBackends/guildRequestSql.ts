@@ -36,10 +36,14 @@ SELECT s.n, s.shard, c.holder_process, c.holder_node, c.holder_name, c.claim::te
   LEFT JOIN smdb_data.claim_clock k ON k.id = 1
   LEFT JOIN smdb_data.shard_nodes d ON d.node_id = c.holder_node`;
 
+/** The insert, which notifies the holder's listener with its for_process at COMMIT (NB6 decision 17). */
 export const REQUEST_INSERT_SQL = `
+WITH r AS (
 INSERT INTO smdb_data.guild_requests
   (id, guild_id, shard_count, shard_id, for_process, op, body, requested_by, claim_by, answer_by)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now() + make_interval(secs => $9), now() + make_interval(secs => $10))`;
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now() + make_interval(secs => $9), now() + make_interval(secs => $10))
+RETURNING for_process)
+SELECT pg_notify('smdb_guild_requests', r.for_process) FROM r`;
 
 export const REQUEST_POLL_SQL = `
 SELECT state, reply, now() >= claim_by AS pickup_over, now() >= answer_by + interval '5 seconds' AS answer_over

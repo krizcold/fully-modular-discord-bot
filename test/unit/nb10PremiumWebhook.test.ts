@@ -224,14 +224,18 @@ describe('test 37: an op waits only for the installs started under its own ledge
     await tick(20);
     expect(await applySharedOp({ op: 'premium.setMessages', args: { args: [{ moduleBlocked: 'no' }] } })).toMatchObject({ ok: true });
     expect(pauseCalls).toEqual(['ent1']);
-    expect(installLines()).toEqual([]);
+    // NB6 decision 63 (sheet 2606-2608): an install's line goes out with its save, before the provider's pause (NB10
+    // wrote it after the pause).
+    await settleQueue();
+    expect(installLines()).toHaveLength(1);
     let done = false;
     const hook = deliver(created('ps2', 'g1')).then(r => { done = true; return r; });
     await tick(30);
     expect(done).toBe(false);
     expect(pauseCalls).toEqual(['ent1', 'ps2']);
+    await settleQueue();
+    expect(installLines()).toHaveLength(2);
     entPause.open();
-    await vi.waitFor(() => expect(installLines()).toHaveLength(1), { timeout: 5000, interval: 20 });
     await tick(30);
     expect(done).toBe(false);
     hookPause.open();

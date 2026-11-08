@@ -179,7 +179,7 @@ export async function applyOperatorDataWrite(req: GuildDataWriteRequest): Promis
   const receivedAt = monoNow();
   const own: { ticket?: WriteTicket; threw?: boolean } = {};
   const reply = await operatorDataWrite(req, own, receivedAt);
-  return own.threw ? reply : carryWrites(reply, { ...NO_WRITES, tickets: own.ticket ? [own.ticket] : [] });
+  return own.threw ? reply : carryWrites(reply, { ...NO_WRITES, tickets: own.ticket && own.ticket.kind !== 'row' ? [own.ticket] : [] });
 }
 
 /** restore-graveyard's retiredAt (undefined for the newest entry) and replace from its body, or the reply that refuses them. */

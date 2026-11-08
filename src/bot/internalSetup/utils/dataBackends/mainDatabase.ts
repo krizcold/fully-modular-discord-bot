@@ -406,8 +406,13 @@ export const NOTICE_FAIL_BOOT_MS = 10_000;
 export const NOTICE_FAIL_WATCH_MS = 5_000;
 export const RECONNECT_READ_AFTER_MS = 60_000;
 
-/** What `data:store` carries to the web UI process (decisions 13 and 17). */
-export type StoreReport = { url: string | null; choosing?: true; held?: true; reason?: string };
+/** What `data:store` carries to the web UI process (decisions 13 and 17); `tag` is the main tag of the url's database. */
+export type StoreReport = { url: string | null; choosing?: true; held?: true; reason?: string; tag?: string };
+
+/** NB6 decision 21's main tag: `"<generation>:<machine>"`, or `"0"` at generation 0. */
+export function mainTagOf(generation: number, machine: string | null): string {
+  return generation === 0 ? '0' : `${generation}:${machine ?? ''}`;
+}
 
 export interface ChooserDeps {
   /** The list in use (DATA_BACKEND_URL, or the one decision 22 gave), parsed at each pass. */
@@ -428,6 +433,8 @@ export interface StepHooks {
   report(report: StoreReport): void;
   markForResave(): void;
   startLeave(reason: string): void;
+  /** The chosen database's generation or machine changed while it stays chosen. */
+  mainChanged?(): void;
 }
 
 const ofStore = (p: ProbeAnswer, marker: string | null): p is AnsweredProbe & ProbeAnswer =>
@@ -490,6 +497,8 @@ export class MainChooser implements DatabaseChooser {
   private waitLoggedAt = 0;
   /** The main generation of the move under way, for the re-take's generation rule (decision 12 (d)). */
   moveGeneration = 0;
+  /** The machine of that move's main, beside `moveGeneration`. */
+  moveMachine: string | null = null;
   private lastPass: { answers: ProbeAnswer[]; at: number } | null = null;
   private lastWait: { outcome: WaitOutcome; reason: string } | null = null;
 
@@ -676,13 +685,19 @@ export class MainChooser implements DatabaseChooser {
 
   private choose(decision: Extract<Decision, { outcome: 'chosen' }>): void {
     this.choice = decision.chosen.entry;
-    this.generation = decision.generation;
-    this.machine = decision.machine;
+    this.setMain(decision.generation, decision.machine);
     this.chosenAnswered = true;
     this.deps.onWait(null);
     console.log(usingLine(decision.chosen.address, decision.generation, decision.machine));
     for (const resolve of this.choiceWaiters.splice(0)) resolve(this.choice);
     if (this.backend) this.schedule(WATCH_PASS_MS);
+  }
+
+  private setMain(generation: number, machine: string | null): void {
+    if (generation === this.generation && machine === this.machine) return;
+    this.generation = generation;
+    this.machine = machine;
+    try { this.hooks?.mainChanged?.(); } catch (error) { console.error('[Database]', error); }
   }
 
   // THE NOTICE READ RULE (decision 9): 60 s after a read that succeeded, 10 s (boot wait) or 5 s (watch) after a failed
@@ -815,10 +830,7 @@ export class MainChooser implements DatabaseChooser {
       this.logOnce([markerTexts.watchAll(read.why)]);
     }
     const mineOwn = ofStore(mine, marker);
-    if (mineOwn) {
-      this.generation = mine.generation;
-      this.machine = mine.machine;
-    }
+    if (mineOwn) this.setMain(mine.generation, mine.machine);
     if (this.generation >= 1 && this.noticeDue()) await this.readNotice('watch');
     if (!current()) return;
     const others = answers.filter((a): a is AnsweredProbe & ProbeAnswer => ofStore(a, marker) && a.entry !== chosenEntry);
@@ -832,8 +844,7 @@ export class MainChooser implements DatabaseChooser {
       const [again] = await this.deps.probe(parseAddressList(chosenEntry));
       if (!current() || backend.latchReason() !== null) return;
       if (again.kind === 'answered' && ofStore(again, marker) && again.generation >= target) {
-        this.generation = again.generation;
-        this.machine = again.machine;
+        this.setMain(again.generation, again.machine);
       } else if (higher && unknownWhy !== null) {
         const standing = standingOf(higher);
         this.step({ kind: 'unknown-store', other: higher.address, generation: higher.generation, standing },
@@ -963,10 +974,10 @@ export class MainChooser implements DatabaseChooser {
     this.logOnce(decision.logs);
     if (decision.outcome !== 'chosen') return;
     this.moveGeneration = decision.generation;
+    this.moveMachine = decision.machine;
     if (await backend.useDatabase(decision.chosen.entry)) {
       this.choice = decision.chosen.entry;
-      this.generation = decision.generation;
-      this.machine = decision.machine;
+      this.setMain(decision.generation, decision.machine);
       this.chosenAnswered = true;
       this.tiedPasses = 0;
     }

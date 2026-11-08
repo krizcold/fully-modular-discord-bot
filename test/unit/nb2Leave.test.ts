@@ -3,7 +3,8 @@ import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { readSourceText } from '../helpers/sourceText';
 
-import { saveData } from '../../src/bot/internalSetup/utils/dataManager';
+import { saveData, setGuildDataBackend } from '../../src/bot/internalSetup/utils/dataManager';
+import { _resetRowQueue } from '../../src/bot/internalSetup/utils/sharedStore';
 import { dropPendingForGuild } from '../../src/bot/internalSetup/utils/dataBackends/fileBackend';
 import { getWorkingSet, initWorkingSet, DataBackendUnavailableError } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
 import {
@@ -28,6 +29,8 @@ import { maintenanceFilePath, writeMaintenanceFile } from '../../src/utils/maint
 import { dataPath } from '../../src/utils/dataRoot';
 import { setBackendKind } from '../helpers/backendKind';
 import { FakeStore, tokenFor } from '../helpers/fakeStore';
+import { scriptedBackend } from '../helpers/scriptedPg';
+import { sharedRows } from '../helpers/sharedRows';
 import { freshGuild, storeGuild, tick } from '../helpers/gateRig';
 
 // NB2 round 1 rulings A, B, C, G and I and the rulings L and M of rounds 2 to 4, in the bot process: the answer bound,
@@ -315,23 +318,35 @@ describe('ruling L: a change the database refuses for its content', () => {
     expect(restarts()).toHaveLength(0);
   }, 20_000);
 
-  it('R6-2: a guild refused for its content together with a file that cannot be written asks no restart', async () => {
+  it('R6-2: on a Postgres bot a global file whose mirror path is a folder is saved in the database, so a guild refused for its content alone leads to the restart', async () => {
     const { store, options, guildId } = await storeGuild();
     vi.spyOn(store, 'flushGuild').mockResolvedValue(contentRefusal);
+    // NB6: the global save is a row op. The flush stores it in the shared tables; its mirror step moves the folder made
+    // in the file's place after the accept aside and writes the stored body (A1). A folder there before the save would
+    // make its base unreadable, and the flush would refuse it.
+    const rows = sharedRows();
+    const rowRig = scriptedBackend(rows.answer);
+    setGuildDataBackend(rowRig.backend);
     saveData('refused.json', options, { v: 1 });
     const file = dataPath('global', 'm', 'r6stuck.json');
-    fs.mkdirSync(file, { recursive: true });
     try {
-      saveData('r6stuck.json', { scope: 'global', category: 'm' }, { v: 1 });
+      expect(saveData('r6stuck.json', { scope: 'global', category: 'm' }, { v: 1 })).toBe(true);
+      fs.mkdirSync(file, { recursive: true });
       const { at } = watchedDatabase('answers');
       await at(0);
       closeMaintenanceGate('hook', 'm');
       await handleMaintenanceIpc({ type: 'maintenance:leave', requestId: 'g3', data: {} });
-      await vi.waitFor(() => expect(retryWarnings()).toBeGreaterThanOrEqual(6), { timeout: 10_000 });
-      expect(restarts()).toHaveLength(0);
-      expect(sent).toContainEqual({ type: 'maintenance:mode', data: { mode: 'held', held: { unsavedGuilds: 1, unsavedFiles: 1, unansweredGuilds: 0 } } });
+      await vi.waitFor(() => expect(restarts()).toHaveLength(1), { timeout: 10_000 });
+      expect(rows.docs.get('global/m/r6stuck.json')?.body.toString('utf8')).toBe(JSON.stringify({ v: 1 }, null, 2));
+      await vi.waitFor(() => expect(fs.statSync(file).isFile() && fs.readFileSync(file, 'utf8')).toBe(JSON.stringify({ v: 1 }, null, 2)), { timeout: 5_000 });
+      expect((console.warn as any).mock.calls.filter((c: unknown[]) => String(c[0]).startsWith(`[Shared] Moved ${file} to `))).toHaveLength(1);
+      expect(errorsWith('could not write')).toHaveLength(0);
+      expect(sent).toContainEqual({ type: 'maintenance:mode', data: { mode: 'held', held: { unsavedGuilds: 1, unsavedFiles: 0, unansweredGuilds: 0 } } });
       expect(getWorkingSet()!.dirtyGuildIds()).toContain(guildId);
     } finally {
+      setGuildDataBackend(null);
+      _resetRowQueue();
+      await rowRig.backend.stop();
       dropPendingForGuild('global');
       fs.rmSync(file, { recursive: true, force: true });
     }

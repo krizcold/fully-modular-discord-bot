@@ -119,8 +119,10 @@ describe('a refused save in the bot is held and retried', () => {
   });
 
   it('the folder refusing both files: each op answers held, and the retry writes each change and its lines once, in order', async () => {
-    writePremium({ g2: { active: paidSub('s2', 'ps2', 'low', 'dummy'), paused: [] } });
-    getPaymentRegistry().register(new DummyProvider());
+    const dummy = new DummyProvider();
+    getPaymentRegistry().register(dummy);
+    const bought = await dummy.initiatePurchase({ guildId: 'g2', tierId: 'low', offeringId: 'o1', variantId: 'dummy_monthly_999' } as any);
+    writePremium({ g2: { active: paidSub('s2', bought.providerSubId!, 'low', 'dummy'), paused: [] } });
     refuse('premium-tiers.json', 'premium-tiers.audit.jsonl');
     expect(await grant('g1')).toMatchObject({ answer: 'held' });
     expect(await applySharedOp({ op: 'premium.cancelPaidSubscriptionImmediately', args: { args: ['g2'] } })).toMatchObject({ answer: 'held' });
@@ -148,6 +150,7 @@ describe('a refused save in the bot is held and retried', () => {
     expect(linesOf(AUDIT)).toEqual([]);
     recover();
     await vi.waitFor(() => expect(linesOf(AUDIT).map(l => l.action)).toEqual(['tier.update']), { timeout: 5000, interval: 50 });
+    await vi.waitFor(() => expect(jsonOf(PREMIUM).tiers.high.overrides).toEqual({}), { timeout: 5000, interval: 50 });
     expect(jsonOf(PREMIUM).tiers.high.overrides).toEqual({});
     expect(notices.sent).toEqual(['tier.config-change-affecting-subscriber:g1']);
   });

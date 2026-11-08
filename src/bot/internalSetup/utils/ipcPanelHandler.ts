@@ -181,7 +181,7 @@ export async function runPanelAction(type: string, data: any, panelManager: any)
     const verdict = await verdictOf([ledger]);
     if (!verdict.ok) {
       if (answer.success === false) console.warn(`[IPCPanelHandler] ${type} failed with its writes not confirmed: ${answer.error}`);
-      return { success: false, error: verdict.answer === 'unstorable' ? operatorRefusalText(verdict) : truthText(verdict.answer, verdict.partial) };
+      return { success: false, error: verdict.answer === 'unstorable' ? operatorRefusalText(verdict) : truthText(verdict.answer, verdict.partial, verdict.changed) };
     }
     if (liveUpdate) broadcastWebUIPanelUpdate(liveUpdate.panelId, liveUpdate.response, liveUpdate.guildId);
     return answer;

@@ -40,6 +40,7 @@ import {
   appendDataTracked,
   DataBackendUnavailableError,
   deleteDataTracked,
+  onSharedApplied,
   onWriterTake,
   readRawStrict,
   saveDataTracked,
@@ -68,9 +69,36 @@ import {
   type GlobalModuleConfig,
 } from './settings/settingsStorage';
 import { getPaymentRegistry } from './payment/paymentRegistry';
+import { resolveDataBackend } from '../../../utils/envLoader';
+import { rowBackend, rowCommitOwed, rowOutcome, rowTicketState, shaOf, type RowTicket } from './sharedStore';
+import { appendLine, carryLines, deleteLines, JOURNAL_KEY, readJournal, readLines } from './sharedLines';
+import { refreshShared, setSharedLinesPassStep } from './sharedMirror';
+import { processId } from '../fleet/processId';
+import { getNodeId } from '../fleet/nodeIdentity';
+import { getNodeName } from '../fleet/nodeName';
+import {
+  dropItems,
+  failItems,
+  forgetItems,
+  itemsSettled,
+  landItems,
+  makeItem,
+  newCarry,
+  openItemsOf,
+  runItems,
+  type Carry,
+  type Item,
+  type ItemSink,
+  type Link,
+  type SaveOp,
+  type SaveOutcome,
+} from './premiumItems';
 import { dispatchPremiumNotification } from './premiumNotifications';
 import { isMaintenanceBoot, isMaintenanceGateClosed } from './maintenanceGate';
 import type {
+  ProviderSubscriptionState,
+  SubscriptionView,
+  WalkBatch,
   ProviderEvent,
   InitiateResult,
   ProviderSubscriptionRef,
@@ -81,10 +109,16 @@ import type {
 
 /**
  * How the exit names a line's fate (NB13 C7, D3): 'unconfirmed' only when its bytes are whole in the file and the
- * disk did not confirm their sync; a range a cut try left reads as 'written', which says the line was being written.
+ * disk did not confirm their sync; a range a cut try left reads as 'written', which says the line was being written,
+ * as does a row op whose COMMIT may have landed.
  */
-function exitFate(ticket: FileTicket | undefined): 'landed' | 'unconfirmed' | 'written' | 'open' {
+function exitFate(ticket: FileTicket | RowTicket | undefined): 'landed' | 'unconfirmed' | 'written' | 'open' {
   if (!ticket) return 'open';
+  if (ticket.kind === 'row') {
+    const row = rowTicketState(ticket);
+    if (row === 'landed' || row === 'unconfirmed') return row;
+    return rowCommitOwed(ticket) ? 'written' : 'open';
+  }
   const state = fileTicketState(ticket);
   return state === 'unconfirmed' && fileTicketFailure(ticket)?.cut ? 'written' : state;
 }
@@ -574,6 +608,17 @@ const RETRY_FIRST_MS = 1_000;
 const RETRY_MAX_MS = 60_000;
 const WATCH_IDLE_MS = 1_000;
 const CONFIRM_MS = 8_000;
+/** The shared keys of a Postgres bot (NB6 decisions 8 and 40). */
+const PREMIUM_KEY = 'global/premium-tiers.json';
+const AUDIT_KEY = 'global/premium-tiers.audit.jsonl';
+const READ_BOUND_MS = 10_000;
+/** NB4's liveness test of a journal line's writer (sheets/NB4.md:823). */
+const LIVE_SQL = 'SELECT process_id, takeover_seconds, seen_at > now() - make_interval(secs => takeover_seconds) AS live FROM smdb_data.shard_nodes WHERE process_id = ANY($1)';
+
+/** Decision 27's cause words for a refused premium save's items. */
+function causeWords(cause: string): string {
+  return cause === 'changed-elsewhere' ? 'another machine changed premium-tiers.json (or the Dummy state) at the same time' : cause;
+}
 /** This process's writer id in the event journal, and the count of the events it journaled. */
 let writerId = crypto.randomUUID();
 let journalSeq = 0;
@@ -693,7 +738,7 @@ export function unregisterCacheStop(target: StoppableCache): void {
 /** Where a subscription's subscription.install.paid line stands (decision 13 of NB10). */
 interface InstallLine {
   state: 'buffered' | 'held' | 'queued' | 'landed';
-  ticket?: FileTicket;
+  ticket?: FileTicket | RowTicket;
   /** Taken once, when the line was first built: a payment.webhook op's provider delivers it again after a 503. */
   webhook: boolean;
   line: string;
@@ -714,11 +759,22 @@ interface JournalEntry {
   event: ProviderEvent;
   /** The file that could not be read when the event arrived. */
   file: string;
-  ticket?: FileTicket;
+  ticket?: FileTicket | RowTicket;
+  /** Its shared_lines id on a Postgres bot. */
+  id?: string;
 }
 
-type JournalLine = { writer: string; n: number; event: ProviderEvent };
+type JournalLine = { writer: string; n: number; event: ProviderEvent; id?: string; node?: string; nodeName?: string };
+
+/** A journal line of the database (decision 40) and whether its writer is live by NB4's test. */
+interface SharedJournalLine extends JournalLine {
+  id: string;
+  live: boolean;
+  takeoverSeconds: number | null;
+}
 type CancelStep = 'done' | 'gone' | 'not saved';
+/** An install's outcome (decision 64's in-flight form): its save's op, its save's refusal, or why nothing was installed. */
+type InstallOutcome = { op: SaveOp } | { refused: string } | { skipped: string };
 
 /** A change to a migration refused while that migration is being applied. */
 export class MigrationBusy extends Error {
@@ -749,6 +805,13 @@ function parseJournal(raw: string): { lines: JournalLine[]; bad: string[] } {
   return { lines, bad };
 }
 
+/** The provider pause's warning: T23's form when the Dummy provider can't confirm it saved the pause (decision 88). */
+function pauseWarning(paused: Subscription, err: any): string {
+  return err?.code === 'unconfirmed'
+    ? `[PremiumManager] Can't confirm that the Dummy provider saved the pause of subscription ${paused.providerSubId} (${err.reason}); the bot's copy holds it paused in the queue. If the provider's record stays active, the Dummy provider pauses it within about 2 minutes.`
+    : `[PremiumManager] provider pauseSubscription failed for '${paused.providerId}': ${err?.message || err}`;
+}
+
 function eventWords(event: ProviderEvent): string {
   return `${event.type} event from ${event.providerId} (subscription ${event.providerSubId}, guild ${event.guildId})`;
 }
@@ -771,6 +834,11 @@ export class PremiumManager {
   /** The cache holds a loaded config; lastRaw is the text it was loaded from or last saved as (undefined: not known). */
   private configLoaded = false;
   private lastRaw: string | null | undefined = undefined;
+  /**
+   * The sha of the text the cache was built from (decision 13's lastSha). invalidate() keeps it, so a save made from a
+   * dropped cache before the next load is built on that version and is refused when the row moved on.
+   */
+  private cacheSha: string | undefined = undefined;
   private unreadable: { file: string; cause: string } | null = null;
   private loggedUnreadable: string | null = null;
   private loggedRecheck: string | null = null;
@@ -781,6 +849,8 @@ export class PremiumManager {
   /** Set by the final stop step or a deposition: from then on nothing is written. */
   private stopped: StopKind | null = null;
   private saveHeld = false;
+  /** invalidate() came while a save was held: the cache is dropped if that save ends without an op. */
+  private dropOwed = false;
   private unstorableSave = false;
   /** The ticket of the last premium-tiers.json save this cache handed to the disk. */
   private lastSaveTicket: FileTicket | null = null;
@@ -804,11 +874,29 @@ export class PremiumManager {
   private replayHanded = 0;
   private raisedMarks: Record<string, number> | null = null;
   /** The first premium-tiers.json ticket issued at or after the replay raised its marks. */
-  private marksTicket: FileTicket | null = null;
+  private marksTicket: FileTicket | RowTicket | null = null;
   private afterDrainLines: PendingLine[] = [];
   private installLines = new Map<string, InstallLine>();
   private installLinesFilled = false;
-  private inFlight = new Map<string, { promise: Promise<void>; ledger: WriteLedger | undefined }>();
+  private inFlight = new Map<string, { promise: Promise<unknown>; ledger: WriteLedger | undefined }>();
+  /** Decision 64: the items of held saves, which the next accepted save of the file takes first (a Postgres bot). */
+  private heldCarry: Item[] = [];
+  private heldWaits: Array<(outcome: Promise<SaveOutcome>) => void> = [];
+  /** Decision 75: the replay's items, which its final save of the marks takes. */
+  private replayCarry: Item[] = [];
+  private replayWaits: Array<(outcome: Promise<SaveOutcome>) => void> = [];
+  private installOfItem = new WeakMap<Item, InstallLine>();
+  /** The row op that took each item, for the exit (decision 47). */
+  private itemTickets = new WeakMap<Item, RowTicket>();
+  /** Decision 40: the journal's lines as the last read of the database gave them. */
+  private sharedJournal: SharedJournalLine[] = [];
+  /** The ids of the journal lines the last replay handed or found covered, deleted once its marks landed. */
+  private replayLineIds: string[] = [];
+  private offApplied: (() => void) | null = null;
+  /** The cause of the last save refused before an op took it. */
+  private lastRefusal: LedgerCause | null = null;
+  /** Ops of premium-tiers.json from this process accepted and not settled (decision 96's gate). */
+  private openSaves = 0;
 
   /** Listener: mirror provider events into the cache. */
   private paidEventHandler = (event: ProviderEvent): void => {
@@ -822,34 +910,76 @@ export class PremiumManager {
       this.journalEvent(event);
       return;
     }
+    if (!inReplay && !currentLedger() && isBotProcess() && this.sharedBackend()) {
+      this.handOutside(event, 1);
+      return;
+    }
     this.handleEvent(event);
   };
 
-  private handleEvent(event: ProviderEvent): void {
+  /**
+   * Decision 27's third bullet: an event handed outside every op (a gateway entitlement) whose save is refused
+   * 'changed-elsewhere' is handed again in its own console ledger after the stored version is read, at most three hands.
+   */
+  private handOutside(event: ProviderEvent, hand: number): void {
+    this.handOutsideNext(event, hand, this.handleEvent(event));
+  }
+
+  private handOutsideNext(event: ProviderEvent, hand: number, made: SaveOp | null | Promise<InstallOutcome>): void {
+    void (async () => {
+      const outcome = made instanceof Promise ? await this.installOutcome(made) : made?.outcome ? await made.outcome : null;
+      if (!outcome || typeof outcome !== 'object' || outcome.refused !== 'changed-elsewhere') return;
+      if (hand >= 3) {
+        console.error(`[PremiumManager] A ${event.type} event from ${event.providerId} (subscription ${event.providerSubId}, guild ${event.guildId}) could not be applied: premium-tiers.json kept changing on other machines (3 tries); it is lost: ${JSON.stringify(event)}`);
+        return;
+      }
+      await refreshShared([PREMIUM_KEY]);
+      await outsideLedgers(() => runSealed('console', null, 'premium', async () => {
+        if (this.stopped) {
+          this.refuseEvent(event, this.stopped);
+          return;
+        }
+        this.ensureLoaded();
+        this.handOutsideNext(event, hand + 1, this.handleEvent(event));
+      }));
+    })().catch(error => console.error('[PremiumManager] A provider event could not be handed again:', error));
+  }
+
+  /** An install's save outcome (64's in-flight form), for the re-hand. */
+  private async installOutcome(made: Promise<InstallOutcome>): Promise<SaveOutcome | null> {
+    const result = await made;
+    if ('refused' in result) return { refused: result.refused };
+    if ('op' in result && result.op.outcome) return result.op.outcome;
+    return null;
+  }
+
+  /** One event: the save it made (null when it saved nothing or was refused), or a created event's install. */
+  private handleEvent(event: ProviderEvent): SaveOp | null | Promise<InstallOutcome> {
     if (event.type === 'subscription.created') {
       const providerSubId = event.providerSubId;
       const before = this.inFlight.get(providerSubId);
-      const promise = (async () => {
+      const promise: Promise<InstallOutcome> = (async () => {
         if (before) await before.promise;
-        await this.installAsyncSubscription(event);
+        return this.installAsyncSubscription(event);
       })().catch(err => {
         console.error('[PremiumManager] installAsyncSubscription failed:', err);
+        return { skipped: err instanceof Error ? err.message : String(err) };
       });
       const tracked = { promise, ledger: currentLedger() };
       this.inFlight.set(providerSubId, tracked);
       void promise.finally(() => {
         if (this.inFlight.get(providerSubId) === tracked) this.inFlight.delete(providerSubId);
       });
-      return;
+      return promise;
     }
 
     // For lifecycle events on existing subs, find the record (active or paused)
     // by providerSubId and update in place.
     const subs = this.config.subscriptions[event.guildId];
-    if (!subs) return;
+    if (!subs) return null;
 
     const matching = this.findSubscriptionByProviderSubId(subs, event.providerSubId);
-    if (!matching) return;
+    if (!matching) return null;
     const { sub } = matching;
 
     // Renewal failure is a notification-only event - no cache state change.
@@ -860,8 +990,8 @@ export class PremiumManager {
         tierName: this.config.tiers[sub.tierId]?.displayName || sub.tierId,
         providerName: this.providerDisplayName(event.providerId),
         details: event.reason,
-      });
-      return;
+      }, { standalone: 'the event changes nothing stored' });
+      return null;
     }
 
     // subscription.paused is informational from the provider side: the cache
@@ -870,25 +1000,29 @@ export class PremiumManager {
     if (event.type === 'subscription.paused') {
       if (event.resumesAt) sub.resumesAtHint = event.resumesAt;
       sub.updatedAt = new Date().toISOString();
-      this.save();
-      return;
+      return this.save();
     }
 
-    // Remaining events all carry `state`.
-    const s = event.state;
-    sub.startDate = s.startDate;
-    sub.endDate = s.endDate;
-    sub.autoRenew = s.autoRenew;
-    sub.providerMeta = s.meta;
-    sub.updatedAt = new Date().toISOString();
+    const carry = newCarry();
+    this.applyStateEvent(event, matching, carry);
+    return this.save({ carry });
+  }
 
-    // Map provider status back to our three-value enum.
-    if (s.status === 'expired') sub.status = 'expired';
-    else if (s.status === 'paused') sub.status = 'paused';
-    else sub.status = 'active';
+  /**
+   * An event that carries the provider's state (decision 110): the state copied, the status mapped, and an expired
+   * active sub dropped from the slot with the queue resumed; its items join the carry. No save.
+   */
+  private applyStateEvent(
+    event: Extract<ProviderEvent, { state: ProviderSubscriptionState }>,
+    matching: { sub: Subscription; location: 'active' | 'paused' },
+    carry: Carry,
+  ): void {
+    const subs = this.config.subscriptions[event.guildId];
+    const { sub } = matching;
+    this.copyProviderState(sub, event.state);
 
     // If the active sub just expired, drop it from the slot and resume queue.
-    if (matching.location === 'active' && sub.status === 'expired') {
+    if (matching.location === 'active' && sub.status === 'expired' && subs) {
       this.writeAudit({
         timestamp: new Date().toISOString(),
         actor: 'admin',
@@ -896,24 +1030,133 @@ export class PremiumManager {
         guildId: event.guildId,
         subscriptionId: sub.id,
         providerId: event.providerId,
-      });
+      }, { carry });
       void this.notify(event.guildId, 'paid.sub.expired', {
         tierName: this.config.tiers[sub.tierId]?.displayName || sub.tierId,
         providerName: this.providerDisplayName(event.providerId),
-      });
+      }, { carry });
       delete subs.active;
-      this.resumeNext(event.guildId);
+      this.resumeNext(event.guildId, carry);
     }
-
-    this.save();
   }
 
-  /** Resolves once no install started under this ledger is in flight (decision 13 of NB10). */
+  /** Decision 72: a provider's state copied into premium's sub, with the status mapped to premium's three values. */
+  private copyProviderState(sub: Subscription, s: ProviderSubscriptionState): void {
+    sub.startDate = s.startDate;
+    sub.endDate = s.endDate;
+    sub.autoRenew = s.autoRenew;
+    sub.providerMeta = s.meta;
+    sub.updatedAt = new Date().toISOString();
+    if (s.status === 'expired') sub.status = 'expired';
+    else if (s.status === 'paused') sub.status = 'paused';
+    else sub.status = 'active';
+  }
+
+  /**
+   * Decisions 110 and 113: the Dummy tick's walk events, applied together on the premium sha the tick read, in one
+   * save that passes that sha as its base and is never held.
+   */
+  private walkBatchHandler = (batch: WalkBatch): void => {
+    const events = batch.events;
+    if (this.stopped) {
+      for (const event of events) this.refuseEvent(event, this.stopped);
+      return;
+    }
+    const dropped = (): boolean => {
+      if (!this.unreadable && !this.replay) return false;
+      for (const event of events) {
+        console.warn(this.unreadable
+          ? `[PremiumManager] The ${event.type} event for subscription ${event.providerSubId} was not applied: ${this.unreadable.file} cannot be read; the Dummy provider compares the subscription with the bot's copy again at its next checks after it can be read`
+          : `[PremiumManager] The ${event.type} event for subscription ${event.providerSubId} was not applied: the bot is still applying the provider events kept in premium-tiers.events.jsonl; the Dummy provider compares the subscription with the bot's copy again at its next checks after that`);
+      }
+      return true;
+    };
+    if (dropped()) return;
+    this.ensureLoaded();
+    if (dropped()) return;
+    const found = events.filter(event => {
+      const subs = this.config.subscriptions[event.guildId];
+      return !!subs && !!this.findSubscriptionByProviderSubId(subs, event.providerSubId);
+    });
+    if (found.length === 0) return;
+    const shared = this.sharedBackend();
+    if (shared && (this.lastShaOrNull() !== batch.premiumSha || this.saveHeld)) {
+      const shaDiffers = this.lastShaOrNull() !== batch.premiumSha;
+      for (const event of found) {
+        console.warn(shaDiffers
+          ? `[PremiumManager] The ${event.type} event for subscription ${event.providerSubId} was not applied: premium-tiers.json changed after the Dummy provider read it; the Dummy provider compares the subscription with the bot's copy again at its next checks`
+          : `[PremiumManager] The ${event.type} event for subscription ${event.providerSubId} was not applied: premium-tiers.json holds a change that is not saved yet; the Dummy provider compares the subscription with the bot's copy again at its next checks after that change is saved`);
+      }
+      return;
+    }
+    const carry = newCarry();
+    let applied = false;
+    for (const event of events) {
+      const subs = this.config.subscriptions[event.guildId];
+      const matching = subs ? this.findSubscriptionByProviderSubId(subs, event.providerSubId) : null;
+      if (!matching) continue;
+      this.applyStateEvent(event, matching, carry);
+      applied = true;
+    }
+    if (!applied) return;
+    if (shared) this.save({ carry, eventBase: batch.premiumSha });
+    else this.save({ carry });
+  };
+
+  /** The reader's sha (decision 102): premium-tiers.json's sha as the cache holds it; null when it had no row. */
+  private lastShaOrNull(): string | null {
+    const sha = this.lastSha();
+    return sha === undefined || sha === 'absent' ? null : sha;
+  }
+
+  /** Premium's answers to the Dummy provider through the registry (decisions 84, 94, 96 and 102). */
+  private readonly subscriptionReader = {
+    ready: (): boolean => {
+      this.ensureLoaded();
+      if (this.stopped || this.unreadable || this.replay || !this.configLoaded) return false;
+      if (this.saveHeld) return false;
+      return !this.premiumOpOpen();
+    },
+    read: (providerId: string, guildId: string, providerSubId: string): SubscriptionView | null => {
+      this.ensureLoaded();
+      const subs = this.config.subscriptions[guildId];
+      if (!subs) return null;
+      const active = subs.active;
+      if (active && active.providerId === providerId && active.providerSubId === providerSubId) {
+        return { status: 'active', endDate: active.endDate, autoRenew: active.autoRenew, variantId: active.variantId, resumesAt: null };
+      }
+      const paused = subs.paused.find(p => p.providerId === providerId && p.providerSubId === providerSubId);
+      if (!paused) return null;
+      return { status: 'paused', endDate: paused.endDate, autoRenew: paused.autoRenew, variantId: paused.variantId, resumesAt: paused.resumesAtHint ?? null };
+    },
+    sha: (): string | null => {
+      this.ensureLoaded();
+      return this.lastShaOrNull();
+    },
+  };
+
+  /** An op of premium-tiers.json from this process accepted and not settled (decision 96). */
+  private premiumOpOpen(): boolean {
+    return this.openSaves > 0;
+  }
+
+  /**
+   * Resolves once no install started under this ledger is in flight (decision 13 of NB10) and no item made under it is
+   * open (NB6 decision 64): its op not settled or its effect still running. In the bot the items part waits at most
+   * 8 s from the first call; the web UI waits for them (decision 76).
+   */
   async settled(ledger: WriteLedger | undefined): Promise<void> {
+    const deadline = isBotProcess() ? Date.now() + CONFIRM_MS : null;
     for (;;) {
       const open = [...this.inFlight.values()].filter(entry => entry.ledger === ledger).map(entry => entry.promise);
-      if (open.length === 0) return;
-      await Promise.all(open);
+      if (open.length > 0) {
+        await Promise.all(open);
+        continue;
+      }
+      // Decision 75: the replay's carry is settled by its marks save, after the replay's last wait.
+      await itemsSettled(ledger, deadline === null ? null : Math.max(0, deadline - Date.now()), item => this.replayCarry.includes(item));
+      if ([...this.inFlight.values()].some(entry => entry.ledger === ledger)) continue;
+      return;
     }
   }
 
@@ -924,23 +1167,24 @@ export class PremiumManager {
    */
   private async installAsyncSubscription(
     event: Extract<ProviderEvent, { type: 'subscription.created' }>,
-  ): Promise<void> {
+    opts: { carry?: Carry } = {},
+  ): Promise<InstallOutcome> {
     // Idempotency: webhook deliveries are at-least-once.
     const existing = this.findGuildSubscriptionByProviderSubId(event.guildId, event.providerSubId);
     if (existing) {
-      if (isPaymentLedger(currentLedger())) this.confirmRedelivery(event.guildId, existing);
-      return;
+      if (isPaymentLedger(currentLedger())) await this.confirmRedelivery(event.guildId, existing);
+      return { skipped: 'already' };
     }
 
     const tier = this.config.tiers[event.tierId];
     if (!tier) {
       console.warn(`[PremiumManager] subscription.created for unknown tier '${event.tierId}' (provider=${event.providerId}, sub=${event.providerSubId})`);
-      return;
+      return { skipped: 'tier' };
     }
     const offering = tier.offerings.find(o => o.id === event.offeringId);
     if (!offering) {
       console.warn(`[PremiumManager] subscription.created for unknown offering '${event.offeringId}' on tier '${event.tierId}'`);
-      return;
+      return { skipped: 'offering' };
     }
 
     const variant = event.variantSnapshot
@@ -975,7 +1219,7 @@ export class PremiumManager {
       updatedAt: nowIso,
     };
 
-    await this.installSubscription(event.guildId, sub);
+    const carry = opts.carry ?? newCarry();
     this.writeAudit({
       timestamp: nowIso,
       actor: 'admin',
@@ -986,29 +1230,38 @@ export class PremiumManager {
       providerId: event.providerId,
       subscriptionId: sub.id,
       metadata: { variantId: event.variantId },
-    }, event.providerSubId);
+    }, { carry }, event.providerSubId);
     void this.notify(event.guildId, 'paid.sub.started', {
       tierName: tier.displayName,
       providerName: this.providerDisplayName(event.providerId),
       endDate: sub.endDate,
-    });
+    }, { carry });
+    let op: SaveOp | null;
+    try {
+      op = await this.installSubscription(event.guildId, sub, carry);
+    } catch (error) {
+      forgetItems(carry.items.splice(0));
+      throw error;
+    }
+    return op ? { op } : { refused: this.lastRefusal ?? 'io' };
   }
 
   /**
    * A delivery of a subscription already in the cache, in a payment op: its ledger judges a save of the file that holds
    * the subscription and the subscription's install line, which it writes when the audit file has none.
    */
-  private confirmRedelivery(guildId: string, sub: Subscription): void {
-    this.save();
+  private async confirmRedelivery(guildId: string, sub: Subscription): Promise<void> {
     let line = this.installLines.get(sub.id);
     if (!line && !this.installLinesFilled) {
-      if (!this.fillInstallLines()) {
+      if (!(await this.fillInstallLines())) {
+        this.save();
         recordRefusal('io', AUDIT_DOC);
         return;
       }
       line = this.installLines.get(sub.id);
     }
     if (!line) {
+      const carry = newCarry();
       this.writeAudit({
         timestamp: new Date().toISOString(),
         actor: 'admin',
@@ -1019,9 +1272,11 @@ export class PremiumManager {
         providerId: sub.providerId,
         subscriptionId: sub.id,
         metadata: { variantId: sub.variantId, redelivered: true },
-      }, sub.providerSubId);
+      }, { carry }, sub.providerSubId);
+      this.save({ carry });
       return;
     }
+    this.save();
     if (line.state === 'buffered' || line.state === 'held') {
       recordRefusal(line.state === 'held' ? this.heldCause : 'io', AUDIT_DOC);
       markRetried(AUDIT_DOC);
@@ -1030,14 +1285,26 @@ export class PremiumManager {
     if (line.state === 'queued' && line.ticket && !landed(line.ticket)) recordTicket(line.ticket);
   }
 
-  /** Fills installLines from the whole audit file, once per hold of the lock; false when the file cannot be read. */
-  private fillInstallLines(): boolean {
+  /**
+   * Fills installLines from the whole audit log, once per hold of the lock; false when it cannot be read. On a Postgres
+   * bot the log is the audit key's lines (NB6 decision 41); a line marked notSaved records a change that was not saved.
+   */
+  private async fillInstallLines(): Promise<boolean> {
     let raw: string | null;
-    try {
-      raw = readRawStrict(AUDIT_PATH);
-    } catch (error) {
-      console.error(`[PremiumManager] Cannot read premium-tiers.audit.jsonl (${errnoOf(error)}); the delivery is answered 503 and the next one reads it again`);
-      return false;
+    if (this.sharedBackend()) {
+      const read = await readLines(AUDIT_KEY);
+      if (!read.ok) {
+        console.error(`[PremiumManager] Cannot read premium-tiers.audit.jsonl (${read.cause}); the delivery is answered 503 and the next one reads it again`);
+        return false;
+      }
+      raw = read.lines.map(l => l.line).join('\n');
+    } else {
+      try {
+        raw = readRawStrict(AUDIT_PATH);
+      } catch (error) {
+        console.error(`[PremiumManager] Cannot read premium-tiers.audit.jsonl (${errnoOf(error)}); the delivery is answered 503 and the next one reads it again`);
+        return false;
+      }
     }
     for (const text of (raw ?? '').split('\n')) {
       const trimmed = text.trim();
@@ -1049,6 +1316,7 @@ export class PremiumManager {
         continue;
       }
       if (entry?.action !== 'subscription.install.paid' || typeof entry.subscriptionId !== 'string') continue;
+      if (entry.metadata && typeof entry.metadata === 'object' && 'notSaved' in entry.metadata) continue;
       if (!this.installLines.has(entry.subscriptionId)) {
         this.installLines.set(entry.subscriptionId, { state: 'landed', webhook: false, line: `${trimmed}\n`, entry });
       }
@@ -1059,10 +1327,16 @@ export class PremiumManager {
 
   constructor() {
     this.config = defaultConfig();
-    getPaymentRegistry().on('provider.event', this.paidEventHandler);
+    const registry = getPaymentRegistry();
+    registry.on('provider.event', this.paidEventHandler);
+    registry.on('provider.walk-batch', this.walkBatchHandler);
+    registry.setSubscriptionReader?.(this.subscriptionReader);
+    // Decision 13: another machine's change applied to the mirror drops the cache; the next use loads it.
+    this.offApplied = onSharedApplied(PREMIUM_KEY, () => this.invalidate());
     if (isBotProcess()) {
       registerCacheStop(this);
       addAfterDrainStep(() => this.afterDrain());
+      setSharedLinesPassStep(() => this.readSharedJournal(true));
     }
   }
 
@@ -1071,7 +1345,13 @@ export class PremiumManager {
     this.stopExpiryChecker();
     this.clearRetry();
     unregisterCacheStop(this);
-    getPaymentRegistry().off('provider.event', this.paidEventHandler);
+    const registry = getPaymentRegistry();
+    registry.off('provider.event', this.paidEventHandler);
+    registry.off('provider.walk-batch', this.walkBatchHandler);
+    registry.setSubscriptionReader?.(null);
+    this.offApplied?.();
+    this.offApplied = null;
+    if (isBotProcess()) setSharedLinesPassStep(null);
   }
 
   // ============================================================================
@@ -1102,7 +1382,7 @@ export class PremiumManager {
       }
     }
     let journalRaw: string | null = null;
-    if (isBotProcess()) {
+    if (isBotProcess() && !this.sharedBackend()) {
       try {
         journalRaw = readRawStrict(JOURNAL_PATH);
       } catch (error) {
@@ -1112,6 +1392,7 @@ export class PremiumManager {
     }
     this.config = loaded ? normalizeConfig(loaded) : defaultConfig();
     this.lastRaw = raw;
+    this.cacheSha = raw === null ? 'absent' : shaOf(Buffer.from(raw, 'utf8'));
     this.configLoaded = true;
     if (this.unreadable) console.log(`[PremiumManager] ${this.unreadable.file} can be read again`);
     this.unreadable = null;
@@ -1119,14 +1400,15 @@ export class PremiumManager {
     if (!isBotProcess()) return;
     const marks = this.config.eventsApplied ?? {};
     const above = (writer: string, n: number) => n > (marks[writer] ?? 0);
-    const pending = (journalRaw !== null && parseJournal(journalRaw).lines.some(l => above(l.writer, l.n)))
-      || this.journal.some(e => above(e.writer, e.n));
+    const stored = this.sharedBackend() ? this.replayableLines() : journalRaw !== null ? parseJournal(journalRaw).lines : [];
+    const pending = stored.some(l => above(l.writer, l.n)) || this.journal.some(e => above(e.writer, e.n));
     if (pending) {
       this.replay = 'waiting';
       this.startReplayIfReady();
       return;
     }
-    if (journalRaw !== null) this.queueJournalDelete();
+    if (this.sharedBackend()) this.deleteJournalLines(stored.map(l => l.id!).filter(Boolean));
+    else if (journalRaw !== null) this.queueJournalDelete();
   }
 
   private becomeUnreadable(file: string, cause: string): void {
@@ -1168,12 +1450,24 @@ export class PremiumManager {
     this.load();
   }
 
-  /** Drops the cache (the web UI, at each take of the writer lock and after a local op that was not ok). */
+  /**
+   * Drops the cache (the web UI, at each take of the writer lock and after a local op that was not ok). A held save
+   * keeps the cache it was made from until its retry is sent, so a change applied meanwhile refuses that retry.
+   */
   invalidate(): void {
+    if (this.saveHeld) {
+      this.dropOwed = true;
+      return;
+    }
+    this.dropOwed = false;
     this.configLoaded = false;
     this.lastRaw = undefined;
     this.lastLoadTry = -Infinity;
-    this.installLines.clear();
+    // In the bot a line it wrote that has not landed is still on its way: it stays, so the exit log can report it. The
+    // web UI's local chain has landed or cancelled each of its writes before the cache is dropped.
+    for (const [id, line] of this.installLines) {
+      if (!isBotProcess() || line.state === 'landed' || (line.ticket && landed(line.ticket))) this.installLines.delete(id);
+    }
     this.installLinesFilled = false;
   }
 
@@ -1195,6 +1489,7 @@ export class PremiumManager {
     if (this.replay === 'running') {
       return `Premium is applying provider events received while ${this.episodeFile} could not be read; nothing was saved. Try again in a moment.`;
     }
+    if (this.sharedBackend()) return this.foreignJournalText();
     if (isBotProcess()) return null;
     let raw: string | null;
     try {
@@ -1234,38 +1529,68 @@ export class PremiumManager {
   }
 
   /**
-   * Saves the whole cache. In the bot a save the disk refuses stays in the cache and is retried (it answers held); a
-   * refusal of the stop or a deposition, and every save while the cache is unreadable or replaying, is not.
+   * Saves the whole cache (NB6 decision 63): the save takes the carry's items into its op. In the bot a save the disk
+   * refuses stays in the cache and is retried (it answers held, and its items join the held carry); a refusal of the
+   * stop or a deposition, and every save while the cache is unreadable or replaying, is not. null: refused.
    */
-  private save(): boolean {
-    if (this.inReplay()) return true;
-    if (this.stopped) {
-      recordRefusal(stopCause(this.stopped), PREMIUM_DOC);
-      return false;
+  private save(opts: { carry?: Carry; eventBase?: string | null } = {}): SaveOp | null {
+    const items = opts.carry ? opts.carry.items.splice(0) : [];
+    if (this.inReplay()) {
+      if (!this.sharedBackend()) {
+        runItems(items);
+        return { key: PREMIUM_KEY, outcome: null };
+      }
+      // Decision 75: the replay's final save of the marks takes its carry.
+      this.replayCarry.push(...items);
+      return { key: PREMIUM_KEY, outcome: new Promise(resolve => this.replayWaits.push(resolve)) };
     }
-    if (this.unreadable) {
-      recordRefusal('io', PREMIUM_DOC);
-      return false;
+    const cause: LedgerCause | null = this.stopped ? stopCause(this.stopped) : this.unreadable ? 'io' : this.replay ? 'not-ready' : null;
+    if (cause) {
+      recordRefusal(cause, PREMIUM_DOC);
+      this.refuseItems(items, cause);
+      return null;
     }
-    if (this.replay) {
-      recordRefusal('not-ready', PREMIUM_DOC);
-      return false;
-    }
-    return this.writeCache();
+    return this.writeCache(items, opts.eventBase);
   }
 
-  private writeCache(): boolean {
+  /** On a Postgres bot premium's files are shared keys: rows of the main database, its items ride their ops. */
+  private sharedBackend(): boolean {
+    return resolveDataBackend() === 'postgres';
+  }
+
+  /** Decision 13: the sha of the bytes the cache was loaded from or last saved; 'absent' for defaults with no file. */
+  private lastSha(): string | undefined {
+    return this.cacheSha;
+  }
+
+  private writeCache(items: Item[] = [], eventBase?: string | null): SaveOp | null {
+    const shared = this.sharedBackend();
+    const taken = shared ? [...this.heldCarry.splice(0), ...items] : items;
     const content = JSON.stringify(this.config, null, 2);
+    const base = eventBase !== undefined ? eventBase ?? 'absent' : this.lastSha();
+    const lines = taken.filter(i => i.kind === 'audit').map(i => ({ id: i.id, line: Buffer.from(i.line!, 'utf8') }));
+    const options = shared
+      ? { scope: 'global' as const, ...(base !== undefined ? { baseSha: base } : {}), ...(lines.length > 0 ? { lines: { key: AUDIT_KEY, lines } } : {}) }
+      : { scope: 'global' as const };
     let cause: LedgerCause;
     try {
-      const tracked = saveDataTracked('premium-tiers.json', { scope: 'global' }, this.config);
+      const tracked = saveDataTracked('premium-tiers.json', options, this.config);
       if (tracked.outcome === 'saved') {
         this.lastRaw = content;
+        this.cacheSha = shaOf(Buffer.from(content, 'utf8'));
         this.saveHeld = false;
+        this.dropOwed = false;
         this.unstorableSave = false;
         if (tracked.ticket.kind === 'file') this.lastSaveTicket = tracked.ticket;
-        if (this.raisedMarks && !this.marksTicket && tracked.ticket.kind === 'file') this.marksTicket = tracked.ticket;
-        return true;
+        if (this.raisedMarks && !this.marksTicket && (tracked.ticket.kind === 'file' || tracked.ticket.kind === 'row')) this.marksTicket = tracked.ticket;
+        if (tracked.ticket.kind === 'row') {
+          const outcome = this.watchOp(tracked.ticket, taken);
+          this.answerWaits(outcome);
+          return { key: PREMIUM_KEY, outcome, ticket: tracked.ticket };
+        }
+        this.answerWaits(null);
+        runItems(taken);
+        return { key: PREMIUM_KEY, outcome: null, ticket: tracked.ticket };
       }
       cause = tracked.outcome === 'frozen' ? 'frozen' : tracked.cause;
     } catch (error) {
@@ -1277,33 +1602,161 @@ export class PremiumManager {
         cause = 'io';
       }
     }
-    if (cause === 'unstorable') {
+    if (cause === 'unstorable' && eventBase === undefined) {
       this.saveHeld = false;
+      if (this.dropOwed) this.invalidate();
       this.unstorableSave = true;
-      return false;
+      this.refuseItems(taken, cause);
+      return null;
     }
-    if (cause === 'node-stopping' || cause === 'writer-lost' || !isBotProcess()) return false;
+    if (eventBase !== undefined) {
+      // Decision 108: a walk batch's save is never held; it does what a refusal at the flush does.
+      this.invalidate();
+      this.refuseItems(taken, cause);
+      return null;
+    }
+    if (cause === 'node-stopping' || cause === 'writer-lost' || !isBotProcess()) {
+      this.refuseItems(taken, cause);
+      return null;
+    }
     this.saveHeld = true;
     markRetried(PREMIUM_DOC);
     this.armRetry();
-    return true;
+    if (shared) {
+      // Decision 64: a held save's list waits for the next accepted save of the file, which takes it first.
+      this.heldCarry.push(...taken);
+      return { key: PREMIUM_KEY, outcome: new Promise(resolve => this.heldWaits.push(resolve)) };
+    }
+    runItems(taken);
+    return { key: PREMIUM_KEY, outcome: null };
   }
+
+  /** The held saves' handles answer with the op of the save that took their lists. */
+  private answerWaits(outcome: Promise<SaveOutcome> | null): void {
+    const waits = this.heldWaits.splice(0);
+    for (const resolve of waits) resolve(outcome ?? Promise.resolve<SaveOutcome>('landed'));
+  }
+
+  /** Settles a save's items with its op (decision 64), and drops the cache when another machine's change refused it. */
+  private watchOp(ticket: RowTicket, items: Item[]): Promise<SaveOutcome> {
+    for (const item of items) {
+      this.itemTickets.set(item, ticket);
+      const install = this.installOfItem.get(item);
+      if (install) install.ticket = ticket;
+    }
+    this.openSaves += 1;
+    return rowOutcome(ticket).then(outcome => {
+      this.openSaves -= 1;
+      if (outcome === 'landed') {
+        landItems(items, ticket);
+        return 'landed' as const;
+      }
+      if (outcome === 'unconfirmed') {
+        failItems(items, 'unconfirmed', this.itemSink);
+        return 'unconfirmed' as const;
+      }
+      const cause = outcome.refused.cause;
+      if (cause === 'changed-elsewhere') {
+        if (this.saveHeld) this.refuseHeldSave(cause);
+        this.invalidate();
+      }
+      failItems(items, { refused: cause, words: causeWords(cause) }, this.itemSink);
+      return { refused: cause };
+    });
+  }
+
+  /** A held save made on a cache another machine's change refused: its retry would be refused too, so it is now. */
+  private refuseHeldSave(cause: LedgerCause): void {
+    const carried = this.heldCarry.splice(0);
+    if (carried.length > 0) failItems(carried, { refused: cause, words: causeWords(cause) }, this.itemSink);
+    for (const resolve of this.heldWaits.splice(0)) resolve(Promise.resolve<SaveOutcome>({ refused: cause }));
+    this.saveHeld = false;
+    this.dropOwed = false;
+  }
+
+  /** A save refused before any op took its items: on Postgres as an op refused (marked lines), on JSON each dropped. */
+  private refuseItems(items: Item[], cause: LedgerCause): void {
+    this.lastRefusal = cause;
+    if (items.length === 0) return;
+    if (this.stopped) {
+      failItems(items, { refused: cause, words: causeWords(cause) }, this.itemSink);
+      return;
+    }
+    if (this.sharedBackend()) failItems(items, { refused: cause, words: causeWords(cause) }, this.itemSink);
+    else dropItems(items, { kind: 'refused', words: causeWords(cause) });
+  }
+
+  private readonly itemSink: ItemSink = {
+    stopWords: () => (this.stopped ? stopWords(this.stopped) : null),
+    writeMarked: lines => {
+      outsideLedgers(() => carryLines(AUDIT_KEY, lines, { lockKey: PREMIUM_KEY }));
+    },
+  };
 
   // ============================================================================
   // AUDIT LOG
   // ============================================================================
 
   /**
-   * Append a single audit entry. In the bot a line the disk refuses is held in order and appended by the retry; the
-   * replay's lines wait until a save carrying its marks has landed. providerSubId names an install line's subscription.
+   * An audit line (decision 63): with `{ carry }` it is stored by the op of the save that takes the carry; standalone it
+   * is written at once. After the stop nothing is made and the line is logged as lost. providerSubId names an install
+   * line's subscription.
    */
-  private writeAudit(entry: AuditEntry, providerSubId?: string): void {
-    const line = JSON.stringify(entry) + '\n';
+  private writeAudit(entry: AuditEntry, link: Link, providerSubId?: string): void {
+    const line = JSON.stringify(entry);
+    if (this.stopped) {
+      // Decision 75: a replay the stop ends drops its lines with no log; the journal keeps the events.
+      if (this.inReplay()) return;
+      recordRefusal(stopCause(this.stopped), AUDIT_DOC);
+      console.error(entry.action === 'subscription.install.paid' && typeof entry.subscriptionId === 'string'
+        ? this.installLineLost({ state: 'queued', webhook: paymentOpOf(currentLedger()) === 'payment.webhook', line: `${line}\n`, entry, providerSubId }, 'was not written', this.stopped)
+        : `[PremiumManager] The audit line ${entry.action} (guild ${entry.guildId ?? 'none'}, ${entry.timestamp}) was not written: ${stopWords(this.stopped)}; it is lost`);
+      return;
+    }
     let install: InstallLine | undefined;
     if (entry.action === 'subscription.install.paid' && typeof entry.subscriptionId === 'string') {
-      install = { state: 'queued', webhook: paymentOpOf(currentLedger()) === 'payment.webhook', line, entry, providerSubId };
+      install = { state: 'queued', webhook: paymentOpOf(currentLedger()) === 'payment.webhook', line: `${line}\n`, entry, providerSubId };
       this.installLines.set(entry.subscriptionId, install);
     }
+    if ('standalone' in link) {
+      if (!this.sharedBackend()) {
+        this.writeAuditLine(entry, install);
+        return;
+      }
+      const ticket = carryLines(AUDIT_KEY, [{ id: crypto.randomUUID(), line }]);
+      recordTicket(ticket);
+      if (install) install.ticket = ticket;
+      return;
+    }
+    const item = makeItem({
+      kind: 'audit',
+      id: crypto.randomUUID(),
+      owner: this,
+      line,
+      marked: (cause, at) => JSON.stringify({ ...entry, metadata: { ...(entry.metadata ?? {}), notSaved: { cause, at } } }),
+      run: () => this.writeAuditLine(entry, install),
+      drop: how => {
+        if (how.kind === 'stopped') {
+          console.error(`[PremiumManager] The audit line ${entry.action} (guild ${entry.guildId ?? 'none'}, ${entry.timestamp}) was not written: ${how.words}; it is lost`);
+        } else if (how.kind === 'unsure') {
+          console.error(`[PremiumManager] The audit line ${entry.action} (guild ${entry.guildId ?? 'none'}, ${entry.timestamp}) was being written ${how.words}; can't confirm whether it is stored: ${line}`);
+        } else if (how.kind === 'refused') {
+          console.error(`[PremiumManager] The audit line ${entry.action} (guild ${entry.guildId ?? 'none'}, ${entry.timestamp}) was not written: the change it records was not saved (${how.words})`);
+        }
+      },
+      settledLine: state => {
+        if (!install || !entry.subscriptionId) return;
+        if (state === 'landed') install.state = 'landed';
+        else if (this.installLines.get(entry.subscriptionId) === install) this.installLines.delete(entry.subscriptionId);
+      },
+    });
+    if (install) this.installOfItem.set(item, install);
+    link.carry.items.push(item);
+  }
+
+  /** NB10's path for one line (a JSON bot): the replay's buffer, else append, or hold it behind the lines held before it. */
+  private writeAuditLine(entry: AuditEntry, install: InstallLine | undefined): void {
+    const line = JSON.stringify(entry) + '\n';
     if (this.inReplay()) {
       if (this.replayDropped) {
         if (install) this.installLines.delete(entry.subscriptionId!);
@@ -1520,6 +1973,14 @@ export class PremiumManager {
   logLossesAtExit(): void {
     if (this.disposed) return;
     const kind = this.stopped ?? 'stopping';
+    // Decision 47: items whose op is still open, or that no save took, are lost with the stop; an audit line whose op
+    // may have committed is named as can't confirm, and one whose op landed is stored.
+    for (const item of openItemsOf(this)) {
+      const ticket = item.kind === 'audit' ? this.itemTickets.get(item) : undefined;
+      const fate = ticket ? exitFate(ticket) : 'open';
+      if (fate === 'landed') continue;
+      item.drop(fate === 'open' ? { kind: 'stopped', words: stopWords(kind) } : { kind: 'unsure', words: beforeWords(kind) });
+    }
     const marksLanded = this.marksLanded();
     const covered = (e: JournalEntry) => marksLanded && !!this.raisedMarks && e.n <= (this.raisedMarks[e.writer] ?? 0);
     for (const e of this.journal) {
@@ -1577,6 +2038,10 @@ export class PremiumManager {
   }
 
   private journalEvent(event: ProviderEvent): void {
+    if (this.sharedBackend()) {
+      this.journalSharedEvent(event);
+      return;
+    }
     const entry: JournalEntry = { writer: writerId, n: ++journalSeq, event, file: this.unreadable?.file ?? this.episodeFile };
     const line = JSON.stringify({ writer: entry.writer, n: entry.n, event }) + '\n';
     let refused: string | null = null;
@@ -1620,7 +2085,114 @@ export class PremiumManager {
     });
   }
 
+  /**
+   * Decision 40: reads the journal key's lines (10 s) and NB4's liveness test of each other process that wrote one. The
+   * bot's pass (fromPass) also starts the replay of lines whose writer is no longer live (decision 54, Q14): it drops the
+   * loaded cache and loads it again in a console ledger, and that load finds the lines pending.
+   */
+  async readSharedJournal(fromPass: boolean): Promise<{ ok: true } | { ok: false; cause: string }> {
+    if (!this.sharedBackend()) return { ok: true };
+    const read = await readJournal();
+    if (!read.ok) return read;
+    const lines: SharedJournalLine[] = [];
+    for (const row of read.lines) {
+      let parsed: any;
+      try {
+        parsed = JSON.parse(row.line);
+      } catch {
+        continue;
+      }
+      if (!parsed || typeof parsed.writer !== 'string' || typeof parsed.n !== 'number' || !parsed.event || typeof parsed.event.type !== 'string') continue;
+      lines.push({
+        id: row.id,
+        writer: parsed.writer,
+        n: parsed.n,
+        event: parsed.event,
+        node: typeof parsed.node === 'string' ? parsed.node : undefined,
+        nodeName: typeof parsed.nodeName === 'string' ? parsed.nodeName : undefined,
+        live: false,
+        takeoverSeconds: null,
+      });
+    }
+    const others = [...new Set(lines.map(l => l.writer).filter(w => w !== processId()))];
+    if (others.length > 0) {
+      const pool = rowBackend();
+      if (!pool?.sharedSelect) return { ok: false, cause: "this process has no connection to the bot's database" };
+      try {
+        const res = await pool.sharedSelect(LIVE_SQL, [others], READ_BOUND_MS);
+        const byWriter = new Map(res.rows.map(r => [String(r.process_id), r]));
+        for (const l of lines) {
+          const row = byWriter.get(l.writer);
+          if (!row) continue;
+          l.live = row.live === true;
+          l.takeoverSeconds = Number(row.takeover_seconds);
+        }
+      } catch (error) {
+        return { ok: false, cause: error instanceof Error ? error.message : String(error) };
+      }
+    }
+    this.sharedJournal = lines;
+    if (fromPass && isBotProcess() && this.configLoaded && !this.replay && !this.stopped && !this.disposed) {
+      const marks = this.config.eventsApplied ?? {};
+      if (this.replayableLines().some(l => l.n > (marks[l.writer] ?? 0))) {
+        this.invalidate();
+        outsideLedgers(() => {
+          void runSealed('console', null, 'premium', async () => {
+            this.ensureLoaded();
+          });
+        });
+      }
+    }
+    return { ok: true };
+  }
+
+  /**
+   * The journal lines this bot replays (decision 40): those of this machine's earlier processes, and those of a writer
+   * that is not live by NB4's test. This process's own lines are its in-memory journal.
+   */
+  private replayableLines(): SharedJournalLine[] {
+    const self = processId();
+    const node = getNodeId();
+    return this.sharedJournal.filter(l => l.writer !== self && (l.node === node || !l.live));
+  }
+
+  /** Decision 40's refusal while another machine's journal lines are pending; NB10's texts for this machine's. */
+  private foreignJournalText(): string | null {
+    const marks = this.config.eventsApplied ?? {};
+    const node = getNodeId();
+    const pending = this.sharedJournal.filter(l => l.writer !== processId() && l.n > (marks[l.writer] ?? 0));
+    const foreign = pending.find(l => l.node !== node && l.takeoverSeconds !== null && (l.live || !isBotProcess()));
+    if (foreign) {
+      const name = foreign.nodeName ?? foreign.node ?? foreign.writer;
+      return `Premium holds provider events that ${name} received while premium-tiers.json could not be read there; nothing was saved. The bot on ${name} applies them once it runs normally (any bot does once that one has been stopped for ${foreign.takeoverSeconds} s); try again then.`;
+    }
+    if (!isBotProcess() && pending.length > 0) {
+      return 'Premium holds provider events the bot has not applied yet (premium-tiers.events.jsonl); nothing was saved. Start the bot to apply them, then try again.';
+    }
+    return null;
+  }
+
+  /** Decision 40: a provider event kept as a line of the journal key, with the id this process minted for it. */
+  private journalSharedEvent(event: ProviderEvent): void {
+    const entry: JournalEntry = { writer: processId(), n: ++journalSeq, event, file: this.unreadable?.file ?? this.episodeFile, id: crypto.randomUUID() };
+    const line = JSON.stringify({ writer: entry.writer, node: getNodeId(), nodeName: getNodeName(), n: entry.n, event });
+    entry.ticket = appendLine(JOURNAL_KEY, line, entry.id);
+    recordTicket(entry.ticket);
+    this.journal.push(entry);
+    const why = this.unreadable ? `${this.unreadable.file} cannot be read` : 'premium applies the provider events it kept';
+    console.warn(`[PremiumManager] A ${eventWords(event)} arrived while ${why}; it is kept in premium-tiers.events.jsonl and applied once premium runs normally`);
+  }
+
+  /** Decision 40: the journal lines a landed save's marks cover, deleted outside the ledgers. */
+  private deleteJournalLines(ids: string[]): void {
+    if (ids.length === 0) return;
+    const gone = new Set(ids);
+    this.sharedJournal = this.sharedJournal.filter(l => !gone.has(l.id));
+    outsideLedgers(() => deleteLines(JOURNAL_KEY, ids));
+  }
+
   private journalFromDisk(): JournalLine[] {
+    if (this.sharedBackend()) return this.replayableLines();
     const raw = readRawStrict(JOURNAL_PATH);
     if (raw === null) return [];
     const { lines, bad } = parseJournal(raw);
@@ -1639,6 +2211,9 @@ export class PremiumManager {
 
   private dropReplay(): void {
     this.replayDropped = true;
+    // Decision 75: the replay's carry is dropped with no log; the journal keeps its entries.
+    forgetItems(this.replayCarry.splice(0));
+    for (const resolve of this.replayWaits.splice(0)) resolve(Promise.resolve({ refused: this.stopped ? stopCause(this.stopped) : 'io' }));
     for (const pending of this.replayBuffer) {
       if (pending.install) this.installLines.delete(pending.entry.subscriptionId!);
     }
@@ -1690,7 +2265,10 @@ export class PremiumManager {
       this.marksTicket = null;
       this.replay = null;
       left = true;
-      this.writeCache();
+      this.replayLineIds = disk.map(l => l.id).filter((id): id is string => typeof id === 'string');
+      const op = this.writeCache(this.replayCarry.splice(0));
+      const outcome = op?.outcome ?? Promise.resolve<SaveOutcome>(op ? 'landed' : { refused: this.lastRefusal ?? 'io' });
+      for (const resolve of this.replayWaits.splice(0)) resolve(outcome);
       this.watchMarks();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -1723,6 +2301,13 @@ export class PremiumManager {
             await sleepOutside(WATCH_IDLE_MS);
             continue;
           }
+          if (ticket.kind === 'row') {
+            const settled = await rowOutcome(ticket);
+            if (settled !== 'landed' && this.marksTicket === ticket) this.marksTicket = null;
+            if (settled === 'landed') continue;
+            await sleepOutside(WATCH_IDLE_MS);
+            continue;
+          }
           const answer = await confirmFile(ticket, CONFIRM_MS);
           if (answer === 'ok') continue;
           if (answer === 'unavailable' && !landed(ticket) && this.marksTicket === ticket) this.marksTicket = null;
@@ -1736,13 +2321,18 @@ export class PremiumManager {
 
   private onMarksLanded(): void {
     const marks = this.raisedMarks ?? {};
+    const coveredOwn = this.journal.filter(e => e.n <= (marks[e.writer] ?? 0) && e.id).map(e => e.id!);
     this.journal = this.journal.filter(e => e.n > (marks[e.writer] ?? 0));
     if (this.stopped) return;
     try {
       const lines = this.replayBuffer.splice(0);
       outsideLedgers(() => {
         for (const pending of lines) this.placeLine(pending);
-        if (this.journal.length === 0) this.queueJournalDelete();
+        if (this.sharedBackend()) {
+          this.deleteJournalLines([...this.replayLineIds.splice(0), ...coveredOwn]);
+        } else if (this.journal.length === 0) {
+          this.queueJournalDelete();
+        }
       });
     } catch (error) {
       console.error(`[PremiumManager] The append of the replay's audit lines failed (${error instanceof Error ? error.message : String(error)})`);
@@ -1758,8 +2348,31 @@ export class PremiumManager {
     return this.unreadable ? 'unreadable' : this.replay ? 'replaying' : 'normal';
   }
 
-  /** Every member notice goes through here: after the stop or a deposition none is sent, and each is logged. */
-  private notify(guildId: string, kind: NotificationType, payload: NotificationPayload): Promise<NotifyOutcome> {
+  /**
+   * Every member notice goes through here (decisions 63 and 64): with `{ carry }` it is sent once the op of the save
+   * that takes the carry landed; standalone at once. After the stop or a deposition none is sent, and each is logged.
+   */
+  private notify(guildId: string, kind: NotificationType, payload: NotificationPayload, link: Link): Promise<NotifyOutcome> {
+    if (this.stopped || 'standalone' in link) return this.sendNotice(guildId, kind, payload);
+    return new Promise<NotifyOutcome>(resolve => {
+      link.carry.items.push(makeItem({
+        kind: 'notice',
+        id: crypto.randomUUID(),
+        owner: this,
+        run: () => this.sendNotice(guildId, kind, payload).then(resolve),
+        drop: how => {
+          const cause = how.kind === 'refused'
+            ? `the change it announces was not saved (${how.words})`
+            : how.kind === 'unconfirmed' ? "can't confirm that the change it announces was saved" : how.words;
+          const told = how.kind === 'unconfirmed' ? `${cause} (the database's answer was lost)` : cause;
+          console.warn(`[PremiumManager] The ${kind} notice for guild ${guildId} was not sent: ${told}`);
+          resolve({ delivered: false, cause });
+        },
+      }));
+    });
+  }
+
+  private sendNotice(guildId: string, kind: NotificationType, payload: NotificationPayload): Promise<NotifyOutcome> {
     if (this.stopped) {
       console.warn(`[PremiumManager] The ${kind} notice for guild ${guildId} was not sent: ${stopWords(this.stopped)}`);
       return Promise.resolve({ delivered: false, cause: stopWords(this.stopped) });
@@ -1778,7 +2391,7 @@ export class PremiumManager {
    * tear down the whole viewer). Filter values are exact-match except for
    * `from` / `to` which are timestamp boundaries (inclusive).
    */
-  readAuditEntries(filters: {
+  async readAuditEntries(filters: {
     from?: string;
     to?: string;
     action?: string;
@@ -1787,13 +2400,20 @@ export class PremiumManager {
     guildId?: string;
     subscriptionId?: string;
     limit?: number;
-  } = {}): { entries: AuditEntry[]; total: number; truncated: boolean } {
+  } = {}): Promise<{ entries: AuditEntry[]; total: number; truncated: boolean }> {
     const limit = Math.max(1, Math.min(filters.limit ?? 500, 5000));
-    if (!fs.existsSync(AUDIT_PATH)) {
-      return { entries: [], total: 0, truncated: false };
+    let lines: string[];
+    if (this.sharedBackend()) {
+      // NB6 decision 8: the lines of the database in seq order (the web UI's reader pool, 10 s).
+      const read = await readLines(AUDIT_KEY);
+      if (!read.ok) throw new Error(read.cause);
+      lines = read.lines.map(l => l.line);
+    } else {
+      if (!fs.existsSync(AUDIT_PATH)) {
+        return { entries: [], total: 0, truncated: false };
+      }
+      lines = fs.readFileSync(AUDIT_PATH, 'utf-8').split('\n');
     }
-    const raw = fs.readFileSync(AUDIT_PATH, 'utf-8');
-    const lines = raw.split('\n');
     const matched: AuditEntry[] = [];
     let totalParsed = 0;
     for (const line of lines) {
@@ -1899,31 +2519,30 @@ export class PremiumManager {
       ),
       offerings: (tier.offerings || []).map(normalizeOffering),
     };
-    const ok = this.save();
-    if (ok) {
-      this.writeAudit({
-        timestamp: new Date().toISOString(),
-        actor: 'admin',
-        action: before ? 'tier.update' : 'tier.create',
-        tierId,
-        before,
-        after: this.config.tiers[tierId],
-      });
-      // Notify subscribers only when the change made the tier stricter -
-      // beneficial changes (more features, higher limits) don't need a DM.
-      if (before && this.tierChangeIsStricter(before, this.config.tiers[tierId])) {
-        const after = this.config.tiers[tierId];
-        for (const [guildId, subs] of Object.entries(this.config.subscriptions)) {
-          const onThisTier = subs.active?.tierId === tierId
-            || subs.paused.some(p => p.tierId === tierId);
-          if (!onThisTier) continue;
-          void this.notify(guildId, 'tier.config-change-affecting-subscriber', {
-            tierName: after.displayName,
-            details: 'Some perks or limits were reduced. Open the subscription panel to see the latest tier contents.',
-          });
-        }
+    const carry = newCarry();
+    this.writeAudit({
+      timestamp: new Date().toISOString(),
+      actor: 'admin',
+      action: before ? 'tier.update' : 'tier.create',
+      tierId,
+      before,
+      after: this.config.tiers[tierId],
+    }, { carry });
+    // Notify subscribers only when the change made the tier stricter -
+    // beneficial changes (more features, higher limits) don't need a DM.
+    if (before && this.tierChangeIsStricter(before, this.config.tiers[tierId])) {
+      const after = this.config.tiers[tierId];
+      for (const [guildId, subs] of Object.entries(this.config.subscriptions)) {
+        const onThisTier = subs.active?.tierId === tierId
+          || subs.paused.some(p => p.tierId === tierId);
+        if (!onThisTier) continue;
+        void this.notify(guildId, 'tier.config-change-affecting-subscriber', {
+          tierName: after.displayName,
+          details: 'Some perks or limits were reduced. Open the subscription panel to see the latest tier contents.',
+        }, { carry });
       }
     }
+    const ok = this.save({ carry }) !== null;
     return ok;
   }
 
@@ -2025,6 +2644,7 @@ export class PremiumManager {
     const before = this.config.tiers[tierId];
     if (!before) return false;
 
+    const carry = newCarry();
     for (const guildId of Object.keys(this.config.subscriptions)) {
       const subs = this.config.subscriptions[guildId];
       const activeWasOnDeleted = subs.active?.tierId === tierId;
@@ -2034,22 +2654,20 @@ export class PremiumManager {
       }
       // Pop the next paused entry if active is now empty.
       if (!subs.active && subs.paused.length > 0) {
-        this.resumeNext(guildId);
+        this.resumeNext(guildId, carry);
       }
       if (this.guildSubsEmpty(subs)) delete this.config.subscriptions[guildId];
     }
 
     delete this.config.tiers[tierId];
-    const ok = this.save();
-    if (ok) {
-      this.writeAudit({
-        timestamp: new Date().toISOString(),
-        actor: 'admin',
-        action: 'tier.delete',
-        tierId,
-        before,
-      });
-    }
+    this.writeAudit({
+      timestamp: new Date().toISOString(),
+      actor: 'admin',
+      action: 'tier.delete',
+      tierId,
+      before,
+    }, { carry });
+    const ok = this.save({ carry }) !== null;
     return ok;
   }
 
@@ -2149,17 +2767,16 @@ export class PremiumManager {
     } else {
       this.config.activatedProviders[providerId] = { defaultEnabled: !!defaultEnabled };
     }
-    const ok = this.save();
-    if (ok) {
-      this.writeAudit({
-        timestamp: new Date().toISOString(),
-        actor: 'admin',
-        action: 'provider.activation.set',
-        providerId,
-        before,
-        after: this.config.activatedProviders[providerId],
-      });
-    }
+    const carry = newCarry();
+    this.writeAudit({
+      timestamp: new Date().toISOString(),
+      actor: 'admin',
+      action: 'provider.activation.set',
+      providerId,
+      before,
+      after: this.config.activatedProviders[providerId],
+    }, { carry });
+    const ok = this.save({ carry }) !== null;
     return ok;
   }
 
@@ -2281,7 +2898,7 @@ export class PremiumManager {
    *   same priority + paid   -> caller already rejected; defensive throw here
    *   lower priority -> insert into paused queue at correct position
    */
-  private async installSubscription(guildId: string, incoming: Subscription): Promise<void> {
+  private async installSubscription(guildId: string, incoming: Subscription, carry: Carry, opts: { boughtPaused?: true } = {}): Promise<SaveOp | null> {
     const subs = (this.config.subscriptions[guildId] ??= { paused: [] });
     const incomingPriority = this.config.tiers[incoming.tierId]?.priority ?? 0;
 
@@ -2293,23 +2910,20 @@ export class PremiumManager {
     if (!activeAlive) {
       // No active sub (or it's expired): incoming becomes active.
       if (active) delete subs.active;
-      subs.active = incoming;
-      this.save();
-      return;
+      subs.active = this.intoActiveSlot(incoming);
+      return this.save({ carry });
     }
 
     const activePriority = this.config.tiers[active!.tierId]?.priority ?? 0;
 
     if (incomingPriority > activePriority) {
-      await this.pauseActiveIntoQueue(guildId, incoming);
-      return;
+      return this.pauseActiveIntoQueue(guildId, this.intoActiveSlot(incoming), carry);
     }
 
     if (incomingPriority === activePriority) {
       if (incoming.source === 'manual') {
         // Manual replaces (manual wins ties at equal priority).
-        await this.pauseActiveIntoQueue(guildId, incoming);
-        return;
+        return this.pauseActiveIntoQueue(guildId, incoming, carry);
       }
       // Same-priority paid: caller is expected to reject upstream.
       throw new Error(
@@ -2332,33 +2946,56 @@ export class PremiumManager {
     };
     subs.paused.push(paused);
     this.sortPausedQueue(subs);
-    this.save();
+    const op = this.save({ carry });
 
     // Best-effort provider pause for paid: the sub was just created as
     // active at the provider; we want it frozen until our resume gives
-    // it new dates.
-    if (paused.source === 'paid' && paused.providerId && paused.providerSubId) {
+    // it new dates. A purchase the provider started paused is not paused again (decision 85).
+    if (!opts.boughtPaused && paused.source === 'paid' && paused.providerId && paused.providerSubId) {
       const provider = getPaymentRegistry().get(paused.providerId);
       if (provider?.pauseSubscription && provider.capabilities.supportsPause) {
         try { await provider.pauseSubscription(paused.providerSubId, active!.endDate); }
         catch (err: any) {
-          console.warn(`[PremiumManager] provider pauseSubscription failed for '${paused.providerId}': ${err?.message || err}`);
+          console.warn(pauseWarning(paused, err));
         }
       }
     }
+    return op;
+  }
+
+  /**
+   * Decision 95: a paused Dummy sub that takes the active slot goes in as resumeNext builds a resumed sub; the Dummy
+   * provider's tick writes its record active. Any other sub goes in as it came.
+   */
+  private intoActiveSlot(incoming: Subscription): Subscription {
+    if (incoming.providerId !== 'dummy' || incoming.status !== 'paused') return incoming;
+    const now = Date.now();
+    const days = incoming.remainingDaysAtPause != null
+      ? incoming.remainingDaysAtPause
+      : incoming.endDate === null ? null : Math.max(0, Math.ceil((Date.parse(incoming.endDate) - now) / DAY_MS));
+    const nowIso = new Date(now).toISOString();
+    return {
+      ...incoming,
+      status: 'active',
+      startDate: nowIso,
+      endDate: days === null ? null : new Date(now + days * DAY_MS).toISOString(),
+      updatedAt: nowIso,
+      pausedAt: undefined,
+      remainingDaysAtPause: undefined,
+      resumesAtHint: undefined,
+    };
   }
 
   /**
    * Move the currently-active subscription to the paused queue and install the replacement, saved before the
    * provider's pause is awaited. Snapshots remaining days, sorts the queue priority-desc.
    */
-  private async pauseActiveIntoQueue(guildId: string, replacement: Subscription): Promise<void> {
+  private async pauseActiveIntoQueue(guildId: string, replacement: Subscription, carry: Carry): Promise<SaveOp | null> {
     const subs = this.config.subscriptions[guildId];
-    if (!subs) return;
+    if (!subs) return null;
     if (!subs.active) {
       subs.active = replacement;
-      this.save();
-      return;
+      return this.save({ carry });
     }
     const cur = subs.active;
     const nowIso = new Date().toISOString();
@@ -2373,8 +3010,7 @@ export class PremiumManager {
     if (remaining === 0) {
       // Nothing left: drop outright instead of queueing.
       subs.active = replacement;
-      this.save();
-      return;
+      return this.save({ carry });
     }
 
     const paused: Subscription = {
@@ -2387,7 +3023,6 @@ export class PremiumManager {
     subs.paused.push(paused);
     this.sortPausedQueue(subs);
     subs.active = replacement;
-    this.save();
     this.writeAudit({
       timestamp: nowIso,
       actor: 'admin',
@@ -2395,7 +3030,15 @@ export class PremiumManager {
       guildId,
       subscriptionId: paused.id,
       providerId: paused.providerId,
-    });
+    }, { carry });
+    if (paused.source === 'paid') {
+      void this.notify(guildId, 'paid.sub.paused-by-stacking', {
+        tierName: this.config.tiers[paused.tierId]?.displayName || paused.tierId,
+        providerName: this.providerDisplayName(paused.providerId),
+        remainingDays: paused.remainingDaysAtPause ?? null,
+      }, { carry });
+    }
+    const op = this.save({ carry });
 
     // Best-effort provider pause for paid subs.
     if (paused.source === 'paid' && paused.providerId && paused.providerSubId) {
@@ -2403,17 +3046,11 @@ export class PremiumManager {
       if (provider?.pauseSubscription && provider.capabilities.supportsPause) {
         try { await provider.pauseSubscription(paused.providerSubId, null); }
         catch (err: any) {
-          console.warn(`[PremiumManager] provider pauseSubscription failed for '${paused.providerId}': ${err?.message || err}`);
+          console.warn(pauseWarning(paused, err));
         }
       }
     }
-    if (paused.source === 'paid') {
-      void this.notify(guildId, 'paid.sub.paused-by-stacking', {
-        tierName: this.config.tiers[paused.tierId]?.displayName || paused.tierId,
-        providerName: this.providerDisplayName(paused.providerId),
-        remainingDays: paused.remainingDaysAtPause ?? null,
-      });
-    }
+    return op;
   }
 
   /**
@@ -2436,11 +3073,12 @@ export class PremiumManager {
    * highest-priority entry, stamp fresh dates from its remaining-days
    * snapshot, and install as active. For paid subs, call provider.resumeSub
    * fire-and-forget (cache is authoritative; provider state catches up).
+   * Its items join the caller's carry, which the caller's save takes.
    *
    * Repeats if the popped entry is itself already past its endDate (lossy
    * pauses can race expiry).
    */
-  private resumeNext(guildId: string): void {
+  private resumeNext(guildId: string, carry: Carry): void {
     const subs = this.config.subscriptions[guildId];
     if (!subs) return;
     while (!subs.active && subs.paused.length > 0) {
@@ -2474,19 +3112,19 @@ export class PremiumManager {
           subscriptionId: resumed.id,
           providerId: resumed.providerId,
           metadata: { reason: 'expired-while-queued' },
-        });
+        }, { carry });
         // The user already got a "paused-by-stacking" notification when this
         // entry went into the queue; it never resumes, so close the loop with
         // an "ended" notification matching its source.
         if (resumed.source === 'manual') {
           void this.notify(guildId, 'manual.grant.ended', {
             tierName: this.config.tiers[resumed.tierId]?.displayName || resumed.tierId,
-          });
+          }, { carry });
         } else {
           void this.notify(guildId, 'paid.sub.expired', {
             tierName: this.config.tiers[resumed.tierId]?.displayName || resumed.tierId,
             providerName: this.providerDisplayName(resumed.providerId),
-          });
+          }, { carry });
         }
         continue;
       }
@@ -2497,7 +3135,9 @@ export class PremiumManager {
         const provider = getPaymentRegistry().get(resumed.providerId);
         if (provider?.resumeSubscription && provider.capabilities.supportsPause) {
           provider.resumeSubscription(resumed.providerSubId, newEndDate).catch((err: any) => {
-            console.warn(`[PremiumManager] provider resumeSubscription failed for '${resumed.providerId}': ${err?.message || err}`);
+            console.warn(err?.code === 'unconfirmed'
+              ? `[PremiumManager] Can't confirm that the Dummy provider saved the resume of subscription ${resumed.providerSubId} (${err.reason}); the bot's copy holds it active. If the provider's record stays paused, the Dummy provider resumes it within about 2 minutes.`
+              : `[PremiumManager] provider resumeSubscription failed for '${resumed.providerId}': ${err?.message || err}`);
           });
         }
       }
@@ -2508,13 +3148,13 @@ export class PremiumManager {
         guildId,
         subscriptionId: resumed.id,
         providerId: resumed.providerId,
-      });
+      }, { carry });
       if (resumed.source === 'paid') {
         void this.notify(guildId, 'paid.sub.resumed-from-queue', {
           tierName: this.config.tiers[resumed.tierId]?.displayName || resumed.tierId,
           providerName: this.providerDisplayName(resumed.providerId),
           endDate: resumed.endDate,
-        });
+        }, { carry });
       }
       break;
     }
@@ -2567,7 +3207,7 @@ export class PremiumManager {
       updatedAt: nowIso,
     };
 
-    await this.installSubscription(guildId, sub);
+    const carry = newCarry();
     this.writeAudit({
       timestamp: nowIso,
       actor: 'admin',
@@ -2576,12 +3216,18 @@ export class PremiumManager {
       tierId,
       subscriptionId: sub.id,
       metadata: { durationDays, notes, grantedBy },
-    });
+    }, { carry });
     void this.notify(guildId, 'manual.grant.added', {
       tierName: tier.displayName,
       endDate,
       notes,
-    });
+    }, { carry });
+    try {
+      await this.installSubscription(guildId, sub, carry);
+    } catch (error) {
+      forgetItems(carry.items.splice(0));
+      throw error;
+    }
     return true;
   }
 
@@ -2603,17 +3249,16 @@ export class PremiumManager {
     if (active.status === 'expired' && Date.parse(active.endDate) > Date.now()) {
       active.status = 'active';
     }
-    const ok = this.save();
-    if (ok) {
-      this.writeAudit({
-        timestamp: new Date().toISOString(),
-        actor: 'admin',
-        action: 'subscription.extend.manual',
-        guildId,
-        subscriptionId: active.id,
-        metadata: { addDays, before, after: active.endDate },
-      });
-    }
+    const carry = newCarry();
+    this.writeAudit({
+      timestamp: new Date().toISOString(),
+      actor: 'admin',
+      action: 'subscription.extend.manual',
+      guildId,
+      subscriptionId: active.id,
+      metadata: { addDays, before, after: active.endDate },
+    }, { carry });
+    const ok = this.save({ carry }) !== null;
     return ok;
   }
 
@@ -2627,10 +3272,11 @@ export class PremiumManager {
     if (!subs) return true;
 
     let removed: Subscription | null = null;
+    const carry = newCarry();
     if (subs.active?.source === 'manual') {
       removed = subs.active;
       delete subs.active;
-      this.resumeNext(guildId);
+      this.resumeNext(guildId, carry);
     } else {
       const idx = subs.paused.findIndex(p => p.source === 'manual');
       if (idx >= 0) {
@@ -2640,8 +3286,7 @@ export class PremiumManager {
     }
     if (this.guildSubsEmpty(subs)) delete this.config.subscriptions[guildId];
 
-    const ok = this.save();
-    if (ok && removed) {
+    if (removed) {
       this.writeAudit({
         timestamp: new Date().toISOString(),
         actor: 'admin',
@@ -2649,12 +3294,12 @@ export class PremiumManager {
         guildId,
         tierId: removed.tierId,
         subscriptionId: removed.id,
-      });
+      }, { carry });
       void this.notify(guildId, 'manual.grant.revoked', {
         tierName: this.config.tiers[removed.tierId]?.displayName || removed.tierId,
-      });
+      }, { carry });
     }
-    return ok;
+    return this.save({ carry }) !== null;
   }
 
   // ============================================================================
@@ -2811,7 +3456,7 @@ export class PremiumManager {
         createdAt: nowIso,
         updatedAt: nowIso,
       };
-      await this.installSubscription(guildId, sub);
+      const carry = newCarry();
       this.writeAudit({
         timestamp: nowIso,
         actor: 'admin',
@@ -2822,12 +3467,18 @@ export class PremiumManager {
         providerId,
         subscriptionId: sub.id,
         metadata: { variantId: opts.variantId, couponCode: opts.couponCode },
-      }, result.providerSubId);
+      }, { carry }, result.providerSubId);
       void this.notify(guildId, 'paid.sub.started', {
         tierName: tier.displayName,
         providerName: this.providerDisplayName(providerId),
         endDate: sub.endDate,
-      });
+      }, { carry });
+      try {
+        await this.installSubscription(guildId, sub, carry, willGoToQueue ? { boughtPaused: true } : {});
+      } catch (error) {
+        forgetItems(carry.items.splice(0));
+        throw error;
+      }
     }
 
     return result;
@@ -2846,7 +3497,14 @@ export class PremiumManager {
     if (!active.providerId || !active.providerSubId) return false;
     const provider = getPaymentRegistry().get(active.providerId);
     if (!provider?.cancelSubscription || !provider.capabilities.supportsCancel) return false;
-    await provider.cancelSubscription(active.providerSubId);
+    const state = await provider.cancelSubscription(active.providerSubId);
+    // Decisions 72 and 73: a returned state is stored at the provider; premium copies it into the sub it holds now
+    // (other changes may have reloaded or removed it during the call) and its save carries the items.
+    const current = this.subscriptionById(guildId, active.id);
+    if (state && !current) return this.saveRemovedMeanwhile(guildId, active.id) === 'done';
+    const carry = newCarry();
+    const link: Link = state ? { carry } : { standalone: 'the provider stored the change' };
+    if (state && current) this.copyProviderState(current, state);
     this.writeAudit({
       timestamp: new Date().toISOString(),
       actor: 'admin',
@@ -2855,13 +3513,13 @@ export class PremiumManager {
       subscriptionId: active.id,
       providerId: active.providerId,
       metadata: { immediately: false },
-    });
+    }, link);
     void this.notify(guildId, 'paid.sub.cancelled-by-user', {
       tierName: this.config.tiers[active.tierId]?.displayName || active.tierId,
       providerName: this.providerDisplayName(active.providerId),
-      endDate: active.endDate,
-    });
-    return true;
+      endDate: (current ?? active).endDate,
+    }, link);
+    return state ? this.save({ carry }) !== null : true;
   }
 
   /** Reactivate a cancelled paid sub while still inside its active window. */
@@ -2874,7 +3532,11 @@ export class PremiumManager {
     if (active.endDate !== null && Date.parse(active.endDate) <= Date.now()) return false;
     const provider = getPaymentRegistry().get(active.providerId);
     if (!provider?.reactivateSubscription || !provider.capabilities.supportsReactivate) return false;
-    await provider.reactivateSubscription(active.providerSubId);
+    const state = await provider.reactivateSubscription(active.providerSubId);
+    const current = this.subscriptionById(guildId, active.id);
+    if (state && !current) return this.saveRemovedMeanwhile(guildId, active.id) === 'done';
+    const carry = newCarry();
+    if (state && current) this.copyProviderState(current, state);
     this.writeAudit({
       timestamp: new Date().toISOString(),
       actor: 'admin',
@@ -2882,8 +3544,8 @@ export class PremiumManager {
       guildId,
       subscriptionId: active.id,
       providerId: active.providerId,
-    });
-    return true;
+    }, state ? { carry } : { standalone: 'the provider stored the change' });
+    return state ? this.save({ carry }) !== null : true;
   }
 
   /**
@@ -2926,6 +3588,7 @@ export class PremiumManager {
     const inActive = subs.active?.id === cancelled.id;
     const at = inActive ? -1 : subs.paused.findIndex(p => p.id === cancelled.id);
     if (!inActive && at < 0) return this.saveRemovedMeanwhile(guildId, cancelled.id);
+    const carry = newCarry();
     this.writeAudit({
       timestamp: new Date().toISOString(),
       actor: 'admin',
@@ -2934,21 +3597,21 @@ export class PremiumManager {
       subscriptionId: cancelled.id,
       providerId: cancelled.providerId,
       metadata,
-    });
+    }, { carry });
     if (notifyOwner) {
       void this.notify(guildId, 'paid.sub.cancelled-by-user', {
         tierName: this.config.tiers[cancelled.tierId]?.displayName || cancelled.tierId,
         providerName: this.providerDisplayName(cancelled.providerId),
-      });
+      }, { carry });
     }
     if (inActive) {
       delete subs.active;
-      if (subs.paused.length > 0) this.resumeNext(guildId);
+      if (subs.paused.length > 0) this.resumeNext(guildId, carry);
     } else {
       subs.paused.splice(at, 1);
     }
     if (this.guildSubsEmpty(subs)) delete this.config.subscriptions[guildId];
-    return this.save() ? 'done' : 'not saved';
+    return this.save({ carry }) ? 'done' : 'not saved';
   }
 
   /**
@@ -3060,26 +3723,36 @@ export class PremiumManager {
       );
     }
 
-    getPaymentRegistry().emitEvent({
-      type: 'subscription.created',
-      providerId,
-      providerSubId,
-      guildId,
-      tierId: ref.metadata.tierId,
-      offeringId: ref.metadata.offeringId,
-      variantId: ref.metadata.variantId,
-      couponCode: ref.metadata.couponCode,
-      state: ref.state,
-    });
+    // Decision 72: no event; the adoption line rides the save of the install it starts.
+    const tierId = ref.metadata.tierId;
+    const offeringId = ref.metadata.offeringId;
+    const carry = newCarry();
     this.writeAudit({
       timestamp: new Date().toISOString(),
       actor: 'admin',
       action: 'subscription.adopt.orphan',
       guildId,
       providerId,
-      metadata: { providerSubId, tierId: ref.metadata.tierId, offeringId: ref.metadata.offeringId },
-    });
-    return true;
+      metadata: { providerSubId, tierId, offeringId },
+    }, { carry });
+    const outcome = await this.installAsyncSubscription({
+      type: 'subscription.created',
+      providerId,
+      providerSubId,
+      guildId,
+      tierId,
+      offeringId,
+      variantId: ref.metadata.variantId,
+      couponCode: ref.metadata.couponCode,
+      state: ref.state,
+    }, { carry });
+    if ('op' in outcome) return true;
+    if ('refused' in outcome) return false;
+    forgetItems(carry.items.splice(0));
+    const why = outcome.skipped === 'tier'
+      ? `tier '${tierId}' does not exist`
+      : outcome.skipped === 'offering' ? `tier '${tierId}' has no offering '${offeringId}'` : "it is already in this bot's subscriptions";
+    throw new Error(`Subscription '${providerSubId}' was not adopted: ${why}.`);
   }
 
   async cancelOrphan(providerId: string, providerSubId: string): Promise<boolean> {
@@ -3096,7 +3769,7 @@ export class PremiumManager {
       action: 'subscription.cancel.orphan',
       providerId,
       metadata: { providerSubId },
-    });
+    }, { standalone: 'the provider stored the cancel' });
     return true;
   }
 
@@ -3142,7 +3815,7 @@ export class PremiumManager {
       delete subs.notificationsChannelId;
       if (this.guildSubsEmpty(subs)) delete this.config.subscriptions[guildId];
     }
-    return this.save();
+    return this.save() !== null;
   }
 
   // ============================================================================
@@ -3250,7 +3923,7 @@ export class PremiumManager {
     const existing = this.config.providerAccountLinks[providerId][externalAccountId];
     if (existing && existing !== guildId) return false;
     this.config.providerAccountLinks[providerId][externalAccountId] = guildId;
-    return this.save();
+    return this.save() !== null;
   }
 
   unlinkAccount(providerId: string, externalAccountId: string): boolean {
@@ -3259,7 +3932,7 @@ export class PremiumManager {
     if (!links) return true;
     delete links[externalAccountId];
     if (Object.keys(links).length === 0) delete this.config.providerAccountLinks[providerId];
-    return this.save();
+    return this.save() !== null;
   }
 
   /**
@@ -3343,6 +4016,7 @@ export class PremiumManager {
     const nowIso = new Date().toISOString();
     const ENDING_SOON_WINDOW_MS = 24 * 60 * 60 * 1000;
     const stillActiveIds = new Set<string>();
+    const carry = newCarry();
     for (const guildId of Object.keys(this.config.subscriptions)) {
       const subs = this.config.subscriptions[guildId];
       const active = subs.active;
@@ -3366,14 +4040,14 @@ export class PremiumManager {
           guildId,
           subscriptionId: active.id,
           metadata: { reason: 'expired' },
-        });
+        }, { carry });
         void this.notify(guildId, 'manual.grant.ended', {
           tierName,
           notes: expiredNotes,
-        });
+        }, { carry });
         this.endingSoonNotified.delete(expiredId);
         delete subs.active;
-        if (subs.paused.length > 0) this.resumeNext(guildId);
+        if (subs.paused.length > 0) this.resumeNext(guildId, carry);
         if (this.guildSubsEmpty(subs)) delete this.config.subscriptions[guildId];
         continue;
       }
@@ -3389,14 +4063,14 @@ export class PremiumManager {
       void this.notify(guildId, 'manual.grant.ending-soon', {
         tierName: this.config.tiers[active.tierId]?.displayName || active.tierId,
         endDate: active.endDate,
-      });
+      }, { standalone: 'endingSoonNotified is memory' });
     }
     // Sweep dedupe set: drop ids that no longer correspond to an active
     // manual sub anywhere (revoked, queue-pop replaced active, etc.).
     for (const id of this.endingSoonNotified) {
       if (!stillActiveIds.has(id)) this.endingSoonNotified.delete(id);
     }
-    if (changed) this.save();
+    if (changed) this.save({ carry });
   }
 
   // ============================================================================
@@ -3412,16 +4086,15 @@ export class PremiumManager {
     if (this.refusedAtEntry()) return false;
     const before = { ...this.config.messages };
     this.config.messages = { ...this.config.messages, ...partial };
-    const ok = this.save();
-    if (ok) {
-      this.writeAudit({
-        timestamp: new Date().toISOString(),
-        actor: 'admin',
-        action: 'message.update',
-        before,
-        after: this.config.messages,
-      });
-    }
+    const carry = newCarry();
+    this.writeAudit({
+      timestamp: new Date().toISOString(),
+      actor: 'admin',
+      action: 'message.update',
+      before,
+      after: this.config.messages,
+    }, { carry });
+    const ok = this.save({ carry }) !== null;
     return ok;
   }
 
@@ -3429,17 +4102,16 @@ export class PremiumManager {
     if (this.refusedAtEntry()) return false;
     const before = { ...this.config.messages };
     this.config.messages = { ...DEFAULT_MESSAGES };
-    const ok = this.save();
-    if (ok) {
-      this.writeAudit({
-        timestamp: new Date().toISOString(),
-        actor: 'admin',
-        action: 'message.update',
-        before,
-        after: this.config.messages,
-        metadata: { reset: true },
-      });
-    }
+    const carry = newCarry();
+    this.writeAudit({
+      timestamp: new Date().toISOString(),
+      actor: 'admin',
+      action: 'message.update',
+      before,
+      after: this.config.messages,
+      metadata: { reset: true },
+    }, { carry });
+    const ok = this.save({ carry }) !== null;
     return ok;
   }
 
@@ -3495,16 +4167,15 @@ export class PremiumManager {
     const before = this.config.migrationSilencePolicy;
     if (before === policy) return true;
     this.config.migrationSilencePolicy = policy;
-    const ok = this.save();
-    if (ok) {
-      this.writeAudit({
-        timestamp: new Date().toISOString(),
-        actor: 'admin',
-        action: 'migration.silence-policy.set',
-        before,
-        after: policy,
-      });
-    }
+    const carry = newCarry();
+    this.writeAudit({
+      timestamp: new Date().toISOString(),
+      actor: 'admin',
+      action: 'migration.silence-policy.set',
+      before,
+      after: policy,
+    }, { carry });
+    const ok = this.save({ carry }) !== null;
     return ok;
   }
 
@@ -3598,9 +4269,7 @@ export class PremiumManager {
       decisions,
     };
     this.config.migrations.push(migration);
-    const ok = this.save();
-    if (!ok) throw new Error('Failed to persist migration.');
-
+    const carry = newCarry();
     this.writeAudit({
       timestamp: migration.scheduledAt,
       actor: migration.scheduledBy,
@@ -3617,7 +4286,7 @@ export class PremiumManager {
         effectiveDate: opts.effectiveDate,
         affectedCount: decisions.length,
       },
-    });
+    }, { carry });
 
     const notice = {
       tierName: targetTier.displayName,
@@ -3625,11 +4294,12 @@ export class PremiumManager {
       details: opts.message || `Your subscription will move from "${sourceTier.displayName}" to "${targetTier.displayName}". Open the subscription panel to accept or decline.`,
     };
     for (const d of migration.decisions) {
-      void this.notify(d.guildId, 'migration.scheduled', notice).then((outcome) => {
+      void this.notify(d.guildId, 'migration.scheduled', notice, { carry }).then((outcome) => {
         if (outcome.delivered) this.markMigrationNotified(migration.id, d.subscriptionId, new Date().toISOString());
         else console.warn(`[PremiumManager] Migration ${migration.id} request not delivered to guild ${d.guildId}: ${outcome.cause}`);
       });
     }
+    if (this.save({ carry }) === null) throw new Error('Failed to persist migration.');
 
     return JSON.parse(JSON.stringify(migration));
   }
@@ -3641,7 +4311,7 @@ export class PremiumManager {
     const entry = migration?.decisions.find(d => d.subscriptionId === subscriptionId);
     if (!entry || entry.notifiedAt) return;
     entry.notifiedAt = stamp;
-    if (!this.save()) console.warn(`[PremiumManager] Migration ${migrationId}: delivery to guild ${entry.guildId} not recorded (save failed)`);
+    if (this.save() === null) console.warn(`[PremiumManager] Migration ${migrationId}: delivery to guild ${entry.guildId} not recorded (save failed)`);
   }
 
   /**
@@ -3661,22 +4331,21 @@ export class PremiumManager {
     if (entry.decision === decision) return true;
     entry.decision = decision;
     entry.decidedAt = new Date().toISOString();
-    const ok = this.save();
-    if (ok) {
-      this.writeAudit({
-        timestamp: entry.decidedAt,
-        actor: 'guild-owner',
-        action: 'migration.decision',
-        guildId,
-        migrationId,
-        metadata: { decision },
-      });
-      const targetTier = this.config.tiers[migration.targetTierId];
-      void this.notify(guildId, decision === 'accepted' ? 'migration.accepted' : 'migration.declined', {
-        tierName: targetTier?.displayName || migration.targetTierId,
-        endDate: migration.effectiveDate,
-      });
-    }
+    const carry = newCarry();
+    this.writeAudit({
+      timestamp: entry.decidedAt,
+      actor: 'guild-owner',
+      action: 'migration.decision',
+      guildId,
+      migrationId,
+      metadata: { decision },
+    }, { carry });
+    const targetTier = this.config.tiers[migration.targetTierId];
+    void this.notify(guildId, decision === 'accepted' ? 'migration.accepted' : 'migration.declined', {
+      tierName: targetTier?.displayName || migration.targetTierId,
+      endDate: migration.effectiveDate,
+    }, { carry });
+    const ok = this.save({ carry }) !== null;
     return ok;
   }
 
@@ -3690,16 +4359,15 @@ export class PremiumManager {
     if (migration.status !== 'pending') return false;
     if (this.migrating.has(migrationId)) throw new MigrationBusy();
     migration.status = 'cancelled';
-    const ok = this.save();
-    if (ok) {
-      this.writeAudit({
-        timestamp: new Date().toISOString(),
-        actor: 'admin',
-        action: 'migration.cancelled',
-        migrationId,
-        providerId: migration.providerId,
-      });
-    }
+    const carry = newCarry();
+    this.writeAudit({
+      timestamp: new Date().toISOString(),
+      actor: 'admin',
+      action: 'migration.cancelled',
+      migrationId,
+      providerId: migration.providerId,
+    }, { carry });
+    const ok = this.save({ carry }) !== null;
     return ok;
   }
 
@@ -3751,7 +4419,7 @@ export class PremiumManager {
     if (!provider || !provider.migrateSubscriptionPrice) {
       // Provider gone since scheduling; mark cancelled rather than apply.
       migration.status = 'cancelled';
-      this.save();
+      const cancelled = newCarry();
       this.writeAudit({
         timestamp: new Date().toISOString(),
         actor: 'system',
@@ -3759,16 +4427,21 @@ export class PremiumManager {
         migrationId: migration.id,
         providerId: migration.providerId,
         metadata: { reason: 'provider-unavailable' },
-      });
+      }, { carry: cancelled });
+      this.save({ carry: cancelled });
       return;
     }
+    const carry = newCarry();
     const targetTier = this.config.tiers[migration.targetTierId];
     const targetOffering = targetTier?.offerings.find(o => o.id === migration.targetOfferingId);
     const policy = this.config.migrationSilencePolicy;
     const stamp = new Date().toISOString();
 
     for (const decision of migration.decisions) {
-      if (this.cannotWrite()) return;
+      if (this.cannotWrite()) {
+        forgetItems(carry.items.splice(0));
+        return;
+      }
       if (decision.appliedAt) continue;
       // Skip if guild lost their sub (cancelled before effective date).
       const subs = this.config.subscriptions[decision.guildId];
@@ -3816,10 +4489,11 @@ export class PremiumManager {
 
       try {
         if (effective === 'accepted') {
-          await provider.migrateSubscriptionPrice(sub.providerSubId, migration.targetVariantId, 'none');
+          const state = await provider.migrateSubscriptionPrice(sub.providerSubId, migration.targetVariantId, 'none');
           // Update local cache to match the new variant. Provider webhooks
           // may also fire and we'll reconcile on top.
           const current = this.subscriptionById(decision.guildId, sub.id);
+          if (current && state) this.copyProviderState(current, state);
           if (current) {
             current.tierId = migration.targetTierId;
             current.offeringId = migration.targetOfferingId;
@@ -3829,10 +4503,11 @@ export class PremiumManager {
           decision.outcome = 'migrated';
         } else {
           // declined OR silent + 'cancel' policy
-          if (provider.cancelSubscription && provider.capabilities.supportsCancel) {
-            await provider.cancelSubscription(sub.providerSubId, false);
-          }
+          const state = provider.cancelSubscription && provider.capabilities.supportsCancel
+            ? await provider.cancelSubscription(sub.providerSubId, false)
+            : undefined;
           const current = this.subscriptionById(decision.guildId, sub.id);
+          if (current && state) this.copyProviderState(current, state);
           if (current) {
             current.autoRenew = false;
             current.updatedAt = stamp;
@@ -3846,23 +4521,25 @@ export class PremiumManager {
       decision.appliedAt = stamp;
 
       // Per-decision notification.
-      if (wasSilent) {
+      if (wasSilent && (decision.outcome === 'migrated' || decision.outcome === 'cancelled')) {
         void this.notify(decision.guildId, 'migration.silence-applied', {
           tierName: targetTier?.displayName || migration.targetTierId,
           details: policy === 'continue' ? 'Migrated to the new plan automatically.' : 'Set to cancel at period end.',
-        });
-      } else if (decision.outcome === 'migrated') {
+        }, { carry });
+      } else if (!wasSilent && decision.outcome === 'migrated') {
         void this.notify(decision.guildId, 'migration.applied', {
           tierName: targetTier?.displayName || migration.targetTierId,
           providerName: this.providerDisplayName(migration.providerId),
-        });
+        }, { carry });
       }
     }
-    if (this.cannotWrite()) return;
+    if (this.cannotWrite()) {
+      forgetItems(carry.items.splice(0));
+      return;
+    }
 
     migration.status = 'applied';
     migration.appliedAt = stamp;
-    this.save();
     this.writeAudit({
       timestamp: stamp,
       actor: 'system',
@@ -3878,7 +4555,8 @@ export class PremiumManager {
           return acc;
         }, {}),
       },
-    });
+    }, { carry });
+    this.save({ carry });
     // Reference targetOffering only to prove it parsed at scheduling - the
     // scheduler doesn't actually need the offering object once the variant
     // change is applied. Touched here so future code can hook in.
@@ -3918,7 +4596,7 @@ export class PremiumManager {
       migrationSilencePolicy: config.migrationSilencePolicy === 'continue' ? 'continue' : 'cancel',
       ...(this.config.eventsApplied ? { eventsApplied: this.config.eventsApplied } : {}),
     };
-    return this.save();
+    return this.save() !== null;
   }
 }
 

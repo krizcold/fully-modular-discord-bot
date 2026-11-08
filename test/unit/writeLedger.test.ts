@@ -31,6 +31,7 @@ import {
   runInLedger,
   runSealed,
   withModule,
+  type LedgerTicket,
   type WriteLedger,
 } from '../../src/bot/internalSetup/utils/dataBackends/writeLedger';
 import { IngestService } from '../../src/bot/internalSetup/ingest/ingestService';
@@ -52,7 +53,7 @@ const freshGuild = () => String(++guilds);
 /** Each entry as [where, sorted modules]: a file path's basename, or ws:<guild> for a working set. */
 function shape(ledger: WriteLedger): Array<[string, string[]]> {
   return ledger.tickets()
-    .map(({ ticket, modules }): [string, string[]] => [ticket.kind === 'file' ? path.basename(ticket.path) : `ws:${ticket.guildId}`, [...modules].sort()])
+    .map(({ ticket, modules }): [string, string[]] => [ticket.kind === 'file' ? path.basename(ticket.path) : ticket.kind === 'row' ? `row:${ticket.key}` : `ws:${ticket.guildId}`, [...modules].sort()])
     .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
 }
 
@@ -635,7 +636,10 @@ async function runHandler(steps: Step[], guildId: string): Promise<{ answers: st
   return { answers, written };
 }
 
-const hasLanded = (ticket: WriteTicket) => (ticket.kind === 'file' ? ticket.record.landed >= ticket.seq : ticket.set.landedSeq >= ticket.seq);
+const hasLanded = (written: WriteTicket) => {
+  const ticket = written as Exclude<LedgerTicket, { kind: 'row' }>;
+  return ticket.kind === 'file' ? ticket.record.landed >= ticket.seq : ticket.set.landedSeq >= ticket.seq;
+};
 
 function held(ledger: WriteLedger): Map<string, Set<string>> {
   const out = new Map<string, Set<string>>();

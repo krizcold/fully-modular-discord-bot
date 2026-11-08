@@ -36,6 +36,7 @@ function AppStorePanel() {
   const [view, setView] = useState('modules'); // 'modules', 'repos', 'premium', 'detail'
   const [modules, setModules] = useState([]);
   const [installed, setInstalled] = useState({});
+  const [moduleFailures, setModuleFailures] = useState([]);
   const [repositories, setRepositories] = useState([]);
   const [tiers, setTiers] = useState({});
   const [subscriptions, setSubscriptions] = useState({});
@@ -91,7 +92,8 @@ function AppStorePanel() {
         showToast(toast.text, toast.kind, toast.kind === 'success' ? undefined : { sticky: true });
       } else {
         if (job.skipped) return;
-        if (job.unloaded === false) showToast(`${job.moduleName} uninstalled. Changes apply on next bot start.`, 'info');
+        if (job.message) showToast(job.message, job.unloaded === true ? 'success' : 'warning', job.unloaded === true ? undefined : { sticky: true });
+        else if (job.unloaded === false) showToast(`${job.moduleName} uninstalled. Changes apply on next bot start.`, 'info');
         else showToast(`${job.moduleName} uninstalled.`, 'success');
       }
     };
@@ -125,6 +127,7 @@ function AppStorePanel() {
         ? installedArr.reduce((acc, m) => { acc[m.name] = m; return acc; }, {})
         : installedArr;
       setInstalled(installedMap);
+      setModuleFailures(appStoreFailureLines(res.moduleFailures, res.moduleFailuresUnread));
       setRepositories(res.repositories || []);
       setTiers(res.tiers || {});
       setSubscriptions(res.subscriptions || {});
@@ -212,6 +215,19 @@ function AppStorePanel() {
           Premium Tiers
         </button>
       </div>
+
+      {moduleFailures.length > 0 && (
+        <div style={{
+          background: 'rgba(237, 66, 69, 0.15)',
+          color: '#ed4245',
+          border: '1px solid rgba(237, 66, 69, 0.3)',
+          borderRadius: '4px',
+          padding: '10px 15px',
+          marginBottom: '20px'
+        }}>
+          {moduleFailures.map(line => <div key={line}>{line}</div>)}
+        </div>
+      )}
 
       {/* Module Detail View */}
       {view === 'detail' && selectedModule && (
@@ -707,9 +723,19 @@ const appStoreOwnJobIds = new Set();
 // A module can hold several jobs at once (an install running, an uninstall queued behind it), so jobs are keyed by
 // id and an event touches only its own job. A newly queued job supersedes the module's failed ones.
 function appStoreInstallToast(job) {
+  // On a database bot the job carries the bot's own answer for anything but a plain load.
+  if (job.message) return { text: job.message, kind: job.loaded === true ? 'success' : 'warning' };
   if (job.loaded !== false) return { text: `${job.moduleName} installed.`, kind: 'success' };
   if (job.loadError) return { text: `${job.moduleName} installed, but the bot did not load it: ${job.loadError}`, kind: 'warning' };
   return { text: `${job.moduleName} installed, but the bot could not confirm it loaded. Check the bot is running, or restart it to load the module.`, kind: 'warning' };
+}
+
+// On a database bot: one line per machine where a module's version failed to load, until a version loads there, or
+// the cause when the machines' statuses could not be read.
+function appStoreFailureLines(failures, unread) {
+  if (typeof unread === 'string') return [`Can't read which machines failed to load a module (${unread}).`];
+  if (!Array.isArray(failures)) return [];
+  return failures.map(f => `${f.module} ${f.version} failed to load on ${f.machine}: ${f.error}`);
 }
 
 function appStoreApplyJobEvent(jobs, event, job) {
@@ -2252,6 +2278,9 @@ function ProviderCredentialsModal({ providerId, providerName, onClose, onSaved }
                       placeholder={isSet ? '[set - leave blank to keep current]' : (f.placeholder || '')}
                       onChange={e => setValues(v => ({ ...v, [f.key]: e.target.value }))}
                     />
+                  )}
+                  {status[f.key]?.unread && (
+                    <div style={{ color: '#e67e22', fontSize: '0.72rem', marginTop: '4px' }}>{status[f.key].unread}</div>
                   )}
                   {f.helpText && (
                     <div style={{ color: '#888', fontSize: '0.72rem', marginTop: '4px' }}>{f.helpText}</div>

@@ -11,7 +11,8 @@
 import {
   getAppStoreManager,
   ModuleUpdateCheck,
-  ModuleUpdatesResult
+  ModuleUpdatesResult,
+  type ModuleUpdateResult as StoreUpdateResult
 } from '@bot/internalSetup/utils/appStoreManager';
 
 export interface UpdateCheckResult {
@@ -54,13 +55,19 @@ export interface CombinedUpdateCheckResult {
   };
 }
 
-/** Result of updating a single module */
+/**
+ * Result of updating a single module; on a Postgres bot `applied` is the apply's answer in the bot (NB6 decision 61), and
+ * `published` the stored change the web UI hands to the bot's `module:apply` (44)
+ */
 export interface ModuleUpdateResult {
   success: boolean;
   moduleName: string;
   oldVersion?: string;
   newVersion?: string;
   error?: string;
+  unconfirmed?: true;
+  applied?: StoreUpdateResult['applied'];
+  published?: StoreUpdateResult['published'];
 }
 
 /** Result of bulk module updates */
@@ -68,19 +75,21 @@ export interface BulkModuleUpdateResult {
   success: boolean;
   totalAttempted: number;
   totalUpdated: number;
-  updated: Array<{ moduleName: string; oldVersion: string; newVersion: string }>;
-  failed: Array<{ moduleName: string; error: string }>;
+  updated: Array<{ moduleName: string; oldVersion: string; newVersion: string; applied?: StoreUpdateResult['applied']; published?: StoreUpdateResult['published'] }>;
+  failed: Array<{ moduleName: string; error: string; unconfirmed?: true; changedElsewhere?: true }>;
   checkErrors: Array<{ moduleName: string; error: string }>;
   skipped: Array<{ moduleName: string; reason: string }>;
 }
 
 /**
- * Operator-facing sentence for a bulk module update; names every module that was not updated.
+ * Operator-facing sentence for a bulk module update; names every module that was not updated. An update the database
+ * did not answer is told by its own can't confirm text (NB6 decision 35), after the sentence.
  */
 export function describeBulkModuleUpdate(result: BulkModuleUpdateResult): string {
   const parts = [`Updated ${result.totalUpdated} module(s)`];
-  if (result.failed.length > 0) {
-    parts.push(`failed: ${result.failed.map(f => `${f.moduleName} (${f.error})`).join(', ')}`);
+  const failed = result.failed.filter(f => !f.unconfirmed);
+  if (failed.length > 0) {
+    parts.push(`failed: ${failed.map(f => `${f.moduleName} (${f.error})`).join(', ')}`);
   }
   if (result.skipped.length > 0) {
     parts.push(`not updated: ${result.skipped.map(s => `${s.moduleName} (${s.reason})`).join(', ')}`);
@@ -88,7 +97,8 @@ export function describeBulkModuleUpdate(result: BulkModuleUpdateResult): string
   if (result.checkErrors.length > 0) {
     parts.push(`could not check: ${result.checkErrors.map(e => `${e.moduleName} (${e.error})`).join(', ')}`);
   }
-  return parts.join('; ');
+  const unconfirmed = result.failed.filter(f => f.unconfirmed).map(f => f.error);
+  return unconfirmed.length > 0 ? `${parts.join('; ')}. ${unconfirmed.join(' ')}` : parts.join('; ');
 }
 
 // Re-export module types for convenience
@@ -427,7 +437,10 @@ export async function triggerModuleUpdate(moduleName: string): Promise<ModuleUpd
       moduleName,
       oldVersion,
       newVersion: updateResult.newVersion,
-      error: updateResult.error
+      error: updateResult.error,
+      ...(updateResult.unconfirmed ? { unconfirmed: true as const } : {}),
+      ...(updateResult.applied ? { applied: updateResult.applied } : {}),
+      ...(updateResult.published ? { published: updateResult.published } : {})
     };
   } catch (error) {
     return {

@@ -240,15 +240,14 @@ describe('the holder\'s reply from a done row (decision 9)', () => {
     expect(hop(value)).toEqual({ status: 503, body: { success: false, code: 'not-taken', error: 'BRAVO did not apply the change; nothing was deleted. Try again in a moment.', servedBy: 'BRAVO' } });
   });
 
-  it('a twin that changed: 409 with the twin text, never the reload text', async () => {
+  it('a twin that changed: 409 with the holder\'s changed text', async () => {
     doneWith('{"ok":false,"code":"changed","which":"twin","error":"This file changed while the save was being made; nothing was saved. Reload it to see the current values."}');
     const { done } = await send();
     const { value } = await done(2000);
-    expect(value).toMatchObject({ ok: false, code: 'changed', status: 409, error: NB7_TEXTS.twin('BRAVO') });
+    expect(value).toMatchObject({ ok: false, code: 'changed', which: 'twin', error: 'This file changed while the save was being made; nothing was saved. Reload it to see the current values.', servedBy: 'BRAVO' });
     const out = hop(value);
     expect(out.status).toBe(409);
-    expect(out.body.error).toBe(NB7_TEXTS.twin('BRAVO'));
-    expect(out.body.error).not.toMatch(/Reload it/);
+    expect(out.body.error).toBe('On BRAVO: This file changed while the save was being made; nothing was saved. Reload it to see the current values.');
   });
 
   it('a target that changed: 409 with the reload text on the holder\'s name', async () => {

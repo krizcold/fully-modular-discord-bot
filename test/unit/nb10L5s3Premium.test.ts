@@ -390,7 +390,7 @@ describe('the replay drop', () => {
     expect(pm.installLines.has('sub1')).toBe(false);
     await runSealed('console', null, 'premium', async ledger => {
       pm.replayLedgers.add(ledger);
-      pm.writeAudit(pending('tier.update', 'g1').entry);
+      pm.writeAudit(pending('tier.update', 'g1').entry, { standalone: 'written at once, as NB10 wrote every line' });
     });
     expect(pm.replayBuffer).toEqual([]);
   });

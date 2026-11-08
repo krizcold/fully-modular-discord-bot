@@ -46,6 +46,9 @@ vi.mock('../../src/bot/internalSetup/utils/dataBackends/mainDatabase', async imp
     confirmNow() {}
     stop() {}
     attach() {}
+    view() {
+      return { chosen: 'db:5432/bot', generation: 0, machine: null, state: 'main', reason: null, addresses: [], checkedAgoMs: null };
+    }
   },
 }));
 

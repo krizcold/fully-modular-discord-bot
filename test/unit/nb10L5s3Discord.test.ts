@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 vi.mock('../../src/utils/envLoader', async orig => ({
   ...(await orig<any>()),
   loadCredentials: () => ({ DISCORD_APPLICATION_ID: '4242', DISCORD_TOKEN: 'test-token' }),
+  providerCredentials: () => ({ DISCORD_APPLICATION_ID: '4242', DISCORD_TOKEN: 'test-token' }),
 }));
 vi.mock('../../src/bot/internalSetup/utils/payment/paymentRegistry', () => ({
   getPaymentRegistry: () => ({ emitEvent: () => undefined }),

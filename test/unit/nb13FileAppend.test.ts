@@ -389,7 +389,7 @@ describe('4.8 and 4.9: two writers, and the reader', () => {
     await flushAll();
     expect(read(audit)).toBe(`${entry(1)}\n\n{"torn":\n${entry(2)}\n`);
     const { getPremiumManager } = await import('../../src/bot/internalSetup/utils/premiumManager');
-    expect(getPremiumManager().readAuditEntries({ action: 'nb13.read' }).entries.map(e => (e as unknown as { i: number }).i).sort()).toEqual([1, 2]);
+    expect((await getPremiumManager().readAuditEntries({ action: 'nb13.read' })).entries.map(e => (e as unknown as { i: number }).i).sort()).toEqual([1, 2]);
   });
 });
 

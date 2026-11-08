@@ -8,8 +8,8 @@ import { guardPoolClients } from '../../bot/internalSetup/utils/pgClient';
 import { loadCredentials } from '../../utils/envLoader';
 import { canonicalGuildKey } from '../../bot/internalSetup/utils/dataKeys';
 import { HOLDER_CHECK_SQL } from '../../bot/internalSetup/utils/dataBackends/guildRequestSql';
-import { addressListInUse, parseAddressList, pgConfig, type ListEntry } from '../../utils/databaseAddress';
-import { decideMain, probePass, type NoticeRead, type ProbeAnswer, type StoreReport } from '../../bot/internalSetup/utils/dataBackends/mainDatabase';
+import { addressListInUse, parseAddressList, pgConfig, showEntry, type ListEntry } from '../../utils/databaseAddress';
+import { decideMain, mainTagOf, probePass, type NoticeRead, type ProbeAnswer, type StoreReport } from '../../bot/internalSetup/utils/dataBackends/mainDatabase';
 import { MarkerUnreadable, readMarkerStoreId } from '../../bot/internalSetup/utils/dataBackends/recognitionGuard';
 import { readNewestNotice } from '../../utils/ownerMessages';
 
@@ -23,8 +23,11 @@ const OWN_READ_BUDGET_MS = 40_000;
 export const STARTING_REFUSAL = 'the bot process is starting; try again once it has started';
 export const CHOOSING_REFUSAL = 'choosing the main database';
 
-/** NB5 decision 17: the entry the web UI's pools use, with `held` while the bot process confirms it, or a refusal. */
-export type WebuiResolution = { entry: string; held?: { reason: string } } | { refusal: string };
+/**
+ * NB5 decision 17: the entry the web UI's pools use, with `held` while the bot process confirms it, or a refusal. `tag`
+ * is the entry's main tag (NB6 C23): the report's, or the own choice's; null when the report carries none.
+ */
+export type WebuiResolution = { entry: string; tag: string | null; held?: { reason: string } } | { refusal: string };
 
 /**
  * Decision 17's case: no bot process (or a maintenance boot, which reports no store) takes the web UI's own choice; a
@@ -55,6 +58,7 @@ export function setWebuiDataStoreUrl(report: StoreReport | null): void {
       ...(url === null ? { choosing: true as const } : {}),
       ...(url !== null && report.held === true ? { held: true as const } : {}),
       ...(typeof report.reason === 'string' ? { reason: report.reason } : {}),
+      ...(url !== null && typeof report.tag === 'string' ? { tag: report.tag } : {}),
     },
   };
 }
@@ -138,7 +142,7 @@ async function choose(ownRead: boolean): Promise<WebuiResolution> {
   const options = { markerStoreId, noticeCheckOff: deps.noticeCheckOff() };
   let decision = decideMain(answers, undefined, options);
   if (decision.outcome === 'needs-notice') decision = decideMain(answers, await deps.readNotice(ownRead), options);
-  if (decision.outcome === 'chosen') return { entry: decision.chosen.entry };
+  if (decision.outcome === 'chosen') return { entry: decision.chosen.entry, tag: mainTagOf(decision.generation, decision.machine) };
   if (decision.outcome === 'needs-notice') return { refusal: CHOOSING_REFUSAL };
   return { refusal: decision.reason };
 }
@@ -168,7 +172,8 @@ export function resolveWebuiDatabase(): WebuiResolution {
   if (current.kind === 'reported') {
     const report = current.report;
     if (report.url === null) return { refusal: report.reason ?? CHOOSING_REFUSAL };
-    return report.held ? { entry: report.url, held: { reason: report.reason ?? '' } } : { entry: report.url };
+    const tag = report.tag ?? null;
+    return report.held ? { entry: report.url, tag, held: { reason: report.reason ?? '' } } : { entry: report.url, tag };
   }
   return ownChoice();
 }
@@ -191,6 +196,64 @@ export async function chooseNow(): Promise<{ resolution: WebuiResolution; countA
     ownStartedAt = Date.now();
   }
   return { resolution, countAtStart };
+}
+
+export const REPORT_CHANGED_REFUSAL = 'the bot process reported a change of its database during the check';
+
+/** A write check's refusal: NB5's reason, and `held` for the bot process's held report (its confirming words). */
+export type WebuiCheckRefusal = { refusal: string; held: boolean };
+
+/** The bot process's report as every write check reads it: a refusal, or null when it lets the entry through. */
+function reportCheck(entry: string | null): WebuiCheckRefusal | null {
+  const current = childCase;
+  if (current.kind === 'starting') return { refusal: STARTING_REFUSAL, held: false };
+  if (current.kind !== 'reported') return null;
+  const report = current.report;
+  if (report.url === null) return { refusal: report.reason ?? CHOOSING_REFUSAL, held: false };
+  if (report.held) return { refusal: report.reason ?? '', held: true };
+  if (entry !== null && report.url !== entry) {
+    return { refusal: `a check of the databases made now picks ${showEntry(entry)}, while the bot process uses ${showEntry(report.url)}`, held: false };
+  }
+  return null;
+}
+
+/** NB6 D7's first write check: the report, and the own choice with no bot process or in a maintenance boot. */
+export function webuiFirstCheck(): WebuiCheckRefusal | null {
+  const report = reportCheck(null);
+  if (report) return report;
+  const current = childCase;
+  if (current.kind === 'none' || current.kind === 'maintenance') {
+    const own = resolveWebuiDatabase();
+    if ('refusal' in own) return { refusal: own.refusal, held: false };
+  }
+  return null;
+}
+
+/** D7's second write check, once chooseNow() answered: the choice, the report on the chosen entry, the report count. */
+export function webuiSecondCheck(resolution: WebuiResolution, countAtStart: number): { entry: string; tag: string | null } | WebuiCheckRefusal {
+  if ('refusal' in resolution) return { refusal: resolution.refusal, held: false };
+  const report = reportCheck(resolution.entry);
+  if (report) return report;
+  if (reportCount !== countAtStart) return { refusal: REPORT_CHANGED_REFUSAL, held: false };
+  const current = childCase;
+  return { entry: resolution.entry, tag: current.kind === 'reported' ? current.report.tag ?? null : resolution.tag };
+}
+
+/** D7's check right before COMMIT is sent, synchronous: the report on the entry and the report count. */
+export function webuiCommitCheck(entry: string, countAtStart: number): WebuiCheckRefusal | null {
+  const report = reportCheck(entry);
+  if (report) return report;
+  if (reportCount !== countAtStart) return { refusal: REPORT_CHANGED_REFUSAL, held: false };
+  return null;
+}
+
+/** The entry a web UI shared transaction opens its session on: the first check, a fresh choice, the second check. */
+export async function webuiWriteTarget(): Promise<{ entry: string; tag: string | null; countAtStart: number } | WebuiCheckRefusal> {
+  const first = webuiFirstCheck();
+  if (first) return first;
+  const { resolution, countAtStart } = await chooseNow();
+  const second = webuiSecondCheck(resolution, countAtStart);
+  return 'refusal' in second ? second : { ...second, countAtStart };
 }
 
 /** The reason a resolution refused, carried by the reader's `data backend unreachable` error; null for another error. */
@@ -268,6 +331,27 @@ export class WebuiDataReader {
       const left = Math.max(1, Math.min(QUERY_BOUND_MS, boundMs - (Date.now() - started)));
       const result = await client.query({ text, values: params, query_timeout: left } as QueryConfig);
       return { rows: result.rows, url };
+    } catch (error) {
+      destroy = typeof (error as { code?: unknown })?.code !== 'string';
+      throw error;
+    } finally {
+      client.release(destroy ? true : undefined);
+    }
+  }
+
+  /**
+   * NB6: one read of the shared tables under its own client bound (10 s: the reconcile's, the journal's and C21's
+   * reads); an error keeps its SQLSTATE, and a client whose query got no answer is destroyed.
+   */
+  async sharedSelect(text: string, values: unknown[], boundMs: number): Promise<{ rows: any[] }> {
+    const pool = this.getPool();
+    const started = Date.now();
+    const client = await connectWithin(pool, Math.min(QUERY_BOUND_MS, boundMs), "the web UI's reader pool", READER_MAX);
+    let destroy = false;
+    try {
+      const left = Math.max(1, boundMs - (Date.now() - started));
+      const result = await client.query({ text, values, query_timeout: left } as QueryConfig);
+      return { rows: result.rows };
     } catch (error) {
       destroy = typeof (error as { code?: unknown })?.code !== 'string';
       throw error;

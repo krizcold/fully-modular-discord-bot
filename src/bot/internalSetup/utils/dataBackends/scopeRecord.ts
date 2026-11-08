@@ -4,6 +4,7 @@
 
 import { randomUUID } from 'crypto';
 
+import type { RowTicket } from '../sharedStore';
 import { fileTicketState, type FileTicket } from './fileBackend';
 import type { WsTicket } from './workingSet';
 
@@ -12,7 +13,7 @@ export interface SaveMark {
   readonly run: string;
   readonly stamp: number;
 }
-type Ticket = WsTicket | FileTicket;
+type Ticket = WsTicket | FileTicket | RowTicket;
 
 /** Lost marks, and refused documents, kept per scope; dropping the oldest raises the scope's prunedThrough. */
 export const LOST_MARKS_PER_SCOPE = 32;
@@ -44,6 +45,8 @@ interface Entry {
   open?: Array<{ stamp: number; ticket: FileTicket }>;
   /** The highest stamp of a file ticket found 'unconfirmed': the entry then stays for the process's life. */
   failedStamp?: number;
+  /** A row ticket's document, under which a refusal of its op is kept once the op settles. */
+  doc?: string;
 }
 
 interface Scope {
@@ -58,9 +61,12 @@ let counter = 0;
 const scopes = new Map<string, Scope>();
 const scopeOfSet = new WeakMap<object, string>();
 
-const landed = (ticket: Ticket): boolean =>
-  ticket.kind === 'file' ? fileTicketState(ticket) === 'landed' : ticket.set.landedSeq >= ticket.seq;
-const keyOf = (ticket: Ticket): object => (ticket.kind === 'file' ? ticket.record : ticket.set);
+const landed = (ticket: Ticket): boolean => {
+  if (ticket.kind === 'file') return fileTicketState(ticket) === 'landed';
+  if (ticket.kind === 'row') return ticket.op.state === 'mirror' || ticket.op.state === 'landed';
+  return ticket.set.landedSeq >= ticket.seq;
+};
+const keyOf = (ticket: Ticket): object => (ticket.kind === 'file' ? ticket.record : ticket.kind === 'row' ? ticket.op : ticket.set);
 
 /** A mark at the latest write noted so far: a write noted later is stamped above it. */
 export function saveMark(): SaveMark {
@@ -91,6 +97,14 @@ function scopeFor(scopeId: string): Scope {
 
 function dropLanded(scope: Scope): void {
   for (const [key, entry] of scope.entries) {
+    const { ticket } = entry;
+    if (ticket.kind === 'row' && (ticket.op.state === 'refused' || ticket.op.state === 'unconfirmed')) {
+      // A settled row op leaves the entries: a refusal is kept as the document's, an op of unknown fate as a lost mark.
+      scope.entries.delete(key);
+      if (ticket.op.state === 'refused') keepRefusal(scope, { stamp: entry.stamp, doc: entry.doc ?? ticket.key, rewritten: false });
+      else keepLost(scope, { stamp: entry.stamp, deposed: false });
+      continue;
+    }
     if (entry.open) {
       // A landed ticket leaves; an 'unconfirmed' one leaves and raises failedStamp.
       entry.open = entry.open.filter(kept => {
@@ -112,9 +126,10 @@ function dropLanded(scope: Scope): void {
 export function noteScopeTicket(scopeId: string, ticket: Ticket, rewrites?: string): void {
   const stamp = ++counter;
   const scope = scopeFor(scopeId);
+  // First, so a row op refused before this write keeps its refusal, which this rewrite then marks.
+  dropLanded(scope);
   const refusal = rewrites === undefined ? undefined : scope.refused.get(rewrites);
   if (refusal) refusal.rewritten = true;
-  dropLanded(scope);
   if (landed(ticket)) return;
   const key = keyOf(ticket);
   const entry = scope.entries.get(key);
@@ -123,7 +138,12 @@ export function noteScopeTicket(scopeId: string, ticket: Ticket, rewrites?: stri
     entry.stamp = stamp;
     if (ticket.kind === 'file') (entry.open ??= []).push({ stamp, ticket });
   } else {
-    scope.entries.set(key, { ticket, stamp, ...(ticket.kind === 'file' ? { open: [{ stamp, ticket }] } : {}) });
+    scope.entries.set(key, {
+      ticket,
+      stamp,
+      ...(ticket.kind === 'file' ? { open: [{ stamp, ticket }] } : {}),
+      ...(ticket.kind === 'row' && rewrites !== undefined ? { doc: rewrites } : {}),
+    });
   }
   if (ticket.kind === 'ws') scopeOfSet.set(ticket.set, scopeId);
 }
@@ -133,13 +153,18 @@ export function noteScopeTicket(scopeId: string, ticket: Ticket, rewrites?: stri
  * be the code that saw the save's own return.
  */
 export function noteScopeRefusal(scopeId: string, doc: string): void {
-  const stamp = ++counter;
-  const scope = scopeFor(scopeId);
-  scope.refused.set(doc, { stamp, doc, rewritten: false });
+  keepRefusal(scopeFor(scopeId), { stamp: ++counter, doc, rewritten: false });
+}
+
+/** A document's refusal, kept as its latest unless one stamped later is kept; the oldest goes past the bound. */
+function keepRefusal(scope: Scope, refusal: Refusal): void {
+  const kept = scope.refused.get(refusal.doc);
+  if (kept && kept.stamp > refusal.stamp) return;
+  scope.refused.set(refusal.doc, refusal);
   if (scope.refused.size <= LOST_MARKS_PER_SCOPE) return;
   let oldest: Refusal | undefined;
-  for (const refusal of scope.refused.values()) {
-    if (!oldest || refusal.stamp < oldest.stamp) oldest = refusal;
+  for (const r of scope.refused.values()) {
+    if (!oldest || r.stamp < oldest.stamp) oldest = r;
   }
   scope.refused.delete(oldest!.doc);
   scope.prunedThrough = Math.max(scope.prunedThrough, oldest!.stamp);
@@ -155,7 +180,12 @@ export function setLeft(set: object): void {
   if (landed(entry.ticket)) return;
   // A fenced set's batch that may have landed is lost as 'unavailable', not deposed (NB13 decision 6).
   const deposed = entry.ticket.kind === 'ws' && entry.ticket.set.state === 'fenced' && entry.ticket.seq > (entry.ticket.set.unknownThrough ?? 0);
-  scope.lost.push({ stamp: entry.stamp, deposed });
+  keepLost(scope, { stamp: entry.stamp, deposed });
+}
+
+/** A lost mark, kept; the oldest goes past the bound. */
+function keepLost(scope: Scope, mark: LostMark): void {
+  scope.lost.push(mark);
   if (scope.lost.length <= LOST_MARKS_PER_SCOPE) return;
   let oldest = 0;
   for (let i = 1; i < scope.lost.length; i += 1) {

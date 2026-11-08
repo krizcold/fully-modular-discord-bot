@@ -13,7 +13,7 @@
 
 import * as crypto from 'crypto';
 import { PROVIDER_FETCH_MS } from './paymentTypes';
-import { loadCredentials } from '@/utils/envLoader';
+import { providerCredentials } from '@/utils/envLoader';
 import { getPaymentRegistry } from './paymentRegistry';
 import type {
   PaymentProvider,
@@ -118,7 +118,7 @@ export class StripeProvider implements PaymentProvider {
   readonly capabilities = CAPABILITIES;
 
   isConfigured(): boolean {
-    const c = loadCredentials();
+    const c = providerCredentials('stripe');
     return !!(c.STRIPE_SECRET_KEY && c.STRIPE_WEBHOOK_SECRET);
   }
 
@@ -679,7 +679,7 @@ export class StripeProvider implements PaymentProvider {
   }
 
   private verifySignature(rawBody: Buffer, header: string | undefined): boolean {
-    const secret = loadCredentials().STRIPE_WEBHOOK_SECRET;
+    const secret = providerCredentials('stripe').STRIPE_WEBHOOK_SECRET;
     if (!secret || !header) return false;
 
     let timestamp = '';
@@ -752,7 +752,7 @@ export class StripeProvider implements PaymentProvider {
   }
 
   private publicHostUrl(): string {
-    const c = loadCredentials();
+    const c = providerCredentials('stripe');
     const callbackUrl = c.OAUTH_CALLBACK_URL;
     if (!callbackUrl) {
       throw new Error('STRIPE: OAUTH_CALLBACK_URL is not set; cannot derive public host for Stripe redirect URLs.');
@@ -766,7 +766,7 @@ export class StripeProvider implements PaymentProvider {
   }
 
   private async api<T = any>(method: 'GET' | 'POST' | 'DELETE', path: string, formBody?: Record<string, string>): Promise<T> {
-    const secret = loadCredentials().STRIPE_SECRET_KEY;
+    const secret = providerCredentials('stripe').STRIPE_SECRET_KEY;
     if (!secret) throw new Error('STRIPE_SECRET_KEY is not set.');
 
     const headers: Record<string, string> = {

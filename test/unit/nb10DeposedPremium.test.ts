@@ -3,8 +3,8 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 
 // NB10 test 26, rounds 4 and 6, with real premium ops: a deposition during a local premium op answers by what landed
 // (case e: an op sent while the deposed one still waits answers the deposed text and takes nothing); in the bot, a
-// grantManual awaiting a provider pause after its save landed answers writer-lost, not saved in full, and sends no
-// notice (case g), a webhook held in its fetch across the deposition answers 503 (case f), and a cancel whose provider
+// grantManual awaiting a provider pause after its save landed answers ok, its lines and notices sent with that save
+// (case g), a webhook held in its fetch across the deposition answers 503 (case f), and a cancel whose provider
 // call returned before it answers writer-lost (case c).
 
 const reg = vi.hoisted(() => ({ current: null as any }));
@@ -146,7 +146,10 @@ describe('the web UI deposed during a real premium op (NB10 test 26)', () => {
 });
 
 describe('the bot deposed during a real premium op (NB10 test 26 case g)', () => {
-  it('a grantManual awaiting a provider pause after its save landed answers writer-lost, not saved in full, with the provider sentence and sends no notice', async () => {
+  // NB6 decision 63 (sheet 2606-2608): the grant's line and notice go out with the save before the pause, so a
+  // deposition during the pause finds the whole op stored and its notices sent, and the op answers ok (NB10 answered
+  // writer-lost, partial: its grant line and notice came after the pause).
+  it('a grantManual awaiting a provider pause after its save landed answers ok: the save took its lines and notices before the deposition', async () => {
     process.env.BOT_PROCESS_ROLE = 'bot';
     while (writerLockDepth() > 0) releaseWriterLock();
     fs.rmSync(writerLockPath(), { force: true });
@@ -162,20 +165,18 @@ describe('the bot deposed during a real premium op (NB10 test 26 case g)', () =>
     deposeNow();
     pause.open();
     const answered: any = await reply;
-    expect(answered).toMatchObject({ ok: false, code: 'unconfirmed', answer: 'writer-lost', partial: true });
-    expect(answered.error).toBe(`${LOST_IN_PART} What was saved: premium-tiers.json, premium-tiers.audit.jsonl. ${RELOAD} ${PROVIDER_SENTENCE}`);
-    expect(answered.error).not.toContain('Please try again');
+    expect(answered).toEqual({ ok: true, result: true });
     await tick(20);
-    expect(notices.sent).toEqual([]);
+    expect(notices.sent).toEqual(['manual.grant.added:g1', 'paid.sub.paused-by-stacking:g1']);
     const warned = [...logged(spies.warn), ...logged(spies.error)];
-    expect(warned.some(l => l.startsWith('[PremiumManager] The manual.grant.added notice for guild g1 was not sent'))).toBe(true);
+    expect(warned.filter(l => l.includes('notice for guild g1 was not sent'))).toEqual([]);
     expect((await import('../../src/bot/internalSetup/utils/premiumManager')).getPremiumManager().isStopped()).toBe(true);
     await settleQueue();
     expect(rawOf(PREMIUM)).toBe(granted);
     const saved = jsonOf(PREMIUM).subscriptions.g1;
     expect(saved.active).toMatchObject({ tierId: 'high', source: 'manual' });
     expect(saved.paused.map((x: any) => x.id)).toEqual(['s1']);
-    expect(linesOf(AUDIT).map(l => l.action)).toEqual(['subscription.pause']);
+    expect(linesOf(AUDIT).map(l => l.action)).toEqual(['subscription.grant.manual', 'subscription.pause']);
     expect(JSON.parse(fs.readFileSync(writerLockPath(), 'utf8')).pid).toBe(OTHER);
   });
 

@@ -6,7 +6,7 @@ import { checkShape } from '../../src/bot/internalSetup/utils/dataBackends/store
 import { fixedDatabase } from '../helpers/fixedDatabase';
 import { startClaimRig, type ClaimRig } from '../helpers/pgClaimRig';
 
-// NB9 test 13 (C9): the store at version 8 holds the reshard row and identify_slots; a store at 7 is refused.
+// NB9 test 13 (C9): the store at version 9 holds the reshard row and identify_slots; a store at 8 is refused.
 
 let rig: ClaimRig;
 beforeAll(async () => { rig = await startClaimRig(); }, 180_000);
@@ -18,10 +18,10 @@ const columns = async (table: string) => (await rig.direct.query(
      FROM information_schema.columns WHERE table_schema = 'smdb_data' AND table_name = $1 ORDER BY ordinal_position`, [table])).rows
   .map(r => `${r.column_name} ${r.data_type}${r.is_nullable === 'NO' ? ' not null' : ''}${r.has_default ? ' default' : ''}`);
 
-describe('a store provisioned at version 8', () => {
+describe('a store provisioned at version 9', () => {
   it('holds reshard row 1 with failures 0 and every other column NULL, the columns of C9 and identify_slots', async () => {
-    expect(SCHEMA_VERSION).toBe(8);
-    expect((await rig.direct.query(`SELECT value FROM smdb_data.meta WHERE key = 'schema_version'`)).rows[0].value).toBe('{"v":8}');
+    expect(SCHEMA_VERSION).toBe(9);
+    expect((await rig.direct.query(`SELECT value FROM smdb_data.meta WHERE key = 'schema_version'`)).rows[0].value).toBe('{"v":9}');
     expect((await rig.direct.query(`SELECT * FROM smdb_data.reshard`)).rows).toEqual([{
       id: 1, target: null, target_by: null, target_at: null, attempt: null, from_count: null, to_count: null, method: null,
       state: null, started_by: null, started_at: null, until_at: null, flipped_at: null, ended_at: null, reason: null,
@@ -61,7 +61,7 @@ describe('a store provisioned at version 8', () => {
   });
 });
 
-describe('a store at version 7', () => {
+describe('a store at version 8', () => {
   it('is refused with the schema mismatch line', async () => {
     await rig.direct.query('CREATE DATABASE nb9_v7');
     const url = rig.url.replace(/\/[^/]+$/, '/nb9_v7');
@@ -74,7 +74,7 @@ describe('a store at version 7', () => {
     }
     const v7 = new Pool({ connectionString: url, max: 1 });
     try {
-      await v7.query(`UPDATE smdb_data.meta SET value = '{"v":7}' WHERE key = 'schema_version'`);
+      await v7.query(`UPDATE smdb_data.meta SET value = '{"v":8}' WHERE key = 'schema_version'`);
     } finally {
       await v7.end();
     }
@@ -86,10 +86,10 @@ describe('a store at version 7', () => {
     const second = new PostgresBackend(fixedDatabase(url));
     second.start();
     try {
-      expect(await second.provisionVerdict()).toEqual({ state: 'mismatch', found: '{"v":7}' });
+      expect(await second.provisionVerdict()).toEqual({ state: 'mismatch', found: '{"v":8}' });
       const until = Date.now() + 30_000;
       while (!lines.some(l => l.includes('schema-mismatch')) && Date.now() < until) await new Promise(resolve => { setTimeout(resolve, 100); });
-      expect(lines).toContain('[PostgresBackend] schema-mismatch: smdb_data.meta schema_version is {"v":7}, expected {"v":8}; refusing to serve');
+      expect(lines).toContain('[PostgresBackend] schema-mismatch: smdb_data.meta schema_version is {"v":8}, expected {"v":9}; refusing to serve');
       expect(second.servesData()).toBe(false);
     } finally {
       await second.stop();

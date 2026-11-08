@@ -34,6 +34,7 @@ import { IngestService } from '../../src/bot/internalSetup/ingest/ingestService'
 import { SubscriptionNotifier } from '../../src/bot/internalSetup/utils/subscriptionNotifier';
 import * as notifications from '../../src/bot/internalSetup/utils/premiumNotifications';
 import { PremiumManager } from '../../src/bot/internalSetup/utils/premiumManager';
+import { runItems } from '../../src/bot/internalSetup/utils/premiumItems';
 import registerCommands from '../../src/bot/internalSetup/events/clientReady/registerCommands';
 import { deleteModuleCommandsFromDiscord } from '../../src/bot/internalSetup/utils/moduleReloader';
 import { postAccessLog } from '../../src/bot/internalSetup/utils/accessLogChannel';
@@ -88,7 +89,11 @@ function premiumWith(config: any): PremiumManager {
   (pm as any).config = config;
   (pm as any).configLoaded = true;
   (pm as any).configMtimeMs = Number.POSITIVE_INFINITY;
-  vi.spyOn(pm, 'save').mockReturnValue(true);
+  // A JSON bot's accepted save runs its carry's items at once (NB6 decision 63, sheet 2606-2608).
+  vi.spyOn(pm as any, 'save').mockImplementation((opts?: any) => {
+    runItems(opts?.carry?.items.splice(0) ?? []);
+    return { key: 'global/premium-tiers.json', outcome: null };
+  });
   return pm;
 }
 

@@ -12,6 +12,7 @@ const h = vi.hoisted(() => ({
 vi.mock('../../src/bot/internalSetup/utils/dataManager', () => ({
   DataBackendUnavailableError: class extends Error { causeKey = 'io'; },
   onWriterTake: () => undefined,
+  onSharedApplied: () => () => undefined,
   readRawStrict: () => h.raw,
   saveDataTracked: (_f: string, _o: unknown, data: unknown) => {
     h.saves.push(JSON.parse(JSON.stringify(data)));
@@ -81,7 +82,8 @@ describe('in the bot process', () => {
     const p = make();
     const pending = p.initiatePurchase({ ...PURCHASE, couponCode: 'TEST20' });
     p.markStopped('deposed');
-    await pending;
+    // NB6 decision 71 (sheet 3145): a save refused at the accept throws T20 with the accept's cause words.
+    await expect(pending).rejects.toThrow('The Dummy provider did not save this change (writer-lost), so nothing was changed at the provider.');
     expect(h.saves).toEqual([]);
     expect(h.refusals).toEqual([['writer-lost', DOC]]);
   });

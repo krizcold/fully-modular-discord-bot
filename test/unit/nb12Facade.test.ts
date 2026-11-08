@@ -10,6 +10,8 @@ import { setBackendKind } from '../helpers/backendKind';
 import { tokenFor } from '../helpers/fakeStore';
 import { ServerStore } from '../helpers/serverStore';
 import { linuxNotDir } from '../helpers/linuxNotDir';
+import { scriptedBackend } from '../helpers/scriptedPg';
+import { sharedRows } from '../helpers/sharedRows';
 
 vi.mock('fs', async orig => (await import('../helpers/forwardingFs')).forwardingFs(await orig<any>()));
 
@@ -340,6 +342,22 @@ describe.each(ROUTES)('placement, %s route', routeName => {
 
   it('a 4 MiB document is saved, one byte more is refused', async () => {
     const r = await routeOf(routeName);
+    // NB6: on a Postgres bot a global save is a row op; its flush stores it in the shared tables, then writes the mirror.
+    const rows = r.ws ? sharedRows() : null;
+    const rowRig = rows ? scriptedBackend(rows.answer) : null;
+    if (rowRig) dm.setGuildDataBackend(rowRig.backend);
+    try {
+      await capCase(r);
+      if (rows) expect(rows.docs.get(`global/nb12/cap-${routeName}.json`)?.body.toString('utf8')).toBe(JSON.stringify('a'.repeat(4 * 1024 * 1024 - 2), null, 2));
+    } finally {
+      if (rowRig) {
+        dm.setGuildDataBackend(null);
+        await rowRig.backend.stop();
+      }
+    }
+  });
+
+  async function capCase(r: Route): Promise<void> {
     const cap = 4 * 1024 * 1024;
     const exact = 'a'.repeat(cap - 2);
     expect(JSON.stringify(exact, null, 2).length).toBe(cap);
@@ -357,7 +375,7 @@ describe.each(ROUTES)('placement, %s route', routeName => {
     await dm.flushAll();
     expect(fs.statSync(globalFile).size).toBe(cap);
     expect(fs.readFileSync(globalFile, 'utf8')).toBe(JSON.stringify(exact, null, 2));
-  });
+  }
 });
 
 describe('the module-root key in path form, working-set route', () => {

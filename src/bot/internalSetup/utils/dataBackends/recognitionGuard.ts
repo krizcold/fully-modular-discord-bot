@@ -44,6 +44,18 @@ export interface MigrationCounts {
   bytes: number;
 }
 
+/** The counts of the data of no guild (NB6 decision 19): rows of shared_docs, shared_lines, shared_modules and shared_module_files, and their bytes. */
+export interface SharedCounts {
+  sharedDocs: number;
+  sharedLines: number;
+  modules: number;
+  moduleFiles: number;
+  sharedBytes: number;
+}
+
+/** A job's counts (NB6 D2): the guild units' and the shared units', all nine always present. */
+export type JobCounts = MigrationCounts & SharedCounts;
+
 /** /data/.migration.json: the last data migration, as its job wrote it. */
 export interface MigrationJournal {
   jobId: string;
@@ -57,7 +69,7 @@ export interface MigrationJournal {
   source?: JournalAddress | null;
   destination?: JournalAddress | null;
   storeId?: string | null;
-  counts?: MigrationCounts;
+  counts?: JobCounts;
   envSwitched?: boolean;
   leftOut?: string[];
   /** What the job did not copy and says so (NB5 decision 16: an unreadable owner channel setting). */

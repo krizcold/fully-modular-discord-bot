@@ -459,8 +459,10 @@ describe('the scope record, over random runs', () => {
         const lost: Array<Array<{ stamp: number; deposed: boolean }>> = scopes.map(() => []);
         const marks = [0, saveMark().stamp];
         const ids = new Map<LedgerTicket, number>();
-        const isLanded = (ticket: LedgerTicket) =>
-          ticket.kind === 'file' ? ticket.record.landed >= ticket.seq : ticket.set.landedSeq >= ticket.seq;
+        const isLanded = (written: LedgerTicket) => {
+          const ticket = written as Exclude<LedgerTicket, { kind: 'row' }>;
+          return ticket.kind === 'file' ? ticket.record.landed >= ticket.seq : ticket.set.landedSeq >= ticket.seq;
+        };
 
         const check = (s: number, since: number) => {
           const answer = pendingFor(scopes[s], since);

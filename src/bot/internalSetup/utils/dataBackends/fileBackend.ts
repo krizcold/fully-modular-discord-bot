@@ -357,7 +357,8 @@ const IS_WINDOWS = process.platform === 'win32';
 // The temp files this process has open, from the open to the rename or the unlink.
 const openTemps = new Set<string>();
 
-async function atomicReplace(target: string, content: string, options: { parentSync?: boolean } = {}): Promise<void> {
+/** Temp file, fsync, rename: text is written as UTF-8, a Buffer as its bytes. */
+export async function atomicReplace(target: string, content: string | Buffer, options: { parentSync?: boolean } = {}): Promise<void> {
   await fs.promises.mkdir(path.dirname(target), { recursive: true });
   const tmp = tmpNameFor(target);
   const fh = await fs.promises.open(tmp, 'w');
@@ -660,10 +661,23 @@ export async function flushAll(): Promise<void> {
   await flushPaths([...pendingOps.keys()]);
 }
 
+/** row: a path of the row queue (NB6 decision 16), whose errno is the cause of its last try in words. */
 export type CancelOutcome =
-  | { path: string; outcome: 'landed' }
-  | { path: string; outcome: 'cancelled'; errno: string | null }
-  | { path: string; outcome: 'unconfirmed'; errno: string | null; cut: boolean };
+  | { path: string; outcome: 'landed'; row?: true }
+  | { path: string; outcome: 'cancelled'; errno: string | null; row?: true }
+  | { path: string; outcome: 'unconfirmed'; errno: string | null; cut: boolean; row?: true };
+
+/** The row queue's part of cancelQueued (sharedStore.ts sets it): the paths it holds and their cancel. */
+export interface RowCancel {
+  holds(path: string): boolean;
+  cancel(paths: string[]): Promise<CancelOutcome[]>;
+}
+
+let rowCancel: RowCancel | null = null;
+
+export function setRowCancel(given: RowCancel | null): void {
+  rowCancel = given;
+}
 
 /**
  * cancelQueued's one answer for a path, read from the records its cancel reads, the one it started with first:
@@ -693,6 +707,13 @@ function cancelAnswer(p: string, records: LandingRecord[], seq: number, dropped:
  * path not on the wire is cancelled at once, and one on the wire is awaited and then cancelled or answered landed.
  */
 export async function cancelQueued(paths: string[], sleep: (ms: number) => Promise<void> = delay, options: { freeze?: boolean } = {}): Promise<CancelOutcome[]> {
+  // NB6 decision 16: a path of the row queue lands or is cancelled there.
+  const rowPaths = rowCancel ? paths.filter(p => !pendingOps.has(p) && rowCancel!.holds(p)) : [];
+  if (rowPaths.length > 0) {
+    const filePaths = paths.filter(p => !rowPaths.includes(p));
+    const [rows, files] = await Promise.all([rowCancel!.cancel(rowPaths), filePaths.length > 0 ? cancelQueued(filePaths, sleep, options) : []]);
+    return paths.map(p => (rowPaths.includes(p) ? rows[rowPaths.indexOf(p)] : files[filePaths.indexOf(p)]));
+  }
   const targets = new Map(paths.map(p => [p, pendingOps.get(p)?.seq]));
   // Each target's landing record from the start: an entry gone at the cancel landed only if the record reached its seq.
   const records = new Map<string, LandingRecord>();

@@ -143,6 +143,7 @@ export class GuildRequestSweep {
   private claimFailing = false;
   private lastFailLog = -Infinity;
   private passRun: Promise<void> | null = null;
+  private again = false;
   private timer: NodeJS.Timeout | null = null;
 
   constructor(private readonly deps: SweepDeps) {}
@@ -180,7 +181,20 @@ export class GuildRequestSweep {
       await run;
     } finally {
       this.passRun = null;
+      if (this.again) {
+        this.again = false;
+        void this.pass();
+      }
     }
+  }
+
+  /** A notify for this process (NB6 decision 17): a pass now, or one more after the pass running. */
+  requestPass(): void {
+    if (this.passRun) {
+      this.again = true;
+      return;
+    }
+    void this.pass();
   }
 
   /**
@@ -508,6 +522,11 @@ export function startGuildRequestSweep(lease: () => CurrentLease | null): void {
     serving: () => getDataBootStatus().state === 'serving',
   });
   sweep.start();
+}
+
+/** NB6 decision 17: a notify for this process asks the sweep for a pass; nothing while no sweep runs. */
+export function requestGuildRequestPass(): void {
+  sweep?.requestPass();
 }
 
 /** The stop step after the exit drain, before the claims' release: finished applies' answers get 2 s to be written. */

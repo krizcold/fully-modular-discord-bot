@@ -17,6 +17,7 @@ import { getAppStoreManager } from './appStoreManager';
 import { reloadModules } from './moduleReloader';
 import { isMaintenanceGateClosed } from './maintenanceGate';
 import { stoppedServing } from './servingGate';
+import { getNodeName } from '../fleet/nodeName';
 
 const CHECK_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
 
@@ -56,11 +57,28 @@ async function runModuleUpdateCheck(): Promise<void> {
     const modulesWithUpdates = checkResult.updates.filter(u => u.hasUpdate);
     console.log(`[ModuleAutoUpdater] ${modulesWithUpdates.length} module update(s) available, downloading...`);
 
-    // Download updates
+    // Download updates; on a Postgres bot each update is applied inside updateModule (NB6 decision 44)
     const updateResult = await manager.updateAllModules();
-    if (updateResult.updated.length === 0) return;
+    for (const f of updateResult.failed) {
+      if (!f.changedElsewhere) continue;
+      const by = f.elsewhere?.by ?? null;
+      const mine = by !== null && by === getNodeName();
+      const where = mine ? 'this machine' : 'another machine';
+      const change = f.elsewhere ?? { kind: 'module' as const, by };
+      if (change.kind === 'other') console.log(`[ModuleAutoUpdater] ${f.moduleName} was not updated: the installed modules changed on ${where} meanwhile; the next check tries again`);
+      else if (change.kind === 'unread') console.log(`[ModuleAutoUpdater] ${f.moduleName} was not updated: installed.json changed on ${where} meanwhile, and this machine could not read the new list (${change.error})`);
+      else if (change.kind === 'removed') console.log(`[ModuleAutoUpdater] ${f.moduleName} was not updated: it was uninstalled on ${mine || by === null ? where : by} meanwhile`);
+      else console.log(`[ModuleAutoUpdater] ${f.moduleName} was updated on ${where} meanwhile; applying that version`);
+    }
+    const applied = updateResult.updated.filter(u => u.applied);
+    for (const u of applied) {
+      if (u.applied!.text) console.warn(`[ModuleAutoUpdater] ${u.applied!.text}`);
+    }
+    const loaded = applied.filter(u => u.applied!.outcome === 'applied').length;
+    if (loaded > 0) console.log(`[ModuleAutoUpdater] Hot-reloaded ${loaded} module(s)`);
 
-    const updatedNames = updateResult.updated.map(u => u.moduleName);
+    const updatedNames = updateResult.updated.filter(u => !u.applied).map(u => u.moduleName);
+    if (updatedNames.length === 0) return;
     console.log(`[ModuleAutoUpdater] Downloaded: ${updatedNames.join(', ')}. Hot-reloading...`);
 
     // Hot-reload the updated modules

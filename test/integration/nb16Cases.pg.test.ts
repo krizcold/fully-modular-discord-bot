@@ -35,7 +35,7 @@ const RESTORE = "; a table or partition reported missing may have held data that
 const UNREADABLE_FIX = `${KEPT}smdb_data.meta is this bot's version table: correct it to the shape the difference lines give (key text, value text NOT NULL, its primary key meta_pkey, row level security off) and restart the bot; do not rename smdb_data aside while its tables hold this bot's data, since the next boot would then make and serve a new, empty store and leave every row in the renamed schema`;
 const LOGIN_TAIL = ', or point DATA_BACKEND_URL, in the web UI env editor, at a login that holds these privileges, then restart the bot';
 const CONFIRM = "so this bot can't confirm what made them or that they are complete";
-const FIRST_FIVE = 'smdb_data.claim_clock (table), smdb_data.claim_seq (sequence), smdb_data.guild_append (partitioned table), smdb_data.guild_append_p00 (table), smdb_data.guild_append_p01 (table) and 72 more';
+const FIRST_FIVE = 'smdb_data.claim_clock (table), smdb_data.claim_seq (sequence), smdb_data.guild_append (partitioned table), smdb_data.guild_append_p00 (table), smdb_data.guild_append_p01 (table) and 79 more';
 
 type Verdict = { state: string; reason?: string; fix?: string; found?: string };
 
@@ -107,7 +107,7 @@ describe('decision 5: no version row, relations present', () => {
 
   it('row 10: meta only (a provisioning that did not finish)', async () => {
     const run = await row('r10', 'empty', p => sql(p, provisionDdl('smdb_data')[0], provisionDdl('smdb_data')[1]));
-    expect(run.verdict.reason).toBe(`the database's smdb_data holds objects but no schema_version, ${CONFIRM}: smdb_data.meta (table); they match their counterparts in this bot's schema (156 of its 158 objects are not there), but the bot does not take over a schema without a version`);
+    expect(run.verdict.reason).toBe(`the database's smdb_data holds objects but no schema_version, ${CONFIRM}: smdb_data.meta (table); they match their counterparts in this bot's schema (170 of its 172 objects are not there), but the bot does not take over a schema without a version`);
   }, T);
 
   it('row 11: guild_data made as a plain table', async () => {
@@ -195,7 +195,7 @@ describe('decision 5: no version row, relations present', () => {
       reason: `the database's smdb_data holds objects and its schema_version can't be read (${cause}), ${CONFIRM}: ${FIRST_FIVE}; compared with this bot's schema: ${listed(sentences)}`,
       fix: UNREADABLE_FIX,
     });
-    expect(run.lines).toEqual(logLines(`schema-mismatch: smdb_data holds 157 object(s) and its schema_version can't be read (${cause}), ${CONFIRM}; refusing to serve`, sentences));
+    expect(run.lines).toEqual(logLines(`schema-mismatch: smdb_data holds 171 object(s) and its schema_version can't be read (${cause}), ${CONFIRM}; refusing to serve`, sentences));
     expect(await boot(urlOf(rig, run.db))).toEqual(run.verdict);
   }, T);
 });
@@ -256,7 +256,7 @@ describe("decision 4: a provisioned store that differs", () => {
       reason: `the database's smdb_data holds objects and its schema_version can't be read (${cause}), ${CONFIRM}: ${FIRST_FIVE}; compared with this bot's schema: ${listed(sentences)}`,
       fix: UNREADABLE_FIX,
     });
-    expect(run.lines).toEqual(logLines(`schema-mismatch: smdb_data holds 157 object(s) and its schema_version can't be read (${cause}), ${CONFIRM}; refusing to serve`, sentences));
+    expect(run.lines).toEqual(logLines(`schema-mismatch: smdb_data holds 171 object(s) and its schema_version can't be read (${cause}), ${CONFIRM}; refusing to serve`, sentences));
   }, T);
 
   it.each([
@@ -534,15 +534,15 @@ describe('privileges (decision 15), as the bot role, not a superuser', () => {
       await grantBot(p, db, { store: false });
       await p.query(`ALTER DEFAULT PRIVILEGES FOR ROLE ${BOT_ROLE} REVOKE ${privilege} ON TABLES FROM ${BOT_ROLE}`);
     }, true);
-    const lines = ['claim_clock', 'guild_append', 'guild_data', 'guild_data_graveyard', 'guild_ownership', 'guild_requests', 'identify_slots', 'meta', 'reshard', 'shard_claims', 'shard_nodes']
+    const lines = ['claim_clock', 'guild_append', 'guild_data', 'guild_data_graveyard', 'guild_ownership', 'guild_requests', 'identify_slots', 'meta', 'reshard', 'shard_claims', 'shard_nodes', 'shared_docs', 'shared_lines', 'shared_module_files', 'shared_module_status', 'shared_modules', 'shared_ops']
       .map(t => `this bot's database role ${BOT_ROLE} lacks ${privilege} on smdb_data.${t}`);
     expect(run.verdict).toEqual({
       state: 'shape',
       reason: `this bot's database role ${BOT_ROLE} lacked privileges on the schema it made in the database, so it was rolled back (default privileges or an event trigger take them from new tables): ${listed(lines)}`,
       fix: `${KEPT}as ${BOT_ROLE} or a superuser, run ALTER DEFAULT PRIVILEGES FOR ROLE ${BOT_ROLE} GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO ${BOT_ROLE}; ALTER DEFAULT PRIVILEGES FOR ROLE ${BOT_ROLE} GRANT USAGE, UPDATE ON SEQUENCES TO ${BOT_ROLE} (SELECT * FROM pg_default_acl lists what is set), remove any event trigger that revokes privileges on new tables, and restart the bot`,
     });
-    expect(run.verdict.reason).toContain('; and 6 more (the bot\'s log lists them)');
-    expect(run.lines).toEqual(logLines(`schema-mismatch: this bot's database role ${BOT_ROLE} lacked 11 privilege(s) on the schema it made in the database, so it was rolled back before it was committed (default privileges set with ALTER DEFAULT PRIVILEGES, or an event trigger, take them from new tables); refusing to serve`, lines));
+    expect(run.verdict.reason).toContain('; and 12 more (the bot\'s log lists them)');
+    expect(run.lines).toEqual(logLines(`schema-mismatch: this bot's database role ${BOT_ROLE} lacked 17 privilege(s) on the schema it made in the database, so it was rolled back before it was committed (default privileges set with ALTER DEFAULT PRIVILEGES, or an event trigger, take them from new tables); refusing to serve`, lines));
     expect(await hasSmdbData(run.pool)).toBe(false);
   }, T);
 
@@ -643,7 +643,7 @@ describe("a fresh database whose role's default access method is a copy of heap 
       const tables = await pool.query(
         `SELECT count(*)::int AS n, count(*) FILTER (WHERE c.relam <> (SELECT oid FROM pg_am WHERE amname = 'heap'))::int AS other
            FROM pg_class c WHERE c.relnamespace = 'smdb_data'::regnamespace AND c.relkind = 'r'`);
-      expect(tables.rows[0]).toEqual({ n: 73, other: 0 });
+      expect(tables.rows[0]).toEqual({ n: 79, other: 0 });
       expect(await boot(urlOf(rig, db))).toEqual({ state: 'provisioned' });
       expect(await shapeSchemas(pool)).toEqual([]);
     } finally {

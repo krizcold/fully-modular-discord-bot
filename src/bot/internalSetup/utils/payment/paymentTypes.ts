@@ -305,6 +305,33 @@ export interface ProviderSubscriptionRef {
   display: { amountLabel: string; periodLabel: string; statusLabel: string };
 }
 
+/**
+ * The renew and expire events of one Dummy tick's walk, with the premium sha the tick read (NB6 decision 110): premium
+ * applies them together, only on that sha.
+ */
+export interface WalkBatch {
+  premiumSha: string | null;
+  events: Array<Extract<ProviderEvent, { type: 'subscription.renewed' | 'subscription.expired' }>>;
+}
+
+/** Premium's view of a subscription it holds, for the provider that keeps its record (NB6 decision 94). */
+export interface SubscriptionView {
+  status: 'active' | 'paused';
+  endDate: string | null;
+  autoRenew: boolean;
+  variantId?: string;
+  resumesAt: string | null;
+}
+
+/** What premium answers the Dummy provider through the registry (NB6 decisions 84, 94 and 102). */
+export interface SubscriptionReader {
+  /** A reader is set and premium can answer: loaded, neither unreadable nor replaying, not stopped, nothing open or held. */
+  ready(): boolean;
+  read(providerId: string, guildId: string, providerSubId: string): SubscriptionView | null;
+  /** The sha of premium-tiers.json premium's cache holds; null when it had no row. */
+  sha(): string | null;
+}
+
 // ============================================================================
 // EVENT BUS
 // ============================================================================
@@ -437,8 +464,8 @@ export interface PaymentProvider {
    * - `immediately = true`: hard cancel - end the subscription right now at
    *   the provider. Maps to Stripe `DELETE /v1/subscriptions/:id`.
    */
-  cancelSubscription?(providerSubId: string, immediately?: boolean): Promise<void>;
-  reactivateSubscription?(providerSubId: string): Promise<void>;
+  cancelSubscription?(providerSubId: string, immediately?: boolean): Promise<void | ProviderSubscriptionState>;
+  reactivateSubscription?(providerSubId: string): Promise<void | ProviderSubscriptionState>;
 
   /**
    * Optional: pause billing so remaining time stops counting down. Required
@@ -450,12 +477,12 @@ export interface PaymentProvider {
    * alongside `pause_collection: { behavior: 'void' }` so the next bill is
    * deferred correctly.
    */
-  pauseSubscription?(providerSubId: string, resumesAt: string | null): Promise<void>;
+  pauseSubscription?(providerSubId: string, resumesAt: string | null): Promise<void | ProviderSubscriptionState>;
   /**
    * Optional: resume a paused subscription with a fresh endDate. `newEndDate`
    * may be null for lifetime. Required when `capabilities.supportsPause`.
    */
-  resumeSubscription?(providerSubId: string, newEndDate: string | null): Promise<void>;
+  resumeSubscription?(providerSubId: string, newEndDate: string | null): Promise<void | ProviderSubscriptionState>;
 
   /**
    * Optional: migrate an existing subscription to a new variant. Used by
@@ -466,7 +493,7 @@ export interface PaymentProvider {
    *   - 'none': switch at the next billing cycle, no immediate charges.
    *   - 'create_prorations': charge/credit the difference now.
    */
-  migrateSubscriptionPrice?(providerSubId: string, newVariantId: string, prorationBehavior: 'none' | 'create_prorations'): Promise<void>;
+  migrateSubscriptionPrice?(providerSubId: string, newVariantId: string, prorationBehavior: 'none' | 'create_prorations'): Promise<void | ProviderSubscriptionState>;
 
   getSubscriptionState(providerSubId: string): Promise<ProviderSubscriptionState | null>;
 

@@ -215,7 +215,7 @@ describe('C36-2 review rows', () => {
 
   it('a Stripe lookup failure is thrown, not answered as a refusal', async () => {
     vi.resetModules();
-    vi.doMock('@/utils/envLoader', () => ({ loadCredentials: () => ({ STRIPE_SECRET_KEY: 'k' }) }));
+    vi.doMock('@/utils/envLoader', () => ({ loadCredentials: () => ({ STRIPE_SECRET_KEY: 'k' }), providerCredentials: () => ({ STRIPE_SECRET_KEY: 'k' }), useSharedDocReader: () => undefined }));
     const fetchMock = vi.fn(async () => { throw new Error('network down'); });
     vi.stubGlobal('fetch', fetchMock);
     try {
@@ -226,7 +226,7 @@ describe('C36-2 review rows', () => {
 
   it('an unconfigured Lemon Squeezy coupon check is thrown, not answered as a refusal', async () => {
     vi.resetModules();
-    vi.doMock('@/utils/envLoader', () => ({ loadCredentials: () => ({}) }));
+    vi.doMock('@/utils/envLoader', () => ({ loadCredentials: () => ({}), providerCredentials: () => ({}), useSharedDocReader: () => undefined }));
     try {
       const { LemonSqueezyProvider } = await import('@/bot/internalSetup/utils/payment/lemonsqueezyProvider');
       await expect(new LemonSqueezyProvider().validateCoupon('SAVE')).rejects.toThrow('not configured');

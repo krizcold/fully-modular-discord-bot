@@ -47,6 +47,11 @@ export class FakeHost implements MigrationHost {
   ownerChannelWriteSettled(): boolean {
     return !this.ownerChannelMark;
   }
+  /** A web UI shared write not yet stored, or a web UI session's mark (NB6 decision 39). */
+  sharedMark = false;
+  sharedWritesSettled(): boolean {
+    return !this.sharedMark;
+  }
 }
 
 export function seedFile(rel: string, content: string | Buffer): void {

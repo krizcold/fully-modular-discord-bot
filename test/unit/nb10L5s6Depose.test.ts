@@ -49,6 +49,7 @@ describe('the web UI deposed', () => {
     expect(checkWriterLock()).toMatchObject({ kind: 'deposed' });
     const dummy = new DummyProvider();
     made.push(dummy);
-    await expect(dummy.cancelSubscription('dummy_1')).resolves.toBeUndefined();
+    // NB6 decision 71 (sheet 3149-3150): a cancel with no record throws T25 before any change.
+    await expect(dummy.cancelSubscription('dummy_1')).rejects.toThrow("Dummy subscription 'dummy_1' not found.");
   });
 });

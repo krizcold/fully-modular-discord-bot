@@ -1,5 +1,8 @@
+import { createHash } from 'crypto';
+import fs from 'fs';
 import http from 'http';
 import type { AddressInfo } from 'net';
+import path from 'path';
 import type { Pool } from 'pg';
 
 // A stand-in for a bot node's web UI, speaking the routes and answers the
@@ -33,6 +36,13 @@ export interface FakeAppOptions {
   rateLimit?: boolean;
   /** Reads answer this late. */
   readDelayMs?: number;
+  /**
+   * NB6: this machine's data folder. With it, a read or write with no guildId is a shared file: read from the mirror
+   * (<folder>/global/<id>), stored in smdb_data.shared_docs of the first pool, then written to the mirror.
+   */
+  sharedMirror?: string;
+  /** false: a shared save is stored over whatever the row holds, never compared with its base (SHARED-OVERWRITE). */
+  sharedCompare?: boolean;
 }
 
 // express.json({ limit: '10kb' }) in webui/server.ts; the app's own error
@@ -45,7 +55,44 @@ export const FAKE_SCHEMA = [
   `CREATE TABLE IF NOT EXISTS smdb_data.guild_data (
      guild_id text NOT NULL, module text NOT NULL, filename text NOT NULL, doc text NOT NULL,
      updated_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (guild_id, module, filename))`,
+  // NB6's shared_docs as postgresBackend.ts provisions it.
+  'CREATE SEQUENCE IF NOT EXISTS smdb_data.shared_rev_seq',
+  `CREATE TABLE IF NOT EXISTS smdb_data.shared_docs (
+     key text PRIMARY KEY, body bytea NOT NULL, sha text NOT NULL, rev bigint NOT NULL,
+     updated_at timestamptz NOT NULL DEFAULT now(), updated_by text NOT NULL)`,
 ];
+
+// The flush's statements (sharedStore.ts LOCK_SQL, CHECKED_SQL and UPSERT_SQL), and T22's refusal (replyGate.ts).
+const SHARED_LOCK = "SELECT pg_advisory_xact_lock(hashtext('smdb_shared'), hashtext($1))";
+const SHARED_SHA = 'SELECT sha FROM smdb_data.shared_docs WHERE key = $1';
+export const SHARED_UPSERT = `INSERT INTO smdb_data.shared_docs (key, body, sha, rev, updated_by)
+  VALUES ($1, $2, $3, nextval('smdb_data.shared_rev_seq'), $4)
+  ON CONFLICT (key) DO UPDATE SET body = EXCLUDED.body, sha = EXCLUDED.sha, rev = EXCLUDED.rev,
+    updated_at = now(), updated_by = EXCLUDED.updated_by`;
+const changedText = (machine: string, at: Date) =>
+  `This data was changed on ${machine} at ${at.toISOString()} after your change read it, so your change was not saved. Reload to see the current values, then try again.`;
+const CHANGED_SINCE_OPEN = 'This file changed since you opened it; nothing was saved. Reload it to see the current values.';
+
+export const shaOfText = (text: string | null): string => (text === null ? 'absent' : createHash('sha256').update(text, 'utf8').digest('hex'));
+export const mirrorFile = (folder: string, id: string): string => path.join(folder, 'global', ...id.split('/'));
+const readMirror = (folder: string, id: string): string | null => (fs.existsSync(mirrorFile(folder, id)) ? fs.readFileSync(mirrorFile(folder, id), 'utf8') : null);
+export function writeMirror(folder: string, id: string, text: string | null): void {
+  const file = mirrorFile(folder, id);
+  if (text === null) {
+    fs.rmSync(file, { force: true });
+    return;
+  }
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, text);
+}
+
+/** A machine's pass for the given shared files: its mirror takes each row's version, and loses a file whose row is gone. */
+export async function syncMirror(pool: Pool, folder: string, ids: string[]): Promise<void> {
+  for (const id of ids) {
+    const rows = (await pool.query('SELECT body FROM smdb_data.shared_docs WHERE key = $1', [`global/${id}`])).rows;
+    writeMirror(folder, id, rows.length === 0 ? null : (rows[0].body as Buffer).toString('utf8'));
+  }
+}
 
 const FROZEN = 'Guild data is frozen for a shard migration; retry after it completes';
 
@@ -96,6 +143,37 @@ export async function startFakeApp(options: FakeAppOptions): Promise<{ url: stri
     previous.set(filename, list);
   };
 
+  /** A shared save as the bot makes it: global.write's compare with this machine's copy, then the flush's. */
+  const sharedWrite = async (b: any): Promise<[number, unknown]> => {
+    const folder = options.sharedMirror!;
+    const id = String(b.file);
+    const key = `global/${id}`;
+    if (typeof b.loadedSha !== 'string' || b.loadedSha.length === 0) {
+      return [400, { success: false, error: 'This page is out of date; nothing was saved. Reload the page and open the file again.' }];
+    }
+    if (shaOfText(readMirror(folder, id)) !== b.loadedSha) return [409, { success: false, error: CHANGED_SINCE_OPEN }];
+    const text = JSON.stringify(b.data, null, 2);
+    const client = await options.pools[0].connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(SHARED_LOCK, [key]);
+      const stored: string = (await client.query(SHARED_SHA, [key])).rows[0]?.sha ?? 'absent';
+      if (options.sharedCompare !== false && stored !== b.loadedSha) {
+        await client.query('ROLLBACK');
+        return [409, { success: false, error: changedText('OTHER', new Date()) }];
+      }
+      await client.query(SHARED_UPSERT, [key, Buffer.from(text, 'utf8'), shaOfText(text), 'fake']);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+    writeMirror(folder, id, text);
+    return [200, { success: true }];
+  };
+
   const server = http.createServer(async (req, res) => {
     const send = (status: number, payload: unknown) => {
       res.writeHead(status, { 'content-type': 'application/json' });
@@ -109,6 +187,10 @@ export async function startFakeApp(options: FakeAppOptions): Promise<{ url: stri
       }
       if (req.method === 'POST' && url.pathname === '/api/config/data/update') {
         const b = await body(req);
+        if (options.sharedMirror && b.guildId === undefined) {
+          const [status, payload] = await sharedWrite(b);
+          return send(status, payload);
+        }
         const { module, filename } = split(String(b.file));
         const pool = options.pools[route(filename)];
         const fault = options.writeFault?.(filename, b.data) ?? 'normal';
@@ -138,6 +220,11 @@ export async function startFakeApp(options: FakeAppOptions): Promise<{ url: stri
       }
       if (req.method === 'GET' && url.pathname === '/api/config/data/get') {
         if (options.readDelayMs) await new Promise(resolve => setTimeout(resolve, options.readDelayMs));
+        if (options.sharedMirror && !url.searchParams.has('guildId')) {
+          const text = readMirror(options.sharedMirror, url.searchParams.get('file') ?? '');
+          if (text === null) return send(404, { success: false, error: 'Data file not found' });
+          return send(200, { success: true, data: JSON.parse(text), exists: true, sha: shaOfText(text) });
+        }
         const { module, filename } = split(decodeURIComponent(url.searchParams.get('file') ?? ''));
         const guildId = url.searchParams.get('guildId');
         const rows = (await options.pools[route(filename)].query(

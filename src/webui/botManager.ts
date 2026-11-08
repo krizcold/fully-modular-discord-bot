@@ -1,10 +1,11 @@
 import { ChildProcess, fork } from 'child_process';
 import { AsyncLocalStorage } from 'async_hooks';
+import * as fs from 'fs';
 import * as path from 'path';
 import { loadCredentials, validateCredentials, BotCredentials, resolveDataBackend } from '../utils/envLoader';
 import { cancelQueued, droppedByDeposition, fileTicketFailure, fileTicketState, filesPending, queuedFilePaths } from '../bot/internalSetup/utils/dataBackends/fileBackend';
 import { carriedWrites, landed, type LedgerTicket } from '../bot/internalSetup/utils/dataBackends/writeLedger';
-import { EXIT_DEPOSED, isSharedPath } from '../bot/internalSetup/utils/dataManager';
+import { EXIT_DEPOSED, isSharedPath, sharedWritesSettled as rowWritesSettled } from '../bot/internalSetup/utils/dataManager';
 import { holderWords, onDeposed, readWriterHolder, releaseWriterLock, takeWriterLock, unconfirmedWords, writerLockPath } from '../bot/internalSetup/utils/writerLock';
 import type { LockHolder } from '../bot/internalSetup/utils/processLock';
 import { applySharedOp, callsProvider, invalidateSharedCaches, partialEnding, partialEndingIn, PROVIDER_SENTENCE } from '../bot/internalSetup/utils/sharedOps';
@@ -12,7 +13,12 @@ import { applyOperatorDataWrite, type GuildDataWriteRequest } from '../bot/inter
 import { IPC_TIMEOUT_MS, IPC_TIMEOUT_MODULE_OP_MS } from './constants';
 import type { WebSocketManager, WSEvent, WSEventData } from './websocketManager';
 import { getSafetyManager } from '../utils/updateSafety';
-import { noteWebuiChild, setWebuiDataStoreUrl } from './utils/webuiDataReader';
+import { getWebuiDataReader, noteWebuiChild, resolveWebuiDatabase, setWebuiDataStoreUrl, webuiCommitCheck, webuiWriteTarget } from './utils/webuiDataReader';
+import { rowMirrorsWritten, rowOpenPaths, rowTicketState, sharedKeyOf, useOutsideChain, useWebuiSessions } from '../bot/internalSetup/utils/sharedStore';
+import { refreshShared, runStoreDocsPass, STORE_DOCS_TAG_CHANGED } from '../bot/internalSetup/utils/sharedMirror';
+import type { PublishedChange } from '../bot/internalSetup/utils/appStoreManager';
+import { STOPPED_SERVING_TEXT } from '../bot/internalSetup/utils/servingGate';
+import type { ApplyResult } from '../bot/internalSetup/utils/moduleApply';
 import { acceptAddressList, hookListInUse } from '../utils/databaseAddress';
 import type { NotifyOutcome } from '../bot/internalSetup/utils/subscriptionNotifier';
 import { readMaintenanceFile } from '../utils/maintenanceFile';
@@ -122,6 +128,10 @@ export type WriterRoute = { route: 'child' } | { route: 'local' } | RouteRefusal
 
 const refuse = (code: RouteCode, error: string, status = 503): RouteRefusal => ({ ok: false, status, code, error });
 const refuseTake = (code: RouteCode, error: string, lockTake: NonNullable<RouteRefusal['lockTake']>): RouteRefusal => ({ ...refuse(code, error), lockTake });
+/** Decision 16's 503: the chain's reconcile did not bring the mirrors up to the rows. */
+const unreconciledReply = (cause: string, local = false) => (local
+  ? { ok: false, status: 500, code: 'io-error', error: `This machine could not write its copy of the shared files (${cause}), so nothing was saved. Check this machine's disk, then try again.` }
+  : { ok: false, status: 503, code: 'backend-unavailable', error: `Can't reach the database to read the shared files (${cause}); nothing was saved. Try again in a moment.` });
 
 /** Why the web UI's own take of the lock refused the populate, in the populate's skip line. */
 export function populateTakeCause(take: NonNullable<RouteRefusal['lockTake']>): string {
@@ -174,12 +184,101 @@ function noAnswerOf(error: unknown): 'timeout' | 'stopped' | 'failed' {
   return reason.startsWith('IPC request timed out') ? 'timeout' : /^bot process (exited|was stopped) before replying$/.test(reason) ? 'stopped' : 'failed';
 }
 
-/** The open frame of a local chain op: the web UI's shared gate admits writes only inside it. */
-const localOpFrames = new AsyncLocalStorage<{ open: boolean }>();
+/**
+ * The open frame of a local chain op, or of the web UI's App Store doc writes (store): the web UI's shared gate admits
+ * writes only inside one.
+ */
+const localOpFrames = new AsyncLocalStorage<{ open: boolean; store?: true }>();
 
-export function inLocalOp(): boolean {
-  return localOpFrames.getStore()?.open === true;
+/** An App Store doc on a Postgres bot: a shared key under global/appstore/ (its cache is local). */
+const isStoreDoc = (absPath: string): boolean => sharedKeyOf(absPath)?.startsWith('global/appstore/') === true;
+
+/** The shared gate: inside a chain op any write; inside inStoreWrite only an App Store doc's; with no path, a chain op. */
+export function inLocalOp(absPath?: string): boolean {
+  const frame = localOpFrames.getStore();
+  if (frame?.open !== true) return false;
+  if (!frame.store) return true;
+  return absPath !== undefined && isStoreDoc(absPath);
 }
+
+// The row ops inStoreWrite accepts are not the local chain's: its land-or-cancel leaves them alone.
+useOutsideChain(() => localOpFrames.getStore()?.store === true);
+
+/**
+ * NB6 decision 31 and C13: on a Postgres bot the web UI makes its own App Store doc writes, with or without a bot
+ * child; the shared gate admits the App Store doc writes fn makes and refuses any other.
+ */
+export async function inStoreWrite<T>(fn: () => Promise<T>): Promise<T> {
+  const frame = { open: true, store: true as const };
+  try {
+    return await localOpFrames.run(frame, fn);
+  } finally {
+    frame.open = false;
+  }
+}
+
+type ModuleOperation = PublishedChange['operation'];
+
+/** T7 (decision 61): the web UI's answer when no bot child runs, or the child is in maintenance. */
+export function notAppliedText(operation: ModuleOperation, module: string, version: string, why: 'not-running' | 'maintenance'): string {
+  if (operation === 'uninstall') {
+    return why === 'not-running'
+      ? `${module} was uninstalled. This machine's bot is not running, so it removes the module's files when it next starts normally.`
+      : `${module} was uninstalled. This machine's bot is in maintenance, so it removes the module's files when maintenance ends.`;
+  }
+  const head = operation === 'install' ? `${module} ${version} was installed.` : `${module} was updated to ${version}.`;
+  return why === 'not-running'
+    ? `${head} This machine's bot is not running, so it applies the module when it next starts normally.`
+    : `${head} This machine's bot is in maintenance, so it applies the module when maintenance ends.`;
+}
+
+/** T8 (decisions 61 and 70): no answer to `module:apply` within 10 minutes, or the bot stopped before it answered. */
+export function unansweredApplyText(operation: ModuleOperation, module: string, version: string, why: 'no-answer' | 'stopped'): string {
+  const done = operation === 'install' ? 'installed' : 'updated';
+  if (operation === 'uninstall') {
+    return why === 'no-answer'
+      ? `${module} was uninstalled, but can't confirm whether this machine removed its files: the bot did not answer within 10 minutes. If it did not, its next pass removes them.`
+      : `${module} was uninstalled, but can't confirm whether this machine removed its files: the bot stopped before it answered. If it did not, it removes them when it next starts normally.`;
+  }
+  return why === 'no-answer'
+    ? `${module} ${version} was ${done}, but can't confirm whether it loaded on this machine: the bot did not answer within 10 minutes. The App Store tab lists this machine if the module fails to load here.`
+    : `${module} ${version} was ${done}, but can't confirm whether this machine applied it: the bot stopped before it answered. If it did not, it tries the version again when it next starts normally.`;
+}
+
+/** What the web UI's install job answers after `module:apply` (decisions 44 and 61, C16): the text for any outcome but 'applied'. */
+export interface ModuleApplyAnswer {
+  outcome: ApplyResult['outcome'] | 'not-running' | 'maintenance' | 'stopped-serving' | 'no-answer' | 'stopped';
+  loaded: boolean;
+  error: string | null;
+  text: string | null;
+  /** An uninstall whose unload failed in the bot: its error (the module runs until a restart). */
+  unloadFailed?: string;
+}
+
+/**
+ * Deletes a staged module folder the bot child no longer needs. The publish landed, so a delete that fails is logged and
+ * the answer stands.
+ */
+export function dropStagedFolder(staged: string): void {
+  try {
+    fs.rmSync(staged, { recursive: true, force: true });
+  } catch (error) {
+    console.error(`[BotManager] Could not delete the staged folder ${staged}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+/** A row op the land-or-cancel dropped with no cause: none of it was sent (decision 42's A11). */
+const ROW_NOT_SENT = "it was not sent before the web panel released the data files' lock";
+
+/** Decision 31's bound on the store docs' pass: its rows are read on the reader pool, 10 s. */
+const STORE_DOCS_PASS_MS = 10_000;
+
+/** Decision 31's 503 when the store docs' pass did not get the database's answer. */
+export const storeDocsUnreadText = (cause: string): string =>
+  `Can't reach the database to read the App Store's files (${cause}); nothing was changed. Try again in a moment.`;
+/** The store docs' pass could not write this machine's store record. */
+const storeDocsLocalText = (cause: string): string =>
+  `This machine could not write its copy of the App Store's files (${cause}), so nothing was changed. Check this machine's disk, then try again.`;
 
 interface LocalEntry {
   label: string;
@@ -212,20 +311,23 @@ export interface MaintenanceSaveResult {
   unconfirmedFiles?: number;
   /** Guilds waiting to be re-saved on the bot's main database (NB5 decision 12); only above 0. */
   resaveGuilds?: number;
+  /** Shared keys holding a save the database did not answer, which may have landed (NB6 C6); only above 0. */
+  unansweredFiles?: number;
   note?: string;
 }
 
-type ChildHeld = { unsavedGuilds: number; unsavedFiles: number; unansweredGuilds: number; resaveGuilds?: number };
+type ChildHeld = { unsavedGuilds: number; unsavedFiles: number; unansweredGuilds: number; resaveGuilds?: number; unansweredFiles?: number };
 
 /**
  * The held counts of a maintenance:mode report, kept while the mode is 'held'; unansweredGuilds is 0 when absent, and
- * resaveGuilds is kept only above 0 (NB5 C3).
+ * resaveGuilds (NB5 C3) and unansweredFiles (NB6 C6) are kept only above 0.
  */
 export function childHeldOf(mode: unknown, held: any): ChildHeld | null {
   if (mode !== 'held' || !held || typeof held.unsavedGuilds !== 'number' || typeof held.unsavedFiles !== 'number') return null;
   return {
     unsavedGuilds: held.unsavedGuilds, unsavedFiles: held.unsavedFiles, unansweredGuilds: typeof held.unansweredGuilds === 'number' ? held.unansweredGuilds : 0,
     ...(typeof held.resaveGuilds === 'number' && held.resaveGuilds > 0 ? { resaveGuilds: held.resaveGuilds } : {}),
+    ...(typeof held.unansweredFiles === 'number' && held.unansweredFiles > 0 ? { unansweredFiles: held.unansweredFiles } : {}),
   };
 }
 
@@ -373,6 +475,8 @@ export class BotManager {
   private chainQueue: LocalEntry[] = [];
   private chainCurrent: { entry: LocalEntry; done: Promise<void> } | null = null;
   private chainHolds = false;
+  /** NB6 decision 16: the reconcile answered since the chain's last take of the writer lock. */
+  private chainReconciled = false;
   private chainDeposed: LockHolder | null = null;
   // NB9: the reshard's second bot process, the child handing over to it, and the attempt of the last fork.
   private standby: StandbyChild | null = null;
@@ -393,6 +497,16 @@ export class BotManager {
   constructor(safeMode: boolean = false) {
     this.safeMode = safeMode;
     onDeposed(holder => this.chainWasDeposed(holder));
+    // NB6 decision 7: on a Postgres bot this process's row ops go out on short-lived sessions of its own.
+    useWebuiSessions({
+      target: webuiWriteTarget,
+      commitCheck: webuiCommitCheck,
+      select: (text, values, boundMs) => getWebuiDataReader().sharedSelect(text, values, boundMs),
+      tag: () => {
+        const resolved = resolveWebuiDatabase();
+        return 'entry' in resolved ? resolved.tag : null;
+      },
+    });
     if (safeMode) {
       console.log('[BotManager] Initialized in SAFE MODE - bot auto-start disabled');
     }
@@ -790,6 +904,7 @@ export class BotManager {
         ...(data.choosing === true ? { choosing: true as const } : {}),
         ...(data.held === true ? { held: true as const } : {}),
         ...(typeof data.reason === 'string' ? { reason: data.reason } : {}),
+        ...(typeof data.tag === 'string' ? { tag: data.tag } : {}),
       });
       this.childModeReported = true;
       this.childStoreReported = true;
@@ -1194,6 +1309,11 @@ export class BotManager {
     return this.ownerChannelWrites === 0;
   }
 
+  /** NB6 decision 39: no row op of this process waits to be stored and no web UI session's mark is set; a migration's S3 waits for this. */
+  sharedWritesSettled(): boolean {
+    return rowWritesSettled();
+  }
+
   /**
    * NB5 decision 22: the addresses hook. With no bot process the list is taken at once; otherwise it is sent to the
    * bot process, whatever its stage, and taken once that process acknowledged it.
@@ -1266,7 +1386,10 @@ export class BotManager {
       const guilds = countOf(counts.unsavedGuilds);
       const files = countOf(counts.unsavedFiles);
       const resave = countOf(counts.resaveGuilds);
-      const apart = heldClauses({ resaveGuilds: resave, unansweredGuilds: countOf(counts.unansweredGuilds), unconfirmedFiles: countOf((counts as MaintenanceSaveResult).unconfirmedFiles) });
+      const apart = heldClauses({
+        resaveGuilds: resave, unansweredGuilds: countOf(counts.unansweredGuilds), unansweredFiles: countOf(counts.unansweredFiles),
+        unconfirmedFiles: countOf((counts as MaintenanceSaveResult).unconfirmedFiles),
+      });
       if (guilds > 0 || files > 0) return apart ? `${unsaved(guilds, files)}; ${apart}` : unsaved(guilds, files);
       // NB5 C3: a guild waiting to be re-saved is a change the bot holds.
       if (resave > 0) return `The bot holds changes a stop or restart can drop: ${apart}`;
@@ -1517,18 +1640,21 @@ export class BotManager {
         unansweredGuilds: countOf(reply?.unansweredGuilds),
         unconfirmedFiles: countOf(reply?.unconfirmedFiles),
         resaveGuilds: countOf(reply?.resaveGuilds),
+        unansweredFiles: countOf(reply?.unansweredFiles),
       };
       const apart = {
         ...(counts.resaveGuilds > 0 ? { resaveGuilds: counts.resaveGuilds } : {}),
         ...(counts.unansweredGuilds > 0 ? { unansweredGuilds: counts.unansweredGuilds } : {}),
         ...(counts.unconfirmedFiles > 0 ? { unconfirmedFiles: counts.unconfirmedFiles } : {}),
+        ...(counts.unansweredFiles > 0 ? { unansweredFiles: counts.unansweredFiles } : {}),
       };
       if (reply?.saved === false) {
         return answered({ saved: false, unsavedGuilds: counts.unsavedGuilds, unsavedFiles: counts.unsavedFiles, ...apart, note: heldClauses(counts) });
       }
-      if (reply?.saved === null && (typeof reply.unansweredGuilds === 'number' || typeof reply.unconfirmedFiles === 'number')) {
+      if (reply?.saved === null && (typeof reply.unansweredGuilds === 'number' || typeof reply.unconfirmedFiles === 'number' || typeof reply.unansweredFiles === 'number')) {
         return answered({
           saved: null, unansweredGuilds: counts.unansweredGuilds, unconfirmedFiles: counts.unconfirmedFiles,
+          ...(counts.unansweredFiles > 0 ? { unansweredFiles: counts.unansweredFiles } : {}),
           note: `${heldClauses(counts)}; can't confirm whether the held changes were saved`,
         });
       }
@@ -1878,6 +2004,7 @@ export class BotManager {
         return refuse('held-elsewhere', `A previous bot process this web UI started (pid ${previous}) has not exited yet and may still open the data files; nothing was saved. Try again once it has exited.`);
       }
       this.chainHolds = true;
+      this.chainReconciled = false;
       return { route: 'local' };
     }
     switch (taken.kind) {
@@ -1911,20 +2038,36 @@ export class BotManager {
       let release!: () => void;
       const done = new Promise<void>(resolve => { release = resolve; });
       this.chainCurrent = { entry, done };
+      let opStarted = false;
       try {
-        const frame = { open: true };
-        let reply: any;
-        try {
-          reply = await localOpFrames.run(frame, entry.run);
-        } catch (error) {
-          reply = { ok: false, code: 'failed', error: error instanceof Error ? error.message : String(error) };
-        } finally {
-          frame.open = false;
+        const reconcile = { end: Promise.resolve() };
+        const unreconciled = await this.reconcileAfterTake(end => { reconcile.end = end; });
+        opStarted = !unreconciled;
+        if (unreconciled) {
+          entry.resolve(unreconciled);
+          // A mirror moved aside before the reconcile's bound is still written: the lock stays held until its pass ends.
+          await reconcile.end;
+        } else {
+          const frame = { open: true };
+          let reply: any;
+          try {
+            reply = await localOpFrames.run(frame, entry.run);
+          } catch (error) {
+            reply = { ok: false, code: 'failed', error: error instanceof Error ? error.message : String(error) };
+          } finally {
+            frame.open = false;
+          }
+          const answer = await this.landOrCancel(entry, reply);
+          // A change answered as not saved stays out of the caches the next op reads.
+          if (answer?.ok !== true) invalidateSharedCaches();
+          entry.resolve(answer);
         }
-        const answer = await this.landOrCancel(entry, reply);
-        // A change answered as not saved stays out of the caches the next op reads.
-        if (answer?.ok !== true) invalidateSharedCaches();
-        entry.resolve(answer);
+      } catch (error) {
+        const cause = error instanceof Error ? error.message : String(error);
+        invalidateSharedCaches();
+        entry.resolve(opStarted
+          ? { ok: false, code: 'failed', error: `Can't confirm whether the change was saved (${cause}).` }
+          : unreconciledReply(cause));
       } finally {
         this.chainCurrent = null;
         release();
@@ -1943,18 +2086,35 @@ export class BotManager {
     }
   }
 
+  /**
+   * NB6 decision 16: on a Postgres bot the chain's first op after each take of the writer lock waits for the reconcile
+   * (10 s); its refusal when the reconcile failed, else null. Every machine's bot may have changed a shared file
+   * while this machine's bot was stopped.
+   */
+  private async reconcileAfterTake(passEnd: (end: Promise<void>) => void): Promise<any | null> {
+    if (this.chainReconciled || resolveDataBackend() !== 'postgres') return null;
+    const res = await refreshShared(null, passEnd);
+    if (!res.ok) return unreconciledReply(res.cause, res.local === true);
+    this.chainReconciled = true;
+    return null;
+  }
+
   /** Every gated path still queued in this process lands or is cancelled before the chain moves on or releases the lock. */
   private async landOrCancel(entry: LocalEntry, reply: any): Promise<any> {
-    const paths = queuedFilePaths().filter(isSharedPath);
+    const paths = [...new Set([...queuedFilePaths().filter(isSharedPath), ...rowOpenPaths()])];
     const results = paths.length > 0 ? await cancelQueued(paths) : [];
+    const mirrors = rowMirrorsWritten();
+    if (mirrors) await mirrors;
     const cancelled = results.flatMap(r => (r.outcome === 'cancelled' ? [r] : []));
     // A path of this op that landed during the wait means part of the change is on disk.
     const partial = reply?.partial === true || results.some(r => r.outcome === 'landed');
     const landedHere = results.flatMap(r => (r.outcome === 'landed' ? [path.basename(r.path)] : []));
     for (const r of cancelled) {
-      console.error(`[Data] Not saved: ${r.path} (${r.errno ?? 'not on disk within 8 s'}); the web UI dropped its write before releasing the data files' lock`);
+      console.error(`[Data] Not saved: ${r.path} (${r.errno ?? (r.row ? ROW_NOT_SENT : 'not on disk within 8 s')}); the web UI dropped its write before releasing the data files' lock`);
     }
-    const unconfirmedResults = results.flatMap(r => (r.outcome === 'unconfirmed' ? [r] : []));
+    // A row op dropped unconfirmed was logged by the row queue.
+    const unconfirmedResults = results.flatMap(r => (r.outcome === 'unconfirmed' && !r.row ? [r] : []));
+    const rowUnconfirmed = results.flatMap(r => (r.outcome === 'unconfirmed' && r.row ? [r] : []));
     for (const r of unconfirmedResults) console.error(`${unconfirmedWords(r)}; the web UI writes no more of it before releasing the data files' lock`);
     const sentence = entry.provider ? ` ${PROVIDER_SENTENCE}` : '';
     const saved = () => {
@@ -1976,7 +2136,8 @@ export class BotManager {
       const someLanded = landedTickets.length > 0 || writes?.landedBefore === true;
       // A line the disk did not confirm, or one being written, may be stored: it counts as open.
       const mayBeStored = (t: LedgerTicket) => t.kind === 'file' && (fileTicketState(t) === 'unconfirmed' || fileTicketState(t) === 'written');
-      const open = writes?.tickets.some(t => !landed(t) && (t.kind !== 'file' || mayBeStored(t) || (!droppedByDeposition(t.record) && filesPending([t.path])))) ?? true;
+      // A row op the flush refused or the cancel dropped stored nothing; one of unknown fate may be stored.
+      const open = writes?.tickets.some(t => !landed(t) && (t.kind === 'row' ? rowTicketState(t) !== 'refused' : t.kind !== 'file' || mayBeStored(t) || (!droppedByDeposition(t.record) && filesPending([t.path])))) ?? true;
       let error: string;
       if (!writes || open || writes.unknowable) {
         error = someLanded
@@ -1991,15 +2152,26 @@ export class BotManager {
       }
       return { ok: false, status: 503, code: 'held-elsewhere', error };
     }
+    // A store doc's wait that gave up (28's 202) carries no answer: the cancel's results decide it.
+    const waitLeftOpen = reply?.ok !== true && reply?.code === 'unconfirmed' && reply.answer === undefined;
     const unconfirmed = reply?.ok === true
       ? reply.pending === true
-      : reply?.code === 'unconfirmed' && (reply.answer === 'pending' || reply.answer === 'held' || reply.answer === 'unavailable');
+      : waitLeftOpen || (reply?.code === 'unconfirmed' && (reply.answer === 'pending' || reply.answer === 'held' || reply.answer === 'unavailable'));
     if (reply?.ok !== true && !unconfirmed) return reply;
+    // NB6 decision 42's A11: a row op whose COMMIT was sent and whose landing check got no answer was dropped.
+    if (rowUnconfirmed.length > 0) {
+      const names = [...new Set(rowUnconfirmed.map(r => path.basename(r.path)))].join(', ');
+      const causes = [...new Set(rowUnconfirmed.map(r => r.errno).filter((e): e is string => !!e))];
+      return {
+        ok: false, status: 503, code: 'unconfirmed',
+        error: `Can't confirm whether your change to ${names} was saved: the database did not answer the save (${causes.length > 0 ? causes.join(', ') : 'no answer'}). Reload to see the current values before you try again.${sentence}`,
+      };
+    }
     // D2: a carried line the disk did not confirm, or one a cut try left, may be stored: the op can't confirm.
     const writes = carriedWrites(reply);
     const unsure = (writes?.tickets ?? []).flatMap(t => (t.kind === 'file' && (fileTicketState(t) === 'unconfirmed' || fileTicketState(t) === 'written') ? [t] : []));
     if (unconfirmedResults.length > 0 || unsure.length > 0) {
-      const named = results.filter(r => r.outcome === 'cancelled' || r.outcome === 'unconfirmed');
+      const named = results.filter(r => !r.row && (r.outcome === 'cancelled' || r.outcome === 'unconfirmed'));
       const names = [...new Set([...named.map(r => path.basename(r.path)), ...unsure.map(t => path.basename(t.path))])];
       const errnos = [...new Set([
         ...named.map(r => (r as { errno: string | null }).errno),
@@ -2011,7 +2183,21 @@ export class BotManager {
       };
     }
     // D10: a refused change rewritten whole or retried may not be stored: with nothing cancelled the op's own answer stands.
-    if (cancelled.length === 0) return writes?.unknowable ? reply : saved();
+    if (cancelled.length === 0) {
+      const rowTickets = (writes?.tickets ?? []).filter(t => t.kind === 'row');
+      if (waitLeftOpen && !(rowTickets.length > 0 && rowTickets.every(landed))) return reply;
+      return writes?.unknowable ? reply : saved();
+    }
+    // NB6 decision 42's A11: a row op whose COMMIT was not sent was cancelled with its session.
+    const rowCancelled = cancelled.filter(r => r.row);
+    if (rowCancelled.length > 0) {
+      const names = [...new Set(rowCancelled.map(r => path.basename(r.path)))].join(', ');
+      const causes = [...new Set(rowCancelled.map(r => r.errno).filter((e): e is string => !!e))];
+      return {
+        ok: false, status: 503, code: 'disk',
+        error: `The database did not take the write of ${names} (${causes.length > 0 ? causes.join(', ') : ROW_NOT_SENT}), so your change was not saved${partial || writes?.unknowable === true ? ' in full' : ''}. Try again in a moment.${sentence}`,
+      };
+    }
     const files = cancelled.map(r => path.basename(r.path)).join(', ');
     const errnos = [...new Set(cancelled.map(r => r.errno).filter((e): e is string => !!e))];
     const inPart = partial || writes?.unknowable === true;
@@ -2373,6 +2559,89 @@ export class BotManager {
     } catch (error) {
       console.error('[BotManager] Error unloading module:', error);
       return { success: false, moduleName, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
+   * NB6 decisions 44 and 61, C16: a publish or uninstall of the web UI landed; the bot child applies the row from the
+   * staged folder. No child: T7, and the staged folder goes. The wait for the child to take requests and its answer
+   * share IPC_TIMEOUT_MODULE_OP_MS; with no answer the folder is left for the apply that may still run (the bot's pass
+   * deletes it after 10 minutes once no apply runs).
+   */
+  async applyModule(change: PublishedChange): Promise<ModuleApplyAnswer> {
+    const version = change.version ?? '';
+    const dropStaged = () => {
+      if (change.staged) dropStagedFolder(change.staged);
+    };
+    const ended = (outcome: ModuleApplyAnswer['outcome'], text: string | null, error: string | null = null): ModuleApplyAnswer =>
+      ({ outcome, loaded: false, error, text });
+    if (!this.isRunning() || !this.botProcess) {
+      dropStaged();
+      return ended('not-running', notAppliedText(change.operation, change.module, version, 'not-running'));
+    }
+    const deadline = Date.now() + IPC_TIMEOUT_MODULE_OP_MS;
+    let timer: NodeJS.Timeout | undefined;
+    const late = new Promise<'late'>(resolve => { timer = setTimeout(() => resolve('late'), IPC_TIMEOUT_MODULE_OP_MS); });
+    let reply: any;
+    try {
+      const opened = await Promise.race([this.whenStage('guild').then(() => 'open' as const), late]);
+      if (opened === 'late') return ended('no-answer', unansweredApplyText(change.operation, change.module, version, 'no-answer'));
+      reply = await this.sendIPCMessage('module:apply', {
+        module: change.module, to: change.to, staged: change.staged, tag: change.tag, version: change.version, updatedBy: change.updatedBy, reason: change.operation,
+      }, Math.max(1, deadline - Date.now()));
+    } catch (error) {
+      const why = noAnswerOf(error) === 'timeout' ? 'no-answer' : 'stopped';
+      return ended(why, unansweredApplyText(change.operation, change.module, version, why));
+    } finally {
+      clearTimeout(timer);
+    }
+    dropStaged();
+    if (reply?.maintenance === true) return ended('maintenance', notAppliedText(change.operation, change.module, version, 'maintenance'));
+    const { publisherAnswer, stoppedServingText } = await import('../bot/internalSetup/utils/moduleApply');
+    if (reply?.success === false && reply.error === STOPPED_SERVING_TEXT) {
+      return ended('stopped-serving', stoppedServingText(change.operation, change.module, version));
+    }
+    if (typeof reply?.outcome !== 'string') {
+      const error = typeof reply?.error === 'string' ? reply.error : 'the bot answered without a result';
+      return ended('failed', error, error);
+    }
+    const answer = publisherAnswer(change.operation, change.module, version, reply as ApplyResult);
+    const unloadFailed = typeof reply.unloadFailed === 'string' ? { unloadFailed: reply.unloadFailed as string } : {};
+    return { outcome: answer.outcome, loaded: answer.loaded, error: answer.error, text: answer.text, ...unloadFailed };
+  }
+
+  /**
+   * NB6 decision 31: while no bot child runs (none, and the last one's exit seen), an App Store route or install job
+   * first brings the App Store docs up to the database's rows, under the store mutex. Null to go on; else the answer.
+   */
+  async storeDocsFirst(): Promise<{ status: number; error: string } | null> {
+    if (resolveDataBackend() !== 'postgres') return null;
+    if (this.botProcess !== null || this.unexitedChildren.size > 0) return null;
+    const { takeStoreMutex, withStoreLock } = await import('../bot/internalSetup/utils/appStoreManager');
+    let hold: { release(): void };
+    try {
+      hold = await takeStoreMutex();
+    } catch (error) {
+      return { status: 500, error: error instanceof Error ? error.message : String(error) };
+    }
+    // A pass cut by the bound keeps the mutex until it ends.
+    const run = runStoreDocsPass(withStoreLock)
+      .catch(error => ({ ok: false as const, cause: error instanceof Error ? error.message : String(error) }))
+      .finally(() => hold.release());
+    let timer: NodeJS.Timeout | undefined;
+    const bound = new Promise<{ ok: false; cause: string }>(resolve => {
+      timer = setTimeout(() => resolve({ ok: false, cause: `no answer within ${STORE_DOCS_PASS_MS / 1000} s` }), STORE_DOCS_PASS_MS);
+    });
+    try {
+      const res = await Promise.race([run, bound]);
+      if (res.ok) return null;
+      if (res.cause === STORE_DOCS_TAG_CHANGED) {
+        return { status: 503, error: "The bot's main database changed while the App Store's files were read, so nothing was changed. Try again in a moment." };
+      }
+      if ('local' in res && res.local) return { status: 500, error: storeDocsLocalText(res.cause) };
+      return { status: 503, error: storeDocsUnreadText(res.cause) };
+    } finally {
+      clearTimeout(timer);
     }
   }
 

@@ -8,7 +8,7 @@ import { DataBackendKind, loadCredentials, resolveDataBackend } from '../../../.
 import { randomUUID } from 'crypto';
 import { Client as PgClient } from 'pg';
 import { PostgresBackend, SCHEMA_VERSION, checkMoveTarget } from './postgresBackend';
-import { MainChooser, probePass, setMainChooser, settleRetires, stepLayers, type ChooserDeps, type StoreReport } from './mainDatabase';
+import { MainChooser, mainTagOf, probePass, setMainChooser, settleRetires, stepLayers, type ChooserDeps, type StoreReport } from './mainDatabase';
 import { addressListInUse, parseAddressList, pgConfig, showEntry } from '../../../../utils/databaseAddress';
 import { readNewestNotice, sendOwnerDm, waitNonce } from '../../../../utils/ownerMessages';
 import { getNodeName } from '../../fleet/nodeName';
@@ -119,12 +119,41 @@ export function initDataBackendLayer(): void {
   startPostgresRuntime();
 }
 
-/** The parent's web UI reader follows the store this child serves (decisions 13 and 17). */
-function reportStore(report: StoreReport): void {
+let tagChooser: MainChooser | null = null;
+let lastReport: StoreReport | null = null;
+
+/** The main tag of the chooser's view, undefined while it has chosen nothing or the view can't be read. */
+function viewTag(): string | undefined {
+  try {
+    const view = tagChooser?.view();
+    return view && view.generation !== null ? mainTagOf(view.generation, view.machine) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The parent's web UI reader follows the store this child serves (decisions 13 and 17); a report naming a url carries
+ * its database's main tag (NB6 C23), the chooser's view unless the caller names the tag.
+ */
+function reportStore(report: StoreReport, tag: string | undefined = report.url === null ? undefined : viewTag()): void {
+  const data: StoreReport = { ...report };
+  if (tag === undefined) delete data.tag;
+  else data.tag = tag;
+  lastReport = data;
   if (!process.send) return;
   try {
-    process.send({ type: 'data:store', data: report }, () => { /* a closed channel is the parent gone */ });
+    process.send({ type: 'data:store', data }, () => { /* a closed channel is the parent gone */ });
   } catch { /* the parent reads the database /data/.env names */ }
+}
+
+/** The chooser read a new generation or machine of the url it keeps: the last report goes again with the new tag. */
+function reportMainChanged(): void {
+  const last = lastReport;
+  if (last === null || last.url === null) return;
+  const tag = viewTag();
+  if (tag === undefined || tag === last.tag) return;
+  reportStore(last, tag);
 }
 
 // The wait message's nonce names this process (decision 9).
@@ -149,6 +178,8 @@ export function mainChooserDeps(): ChooserDeps {
 function startPostgresRuntime(chooser: MainChooser = new MainChooser(mainChooserDeps())): PostgresBackend {
   const backend = new PostgresBackend({ chooser, markerStoreId: readMarkerStoreId });
   setMainChooser(chooser);
+  tagChooser = chooser;
+  lastReport = null;
   reportStore({ url: null, choosing: true });
   bootStatus = { ...bootStatus, mode: 'postgres', state: 'starting', waitReason: null };
   const ws = initWorkingSet(backend);
@@ -170,9 +201,10 @@ function wireDatabaseSteps(backend: PostgresBackend, chooser: MainChooser, ws: W
   });
   chooser.attach(backend, {
     stopServing: reason => stepLayers.stopServing(reason),
-    report: reportStore,
+    report: report => reportStore(report),
     markForResave: () => ws.markForResave(showEntry(backend.chosenEntry() ?? ''), (shardId, count) => stepLayers.holdsShard(shardId, count)),
     startLeave: reason => stepLayers.startLeave(reason),
+    mainChanged: reportMainChanged,
   });
   backend.setMoveSteps({
     checkTarget: entry => checkMoveTarget(entry, readMarkerStoreId),
@@ -184,7 +216,7 @@ function wireDatabaseSteps(backend: PostgresBackend, chooser: MainChooser, ws: W
       reached: guildId => ws.dropRetired(guildId),
       flagEpoch: flagged => ws.flagEpoch(flagged),
     }),
-    moved: entry => reportStore({ url: entry }),
+    moved: entry => reportStore({ url: entry }, mainTagOf(chooser.moveGeneration, chooser.moveMachine)),
     attemptEnded: () => stepLayers.attemptEnded(),
   });
 }

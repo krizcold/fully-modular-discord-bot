@@ -11,7 +11,8 @@ import { getModuleRegistry } from '../../bot/internalSetup/utils/moduleRegistry'
 import {
   getAppStoreManager,
   AppStoreRepository,
-  StoreModuleInfo
+  StoreModuleInfo,
+  StoreWriteError,
 } from '../../bot/internalSetup/utils/appStoreManager';
 import { getPremiumManager, DEFAULT_MESSAGES, PremiumMessages } from '../../bot/internalSetup/utils/premiumManager';
 import {
@@ -25,16 +26,20 @@ import { moduleConfigErrors } from '../../bot/internalSetup/utils/settings/setti
 import type { HardLimitOverride, SettingValue } from '../../bot/types/settingsTypes';
 import { getPaymentRegistry } from '../../bot/internalSetup/utils/payment/paymentRegistry';
 import type { OfferingVariant } from '../../bot/internalSetup/utils/payment/paymentTypes';
-import { credentialsReadError, loadCredentials, saveCredentials, BotCredentials } from '../../utils/envLoader';
+import {
+  credentialsReadError, loadCredentials, providerCredentials, providerCredentialsUnread, providerDocKey,
+  resolveDataBackend, saveCredentials, BotCredentials,
+} from '../../utils/envLoader';
 import { dataPath } from '../../utils/dataRoot';
 import { getModulesDir, getModulesDevDir } from '../../bot/internalSetup/utils/pathHelpers';
-import { BotManager } from '../botManager';
+import { BotManager, inStoreWrite } from '../botManager';
 import { ComponentToggleDebouncer } from '../utils/componentToggleDebouncer';
 import { getInstallQueue } from '../utils/installQueue';
 import { readConfigFile, writeConfigFile } from '../../bot/internalSetup/utils/appStoreConfigFile';
 import { childQueuedError, readServedGlobal, withTargetLock } from '../utils/servedRead';
 import { SharedOpAnswered, sharedOpFailure, sharedOpRunner } from './hopFailure';
 import { shaOfRaw } from '../../bot/internalSetup/utils/ipcDataHandler';
+import { rowBackend } from '../../bot/internalSetup/utils/sharedStore';
 
 /**
  * A module's Free baseline (its global settings.json) as the process that
@@ -183,12 +188,67 @@ async function refreshOfferingProviderLinks(offering: any, warnings: string[]): 
   return out;
 }
 
+/** Decision 28's answer for a StoreWriteError (409, 500 or 202 with its text); false for any other error. */
+function storeWriteAnswered(res: Response, error: unknown): boolean {
+  if (!(error instanceof StoreWriteError)) return false;
+  res.status(error.status).json({ success: false, error: error.message });
+  return true;
+}
+
+/** A credential value the forms count as set. */
+const isSet = (v: string | undefined): boolean => !!(v && v.trim() && !v.startsWith('REPLACE'));
+
+/** The premium tab's status for a built-in provider's keys while the credentials doc cannot be read; null when it can. */
+function docUnread(providerId: string): string | null {
+  const unread = providerCredentialsUnread(providerId);
+  return unread === null ? null : `can't confirm: ${unread}`;
+}
+
+const FAILED_STATUS_SQL = "SELECT s.module, s.node_name, s.sha, s.error, m.version FROM smdb_data.shared_module_status s LEFT JOIN smdb_data.shared_modules m ON m.module = s.module AND m.sha = s.sha WHERE s.state = 'failed' ORDER BY s.module, s.node_name";
+
+/** A machine where a module's version failed to load (owner question 1); the version is the module row's, else the sha. */
+export interface ModuleFailure {
+  module: string;
+  version: string;
+  machine: string;
+  error: string;
+}
+
+/** On a Postgres bot, the machines whose status row says 'failed', read on the reader pool, or the read's cause; null on a JSON bot. */
+async function moduleFailures(): Promise<{ moduleFailures: ModuleFailure[] } | { moduleFailuresUnread: string } | null> {
+  if (resolveDataBackend() !== 'postgres') return null;
+  const backend = rowBackend();
+  if (!backend?.sharedSelect) return { moduleFailuresUnread: "this process has no connection to the bot's database" };
+  try {
+    const { rows } = await backend.sharedSelect(FAILED_STATUS_SQL, [], 10_000);
+    return {
+      moduleFailures: rows.map(row => ({
+        module: String(row.module),
+        version: row.version ? String(row.version) : String(row.sha),
+        machine: String(row.node_name),
+        error: row.error === null || row.error === undefined ? '' : String(row.error),
+      })),
+    };
+  } catch (error) {
+    return { moduleFailuresUnread: error instanceof Error ? error.message : String(error) };
+  }
+}
+
 export function createAppStoreRoutes(botManager: BotManager): Router {
   const shared = sharedOpRunner(botManager);
   const toggleDebouncer = new ComponentToggleDebouncer(1500);
   const installQueue = getInstallQueue();
   installQueue.setBotManager(botManager);
   const router = Router();
+
+  /** Decision 31: with no bot child, the route first brings the App Store docs up to the rows; false when it answered. */
+  const storeFirst = async (res: Response): Promise<boolean> => {
+    if (resolveDataBackend() !== 'postgres') return true;
+    const refused = await botManager.storeDocsFirst();
+    if (!refused) return true;
+    res.status(refused.status).json({ success: false, error: refused.error });
+    return false;
+  };
 
   // ============================================================================
   // BUNDLED DATA (single request for all AppStore data)
@@ -200,6 +260,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
    */
   router.get('/bundle', async (_req: Request, res: Response) => {
     try {
+      if (!(await storeFirst(res))) return;
       const manager = getAppStoreManager();
       const premiumMgr = getPremiumManager();
 
@@ -241,11 +302,13 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         ...m,
         loaded: loadedSet ? loadedSet.has(m.name) : null
       }));
+      const failures = await moduleFailures();
 
       res.json({
         success: true,
         modules: modules.map(m => formatModuleInfo(m)),
         installed,
+        ...failures,
         repositories: repos.map(repo => ({
           ...repo,
           githubToken: repo.githubToken ? '***' : null
@@ -271,8 +334,9 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
    * GET /api/appstore/repos
    * List all configured repositories
    */
-  router.get('/repos', (_req: Request, res: Response) => {
+  router.get('/repos', async (_req: Request, res: Response) => {
     try {
+      if (!(await storeFirst(res))) return;
       const manager = getAppStoreManager();
       const repos = manager.getRepositories();
 
@@ -303,6 +367,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
    */
   router.post('/repos', async (req: Request, res: Response) => {
     try {
+      if (!(await storeFirst(res))) return;
       const { name, url, branch, githubToken } = req.body;
 
       if (!name || typeof name !== 'string') {
@@ -335,12 +400,12 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         });
       }
 
-      const repo = manager.addRepository(
+      const repo = await inStoreWrite(() => manager.addRepositoryAwaited(
         name,
         url,
         finalBranch,
         githubToken
-      );
+      ));
 
       // Immediately clone and scan for modules. The repo itself was added
       // successfully; if the scan fails (auth, DNS, malformed manifest) the
@@ -350,7 +415,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       let modules: any[] = [];
       let refreshWarning: string | undefined;
       try {
-        const scanned = await manager.refreshRepository(repo.id);
+        const scanned = await inStoreWrite(() => manager.refreshRepository(repo.id));
         modules = scanned.map(m => formatModuleInfo(m));
       } catch (refreshErr) {
         refreshWarning = refreshErr instanceof Error ? refreshErr.message : String(refreshErr);
@@ -369,6 +434,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
           : {}),
       });
     } catch (error) {
+      if (storeWriteAnswered(res, error)) return;
       if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({
@@ -383,8 +449,9 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
    * Update a repository
    * Body: { name?, url?, branch?, githubToken?, enabled? }
    */
-  router.put('/repos/:id', (req: Request, res: Response) => {
+  router.put('/repos/:id', async (req: Request, res: Response) => {
     try {
+      if (!(await storeFirst(res))) return;
       const { id } = req.params;
       const updates = req.body as Partial<AppStoreRepository>;
 
@@ -397,7 +464,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         });
       }
 
-      const success = manager.updateRepository(id, updates);
+      const success = await inStoreWrite(() => manager.updateRepositoryAwaited(id, updates));
 
       if (!success) {
         return res.status(500).json({
@@ -415,6 +482,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         }
       });
     } catch (error) {
+      if (storeWriteAnswered(res, error)) return;
       if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({
@@ -428,8 +496,9 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
    * DELETE /api/appstore/repos/:id
    * Remove a repository
    */
-  router.delete('/repos/:id', (req: Request, res: Response) => {
+  router.delete('/repos/:id', async (req: Request, res: Response) => {
     try {
+      if (!(await storeFirst(res))) return;
       const { id } = req.params;
       const manager = getAppStoreManager();
 
@@ -440,13 +509,14 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         });
       }
 
-      const success = manager.removeRepository(id);
+      const success = await inStoreWrite(() => manager.removeRepositoryAwaited(id));
 
       res.json({
         success,
         message: success ? 'Repository removed' : 'Failed to remove repository'
       });
     } catch (error) {
+      if (storeWriteAnswered(res, error)) return;
       if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({
@@ -462,6 +532,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
    */
   router.post('/repos/:id/refresh', async (req: Request, res: Response) => {
     try {
+      if (!(await storeFirst(res))) return;
       const { id } = req.params;
       const manager = getAppStoreManager();
 
@@ -472,7 +543,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         });
       }
 
-      const modules = await manager.refreshRepository(id);
+      const modules = await inStoreWrite(() => manager.refreshRepository(id));
 
       res.json({
         success: true,
@@ -498,6 +569,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
    */
   router.get('/modules', async (_req: Request, res: Response) => {
     try {
+      if (!(await storeFirst(res))) return;
       const manager = getAppStoreManager();
       const modules = await manager.getAvailableModules();
 
@@ -519,8 +591,9 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
    * GET /api/appstore/modules/:name
    * Get details for a specific module
    */
-  router.get('/modules/:name', (req: Request, res: Response) => {
+  router.get('/modules/:name', async (req: Request, res: Response) => {
     try {
+      if (!(await storeFirst(res))) return;
       const { name } = req.params;
       const manager = getAppStoreManager();
       const moduleInfo = manager.getModuleInfo(name);
@@ -651,14 +724,17 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
    * GET /api/appstore/installed
    * List all installed modules
    */
-  router.get('/installed', (_req: Request, res: Response) => {
+  router.get('/installed', async (_req: Request, res: Response) => {
     try {
+      if (!(await storeFirst(res))) return;
       const manager = getAppStoreManager();
       const installed = manager.getInstalledModules();
+      const failures = await moduleFailures();
 
       res.json({
         success: true,
-        modules: installed
+        modules: installed,
+        ...failures,
       });
     } catch (error) {
       if (error instanceof SharedOpAnswered) return;
@@ -678,8 +754,9 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
    * GET /api/appstore/credentials/:name
    * Get credentials for a module (masked)
    */
-  router.get('/credentials/:name', (req: Request, res: Response) => {
+  router.get('/credentials/:name', async (req: Request, res: Response) => {
     try {
+      if (!(await storeFirst(res))) return;
       const { name } = req.params;
       const manager = getAppStoreManager();
       const credentials = manager.getCredentials(name);
@@ -718,8 +795,9 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
    * Save credentials for a module
    * Body: { credentials: Record<string, string> }
    */
-  router.put('/credentials/:name', (req: Request, res: Response) => {
+  router.put('/credentials/:name', async (req: Request, res: Response) => {
     try {
+      if (!(await storeFirst(res))) return;
       const { name } = req.params;
       const { credentials } = req.body;
 
@@ -731,13 +809,14 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       }
 
       const manager = getAppStoreManager();
-      const success = manager.saveCredentials(name, credentials);
+      const success = await inStoreWrite(() => manager.saveCredentialsAwaited(name, credentials));
 
       res.json({
         success,
         message: success ? 'Credentials saved' : 'Failed to save credentials'
       });
     } catch (error) {
+      if (storeWriteAnswered(res, error)) return;
       if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({
@@ -751,17 +830,19 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
    * DELETE /api/appstore/credentials/:name
    * Delete credentials for a module
    */
-  router.delete('/credentials/:name', (req: Request, res: Response) => {
+  router.delete('/credentials/:name', async (req: Request, res: Response) => {
     try {
+      if (!(await storeFirst(res))) return;
       const { name } = req.params;
       const manager = getAppStoreManager();
-      const success = manager.deleteCredentials(name);
+      const success = await inStoreWrite(() => manager.deleteCredentialsAwaited(name));
 
       res.json({
         success,
         message: success ? 'Credentials deleted' : 'Failed to delete credentials'
       });
     } catch (error) {
+      if (storeWriteAnswered(res, error)) return;
       if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({
@@ -1755,12 +1836,12 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
    * Query: from, to (ISO timestamps), action, tierId, providerId, guildId,
    *        subscriptionId, limit. Returns newest-first up to `limit`.
    */
-  router.get('/premium/audit', (req: Request, res: Response) => {
+  router.get('/premium/audit', async (req: Request, res: Response) => {
     try {
       const manager = getPremiumManager();
       const { from, to, action, tierId, providerId, guildId, subscriptionId, limit } = req.query as Record<string, string | undefined>;
       const parsedLimit = limit ? parseInt(limit, 10) : undefined;
-      const result = manager.readAuditEntries({
+      const result = await manager.readAuditEntries({
         from: from || undefined,
         to: to || undefined,
         action: action || undefined,
@@ -1877,14 +1958,15 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       const provider = getPaymentRegistry().get(req.params.providerId);
       if (!provider) return res.status(404).json({ success: false, error: `Provider '${req.params.providerId}' not registered` });
       const fields = provider.getCredentialFields ? provider.getCredentialFields() : [];
-      const c = loadCredentials();
-      const status: Record<string, { set: boolean; preview?: string }> = {};
+      const c = providerCredentials(req.params.providerId);
+      const unread = docUnread(req.params.providerId);
+      const status: Record<string, { set: boolean; preview?: string; unread?: string }> = {};
       for (const f of fields) {
         const v = c[f.key];
-        const set = !!(v && v.trim() && !v.startsWith('REPLACE'));
+        const set = isSet(v);
         status[f.key] = set
           ? { set: true, preview: f.type === 'secret' ? '••••••••' : (v || '') }
-          : { set: false };
+          : unread && providerDocKey(req.params.providerId, f.key) ? { set: false, unread } : { set: false };
       }
       res.json({ success: true, fields, status, isConfigured: provider.isConfigured() });
     } catch (error) {
@@ -1904,7 +1986,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
    * declares them in its field list (those are owned by Bot Manager under
    * managed deployments).
    */
-  router.put('/premium/providers/:providerId/credentials', (req: Request, res: Response) => {
+  router.put('/premium/providers/:providerId/credentials', async (req: Request, res: Response) => {
     try {
       const running = botManager.migrationRunning?.();
       if (running) {
@@ -1929,30 +2011,63 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         return res.status(500).json({ success: false, error: `Could not read /data/.env, so nothing was saved: ${readError}` });
       }
       const next: BotCredentials = { ...existing };
+      // NB6 decision 57: on a Postgres bot a built-in provider's own keys go to the credentials doc; the rest stay here.
+      const onDatabase = resolveDataBackend() === 'postgres';
+      const providerId = req.params.providerId;
+      const docChanges: Record<string, string | null> = {};
+      const localKeys: string[] = [];
 
       for (const f of fields) {
         if (RESERVED.has(f.key)) continue;
         if (!allowed.has(f.key)) continue;
+        const toDoc = onDatabase && providerDocKey(providerId, f.key);
+        let value: string | undefined;
         if (clearList.includes(f.key)) {
-          next[f.key] = undefined;
-          continue;
+          value = undefined;
+        } else {
+          const incoming = values[f.key];
+          if (typeof incoming !== 'string') continue;
+          const trimmed = incoming.trim();
+          if (trimmed === '') continue; // leave-blank-to-keep
+          value = trimmed;
         }
-        const incoming = values[f.key];
-        if (typeof incoming !== 'string') continue;
-        const trimmed = incoming.trim();
-        if (trimmed === '') continue; // leave-blank-to-keep
-        next[f.key] = trimmed;
+        if (toDoc) {
+          docChanges[f.key] = value ?? null;
+        } else {
+          next[f.key] = value;
+          localKeys.push(f.key);
+        }
       }
 
-      const result = saveCredentials(next);
-      if (!result.success) {
-        return res.status(500).json({ success: false, error: result.error || 'Failed to save credentials' });
+      if (!onDatabase || localKeys.length > 0) {
+        const result = saveCredentials(next);
+        if (!result.success) {
+          return res.status(500).json({ success: false, error: result.error || 'Failed to save credentials' });
+        }
+      }
+      const kept = onDatabase && localKeys.length > 0 ? localKeys.join(', ') : null;
+      if (Object.keys(docChanges).length > 0) {
+        // Decision 25: the bot writes the doc while it runs, the local chain while it does not.
+        const failure = sharedOpFailure(await botManager.runSharedOp('provider.saveCredentials', { providerId, changes: docChanges }));
+        if (failure) {
+          const tail = kept ? ` ${kept} were saved on this machine only (in /data/.env); set them on each machine of the bot.` : '';
+          return res.status(failure.status).json({ success: false, error: `${failure.error}${tail}` });
+        }
       }
       // Return the updated masked status so the modal can refresh in place.
-      const c = loadCredentials();
-      const status: Record<string, { set: boolean }> = {};
-      for (const f of fields) status[f.key] = { set: !!(c[f.key] && c[f.key]!.trim() && !c[f.key]!.startsWith('REPLACE')) };
-      res.json({ success: true, status, isConfigured: provider.isConfigured() });
+      const c = providerCredentials(providerId);
+      const unread = docUnread(providerId);
+      const status: Record<string, { set: boolean; unread?: string }> = {};
+      for (const f of fields) {
+        const set = isSet(c[f.key]);
+        status[f.key] = !set && unread && providerDocKey(providerId, f.key) ? { set, unread } : { set };
+      }
+      res.json({
+        success: true,
+        status,
+        isConfigured: provider.isConfigured(),
+        ...(kept ? { message: `Saved. ${kept} are kept on this machine only (in /data/.env); set them on each machine of the bot.` } : {}),
+      });
     } catch (error) {
       if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -1988,23 +2103,31 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
   const APPSTORE_CONFIG_PATH = path.join(APPSTORE_CONFIG_DIR, 'config.json');
 
   function loadComponentConfig(): Record<string, boolean> {
-    const read = readConfigFile(COMPONENT_CONFIG_PATH);
-    if (!read.ok) throw new Error(`component-config.json cannot be read: ${read.error}`);
-    return read.config;
+    return readComponentConfig().config;
   }
 
-  function saveComponentConfig(config: Record<string, boolean>): void {
-    writeConfigFile(COMPONENT_CONFIG_PATH, config);
+  function readComponentConfig(): { config: Record<string, boolean>; sha: string } {
+    const read = readConfigFile(COMPONENT_CONFIG_PATH);
+    if (!read.ok) throw new Error(`component-config.json cannot be read: ${read.error}`);
+    return read;
+  }
+
+  function saveComponentConfig(config: Record<string, boolean>, base: string): Promise<void> {
+    return inStoreWrite(() => writeConfigFile(COMPONENT_CONFIG_PATH, config, base));
+  }
+
+  function readAppStoreConfig(): { config: Record<string, any>; sha: string } {
+    const read = readConfigFile(APPSTORE_CONFIG_PATH);
+    if (!read.ok) throw new Error(`config.json cannot be read: ${read.error}`);
+    return read;
   }
 
   function loadAppStoreConfig(): Record<string, any> {
-    const read = readConfigFile(APPSTORE_CONFIG_PATH);
-    if (!read.ok) throw new Error(`config.json cannot be read: ${read.error}`);
-    return read.config;
+    return readAppStoreConfig().config;
   }
 
-  function saveAppStoreConfig(config: Record<string, any>): void {
-    writeConfigFile(APPSTORE_CONFIG_PATH, config);
+  function saveAppStoreConfig(config: Record<string, any>, base: string): Promise<void> {
+    return inStoreWrite(() => writeConfigFile(APPSTORE_CONFIG_PATH, config, base));
   }
 
   /** Map Discord ApplicationCommandOptionType numbers to readable strings */
@@ -2111,8 +2234,9 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
    * GET /api/appstore/components
    * Returns all components from loaded modules + internalSetup, grouped by module
    */
-  router.get('/components', (req: Request, res: Response) => {
+  router.get('/components', async (req: Request, res: Response) => {
     try {
+      if (!(await storeFirst(res))) return;
       const registry = getModuleRegistry();
       const allModules = registry.getAllModules();
       const config = loadComponentConfig();
@@ -2174,8 +2298,9 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
    * PUT /api/appstore/components/:module/:type/:name
    * Toggle a component on/off
    */
-  router.put('/components/:module/:type/:name', (req: Request, res: Response) => {
+  router.put('/components/:module/:type/:name', async (req: Request, res: Response) => {
     try {
+      if (!(await storeFirst(res))) return;
       const { module: moduleName, type, name } = req.params;
       const { enabled } = req.body;
 
@@ -2188,7 +2313,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       }
 
       const key = `${moduleName}:${type}:${name}`;
-      const config = loadComponentConfig();
+      const { config, sha } = readComponentConfig();
       const changed = (config[key] !== false) !== enabled;
 
       if (changed) {
@@ -2197,7 +2322,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         } else {
           config[key] = false;
         }
-        saveComponentConfig(config);
+        await saveComponentConfig(config, sha);
       }
 
       // Fire debounced runtime toggle (async, doesn't block response)
@@ -2213,6 +2338,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
 
       res.json({ success: true, key, enabled, changed, ...(changed ? {} : { message: enabled ? 'already enabled' : 'already disabled' }) });
     } catch (error) {
+      if (storeWriteAnswered(res, error)) return;
       const msg = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: msg });
     }
@@ -2224,8 +2350,9 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
    * GET /api/appstore/config
    * Returns AppStore general config (cleanup toggle, etc.)
    */
-  router.get('/config', (_req: Request, res: Response) => {
+  router.get('/config', async (_req: Request, res: Response) => {
     try {
+      if (!(await storeFirst(res))) return;
       const config = loadAppStoreConfig();
       res.json({
         success: true,
@@ -2246,14 +2373,15 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
    */
   router.put('/config', async (req: Request, res: Response) => {
     try {
-      const config = loadAppStoreConfig();
+      if (!(await storeFirst(res))) return;
+      const { config, sha } = readAppStoreConfig();
       if (typeof req.body.autoCleanup === 'boolean') {
         config.autoCleanup = req.body.autoCleanup;
       }
       if (typeof req.body.autoUpdate === 'boolean') {
         config.autoUpdate = req.body.autoUpdate;
       }
-      saveAppStoreConfig(config);
+      await saveAppStoreConfig(config, sha);
 
       // Turning autoCleanup ON kicks off the orphan sweep as tracked background
       // work: rate-limited global-command sweeps can run for minutes, so the
@@ -2275,6 +2403,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         ...(cleanupStopping ? { cleanupStopping: true } : {}),
       });
     } catch (error) {
+      if (storeWriteAnswered(res, error)) return;
       const msg = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: msg });
     }

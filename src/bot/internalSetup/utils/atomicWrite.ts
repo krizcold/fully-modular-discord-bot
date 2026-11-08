@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 
 /** Writes through a temp file and a rename; `keep` gives the new file that mode, and that owner where the process may set it. */
-export function atomicWriteFileSync(file: string, contents: string, keep?: { mode: number; uid: number; gid: number }): void {
+export function atomicWriteFileSync(file: string, contents: string | Buffer, keep?: { mode: number; uid: number; gid: number }): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
   const fd = fs.openSync(tmp, 'w', keep ? keep.mode & 0o777 : 0o666);

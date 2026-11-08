@@ -1,9 +1,11 @@
 import express, { Router, Request, Response } from 'express';
 import * as path from 'path';
 import * as fs from 'fs';
-import { BotManager } from '../botManager';
+import type { BotManager, ModuleApplyAnswer } from '../botManager';
+import type { PublishedChange } from '../../bot/internalSetup/utils/appStoreManager';
 import { getSafetyManager } from '../../utils/updateSafety';
 import { dataPath } from '../../utils/dataRoot';
+import { resolveDataBackend } from '../../utils/envLoader';
 
 import {
   checkForUpdates,
@@ -13,10 +15,14 @@ import {
   checkForAllUpdates,
   triggerModuleUpdate,
   triggerAllModuleUpdates,
-  describeBulkModuleUpdate
+  describeBulkModuleUpdate,
+  type BulkModuleUpdateResult
 } from '@/updater';
 
 const COPY_OPTIONS = { recursive: true, force: true, preserveTimestamps: true, verbatimSymlinks: true } as const;
+
+const MODULES_ONLY_TEXT = "This backup holds only App Store modules. This bot keeps its modules in its database, so nothing was restored; the App Store tab installs only the version each module's repository holds now.";
+const MODULES_KEPT_TEXT = "Rollback restored /app/custom. The App Store modules in this backup were not restored: this bot keeps its modules in its database, and the App Store tab installs only the version each module's repository holds now. Please restart the bot.";
 
 type BackupLookup = { status: 400 | 404; error: string } | { dir: string };
 
@@ -37,6 +43,40 @@ async function emptyDir(dir: string): Promise<void> {
   for (const name of await fs.promises.readdir(dir)) {
     await fs.promises.rm(path.join(dir, name), { recursive: true, force: true });
   }
+}
+
+type Published = { published?: PublishedChange; applied?: unknown };
+
+/** NB6 decisions 44 and 61: the change a stored update in the web UI hands to the bot's `module:apply`; none in the bot or on a JSON bot. */
+const toApply = (result: Published): PublishedChange | null => (result.published && !result.applied ? result.published : null);
+
+/** An update result as the route answers it: the staged folder and the writer stay inside the process. */
+function shown<T extends Published>(result: T): Omit<T, 'published'> {
+  const { published: _published, ...rest } = result;
+  return rest;
+}
+
+/** The sentence, then each apply's text (decision 61), as sentences. */
+function withTexts(head: string, texts: string[]): string {
+  if (texts.length === 0) return head;
+  return `${head.endsWith('.') ? head : `${head}.`} ${texts.join(' ')}`;
+}
+
+/** The summary with a clause of the reload, before the sentences of updates the database did not answer (26b decision 3). */
+function withClause(result: BulkModuleUpdateResult, clause: string): string {
+  const unconfirmed = result.failed.filter(f => f.unconfirmed).map(f => f.error);
+  const head = `${describeBulkModuleUpdate({ ...result, failed: result.failed.filter(f => !f.unconfirmed) })}; ${clause}`;
+  return unconfirmed.length > 0 ? `${head}. ${unconfirmed.join(' ')}` : head;
+}
+
+/** The bot child applies each stored update in turn (decision 44); its answers by module, for the routes' answers. */
+async function applyEach(botManager: BotManager, updated: Array<Published & { moduleName: string }>): Promise<Array<ModuleApplyAnswer & { moduleName: string }>> {
+  const answers: Array<ModuleApplyAnswer & { moduleName: string }> = [];
+  for (const u of updated) {
+    const change = toApply(u);
+    if (change) answers.push({ moduleName: u.moduleName, ...(await botManager.applyModule(change)) });
+  }
+  return answers;
 }
 
 async function dirSize(dir: string): Promise<number> {
@@ -159,8 +199,23 @@ export function createUpdateRouter(botManager: BotManager): Router {
       }
 
       const result = await triggerModuleUpdate(name);
+      const change = result.success ? toApply(result) : null;
 
-      if (result.success) {
+      if (change) {
+        const answer = await botManager.applyModule(change);
+        if (answer.outcome === 'failed') {
+          res.json({ success: false, moduleName: result.moduleName, oldVersion: result.oldVersion, newVersion: result.newVersion, apply: answer, error: answer.text });
+          return;
+        }
+        res.json({
+          success: true,
+          moduleName: result.moduleName,
+          oldVersion: result.oldVersion,
+          newVersion: result.newVersion,
+          apply: answer,
+          message: answer.text ?? `Module ${name} updated successfully from ${result.oldVersion} to ${result.newVersion}`
+        });
+      } else if (result.success) {
         res.json({
           success: true,
           moduleName: result.moduleName,
@@ -191,16 +246,19 @@ export function createUpdateRouter(botManager: BotManager): Router {
   router.post('/modules', async (req: Request, res: Response) => {
     try {
       const result = await triggerAllModuleUpdates();
+      const applies = await applyEach(botManager, result.updated);
+      const texts = applies.map(a => a.text).filter((text): text is string => text !== null);
 
       res.json({
-        success: result.success,
+        success: result.success && applies.every(a => a.outcome !== 'failed'),
         totalAttempted: result.totalAttempted,
         totalUpdated: result.totalUpdated,
-        updated: result.updated,
+        updated: result.updated.map(shown),
         failed: result.failed,
         checkErrors: result.checkErrors,
         skipped: result.skipped,
-        message: describeBulkModuleUpdate(result)
+        ...(applies.length > 0 ? { apply: applies } : {}),
+        message: withTexts(describeBulkModuleUpdate(result), texts)
       });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -224,15 +282,36 @@ export function createUpdateRouter(botManager: BotManager): Router {
     try {
       // Step 1: Download module updates via AppStoreManager
       const updateResult = await triggerAllModuleUpdates();
+      const download = { ...updateResult, updated: updateResult.updated.map(shown) };
 
       if (updateResult.totalUpdated === 0) {
         res.json({
           success: updateResult.success,
-          download: updateResult,
+          download,
           reload: null,
           message: updateResult.success
             ? 'No modules were updated; nothing to reload'
             : describeBulkModuleUpdate(updateResult)
+        });
+        return;
+      }
+
+      // On a Postgres bot the web UI's stored updates are applied by the bot child, with no reload (NB6 decisions 44, 61)
+      const applies = await applyEach(botManager, updateResult.updated);
+      if (applies.length > 0) {
+        const reload = {
+          success: applies.every(a => a.outcome === 'applied'),
+          reloaded: applies.filter(a => a.outcome === 'applied').map(a => a.moduleName),
+          failed: applies.filter(a => a.outcome !== 'applied').map(a => ({ moduleName: a.moduleName, error: a.text ?? a.outcome }))
+        };
+        res.json({
+          success: updateResult.success && reload.success,
+          download,
+          reload,
+          apply: applies,
+          message: reload.success
+            ? withClause(updateResult, 'reloaded the updated module(s)')
+            : withTexts(describeBulkModuleUpdate(updateResult), reload.failed.map(f => f.error))
         });
         return;
       }
@@ -243,11 +322,11 @@ export function createUpdateRouter(botManager: BotManager): Router {
 
       res.json({
         success: updateResult.success && (reloadResult?.success !== false),
-        download: updateResult,
+        download,
         reload: reloadResult,
         message: reloadResult?.success
-          ? `${describeBulkModuleUpdate(updateResult)}; reloaded the updated module(s)`
-          : `${describeBulkModuleUpdate(updateResult)}; reload had issues`
+          ? withClause(updateResult, 'reloaded the updated module(s)')
+          : withClause(updateResult, 'reload had issues')
       });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -266,12 +345,30 @@ export function createUpdateRouter(botManager: BotManager): Router {
       // Step 1: Download module update
       const updateResult = await triggerModuleUpdate(name);
 
+      const download = shown(updateResult);
+
       if (!updateResult.success) {
         res.json({
           success: false,
-          download: updateResult,
+          download,
           reload: null,
           error: updateResult.error || 'Failed to download module update'
+        });
+        return;
+      }
+
+      // On a Postgres bot the web UI's stored update is applied by the bot child, with no reload (NB6 decisions 44, 61)
+      const change = toApply(updateResult);
+      if (change) {
+        const answer = await botManager.applyModule(change);
+        const applied = answer.outcome === 'applied';
+        res.json({
+          success: applied,
+          download,
+          reload: null,
+          apply: answer,
+          message: applied ? `Updated and reloaded ${name}` : answer.text,
+          ...(answer.outcome === 'failed' ? { error: answer.text } : {})
         });
         return;
       }
@@ -281,7 +378,7 @@ export function createUpdateRouter(botManager: BotManager): Router {
 
       res.json({
         success: reloadResult?.success !== false,
-        download: updateResult,
+        download,
         reload: reloadResult,
         message: reloadResult?.success
           ? `Updated and reloaded ${name}`
@@ -465,6 +562,13 @@ export function createUpdateRouter(botManager: BotManager): Router {
         return;
       }
 
+      // NB6 decision 32: a Postgres bot keeps its modules in the database, so only /app/custom is restored.
+      const modulesInDatabase = resolveDataBackend() === 'postgres';
+      if (modulesInDatabase && kinds[0] !== 'dir') {
+        res.status(409).json({ success: false, error: MODULES_ONLY_TEXT });
+        return;
+      }
+
       // Unconditional: a crashed child may still be waiting on its automatic
       // start, which the shutdown calls off.
       const wasRunning = botManager.isRunning();
@@ -475,7 +579,7 @@ export function createUpdateRouter(botManager: BotManager): Router {
         await emptyDir('/app/custom');
         await fs.promises.cp(backupCustom, '/app/custom', COPY_OPTIONS);
       }
-      if (kinds[1] === 'dir') {
+      if (kinds[1] === 'dir' && !modulesInDatabase) {
         await emptyDir(dataPath('appstore-modules'));
         await fs.promises.cp(backupAppstore, dataPath('appstore-modules'), COPY_OPTIONS);
       }
@@ -495,7 +599,7 @@ export function createUpdateRouter(botManager: BotManager): Router {
 
       res.json({
         success: true,
-        message: 'Rollback successful. Please restart the bot.'
+        message: modulesInDatabase && kinds[1] === 'dir' ? MODULES_KEPT_TEXT : 'Rollback successful. Please restart the bot.'
       });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';

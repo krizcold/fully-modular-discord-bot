@@ -11,6 +11,7 @@ import { reloadModule, reloadModules, unloadModuleFromMemory } from './moduleRel
 import { getModuleRegistry } from './moduleRegistry';
 import { reRegisterSlashCommands } from './commandUtils';
 import { maintenanceIpcRefusal } from './maintenance';
+import { applyModuleChange, type ModuleChange } from './moduleApply';
 
 let clientRef: Client | null = null;
 
@@ -62,6 +63,22 @@ export function setupReloadIPCHandlers(client: Client): void {
           // Load a newly installed module into memory (fresh install, not reload)
           const loadResult = await reloadModule(clientRef, data.moduleName);
           response = loadResult;
+          break;
+        }
+
+        case 'module:apply': {
+          // NB6 decisions 44, 58 and 61: the web UI's publish landed; this machine applies the row.
+          const change: ModuleChange = {
+            module: data.module,
+            to: data.to,
+            source: typeof data.staged === 'string' ? data.staged : 'rows',
+            displaced: 'backups',
+            reason: data.reason === 'install' || data.reason === 'update' || data.reason === 'uninstall' ? data.reason : 'remote',
+            tag: data.tag ?? null,
+            version: data.version ?? null,
+            updatedBy: data.updatedBy ?? null,
+          };
+          response = await applyModuleChange(change);
           break;
         }
 

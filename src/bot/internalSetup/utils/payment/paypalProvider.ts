@@ -28,7 +28,7 @@
  */
 
 import { PROVIDER_FETCH_MS } from './paymentTypes';
-import { loadCredentials } from '@/utils/envLoader';
+import { providerCredentials } from '@/utils/envLoader';
 import { getPaymentRegistry } from './paymentRegistry';
 import type {
   PaymentProvider,
@@ -59,7 +59,7 @@ const CAPABILITIES: ProviderCapabilities = {
 };
 
 function paypalApiBase(): string {
-  const env = loadCredentials().PAYPAL_ENV || 'sandbox';
+  const env = providerCredentials('paypal').PAYPAL_ENV || 'sandbox';
   return env === 'live' ? 'https://api-m.paypal.com' : 'https://api-m.sandbox.paypal.com';
 }
 
@@ -73,7 +73,7 @@ export class PayPalProvider implements PaymentProvider {
   private tokenCache: PayPalToken | null = null;
 
   isConfigured(): boolean {
-    const c = loadCredentials();
+    const c = providerCredentials('paypal');
     return !!(c.PAYPAL_CLIENT_ID && c.PAYPAL_CLIENT_SECRET && c.PAYPAL_WEBHOOK_ID);
   }
 
@@ -122,7 +122,7 @@ export class PayPalProvider implements PaymentProvider {
   }
 
   async initiatePurchase(opts: InitiateOpts): Promise<InitiateResult> {
-    const c = loadCredentials();
+    const c = providerCredentials('paypal');
     if (!this.isConfigured()) throw new Error('PayPal not configured');
     const returnUrl = c.WEBUI_BASE_URL
       ? `${c.WEBUI_BASE_URL}/guild/${encodeURIComponent(opts.guildId)}/subscription?subscribe=success`
@@ -240,7 +240,7 @@ export class PayPalProvider implements PaymentProvider {
   }
 
   async handleWebhook(rawBody: Buffer, _signature: string, headers: Record<string, string>): Promise<void> {
-    const c = loadCredentials();
+    const c = providerCredentials('paypal');
     if (!c.PAYPAL_WEBHOOK_ID) throw new Error('PAYPAL_WEBHOOK_ID not configured');
     const event = JSON.parse(rawBody.toString('utf-8'));
 
@@ -331,7 +331,7 @@ export class PayPalProvider implements PaymentProvider {
     if (this.tokenCache && this.tokenCache.expires_at > Date.now() + 60_000) {
       return this.tokenCache.access_token;
     }
-    const c = loadCredentials();
+    const c = providerCredentials('paypal');
     if (!c.PAYPAL_CLIENT_ID || !c.PAYPAL_CLIENT_SECRET) throw new Error('PayPal not configured');
     const auth = Buffer.from(`${c.PAYPAL_CLIENT_ID}:${c.PAYPAL_CLIENT_SECRET}`).toString('base64');
     const res = await fetch(`${paypalApiBase()}/v1/oauth2/token`, {
