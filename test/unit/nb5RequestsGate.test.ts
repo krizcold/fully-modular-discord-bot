@@ -32,9 +32,7 @@ import {
   GuildRequestSweep,
   RequestsStoppedError,
   _resetGuildRequestPool,
-  _setLookupDb,
   gatedSweepDb,
-  notServedHereText,
   startGuildRequestSweep,
   type SweepDeps,
   type SweepGate,
@@ -126,7 +124,6 @@ beforeEach(() => {
   };
 });
 afterEach(() => {
-  _setLookupDb(null);
   _resetGuildRequestPool();
   setGuildDataBackend(null);
   setBackendKind(null);
@@ -275,15 +272,6 @@ describe('G9: the sweep across a hold and a latch', () => {
     expect(lines(logs.log)).toContain(`[GuildRequests] write of m/a.json for server ${GUILD}, sent from ALPHA: saved`);
   });
 
-  it('(j) the lookup while held answers NB7\'s texts with the hold\'s text, and sends nothing', async () => {
-    const { g, gate } = fakeGate();
-    const f = fakePool(() => ({ rows: [] }));
-    g.refusal = CONFIRMING;
-    _setLookupDb(gatedSweepDb(f.pool, gate));
-    expect(await notServedHereText(GUILD, 'panel')).toBe(`This machine's bot does not run this server, and the machine that runs it could not be looked up (${CONFIRMING}); open its panels from the web panel of the machine that runs it.`);
-    expect(await notServedHereText(GUILD, 'console')).toBe(`this machine's bot does not run guild ${GUILD}, and the machine that runs it could not be looked up (${CONFIRMING})`);
-    expect(f.state.connects).toBe(0);
-  });
 });
 
 describe('G9 and H4: the pool follows the chosen entry', () => {

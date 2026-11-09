@@ -437,9 +437,9 @@ describe('the sweep and the keep time', () => {
   });
 });
 
-describe('version 9', () => {
+describe('version 10', () => {
   it('a database of version 8 is refused (C19)', async () => {
-    expect(SCHEMA_VERSION).toBe(9);
+    expect(SCHEMA_VERSION).toBe(10);
     await direct.query('CREATE DATABASE nb14v7');
     const user = encodeURIComponent(container.getUsername());
     const password = encodeURIComponent(container.getPassword());
@@ -461,7 +461,7 @@ describe('version 9', () => {
     try {
       const until = Date.now() + 30_000;
       while (!lines.some(l => l.includes('schema-mismatch')) && Date.now() < until) await sleep(100);
-      expect(lines).toContain('[PostgresBackend] schema-mismatch: smdb_data.meta schema_version is {"v":8}, expected {"v":9}; refusing to serve');
+      expect(lines).toContain('[PostgresBackend] schema-mismatch: smdb_data.meta schema_version is {"v":8}, expected {"v":10}; refusing to serve');
       expect(second.servesData()).toBe(false);
     } finally {
       await second.stop();

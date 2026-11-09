@@ -24,7 +24,11 @@ vi.mock('../../src/bot/internalSetup/utils/panelManager', async importOriginal =
 import { confirmWrite, saveData, saveDataOutcome } from '../../src/bot/internalSetup/utils/dataManager';
 import { freezeGuildWrites, unfreezeGuildWrites } from '../helpers/freezeGuild';
 import { currentLedger } from '../../src/bot/internalSetup/utils/dataBackends/writeLedger';
-import { CONFIRM_MS, truthText } from '../../src/bot/internalSetup/utils/dataBackends/replyGate';
+import { CONFIRM_MS, ranTruthText, type TruthAnswer } from '../../src/bot/internalSetup/utils/dataBackends/replyGate';
+
+const ranFailure = (truth: TruthAnswer, partial: boolean, error = ranTruthText({ answer: truth, partial })) => ({
+  success: false, ran: true, truth, partial, error, ...(truth === 'pending' || truth === 'held' ? { pending: true } : {}),
+});
 import { runPanelAction, setupPanelIPCHandlers } from '../../src/bot/internalSetup/utils/ipcPanelHandler';
 import { registerPanelButtonHandler } from '../../src/bot/internalSetup/utils/panel/panelButtonHandler';
 import { PanelWebUIAdapter } from '../../src/bot/internalSetup/utils/panel/panelWebUIAdapter';
@@ -164,7 +168,7 @@ describe('a panel run whose writes are not confirmed', () => {
       saveDataOutcome('x.json', notReadyGuild(), { v: 1 });
       return VIEW;
     });
-    expect(answer).toEqual({ success: false, error: truthText('not-ready', false) });
+    expect(answer).toEqual(ranFailure('not-ready', false));
     expect(broadcasts).toEqual([]);
   });
 
@@ -175,7 +179,7 @@ describe('a panel run whose writes are not confirmed', () => {
       saveData('x.json', options, { v: 1 });
       return VIEW;
     }, guildId);
-    expect(answer).toEqual({ success: false, error: truthText('held', false) });
+    expect(answer).toEqual(ranFailure('held', false));
     expect(broadcasts).toEqual([]);
   });
 
@@ -187,7 +191,7 @@ describe('a panel run whose writes are not confirmed', () => {
       stop.on = true;
       return VIEW;
     }, guildId);
-    expect(answer).toEqual({ success: false, error: 'The bot is restarting and could not confirm your change was saved; it may be lost. Please check once it is back.' });
+    expect(answer).toEqual(ranFailure('held', false, 'The action ran, but the bot is restarting and could not confirm its changes were saved; they may be lost. Check the server before you run it again.'));
     expect(broadcasts).toEqual([]);
   });
 
@@ -198,7 +202,7 @@ describe('a panel run whose writes are not confirmed', () => {
       saveData('x.json', options, { v: 1 });
       return VIEW;
     }, guildId);
-    expect(answer).toEqual({ success: false, error: truthText('deposed', false) });
+    expect(answer).toEqual(ranFailure('deposed', false));
   });
 
   it('a refusal and then a whole rewrite of the same document answers unavailable', async () => {
@@ -210,7 +214,7 @@ describe('a panel run whose writes are not confirmed', () => {
       expect(saveDataOutcome('x.json', options, { v: 2 })).toBe('saved');
       return VIEW;
     }, guildId);
-    expect(answer).toEqual({ success: false, error: truthText('unavailable', true) });
+    expect(answer).toEqual(ranFailure('unavailable', true));
   });
 
   it('a write still unconfirmed at the confirm bound answers pending, and nothing is broadcast', async () => {
@@ -225,7 +229,7 @@ describe('a panel run whose writes are not confirmed', () => {
     }, guildId);
     await tick(40);
     vi.advanceTimersByTime(CONFIRM_MS + 2000);
-    expect(await done).toEqual({ success: false, error: truthText('pending', false) });
+    expect(await done).toEqual(ranFailure('pending', false));
     expect(broadcasts).toEqual([]);
     store.release();
   });
@@ -242,7 +246,7 @@ describe('writes recorded while the verdict waits', () => {
     }, guildId);
     await tick(40);
     store.release();
-    expect(await done).toEqual({ success: false, error: truthText('not-ready', true) });
+    expect(await done).toEqual(ranFailure('not-ready', true));
     expect(broadcasts).toEqual([]);
   });
 
@@ -279,7 +283,7 @@ describe('a handler that throws', () => {
         saveDataOutcome('x.json', notReadyGuild(), { v: 1 });
         throw new Error('boom');
       });
-      expect(answer).toEqual({ success: false, error: truthText('not-ready', false) });
+      expect(answer).toEqual(ranFailure('not-ready', false));
       expect(warn.mock.calls.map(c => String(c[0])).filter(l => l.includes('boom'))).toEqual(['[IPCPanelHandler] panel:modal failed with its writes not confirmed: boom']);
     } finally {
       warn.mockRestore();
@@ -304,7 +308,7 @@ describe('a handler that throws', () => {
         throw new Error('escaped');
       },
     };
-    expect(await runPanelAction('panel:execute', { panelId: 'gone', userId: OWNER }, refusing)).toEqual({ success: false, error: truthText('not-ready', false) });
+    expect(await runPanelAction('panel:execute', { panelId: 'gone', userId: OWNER }, refusing)).toEqual(ranFailure('not-ready', false));
   });
 });
 
@@ -339,7 +343,7 @@ describe('the registered-button fallback', () => {
       saveDataOutcome('x.json', notReadyGuild(), { v: 1 });
       throw new Error('handler failed');
     });
-    expect(await runPanelAction('panel:button', { panelId: id, buttonId: 'ra_add_1', userId: OWNER }, pm)).toEqual({ success: false, error: truthText('not-ready', false) });
+    expect(await runPanelAction('panel:button', { panelId: id, buttonId: 'ra_add_1', userId: OWNER }, pm)).toEqual(ranFailure('not-ready', false));
   });
 
   it.each([['panel', 'panel_ID_btn_nav_x'], ['persistent_warning', 'persistent_warning_ID_web_ui'], ['panel', 'panel']])('core\'s own key %s is skipped: a handleButton that returns null answers the view', async (key, customId) => {
@@ -376,7 +380,7 @@ describe('answers before any write', () => {
 
   it('a guild still loading answers the loading notice (R5-J3: one text on Discord and panels)', async () => {
     loading.add('777');
-    expect(await run('panel:execute', async () => VIEW, '777')).toEqual({ success: false, error: "This server's data is still loading, try again in a moment." });
+    expect(await run('panel:execute', async () => VIEW, '777')).toEqual({ success: false, ran: false, error: "This server's data is still loading, try again in a moment." });
   });
 });
 
@@ -402,7 +406,7 @@ describe('the IPC listener', () => {
       emitIpc({ type: 'panel:dropdown', requestId: 'bt4-2', data: request('panel:dropdown', 'ipc-ok') });
       for (let i = 0; i < 50 && replies.length < 2; i++) await tick(10);
       expect(replies.sort((a, b) => a.requestId.localeCompare(b.requestId))).toEqual([
-        { requestId: 'bt4-1', data: { success: false, error: truthText('not-ready', false) } },
+        { requestId: 'bt4-1', data: ranFailure('not-ready', false) },
         { requestId: 'bt4-2', data: { success: true, data: { content: 'View' } } },
       ]);
       expect(broadcasts).toHaveLength(1);

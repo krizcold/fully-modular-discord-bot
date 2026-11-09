@@ -85,12 +85,12 @@ describe('the request insert announces itself', () => {
 
   it('cell 442 (guard): the settle insert, of a new id and of a pending row, sends no notification', async () => {
     const fresh = valuesOf('p-bravo');
-    expect((await rig.direct.query(SETTLE_INSERT_SQL, fresh)).rows).toEqual([{ state: 'expired' }]);
+    expect((await rig.direct.query(SETTLE_INSERT_SQL, fresh)).rows).toEqual([{ state: 'expired', pickup_over: true }]);
     const pending = valuesOf('p-bravo');
     await rig.direct.query(REQUEST_INSERT_SQL, [...pending, 5, 20]);
     expect(await heardBefore()).toEqual([{ channel: CHANNEL, payload: 'p-bravo' }]);
     heard.length = 0;
-    expect((await rig.direct.query(SETTLE_INSERT_SQL, pending)).rows).toEqual([{ state: 'expired' }]);
+    expect((await rig.direct.query(SETTLE_INSERT_SQL, pending)).rows).toEqual([{ state: 'expired', pickup_over: false }]);
     expect(await heardBefore()).toEqual([]);
   });
 });

@@ -2,7 +2,7 @@ import { EventEmitter } from 'events';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const fakePools = vi.hoisted(() => [] as any[]);
-const fakeServer = vi.hoisted(() => ({ script: (_text: string): unknown => undefined, identity: 'S1' }));
+const fakeServer = vi.hoisted(() => ({ script: (_text: string): unknown => undefined, identity: 'S1', shim: (_text: string, _values?: unknown[]): unknown => undefined }));
 
 vi.mock('pg', async importOriginal => {
   const real = await importOriginal<typeof import('pg')>();
@@ -14,7 +14,7 @@ vi.mock('pg', async importOriginal => {
       const text = typeof config === 'string' ? config : config.text;
       this.queries.push(text);
       if (text.includes('pg_postmaster_start_time')) return { rows: [{ server: fakeServer.identity }] };
-      const answer = fakeServer.script(text);
+      const answer = fakeServer.shim(text, config.values);
       if (answer instanceof Error) throw answer;
       return answer ?? { rows: [], rowCount: 0 };
     }
@@ -51,7 +51,8 @@ import {
   type RequestDb,
 } from '../../src/webui/utils/guildRequests';
 import { readServedGuild } from '../../src/webui/utils/servedRead';
-import { GuildRequestSweep, notServedHereText, _setLookupDb } from '../../src/bot/internalSetup/fleet/guildRequests';
+import { pollShim } from '../helpers/nb15PollShim';
+import { GuildRequestSweep, _sweepDbForTests } from '../../src/bot/internalSetup/fleet/guildRequests';
 import {
   REQUEST_CLAIM_SQL,
   REQUEST_INSERT_SQL,
@@ -84,6 +85,8 @@ const poll = (state: string, over: Record<string, unknown> = {}) => ({ rows: [{ 
 let server = 'S1';
 let sent: Sent[] = [];
 let script: (sql: string) => unknown = () => undefined;
+const shim = pollShim(() => script);
+fakeServer.shim = pollShim(() => fakeServer.script);
 let holderUrl: string | undefined;
 
 function install(): void {
@@ -99,7 +102,7 @@ function install(): void {
           server: at,
           query: (sql: string, _values: unknown[], boundMs: number) => {
             sent.push({ sql, server: at, url });
-            return answerOf(script(sql), boundMs);
+            return answerOf(shim(sql, _values), boundMs);
           },
           release: () => undefined,
         };
@@ -164,7 +167,7 @@ describe('NB7-DL1 and NB7-RS-2: "nothing was saved" only with the row shown neve
     script = sql => {
       if (sql === REQUEST_INSERT_SQL) return lost();
       if (sql === SETTLE_INSERT_SQL) return ++settles === 1 ? lost() : { rows: [] };
-      if (sql === REQUEST_POLL_SQL) return poll('expired');
+      if (sql === REQUEST_POLL_SQL) return poll('expired', { pickup_over: true });
       return undefined;
     };
     const { result } = await send();
@@ -262,7 +265,7 @@ describe('NB7-RS-3 and NB7-M1: the exit sends one settle per request and logs wh
     const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
     const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
     let exited = false;
-    script = sql => (sql === REQUEST_POLL_SQL ? (exited ? poll('expired') : poll('pending')) : undefined);
+    script = sql => (sql === REQUEST_POLL_SQL ? (exited ? poll('expired', { pickup_over: true }) : poll('pending')) : undefined);
     await send();
     await vi.advanceTimersByTimeAsync(10);
     exited = true;
@@ -387,9 +390,9 @@ describe('NB7-RS-1: every client of the two new pools keeps an error listener', 
     vi.useRealTimers();
     vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     _setGuildRequestDeps({
-      holderOf: async () => ({ rows: [heldRow()], url: 'postgres://fake-requests' }),
+      holderOf: async () => ({ rows: [heldRow()], url: 'postgres://fake-requests?sslmode=require' }),
       readDoc: async () => null,
-      currentUrl: () => 'postgres://fake-requests',
+      currentUrl: () => 'postgres://fake-requests?sslmode=require',
       nodeId: () => 'n-a',
       nodeName: () => 'ALPHA',
     });
@@ -423,9 +426,8 @@ describe('NB7-RS-1: every client of the two new pools keeps an error listener', 
       refusalDetail: () => null,
     }));
     try {
-      _setLookupDb(null);
       fakeServer.script = () => ({ rows: [] });
-      await notServedHereText(GUILD, 'panel');
+      await _sweepDbForTests().query('SELECT 1', [], 1000);
       const pool = fakePools.find(p => p.options.application_name === 'smdb-guild-requests');
       expect(pool).toBeDefined();
       expect(pool.clients.length).toBeGreaterThan(0);

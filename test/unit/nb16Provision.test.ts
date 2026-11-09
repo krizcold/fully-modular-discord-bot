@@ -584,7 +584,7 @@ describe('a throw at any statement of the check', () => {
   });
 });
 
-// The schema of SCHEMA_VERSION 9, frozen. A change here means the DDL changed.
+// The schema of SCHEMA_VERSION 10, frozen. A change here means the DDL changed.
 const FROZEN_V9_DDL = [
   `CREATE SCHEMA IF NOT EXISTS smdb_data`,
   `CREATE TABLE IF NOT EXISTS smdb_data.meta (
@@ -712,7 +712,9 @@ const FROZEN_V9_DDL = [
     shard_count   integer     NOT NULL,
     shard_id      integer     NOT NULL,
     for_process   text        NOT NULL,
-    op            text        NOT NULL CHECK (op IN ('write','delete','delete-namespace','restore-graveyard')),
+    op            text        NOT NULL CHECK (op IN ('write','delete','delete-namespace','restore-graveyard',
+                                'panel:execute','panel:button','panel:dropdown','panel:modal','command:invoke',
+                                'guild:channels','guild:roles','panel:list','panel:live','guild:membership')),
     body          text        NOT NULL,
     requested_by  text        NOT NULL,
     state         text        NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','applying','done','expired')),
@@ -792,9 +794,9 @@ function frozenPartitions(ifNotExists: boolean): string[] {
 
 const BUMP = 'the DDL changed: bump SCHEMA_VERSION (the boot refuses a stored schema that differs) and update this copy';
 
-describe('the schema of SCHEMA_VERSION 9 (guard)', () => {
+describe('the schema of SCHEMA_VERSION 10 (guard)', () => {
   it("provision()'s 94 statements are today's, text for text", () => {
-    expect(pg.SCHEMA_VERSION, BUMP).toBe(9);
+    expect(pg.SCHEMA_VERSION, BUMP).toBe(10);
     expect([...pg.provisionDdl('smdb_data'), ...pg.partitionDdl('smdb_data', true)], BUMP).toEqual([...FROZEN_V9_DDL, ...frozenPartitions(true)]);
   });
 

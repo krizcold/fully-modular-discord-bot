@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs, parseLog } from './oracle.mjs';
 import { appCopy, buildHistory, dbCopy, judge, parseRequests } from './judge.mjs';
 import { buildSharedHistory, judgeShared, mirrorCopy, rowCopy, SHARED_BOUND_S } from './shared.mjs';
+import { actionListing, buildActions, isActLog, judgeActions } from './actions.mjs';
 
 const USAGE = `check.mjs --log FILE [--log FILE ...]
   [--db NAME=FILE ...]   a database listing that must hold every acknowledged effect
@@ -23,7 +24,8 @@ const USAGE = `check.mjs --log FILE [--log FILE ...]
   [--ownership FILE]     the claim sequence listing (oracle.mjs sql ownership), taken after the fleet reads: a live claim at or above the next draw is CONTROL
   [--reshard FILE]       the reshard listing (oracle.mjs sql reshard), taken after --fleet; a second one, taken after --fleet-again, goes with that set: two open attempts, an old row after done, meta behind a flipped attempt, a guild in two grants or a grant before done is CONTROL
   [--claims FILE]        the shard claims listing (oracle.mjs sql claims), taken after --fleet; a second one, taken after --fleet-again, goes with that set: a lease whose claim shard_claims does not hold for its process is CONTROL
-  [--requests NAME=FILE ...] the run's guild_requests rows (oracle.mjs sql requests), from the database the requests went to: a send taken twice is TWICE, an answer its row contradicts is FALSE-ANSWER
+  [--requests NAME=FILE ...] the run's guild_requests rows (oracle.mjs sql requests, a snapshot every 30 s and one at the end, in one file), from the database the requests went to: a send taken twice is TWICE, an answer its row contradicts is FALSE-ANSWER
+  [--actions NAME=FILE ...] an act run's action saves (oracle.mjs sql actions), from the serving primary: the only copy an act log is judged by
   [--shared-db NAME=FILE ...] the run's shared files in the database (oracle.mjs sql shared), from the serving primary
   [--mirror FILE ...]    one machine's mirror files of the run's shared files (oracle.mjs mirror), one per machine
   [--shared-bound S (${SHARED_BOUND_S})] seconds after the writers' end before a mirror is judged
@@ -43,10 +45,12 @@ export function check(argv) {
   const a = parseArgs(argv, {
     log: 'many', db: 'many', lag: 'many', app: 'many', agree: 'one', fleet: 'many', 'fleet-again': 'many', 'no-fleet': 'flag', window: 'many',
     k: 'one', out: 'one', ownership: 'one', claims: 'many', requests: 'many', reshard: 'many', 'shared-db': 'many', mirror: 'many',
-    'shared-bound': 'one',
+    'shared-bound': 'one', actions: 'many',
   });
   if (a.log.length === 0) throw new Error('at least one --log is needed');
   const logs = a.log.map((/** @type {string} */ f) => parseLog(fs.readFileSync(f, 'utf8')));
+  if (logs.some(isActLog)) return checkActions(a, logs);
+  if (a.actions.length > 0) throw new Error('--actions judges act logs (oracle.mjs act); none was given');
   const history = buildHistory(logs);
   const copies = [
     ...a.db.map((/** @type {string} */ s) => { const { name, file } = named(s); return dbCopy(name, 'judged', fs.readFileSync(file, 'utf8')); }),
@@ -92,11 +96,61 @@ export function check(argv) {
   result.copies.push(...rows.map(c => `${c.name} (shared rows)`), ...mirrors.map(c => `${c.name} (mirror)`));
   result.result = result.verdicts.length > 0 ? 'FAIL' : result.inconclusive.length > 0 ? 'INCONCLUSIVE' : 'PASS';
   if (a.out) fs.writeFileSync(a.out, `${JSON.stringify(result, null, 2)}\n`);
-  return { result, run: history.run, guild: history.guild };
+  return { result, run: history.run, guild: history.guild, mode: 'write' };
+}
+
+/**
+ * An act run (NB15 test 12): its actions against the --actions listings, with the control facts, the windows and the
+ * end lines judged as for a write run.
+ * @param {Record<string, any>} a
+ * @param {any[][]} logs
+ */
+function checkActions(a, logs) {
+  if (!logs.every(isActLog)) throw new Error('act logs are judged on their own: give no write log with them');
+  for (const option of ['db', 'lag', 'app', 'requests', 'shared-db', 'mirror']) {
+    if (a[option].length > 0) throw new Error(`--${option} judges write runs; an act run is judged by --actions`);
+  }
+  if (a.agree) throw new Error('--agree judges write runs; an act run is judged by --actions');
+  const history = buildHistory(logs);
+  const acts = buildActions(logs);
+  // The windows' coverage counts the actions answered as ran and saved.
+  history.ops = /** @type {any} */ (acts.actions);
+  const listings = a.actions.map((/** @type {string} */ s) => { const { name, file } = named(s); return actionListing(name, fs.readFileSync(file, 'utf8')); });
+  const names = listings.map((/** @type {{ name: string }} */ l) => l.name);
+  if (new Set(names).size !== names.length) throw new Error('copy names must differ');
+  const facts = (/** @type {string[]} */ files) => files.map(f => {
+    const doc = JSON.parse(fs.readFileSync(f, 'utf8'));
+    return { name: doc.name, state: doc.state };
+  });
+  const fleet = facts(a.fleet);
+  const fleetAgain = facts(a['fleet-again']);
+  const k = a.k !== undefined ? Number(a.k) : 5;
+  if (!Number.isInteger(k) || k < 0) throw new Error('--k must be a whole number');
+  if (a['no-fleet'] && fleet.length + fleetAgain.length > 0) throw new Error('--no-fleet and --fleet exclude each other');
+  if (fleetAgain.length > 0 && fleet.length === 0) throw new Error('--fleet-again needs a first set (--fleet)');
+  if (a.claims.length > 2) throw new Error('--claims is given once, or twice with --fleet-again');
+  if (a.claims.length === 2 && fleetAgain.length === 0) throw new Error('a second --claims needs --fleet-again');
+  // Each listing stands in as a judged copy with no guild doc, so the guild rules find nothing to judge in it.
+  const copies = listings.map((/** @type {{ name: string }} */ l) => ({ name: l.name, mode: /** @type {const} */ ('judged'), complete: true, docs: new Map() }));
+  const result = judge({
+    history, copies, fleet, fleetAgain, noFleet: a['no-fleet'] === true, windows: a.window, k,
+    ownership: a.ownership ? fs.readFileSync(a.ownership, 'utf8') : undefined,
+    claims: a.claims.map((/** @type {string} */ f) => fs.readFileSync(f, 'utf8')),
+    reshard: a.reshard.map((/** @type {string} */ f) => fs.readFileSync(f, 'utf8')),
+  });
+  const judged = judgeActions(acts, listings);
+  result.verdicts.push(...judged.verdicts);
+  result.inconclusive = result.inconclusive.filter(reason => reason !== 'no judged copy was given');
+  result.inconclusive.push(...judged.inconclusive);
+  result.notes.push(...judged.notes);
+  result.copies = names.map((/** @type {string} */ n) => `${n} (actions)`);
+  result.result = result.verdicts.length > 0 ? 'FAIL' : result.inconclusive.length > 0 ? 'INCONCLUSIVE' : 'PASS';
+  if (a.out) fs.writeFileSync(a.out, `${JSON.stringify(result, null, 2)}\n`);
+  return { result, run: history.run, guild: history.guild, mode: 'act' };
 }
 
 /** @param {ReturnType<typeof check>} checked */
-export function render({ result, run, guild }) {
+export function render({ result, run, guild, mode }) {
   const lines = [`run ${run} on guild ${guild}; copies: ${result.copies.join(', ') || 'none'}`];
   lines.push(`answers: ${Object.entries(result.answers).map(([k, v]) => `${k} ${v}`).join(', ')}; reads during the run: ${result.reads}`);
   for (const v of result.verdicts) {
@@ -106,7 +160,9 @@ export function render({ result, run, guild }) {
   for (const note of result.notes) lines.push(`note: ${note}`);
   // The operator route is the only one exercised; until the owner rules on
   // what "saved" means for module saves, nothing here claims zero loss [A18].
-  lines.push(`RESULT ${result.result} (operator route; module path unproven)`);
+  lines.push(mode === 'act'
+    ? `RESULT ${result.result} (panel and invoke routes, judged by the action module's saves)`
+    : `RESULT ${result.result} (operator route; module path unproven)`);
   return lines.join('\n');
 }
 

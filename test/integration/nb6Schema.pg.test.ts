@@ -20,9 +20,9 @@ const columns = async (table: string) => (await rig.direct.query(
   .map(r => `${r.column_name} ${r.data_type}${r.is_nullable === 'NO' ? ' not null' : ''}${r.has_default ? ' default' : ''}`);
 
 describe('a store provisioned at version 9', () => {
-  it('holds {"v":9}, the six shared tables with their columns, the sequence and the lines index', async () => {
-    expect(SCHEMA_VERSION).toBe(9);
-    expect((await rig.direct.query(`SELECT value FROM smdb_data.meta WHERE key = 'schema_version'`)).rows[0].value).toBe('{"v":9}');
+  it('holds {"v":10}, the six shared tables with their columns, the sequence and the lines index', async () => {
+    expect(SCHEMA_VERSION).toBe(10);
+    expect((await rig.direct.query(`SELECT value FROM smdb_data.meta WHERE key = 'schema_version'`)).rows[0].value).toBe('{"v":10}');
     const tables = (await rig.direct.query(
       `SELECT table_name FROM information_schema.tables WHERE table_schema = 'smdb_data' AND table_name LIKE 'shared%' ORDER BY table_name`)).rows.map(r => r.table_name);
     expect(tables).toEqual(['shared_docs', 'shared_lines', 'shared_module_files', 'shared_module_status', 'shared_modules', 'shared_ops']);
@@ -106,7 +106,7 @@ describe('a store at version 8', () => {
       expect(await second.provisionVerdict()).toEqual({ state: 'mismatch', found: '{"v":8}' });
       const until = Date.now() + 30_000;
       while (!lines.some(l => l.includes('schema-mismatch')) && Date.now() < until) await new Promise(resolve => { setTimeout(resolve, 100); });
-      expect(lines).toContain('[PostgresBackend] schema-mismatch: smdb_data.meta schema_version is {"v":8}, expected {"v":9}; refusing to serve');
+      expect(lines).toContain('[PostgresBackend] schema-mismatch: smdb_data.meta schema_version is {"v":8}, expected {"v":10}; refusing to serve');
       expect(second.servesData()).toBe(false);
     } finally {
       await second.stop();

@@ -118,6 +118,13 @@ describe('NB7 test 7: the request route against a model store', () => {
     await fc.assert(property(), { numRuns: RUNS });
   }, 600_000);
 
+  // NB15 gatekeeper ruling 2 (the second defect NB22 named): this seed gave the shutdown "nothing was saved" answer for
+  // a request a failover behind the same URL brought back and the holder applied; an exit's withdrawal before the
+  // row's claim_by now proves nothing.
+  it('regression: seed -286170851, an exit then a failover behind the same URL, answers no false "nothing was saved"', async () => {
+    await fc.assert(property(), { numRuns: 200, seed: -286170851 });
+  }, 600_000);
+
   it('bite: the draft\'s started-map pass in place of the unanswered-batch statement finds a false "nothing was saved"', async () => {
     const out = await fc.check(property({ startedMap: () => new Set() }), { numRuns: BITE_RUNS, seed: 7, examples: [lateStartedMapPass() as any] });
     expect(out.failed, 'the property run found no counterexample with the started-map pass').toBe(true);
@@ -167,10 +174,9 @@ describe('NB7 test 7: the request route against a model store', () => {
     expect(() => w.check()).toThrow(/can't confirm \(timeout\) answered for request/);
   });
 
-  it('bite (ruling 8): a statement that answers a started request unapplied gives "nothing was saved" for a change the holder applied', async () => {
+  it('ruling 8 with the holder\'s rule removed: an unapplied answer read on the failed-over server proves nothing, so the sender never says "nothing was saved"', async () => {
     const out = await fc.check(property({ leavesNoneOut: true }), { numRuns: 1, seed: 7, examples: [secondClaimLost() as any] });
-    expect(out.failed).toBe(true);
-    expect(String(out.errorInstance)).toMatch(/answered for a request the holder started/);
+    expect(out.failed, String(out.errorInstance)).toBe(false);
   });
 
   it('the model counts each insert the sender sends', () => {

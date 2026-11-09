@@ -16,6 +16,7 @@ export type WSEvent =
   | 'bot:fleet:status'
   | 'connection:established'
   | 'panel:updated'
+  | 'panel:live_status'
   | 'appstore:install:queued'
   | 'appstore:install:started'
   | 'appstore:install:completed'
@@ -361,7 +362,8 @@ export class WebSocketManager {
    * - Automatically cleans up dead clients
    * - Reduces log noise for high-frequency events
    */
-  public broadcast(type: WSEvent, data: WSEventData): void {
+  /** The number of clients the message went to. */
+  public broadcast(type: WSEvent, data: WSEventData): number {
     const message: WSMessage = {
       type,
       data,
@@ -402,6 +404,7 @@ export class WebSocketManager {
     if (type !== 'bot:log' && type !== 'bot:metrics:snapshot' && type !== 'bot:fleet:status') {
       console.log(`[WebSocket] Broadcasted ${type} to ${sentCount} clients (seq: ${message.sequence})`);
     }
+    return sentCount;
   }
 
   /**

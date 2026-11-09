@@ -7,7 +7,8 @@ import { getAdminPanelList } from './adminPanelUI';
 import { PanelManagerConfig, PanelListItem } from '../../../types/panelTypes';
 import { loadCredentials } from '../../../../utils/envLoader';
 import { parseButtonCustomId } from './panelCustomIds';
-import { checkPanelPermissions } from './panelPermissions';
+import { checkPanelPermissions, isFromRequest } from './panelPermissions';
+import { noteLiveChange } from '../../fleet/panelLive';
 import type { RegisteredButtonInfo } from '../../../types/commandTypes';
 import { withModule } from '../dataBackends/writeLedger';
 
@@ -23,21 +24,22 @@ export function broadcastWebUIPanelUpdate(
   serializedResponse: SerializedPanelResponse,
   guildId?: string | null
 ): void {
-  if (!process.send) return;
+  sendLiveUpdate({ panelId, guildId: guildId || null, sessionId: null, response: serializedResponse });
+}
 
-  try {
-    process.send({
-      type: 'panel:live_update',
-      data: {
-        panelId,
-        guildId: guildId || null,
-        sessionId: null,
-        response: serializedResponse
-      }
-    });
-  } catch (error) {
-    console.error('[PanelWebUIAdapter] Error broadcasting panel update:', error);
+/**
+ * NB15 decision 15: the one sender of 'panel:live_update'. The message goes to this machine's web UI as before, and
+ * a change to a guild panel that another machine's web UI watches is kept for its next fetch.
+ */
+export function sendLiveUpdate(data: { panelId: string; guildId: string | null; sessionId: string | null; response: unknown }): void {
+  if (process.send) {
+    try {
+      process.send({ type: 'panel:live_update', data });
+    } catch (error) {
+      console.error('[PanelWebUIAdapter] Error broadcasting panel update:', error);
+    }
   }
+  noteLiveChange(data.guildId, data.panelId, data.response);
 }
 
 /**
@@ -191,7 +193,8 @@ function createWebUIContext(
     guildId: contextGuildId,
     channelId: channelId || null,
     accessMethod: 'web_ui',
-    navigationStack: navigationStack || []
+    navigationStack: navigationStack || [],
+    ...(isFromRequest() ? { fromRequest: true } : {})
   };
 }
 

@@ -4,7 +4,7 @@
 // move to another database, and ends at the stop.
 
 import { Client, type ClientConfig } from 'pg';
-import { pgConfig } from '../../../utils/databaseAddress';
+import { keepTransportClass, pgConfig, transportClassOf, transportOf } from '../../../utils/databaseAddress';
 import { processId } from '../fleet/processId';
 
 export const LISTEN_APPLICATION_NAME = 'smdb-shared-listen';
@@ -51,9 +51,12 @@ export function _setListenClientFactory(factory: ((config: ClientConfig) => List
   makeClient = factory ?? (config => new Client(config));
 }
 
-/** C26: the channels a connected client LISTENs on. NB15 narrows it for a client its transport check classes. */
-export function channelsFor(_client: ListenClient): string[] {
-  return [SHARED_CHANNEL, GUILD_REQUESTS_CHANNEL];
+/**
+ * C26: the channels a connected client LISTENs on. NB6 decision 29 and NB15 decision 21: a client classed
+ * 'unprotected' still hears shared changes, never a guild request.
+ */
+export function channelsFor(client: ListenClient): string[] {
+  return transportClassOf(client) === 'unprotected' ? [SHARED_CHANNEL] : [SHARED_CHANNEL, GUILD_REQUESTS_CHANNEL];
 }
 
 interface Run {
@@ -164,9 +167,11 @@ function connect(current: Run): void {
     return;
   }
   let client: ListenClient;
+  let config: ClientConfig;
   try {
+    config = pgConfig(entry);
     client = makeClient({
-      ...pgConfig(entry),
+      ...config,
       application_name: LISTEN_APPLICATION_NAME,
       connectionTimeoutMillis: CONNECT_MS,
       keepAlive: true,
@@ -183,6 +188,7 @@ function connect(current: Run): void {
   void (async () => {
     try {
       await within(client.connect(), CONNECT_MS);
+      keepTransportClass(client, transportOf(config, client));
       for (const channel of channelsFor(client)) {
         if (run !== current || current.generation !== generation) return;
         await within(client.query(`LISTEN ${channel}`), CHECK_BOUND_MS);
@@ -219,6 +225,7 @@ function scheduleCheck(current: Run, generation: number): void {
 function notified(current: Run, generation: number, msg: { channel: string; payload?: string }): void {
   if (run !== current || current.generation !== generation) return;
   if (msg.channel === GUILD_REQUESTS_CHANNEL) {
+    if (current.client && !channelsFor(current.client).includes(GUILD_REQUESTS_CHANNEL)) return;
     if (msg.payload === processId()) current.deps.onGuildRequest();
     return;
   }

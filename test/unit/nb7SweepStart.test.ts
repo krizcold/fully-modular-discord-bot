@@ -80,7 +80,7 @@ describe('the sweep the bot starts', () => {
     await vi.advanceTimersByTimeAsync(1000);
     for (let i = 0; i < 20; i++) await Promise.resolve();
     expect(db.configs).toHaveLength(1);
-    expect(db.configs[0]).toMatchObject({ host: 'db.example', port: 5432, database: 'smdb', user: 'sweep', application_name: 'smdb-guild-requests', max: 2, statement_timeout: 5000 });
+    expect(db.configs[0]).toMatchObject({ host: 'db.example', port: 5432, database: 'smdb', user: 'sweep', application_name: 'smdb-guild-requests', max: 3, statement_timeout: 5000 });
     const claim = db.sent.find(s => s.text === REQUEST_CLAIM_SQL)!;
     expect(claim.values[0]).toBe('p-b');
     expect(claim.values.slice(2, 5)).toEqual([[2], [1], [9]]);

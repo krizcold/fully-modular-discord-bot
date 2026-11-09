@@ -29,7 +29,7 @@ describe('the bot stops with a write held', () => {
     const answer = await handleInvoke({ command: 'holder', guildId, force: true });
     expect(answer).toMatchObject({
       success: false,
-      error: 'The bot is restarting and could not confirm your change was saved; it may be lost. Please check once it is back.',
+      error: 'The action ran, but the bot is restarting and could not confirm its changes were saved; they may be lost. Check the server before you run it again.',
       truth: 'held',
       pending: true,
     });

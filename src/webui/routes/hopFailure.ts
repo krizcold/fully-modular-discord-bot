@@ -39,6 +39,10 @@ export function hopFailure(code: unknown, detail?: string): HopFailure | null {
       return { status: 503, error: detail || "No machine runs this server's shard right now; nothing was saved. Try again in a moment." };
     case 'not-taken':
       return { status: 503, error: detail || 'The machine that runs this server did not apply the change; nothing was saved. Try again in a moment.' };
+    case 'insecure-transport':
+      return { status: 503, error: detail || "This machine's database address does not check the database's certificate, so changes to servers other machines run are off; nothing was saved. Set sslmode=verify-full with sslrootcert in DATA_BACKEND_URL." };
+    case 'answer-too-large':
+      return { status: 502, error: detail || 'The answer from the machine that runs this server is too large to pass between machines.' };
     default:
       return null;
   }

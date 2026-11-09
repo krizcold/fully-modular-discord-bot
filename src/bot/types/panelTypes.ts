@@ -116,6 +116,7 @@ export interface PanelContext {
   accessMethod: 'system_panel' | 'guild_panel' | 'direct_command' | 'web_ui'; // How the panel was accessed
   data?: any; // Additional data passed between panel interactions
   navigationStack?: string[]; // Track panel navigation history for nested return buttons
+  fromRequest?: boolean; // A request row from another machine's web UI (NB15): no 'web-ui-owner' pass
 }
 
 // Base panel configuration

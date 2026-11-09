@@ -84,7 +84,7 @@ describe('the insert', () => {
     expect(value).toMatchObject({ ok: false, code: 'backend-unavailable', error: 'The database did not confirm that the change was sent to BRAVO, so it was withdrawn; nothing was saved. Try again in a moment.' });
     const settle = rig.statements.find(isSettleInsert)!;
     const insert = rig.statements.find(isInsert)!;
-    expect(settle.values).toEqual(insert.values.slice(0, 8));
+    expect(settle.values).toEqual([...insert.values.slice(0, 6), '', insert.values[7]]);
   });
 
   it('ruling 2 (DL1): a settle that returns the row from another server instance behind the URL answers can\'t confirm', async () => {
@@ -108,7 +108,7 @@ describe('the insert', () => {
     at(sql => {
       if (isInsert({ sql } as any)) return pgError('08006');
       if (isSettleInsert({ sql } as any)) return ++settles === 1 ? new Error('Connection terminated unexpectedly') : { rows: [] };
-      return poll('expired');
+      return poll('expired', { pickup_over: true });
     });
     const { done } = await send();
     const { value } = await done(10_000);
@@ -222,7 +222,7 @@ describe('the holder\'s reply from a done row (decision 9)', () => {
     sendHopReply({ status(code: number) { out.status = code; return this; }, json(body: any) { out.body = body; return this; } } as any, reply);
     return out;
   }
-  const doneWith = (reply: string) => at(sql => (isInsert({ sql } as any) ? { rows: [], rowCount: 1 } : isPoll({ sql } as any) ? poll('done', { reply }) : undefined));
+  const doneWith = (reply: string) => at(sql => (isInsert({ sql } as any) ? { rows: [], rowCount: 1 } : isPoll({ sql } as any) ? poll('done', { reply, pickup_over: true }) : undefined));
 
   it('not-held: the bot stopped serving, nothing was saved, 503 not-taken', async () => {
     doneWith('{"ok":false,"code":"not-held"}');

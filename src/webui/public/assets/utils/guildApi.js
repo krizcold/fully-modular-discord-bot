@@ -22,11 +22,14 @@ async function guildFetch(url, options = {}) {
     throw new Error('Session expired: redirecting to login');
   }
   if (response.status === 503) {
-    // Guild Web-UI got disabled mid-session. Send user back to /guild which
-    // renders the "Disabled" page with a link to the Main Web-UI.
-    console.warn('[guildApi] Guild Web-UI disabled, redirecting');
-    window.location.href = '/guild';
-    throw new Error('Guild Web-UI is disabled');
+    // Only a 503 that says the Guild Web-UI is disabled sends the user back to /guild, which renders the "Disabled"
+    // page; any other 503 (the bot that runs a server is restarting, say) is the route's own answer, shown as it is.
+    const body = await response.clone().json().catch(() => null);
+    if (body && body.code === 'guild-webui-disabled') {
+      console.warn('[guildApi] Guild Web-UI disabled, redirecting');
+      window.location.href = '/guild';
+      throw new Error('Guild Web-UI is disabled');
+    }
   }
   return response;
 }

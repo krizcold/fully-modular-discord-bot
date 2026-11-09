@@ -41,6 +41,7 @@ export function requireGuildWebUIEnabled(req: Request, res: Response, next: Next
   if (!isGuildWebUIEnabled()) {
     res.status(503).json({
       success: false,
+      code: 'guild-webui-disabled',
       error: 'Guild Web-UI is currently disabled. Configure credentials in the Main Web-UI to enable it.'
     });
     return;
@@ -48,6 +49,7 @@ export function requireGuildWebUIEnabled(req: Request, res: Response, next: Next
   if (!isOAuthConfigured()) {
     res.status(503).json({
       success: false,
+      code: 'guild-webui-disabled',
       error: 'Guild Web-UI is enabled but OAuth credentials are incomplete. Check DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET, and OAUTH_CALLBACK_URL.'
     });
     return;

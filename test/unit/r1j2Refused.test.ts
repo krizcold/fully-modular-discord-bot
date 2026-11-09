@@ -41,7 +41,7 @@ describe('a refused data layer', () => {
     expect(wire.map(c => [callbackType(c), textOf(c)])).toEqual([[InteractionResponseType.ChannelMessageWithSource, gateCauseText('refused')]]);
 
     const pm = { getPanel: () => undefined, executePanelForWebUI: vi.fn(async () => ({ success: true })) };
-    expect(await runPanelAction('panel:execute', { panelId: 'p', userId: 'u', guildId }, pm)).toEqual({ success: false, error: gateCauseText('refused') });
+    expect(await runPanelAction('panel:execute', { panelId: 'p', userId: 'u', guildId }, pm)).toEqual({ success: false, ran: false, error: gateCauseText('refused') });
     expect(pm.executePanelForWebUI).not.toHaveBeenCalled();
 
     const guild = Object.assign(Object.create(Guild.prototype), { id: guildId }) as Guild;

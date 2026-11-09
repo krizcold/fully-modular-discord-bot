@@ -22,7 +22,7 @@ Config:    config list|get|backups [--file F] [--guild ID] | config update|resto
 AppStore:  appstore bundle|repos|modules|installed|queue | appstore module <name>
            appstore install <name> --repo <id> [--wait] | appstore uninstall <name> [--wait]
            premium tiers
-Panels:    panels list | exec <panelId> | press <panelId> <buttonId> | select <panelId> <dropdownId> --values a,b
+Panels:    panels list [--guild ID] | exec <panelId> | press <panelId> <buttonId> | select <panelId> <dropdownId> --values a,b
            panels modal <panelId> <modalId> --fields '{...}'   [--guild ID] [--user ID] [--channel ID]
 Command:   cmd invoke <command> --guild ID [--user ID] [--channel ID] [--options '{...}'] [--force] [--repeat N] [--interval MS]
 Dev tab:   devmodules list | reload <name> | reload-all

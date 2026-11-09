@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { GuildRequestSweep, type SweepDeps } from '../../src/bot/internalSetup/fleet/guildRequests';
-import { ANSWER_READ_BACK_SQL, ANSWER_SQL, CLEANUP_SQL, REQUEST_CLAIM_SQL, UNANSWERED_BATCHES_SQL } from '../../src/bot/internalSetup/utils/dataBackends/guildRequestSql';
+import { ACTION_OPS, ANSWER_READ_BACK_SQL, ANSWER_SQL, CLEANUP_BODIES_SQL, CLEANUP_SQL, DATA_OPS, READ_OPS, REQUEST_CLAIM_SQL, UNANSWERED_BATCHES_SQL } from '../../src/bot/internalSetup/utils/dataBackends/guildRequestSql';
 import { answerGuildWrite } from '../../src/bot/internalSetup/utils/ipcDataHandler';
 import { setMaintenanceGate } from '../../src/bot/internalSetup/utils/maintenanceGate';
 import { readSourceText } from '../helpers/sourceText';
@@ -16,7 +16,7 @@ const isClaim = (s: Sent) => s.text === REQUEST_CLAIM_SQL;
 const isUnanswered = (s: Sent) => s.text === UNANSWERED_BATCHES_SQL;
 const isAnswer = (s: Sent) => s.text === ANSWER_SQL;
 const isReadBack = (s: Sent) => s.text === ANSWER_READ_BACK_SQL;
-const isCleanup = (s: Sent) => s.text === CLEANUP_SQL;
+const isCleanup = (s: Sent) => s.text === CLEANUP_SQL || s.text === CLEANUP_BODIES_SQL;
 
 const row = (over: Record<string, unknown> = {}) => ({
   id: 'r1', guild_id: '4194304', op: 'write', requested_by: 'ALPHA', left_ms: '20000',
@@ -79,12 +79,12 @@ describe('the claim', () => {
     await s.pass();
     const claims = sent.filter(isClaim);
     expect(claims).toHaveLength(2);
-    expect(claims[0].values).toEqual(['p-a', 'b1', [2], [1], [9], 16]);
+    expect(claims[0].values).toEqual(['p-a', 'b1', [2], [1], [9], DATA_OPS, 16, ACTION_OPS, 8, READ_OPS, 64]);
     expect(claims[1].values[1]).toBe('b2');
     expect(claims[0].boundMs).toBe(2000);
   });
 
-  it('sends no claim with 16 applies running, and offers only the free places', async () => {
+  it('with 16 applies running, the data pick takes LIMIT 0, and then offers only the free places', async () => {
     const pending: Array<() => void> = [];
     const rows = Array.from({ length: 16 }, (_, i) => row({ id: `r${i}` }));
     let first = true;
@@ -97,11 +97,12 @@ describe('the claim', () => {
     await flush();
     expect(s.running()).toBe(16);
     await s.pass();
-    expect(sent.filter(isClaim)).toHaveLength(1);
+    expect(sent.filter(isClaim)).toHaveLength(2);
+    expect(sent.filter(isClaim)[1].values[6]).toBe(0);
     pending.splice(0, 3).forEach(done => done());
     await flush();
     await s.pass();
-    expect(sent.filter(isClaim)[1].values[5]).toBe(3);
+    expect(sent.filter(isClaim)[2].values[6]).toBe(3);
   });
 
   it('sets answerByMono from left_ms for a restore and a namespace delete', async () => {
@@ -209,7 +210,7 @@ describe('ruling 8 (NB7-R4-DL1, R4-T1, R4-1): the statement leaves out every req
     expect(sent.filter(isUnanswered).map(x => x.values)).toEqual([[['b2'], ['r1']]]);
   });
 
-  it('an id started more than an hour ago is still left out', async () => {
+  it('an id started more than an hour ago is pruned from the left-out list (NB15 ruling 1)', async () => {
     let claims = 0;
     const { s, sent } = sweep(x => {
       if (isClaim(x)) return ++claims === 1 ? { rows: [row()] } : new Error('Query read timeout');
@@ -219,7 +220,7 @@ describe('ruling 8 (NB7-R4-DL1, R4-T1, R4-1): the statement leaves out every req
     await flush();
     vi.advanceTimersByTime(60 * 60 * 1000 + 1);
     await s.pass();
-    expect(sent.filter(isUnanswered).map(x => x.values)).toEqual([[['b2'], ['r1']]]);
+    expect(sent.filter(isUnanswered).map(x => x.values)).toEqual([[['b2'], []]]);
   });
 });
 
@@ -377,16 +378,20 @@ describe('the sweep\'s log and cleanup', () => {
     expect(log).toHaveBeenCalledWith("[GuildRequests] Reading the changes sent from other machines' panels works again");
   });
 
-  it('cleans up every 60 s, also with no pairs', async () => {
+  it('cleans up every 60 s on its own tick, also with no pairs; a pass runs no cleanup', async () => {
     const { s, sent } = sweep(() => undefined, { pairs: () => [] });
+    const deletes = () => sent.filter(x => x.text === CLEANUP_SQL);
     await s.pass();
-    expect(sent.filter(isCleanup)).toHaveLength(1);
-    expect(sent.filter(isCleanup)[0].boundMs).toBe(5000);
-    await s.pass();
-    expect(sent.filter(isCleanup)).toHaveLength(1);
+    expect(deletes()).toHaveLength(0);
+    await s.cleanupTick();
+    expect(deletes()).toHaveLength(1);
+    expect(deletes()[0].boundMs).toBe(5000);
+    expect(sent.filter(x => x.text === CLEANUP_BODIES_SQL)).toHaveLength(1);
+    await s.cleanupTick();
+    expect(deletes()).toHaveLength(1);
     vi.advanceTimersByTime(60_001);
-    await s.pass();
-    expect(sent.filter(isCleanup)).toHaveLength(2);
+    await s.cleanupTick();
+    expect(deletes()).toHaveLength(2);
   });
 
   it('starts at the guild report, on Postgres only', () => {

@@ -274,11 +274,11 @@ describe('W3: the row pending', () => {
     await nothingSaved(w, sent, NOT_TAKEN);
   });
 
-  it('sender stop: the exit\'s settle withdraws it ("nothing was saved" in the log)', async () => {
+  it('sender stop before claim_by: the exit\'s settle proves nothing a failover cannot undo, so the log says can\'t confirm', async () => {
     const w = new World();
     const sent = await w.send();
     await w.exit();
-    expect(loggedWith(logs.log, /^\[Main\] Exiting: withdrew the write of server \d+ sent to BRAVO; nothing was saved$/)).toBe(true);
+    expect(loggedWith(logs.error, /^\[Main\] Exiting; can't confirm whether the write of server \d+ sent to BRAVO was saved$/)).toBe(true);
     await w.drain();
     expect(w.applications(sent)).toBe(0);
     expect(w.model.sentSql.filter(s => s === SETTLE_UPDATE_SQL || s === SETTLE_INSERT_SQL)).toHaveLength(1);
@@ -369,7 +369,7 @@ describe('W4: a settle on the wire', () => {
     const w = new World();
     const sent = await settleOnWire(w);
     w.model.deliver();
-    await run(w, 500, { until: sent });
+    await run(w, 6000, { until: sent });
     await nothingSaved(w, sent, WITHDRAWN);
   });
 
@@ -391,7 +391,7 @@ describe('W4: a settle on the wire', () => {
     await exit;
     await flush();
     expect(w.model.sentSql.filter(s => s === SETTLE_INSERT_SQL || s === SETTLE_UPDATE_SQL)).toHaveLength(1);
-    expect(loggedWith(logs.log, /^\[Main\] Exiting: withdrew the write/)).toBe(true);
+    expect(loggedWith(logs.error, /^\[Main\] Exiting; can't confirm whether the write/)).toBe(true);
     await w.drain();
     expect(w.applications(sent)).toBe(0);
   });
@@ -417,7 +417,7 @@ describe('W4: a settle on the wire', () => {
     expect(w.model.rows.get(sent.id!)?.state).toBe('pending');
     await exit(w);
     w.model.deliver();
-    await run(w, 500, { until: sent });
+    await run(w, 6000, { until: sent });
     expect(w.model.rows.get(sent.id!)?.state).toBe('expired');
     await nothingSaved(w, sent, WITHDRAWN);
   });
@@ -562,7 +562,7 @@ describe('H1: the claim on the wire', () => {
     w.model.deliver();
     await pass;
     await w.pass();
-    await run(w, 1000, { until: sent });
+    await run(w, 6000, { until: sent });
     expect(w.model.rows.get(sent.id!)).toMatchObject({ state: 'done' });
     await nothingSaved(w, sent, NB7_TEXTS.unapplied('BRAVO', 'saved'));
   });
@@ -596,7 +596,7 @@ describe('H1: the claim on the wire', () => {
     await pass;
     expect(w.sweep.unanswered()).toHaveLength(1);
     await w.pass();
-    await run(w, 1000, { until: sent });
+    await run(w, 6000, { until: sent });
     await nothingSaved(w, sent, NB7_TEXTS.unapplied('BRAVO', 'saved'));
   });
 

@@ -100,7 +100,7 @@ function computeReloadActions(
   return changes;
 }
 
-export function createSetupRoutes(botManager?: Pick<BotManager, 'migrationRunning' | 'ownerChannelWriteStart'>): Router {
+export function createSetupRoutes(botManager?: Pick<BotManager, 'migrationRunning' | 'ownerChannelWriteStart' | 'sendGuildWebUiSetting'>): Router {
   const router = Router();
 
   // Auth is applied in server.ts via requireAuth middleware
@@ -347,6 +347,8 @@ export function createSetupRoutes(botManager?: Pick<BotManager, 'migrationRunnin
           console.error('[Setup] reconfigureOAuth failed:', err);
         }
       }
+      // NB15 decision 3: the bot process decides member requests from other machines by this machine's setting.
+      botManager?.sendGuildWebUiSetting?.();
 
       // Return masked status (NEVER return actual values)
       const status = getCredentialStatus(credentials);

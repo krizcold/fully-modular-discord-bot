@@ -13,7 +13,9 @@ vi.mock('../../src/bot/internalSetup/utils/panelManager', async importOriginal =
 
 import { drainForExit, saveData } from '../../src/bot/internalSetup/utils/dataManager';
 import { dataUnavailableMessage } from '../../src/bot/internalSetup/utils/dataBackends/boot';
-import { truthText } from '../../src/bot/internalSetup/utils/dataBackends/replyGate';
+import { ranTruthText } from '../../src/bot/internalSetup/utils/dataBackends/replyGate';
+
+const ranText = (answer: Parameters<typeof ranTruthText>[0]['answer'], partial: boolean) => ranTruthText({ answer, partial });
 import { handleInvoke } from '../../src/bot/internalSetup/utils/ipcCommandHandler';
 
 describe('the bot stops mid-run', () => {
@@ -26,7 +28,7 @@ describe('the bot stops mid-run', () => {
       },
     }];
     const answer = await handleInvoke({ command: 'stopper', guildId: '555', force: true });
-    expect(answer).toMatchObject({ success: false, error: truthText('node-stopping', false), truth: 'node-stopping' });
+    expect(answer).toMatchObject({ success: false, error: ranText('node-stopping', false), truth: 'node-stopping' });
     expect(String(answer.handlerError)).toMatch(/stopping/);
     expect(answer.captured).toEqual([{ method: 'reply', payload: { content: dataUnavailableMessage('node-stopping'), flags: 64 } }]);
   });

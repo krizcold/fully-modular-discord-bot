@@ -43,7 +43,7 @@ describe('a panel action', () => {
     const pm = manager(async () => ({ success: true }));
     const answer = watch(runPanelAction('panel:execute', { panelId: 'p', userId: 'u', guildId }, pm));
     await vi.advanceTimersByTimeAsync(2600);
-    expect(answer.value()).toEqual({ success: false, error: gateCauseText(cause) });
+    expect(answer.value()).toEqual({ success: false, ran: false, error: gateCauseText(cause) });
     expect(pm.executePanelForWebUI).not.toHaveBeenCalled();
   });
 
@@ -84,7 +84,7 @@ describe('a console invoke', () => {
     const guildId = r.guild();
     const answer = watch(invoke(guildId));
     await vi.advanceTimersByTimeAsync(2600);
-    expect(answer.value()).toEqual({ success: false, error: text(guildId) });
+    expect(answer.value()).toEqual({ success: false, ran: false, error: text(guildId) });
     expect(ran).not.toHaveBeenCalled();
   });
 

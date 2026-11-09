@@ -5,10 +5,11 @@ every answer. Copies of the run's docs are taken afterwards, and the checker jud
 
 | File | Runs where | What it does |
 |---|---|---|
-| oracle.mjs | the dev box, or a node image on a host | `write`, `read` (a copy through one node's app read path), `fleet` (the control facts), `sql` (the database listing query; `sql ownership` lists the claim sequence and the highest guild_ownership and shard_claims claims for check.mjs `--ownership`; `sql claims` lists the shard_claims rows for check.mjs `--claims`; `sql requests` lists the run's guild_requests rows for check.mjs `--requests`; `sql shared` lists the run's shared files in shared_docs for check.mjs `--shared-db`), `mirror` (one machine's mirror files of the shared files), `bite`, `cleanup` |
+| oracle.mjs | the dev box, or a node image on a host | `write`, `act` (panel button presses and command invokes, NB15 test 12), `read` (a copy through one node's app read path), `fleet` (the control facts), `sql` (the database listing query; `sql ownership` lists the claim sequence and the highest guild_ownership and shard_claims claims for check.mjs `--ownership`; `sql claims` lists the shard_claims rows for check.mjs `--claims`; `sql requests` lists one snapshot of the run's guild_requests rows for check.mjs `--requests`; `sql shared` lists the run's shared files in shared_docs for check.mjs `--shared-db`; `sql actions` lists the docs an act run's actions saved for check.mjs `--actions`), `mirror` (one machine's mirror files of the shared files), `bite`, `cleanup` |
 | check.mjs | the dev box | judges logs and copies; exit 0 PASS, 1 FAIL, 2 INCONCLUSIVE, 64 usage |
 | judge.mjs | (library) | the verdict rules |
 | shared.mjs | (library) | the verdict rules of the shared files (NB6) |
+| actions.mjs | (library) | the verdict rules of an act run (NB15 test 12) |
 | model.ts, fakeApp.ts | tests only | the model of a correct store with every check, and a stand-in node on real Postgres with injectable faults |
 
 oracle.mjs and check.mjs need Node 18 or newer and nothing from npm.
@@ -41,6 +42,9 @@ by this process's monotonic clock:
 - `REFUSED`: any other status, with `definite` true only for refusals given before anything was applied;
 - `UNKNOWN`: no answer, including requests cut short when the writer stops.
 
+An `ans` line carries `remote: true` when the answer names the machine that ran the change (`servedBy`): the change
+went through a request row.
+
 A `read` line names the lane that read, and under `by` the lane that the served content names.
 
 Each log's start line names its sink. A `file` log (`--log FILE`) gets each send line, whole, before its request goes
@@ -56,6 +60,39 @@ its in-flight requests stay unanswered, so they read as UNKNOWN.
 Lines in the marks file mark critical windows on the same clock, and inside a window the writer runs `--burst` times
 faster. A line must be exactly `begin NAME`, `end NAME` or `stop`; anything else makes the run inconclusive. A mark is
 stamped when the writer reads it: it polls the file every `--marks-every` ms (50), and once more before its end line.
+
+## What the act writer sends (NB15 test 12)
+
+`oracle.mjs act` presses a panel button (`POST /api/panels/button`) and invokes a command (`POST
+/api/commands/invoke`) through each lane's web UI, for a guild the bot process of another machine may hold. Each action
+carries a nonce `act_<run>_<lane>_<n>`: a button press sends it after a colon in its button id (`--button` + `:` +
+nonce), an invoke as the command option `--option` (`nonce`). Neither route takes a doc name, so the run needs the
+oracle's action module on the bot: its button and its command each save one doc `<nonce>.<tag>.json` in module
+`oracle` per run, with a tag of its own for every run. No such module ships in the repo; the act run of NX3 provides it.
+
+Each answer is classed by the panel and invoke routes' rule (`classifyAnswer` with route `'panel'`, NB15 ruling 10):
+- `ACKED`: 200 with `success` true and no `pending`, which says the action ran and saved;
+- `REFUSED` and definite: an answer whose `code` proves nothing ran (`not-taken`, `no-holder`, `not-held` and the
+  others in `DEFINITE_CODES`), `ran: false`, or the route's own 400, 413 or 429 without `ran: true`;
+- `REFUSED` and not definite: every other failure, since a holder's text after "On <name>: " can be a module's own
+  words; the data routes' text list is never read;
+- `UNKNOWN`: no answer, or `code` `no-answer`.
+
+The log's lines are `act-send` (lane, kind `button` or `invoke`, nonce) and `act-ans` (status, class, `code`, `ran`,
+`truth`, the error's first 200 characters); the start line says `mode: 'act'`, and the end line counts the answers
+under `act`. Marks, `stop`, the signals, `--duration`, the limiter and file logs work as for `write`. `--timeout`
+defaults to 100 s, above the routes' own bound of a 30 s local wait plus T (60 s), so the route answers first.
+
+The checker judges an act log on its own, by `--actions` (the listing `sql actions` prints, from the serving primary,
+taken once every web UI has answered), with the control facts, the windows and `--k` as for a write run; the guild
+copies, `--requests` and the shared files are refused with it. Each doc named `<nonce>.<tag>.json` counts one run of
+its action:
+- TWICE: an action ran and saved more than once;
+- FALSE-ANSWER: an action answered ACKED whose save is not stored, or one refused as never run whose save is stored;
+- PHANTOM: saves of a nonce no writer sent;
+- an answer that may have run (not definite, or unknown) allows no run or one;
+- INCONCLUSIVE when no listing was given, when no button press or no invoke was answered ACKED, or when the end line
+  counts actions its lines do not hold.
 
 ## The web UI's limits
 
@@ -80,13 +117,13 @@ answering 500 "An error occurred" from its error handler.
 | LOST | An acknowledged doc is absent, or a hot doc holds a value that an acknowledged later write by another lane should have replaced. |
 | ROLLBACK | A hot doc holds a counter lower than one its own lane had acknowledged. |
 | FORK | Two copies each hold docs the other lacks, or copies named in `--agree` differ. |
-| PHANTOM | A doc is present though its write was refused before applying, or a run doc that no writer sent is present, or a holder took a request row of the run that no writer sent (`--requests`), or the history of a shared file's version holds a write refused before applying. |
+| PHANTOM | A doc is present though its write was refused before applying, or a run doc that no writer sent is present, or a holder took a request row of the run that no writer sent (`--requests`), or the history of a shared file's version holds a write refused before applying, or an act run's listing holds saves of an action no writer sent (`--actions`). |
 | HELD-MISSING | A held (202) effect never arrived. |
 | RESURRECTED | A doc is back after its delete was acknowledged. |
 | WRONG-CONTENT | A doc holds bytes that no one wrote to it. |
 | CONTROL | A shard is leased to two live processes at once, a shard in a process's shard table is not leased by that process or is leased by another one, nodes disagree on the shard count, a guild maps to two shards or out of range, one claim is reported on two shards or by two processes, a lease's claim is not the one the shard_claims row of its shard holds for that process (`--claims`), or a live claim is at or above the claim the next take would draw (`--ownership`). Facts are keyed by process id (a JSON bot's by node id). With two sets of control facts, only a CONTROL that both sets show counts. |
-| TWICE | Holders started more than one request row carrying one send (`--requests`): the change was taken twice. |
-| FALSE-ANSWER | A send's answer contradicts its request rows (`--requests`): a 200 with no row the holder answered ok, a 202 with no row it answered accepted, or a refusal given as never applied whose row a holder took and left unanswered or answered as applied. |
+| TWICE | Holders started more than one request row carrying one send (`--requests`): the change was taken twice. Or an action of an act run ran and saved more than once (`--actions`). |
+| FALSE-ANSWER | A send's answer contradicts its request rows (`--requests`): a 200 with no row the holder answered ok, a 202 with no row it answered accepted, or a refusal given as never applied whose row a holder took and left unanswered or answered as applied. Or an action answered as ran and saved whose save is not stored, or refused as never run whose save is stored (`--actions`). |
 | SHARED-LOST | An acknowledged shared write is not in the history of the version the database row (`--shared-db`) or a machine's mirror (`--mirror`, after the bound) holds: that version's write, the write it was built on, and so on. |
 | SHARED-OVERWRITE | Two acknowledged shared writes were built on one version: at most one of them was stored over the version it read. |
 | SHARED-FORK | Two machines' mirrors of one shared file hold different versions after the bound. |
@@ -112,6 +149,24 @@ How the checker judges:
   A row shows what the holder did: nothing (never taken, or answered `unapplied` or `not-held`, both given before
   anything is applied), the holder's answer, or taken with no answer, which may have been applied. A send with no row
   went by the local route and is judged by the copies alone. A listing with no row of the run is judged, with a note.
+  The holder's cleanup deletes a row 2 minutes after its answer (NB15 decision 16), so the rows are listed in
+  snapshots, one every 30 s during the run and one at its end, and judged as the union of the snapshots by row id: one
+  row seen in many snapshots is one row, two rows are two starts, and a row deleted before the end is still judged.
+  A row takes its state and reply from the latest snapshot that lists it. The run is INCONCLUSIVE when the snapshots
+  may have missed an answered row: no snapshot line, a first snapshot more than 90 s after the earliest start line
+  (120 s less 30 s for the clocks of two hosts), two snapshots more than 110 s apart, or no snapshot taken at least 30 s
+  after the last end line (the database's clock against the writer's), or a log with no end time. A snapshot cut short
+  (rows after the last snapshot line), whose count line does not match its rows, that lists a row twice, or that gives
+  a row a body other than another snapshot's, is refused.
+  The holder's claim empties a row's body, so a row a holder took no longer names its send: the listing gives it
+  with no key when it was made inside the run's span (the logs' first start and last end, 30 s either side). A row
+  that a snapshot caught with its body before the claim keeps that key and is judged by it; the rows no snapshot
+  caught with a body are judged by count, per op, against the sends no keyed row shows started. More started
+  rows with no key than those sends is TWICE; more than those of them not refused as never applied is FALSE-ANSWER;
+  fewer of them answered ok (or accepted) than those sends answered 200 (or 202) with `remote: true` is FALSE-ANSWER.
+  Each such verdict names `(write rows with no key)` or `(delete rows with no key)`, not one doc. Another run on the
+  same guild inside the span counts its taken rows too, so start a run on a guild more than 30 s after the last one
+  on it ended.
 
 A streamed log with no end line is refused (exit 64): it may have lost requests the store still saw. Judge the writer's
 own file log instead (step 2).
@@ -162,7 +217,11 @@ fleet.
     it allows, or none), name TWICE on a send given a second started row and FALSE-ANSWER on a send whose row
     contradicts its answer, and hand-built cases read listing lines (pretty-printed content, reordered keys, a bad
     line, a missing field) and cover not-held and unapplied answers, deletes, an unparseable reply and rows no writer
-    sent.
+    sent. Snapshots every 30 s of a run whose early rows the cleanup deleted before its end pass, while its last
+    snapshot alone fails; a row listed in many snapshots counts once, a started row with a new id is TWICE, a row a
+    snapshot caught with its body is judged by its key, the latest snapshot gives a row's state whatever the file's
+    order, and each case above that may miss a deleted row is INCONCLUSIVE; a snapshot cut short, miscounted, listing
+    a row twice or giving one row two bodies is refused.
 - **test/unit/oracleJudge.test.ts** runs those checks against judge.mjs.
 - **test/unit/nb6Oracle.test.ts** holds the shared files: the refusal list against the bot's own texts (`truthText`),
   each shared verdict on hand-built logs and copies and the cases that may not raise one (a write with no answer, a
@@ -170,6 +229,13 @@ fleet.
   checker against two stand-in machines over one row store: a run whose saves the machines compared passes, a run
   whose machines store over any version is SHARED-OVERWRITE, and a mirror put back to an older acknowledged version
   is SHARED-FORK and SHARED-LOST on that mirror.
+- **test/unit/nb15OracleActions.test.ts** holds the act run: the writer against two stand-in web UIs over one store
+  sends each button press and invoke with its nonce, logs a 200 success as ACKED, a 500 whose text is a module's own
+  words ("On B: Data file not found: settings.json") as possibly run, a `no-answer` as unknown and a `not-held` with
+  `ran: false` as definite, and the run passes with its listing; a stand-in that runs one action twice, answers one
+  as ran and saved without saving it and saves one it refused as never run fails with exactly TWICE and two
+  FALSE-ANSWER on those nonces. Hand-built logs cover the answers that may have run, PHANTOM, each INCONCLUSIVE case
+  and the refusal of other copies beside an act log.
 - **test/unit/oracleMutants.test.ts** runs them against 76 mutants of judge.mjs, each breaking one rule. A hand-built
   check must kill each one, so the result does not depend on what the generator draws.
 - **test/integration/oracle.test.ts** runs the tools as child processes against stand-in nodes on real Postgres, and
@@ -209,9 +275,9 @@ fleet.
     through the real request route to the bot process that holds the guild's shard, which runs the real sweep over
     the real fenced flush. That process is killed after a claim before its apply, after its flush before its answer,
     and after its apply's accept before its flush, and each time a new process of its machine takes the shard. The
-    run passes with the docs, the `sql requests` listing, the control facts, the claims and the claim sequence, with
-    can't confirm answers for the killed changes and a "nothing was saved" answer for a change sent to the dead
-    process; the bitten listing (a second started row of one acknowledged write, and an acknowledged write's row
+    run passes with the docs, the `sql requests` snapshots taken every 30 s, the control facts, the claims and the
+    claim sequence, with can't confirm answers for the killed changes and a "nothing was saved" answer for a change
+    sent to the dead process; the bitten listing (a second started row of one acknowledged write, and an acknowledged write's row
     answered `unapplied`) fails with exactly TWICE and FALSE-ANSWER on those docs.
 
 ## On the live fleet (the main session's runs)
@@ -302,12 +368,18 @@ Guardrails: the secret filter on every read; `ssh <host> ...` with no flag befor
        shard_claims claims. The checker works out the claim the next take would draw (as the bot draws it) and calls
        CONTROL when a live process already holds that claim or a higher one on a lease: the sequence went back, as after a restore that did not raise
        it. An empty or unreadable listing is not judged, and the checker writes a note saying so.
-     - **The request rows, from the serving primary, once the web UIs have answered every request** (NB7: a guild
-       another machine runs). A row is deleted an hour after its insert, so take it within the hour:
+     - **The request rows, from the serving primary, every 30 s from the writer's start and once more after the web
+       UIs have answered every request** (NB7: a guild another machine runs). An answered row is deleted 2 minutes
+       after its answer (NB15 decision 16), and every other row an hour after its insert, so one listing at the end
+       misses the rows answered early. Start this loop on the host that holds the writer's log once its start line is
+       written, and stop it after one pass that begins once the web UIs have answered and at least 30 s after the
+       writer's end line (the checker allows the clocks of two hosts that much). Each pass is appended only when
+       psql succeeded, so a pass cut short never reaches the file:
 
-           node test/oracle/oracle.mjs sql requests --log <run>.jsonl | ssh contabo-dbot docker exec -i <postgres container> psql -U smdb -d smdb -At > requests.jsonl
+           while :; do node test/oracle/oracle.mjs sql requests --log <run>.jsonl | ssh contabo-dbot docker exec -i <postgres container> psql -U smdb -d smdb -At > requests.part && cat requests.part >> requests.jsonl; sleep 30; done
 
-       A row holds the change's content, so send the output to a file as bytes, as for the database copy.
+       Each pass ends with a line holding the database's time and the count of its rows. A row holds the change's
+       content, so send the output to a file as bytes, as for the database copy.
 4. **Judge:**
 
        node test/oracle/check.mjs --log <run>.jsonl --db primary=<p>.jsonl --lag standby=<s>.jsonl --app <node>-app.jsonl --fleet <node>-fleet-1.json --fleet-again <node>-fleet-2.json --claims claims-1.jsonl --claims claims-2.jsonl --ownership ownership.jsonl --window kill-bot
@@ -315,7 +387,14 @@ Guardrails: the secret filter on every read; `ssh <host> ...` with no flag befor
    - Use `--db` for a copy that must hold everything acknowledged (the serving primary, and a sync standby).
    - Use `--lag` for an async standby.
    - Use `--agree` for copies that must match after the chain settles.
-   - Use `--requests NAME=FILE` for the request rows: each send is compared with the rows that carry it.
+   - Use `--requests NAME=FILE` for the request rows (the file of all the snapshots): each send is compared with the
+     rows that carry it.
+   - **An act run (NB15 test 12)** has its own log and its own check. Run `act` beside the scenario as for `write`
+     (`--panel`, `--button` and `--command` name the action module's panel, button and command), take the listing
+     once every web UI has answered, and judge it with the control facts:
+
+           node test/oracle/oracle.mjs sql actions --log <run>-act.jsonl | ssh contabo-dbot docker exec -i <postgres container> psql -U smdb -d smdb -At > actions.jsonl
+           node test/oracle/check.mjs --log <run>-act.jsonl --actions primary=actions.jsonl --fleet <node>-fleet-1.json --fleet-again <node>-fleet-2.json --window kill-claim --window kill-module --window kill-flush
    - **Shared files (NB6),** for a run with `--shared` on a Postgres bot of two machines, one lane on each:
      - the row listing from the serving primary, once the writers have ended, sent to a file as bytes:
 
@@ -339,7 +418,8 @@ Guardrails: the secret filter on every read; `ssh <host> ...` with no flag befor
 ## Not yet covered
 
 - **The module route** (`smdb cmd invoke --repeat`) [A18]. It needs a command that saves through module saveData; none
-  ships in the repo.
+  ships in the repo. The act run judges panel buttons and invokes the same way, so it too needs the oracle's action
+  module (above), which NX3 provides.
 - **What modules read.**
   - The app read path (`GET /api/config/data/get`) reads through the serving bot child, queue first: for a Postgres
     guild that is the child's working set, the one modules read through loadData. Only while the bot is down does it

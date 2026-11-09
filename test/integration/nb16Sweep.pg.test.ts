@@ -145,7 +145,7 @@ const EXTRAS: Record<string, Extras> = {
   'guild_requests.op retype': {
     sentences: [{
       rel: 'guild_requests', aspect: ASPECT.constraint, sub: 'guild_requests_op_check',
-      text: "smdb_data.guild_requests constraint guild_requests_op_check is CHECK (((op)::text = ANY (ARRAY['write'::text, 'delete'::text, 'delete-namespace'::text, 'restore-graveyard'::text]))), where this bot's schema has CHECK ((op = ANY (ARRAY['write'::text, 'delete'::text, 'delete-namespace'::text, 'restore-graveyard'::text])))",
+      text: "smdb_data.guild_requests constraint guild_requests_op_check is CHECK (((op)::text = ANY (ARRAY['write'::text, 'delete'::text, 'delete-namespace'::text, 'restore-graveyard'::text, 'panel:execute'::text, 'panel:button'::text, 'panel:dropdown'::text, 'panel:modal'::text, 'command:invoke'::text, 'guild:channels'::text, 'guild:roles'::text, 'panel:list'::text, 'panel:live'::text, 'guild:membership'::text]))), where this bot's schema has CHECK ((op = ANY (ARRAY['write'::text, 'delete'::text, 'delete-namespace'::text, 'restore-graveyard'::text, 'panel:execute'::text, 'panel:button'::text, 'panel:dropdown'::text, 'panel:modal'::text, 'command:invoke'::text, 'guild:channels'::text, 'guild:roles'::text, 'panel:list'::text, 'panel:live'::text, 'guild:membership'::text])))",
     }],
   },
   'guild_requests.state retype': {

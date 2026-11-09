@@ -117,6 +117,61 @@ export function operatorRefusalText(verdict: { refused?: RefusedDoc[]; accepted?
   else if (verdict.accepted === 'unconfirmed') parts.push("The bot answered before all of the action's accepted writes were saved, so it cannot confirm they were.");
   return parts.join(' ');
 }
+
+const CHECK_FIRST = 'Check the server before you run it again.';
+
+/**
+ * NB15 decision 7: a failed verdict of an action that ran, for the web panel and the console. It names truthText's
+ * cause and never asks the reader to try again, since the action's module code already ran.
+ */
+export function ranTruthText(verdict: { answer: TruthAnswer; partial: boolean; changed?: ChangedBy; refused?: RefusedDoc[]; accepted?: AcceptedWrites }): string {
+  const { answer, partial, changed } = verdict;
+  const notSaved = partial ? 'were not saved in full' : 'were not saved';
+  const ran = (cause: string) => `The action ran, but ${cause}. ${CHECK_FIRST}`;
+  if ((answer === 'held' || answer === 'pending') && isStopping()) {
+    return ran(`the bot is restarting and could not confirm its changes were saved${partial ? ' in full' : ''}; they may be lost`);
+  }
+  switch (answer) {
+    case 'unstorable': {
+      const text = operatorRefusalText(verdict);
+      return `The action ran, but ${text.charAt(0).toLowerCase()}${text.slice(1)} ${CHECK_FIRST}`;
+    }
+    case 'node-stopping':
+      return ran(`the bot is restarting, so its changes ${notSaved}`);
+    case 'maintenance':
+      return ran(`the bot is in maintenance, so its changes ${notSaved}`);
+    case 'guild-fenced':
+    case 'deposed':
+      return ran(`another bot process took over this server's data, so its changes ${notSaved}`);
+    case 'changed-elsewhere':
+      if (changed === 'deleted') return ran(`this data was deleted after the action read it, so its changes ${notSaved}`);
+      if (changed) return ran(`this data was changed ${changed.machine === null ? 'on this machine' : `on ${changed.machine}`} at ${changed.at.toISOString()} after the action read it, so its changes ${notSaved}`);
+      return ran(`another machine changed this data while the action's changes were being saved, so they ${notSaved}`);
+    case 'writer-lost':
+      return ran(`another process took over the bot's data files, so its changes ${notSaved}`);
+    case 'database-unreachable':
+      return ran(`the bot's database is unreachable, so its changes ${notSaved}`);
+    case 'database-backlog':
+      return ran(`the bot's database is behind on saving changes, so its changes ${notSaved}`);
+    case 'frozen':
+      return ran(`this server's data is not served by this bot process right now, so its changes ${notSaved}`);
+    case 'not-ready':
+      return ran(`this server's data is still loading, so its changes ${notSaved}`);
+    case 'storage-failing':
+      return ran(`the bot cannot write to its disk right now, so its changes ${notSaved}`);
+    case 'io':
+      return ran(`the bot could not write to storage, so its changes ${notSaved}`);
+    case 'unavailable':
+      return ran(`the bot can't confirm whether its changes were saved${partial ? ' in full' : ''}`);
+    case 'held':
+      return ran(`its changes ${notSaved} yet: storage refused them for now, and the bot keeps retrying`);
+    case 'pending':
+      return ran(`its changes are not confirmed as saved${partial ? ' in full' : ''} yet`);
+  }
+}
+
+/** Every truth answer, worst first (tests read it). */
+export const TRUTH_ANSWERS: readonly TruthAnswer[] = RANK;
 /** A refused document of the verdict, with its answer and, for 'unstorable', its reason. */
 export interface RefusedDoc {
   doc: string;

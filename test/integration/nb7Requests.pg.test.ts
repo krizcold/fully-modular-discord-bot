@@ -5,8 +5,11 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 import { PostgresBackend, provisionStoreInTransaction, SCHEMA_VERSION } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
 import { fixedDatabase } from '../helpers/fixedDatabase';
 import {
+  ACTION_OPS,
   ANSWER_SQL,
   CLEANUP_SQL,
+  DATA_OPS,
+  READ_OPS,
   REQUEST_CLAIM_SQL,
   REQUEST_INSERT_SQL,
   SETTLE_INSERT_SQL,
@@ -238,7 +241,7 @@ describe('the settle and the claim', () => {
         const id = await insertRow({ forProcess: 'p-b' });
         const batch = randomUUID();
         const [claimed, settled] = await Promise.all([
-          one.query(REQUEST_CLAIM_SQL, ['p-b', batch, [2], [1], [b.claim], 16]),
+          one.query(REQUEST_CLAIM_SQL, ['p-b', batch, [2], [1], [b.claim], DATA_OPS, 16, ACTION_OPS, 8, READ_OPS, 64]),
           two.query(SETTLE_UPDATE_SQL, [id]),
         ]);
         const wonClaim = claimed.rows.some(r => r.id === id);
@@ -259,7 +262,7 @@ describe('the settle and the claim', () => {
     const b = await take('b', 1);
     const id = randomUUID();
     const values = [id, GUILD, 2, 1, 'p-b', 'write', JSON.stringify({ module: 'm', filename: 'a.json', contentJson: '{}' }), 'ALPHA'];
-    expect((await rig.direct.query(SETTLE_INSERT_SQL, values)).rows).toEqual([{ state: 'expired' }]);
+    expect((await rig.direct.query(SETTLE_INSERT_SQL, values)).rows).toEqual([{ state: 'expired', pickup_over: true }]);
     await expect(rig.direct.query(REQUEST_INSERT_SQL, [...values, 5, 20])).rejects.toMatchObject({ code: '23505' });
     const applied: GuildDataWriteRequest[] = [];
     await sweepFor(b, applied).pass();
@@ -274,10 +277,10 @@ describe('the settle and the claim', () => {
     try {
       const first = await insertRow({ forProcess: 'p-b' });
       const lost = randomUUID();
-      expect((await one.query(REQUEST_CLAIM_SQL, ['p-b', lost, [2], [1], [b.claim], 16])).rows.map(r => r.id)).toEqual([first]);
+      expect((await one.query(REQUEST_CLAIM_SQL, ['p-b', lost, [2], [1], [b.claim], DATA_OPS, 16, ACTION_OPS, 8, READ_OPS, 64])).rows.map(r => r.id)).toEqual([first]);
       const second = await insertRow({ forProcess: 'p-b' });
       const later = randomUUID();
-      expect((await two.query(REQUEST_CLAIM_SQL, ['p-b', later, [2], [1], [b.claim], 16])).rows.map(r => r.id)).toEqual([second]);
+      expect((await two.query(REQUEST_CLAIM_SQL, ['p-b', later, [2], [1], [b.claim], DATA_OPS, 16, ACTION_OPS, 8, READ_OPS, 64])).rows.map(r => r.id)).toEqual([second]);
       const changed = await one.query(UNANSWERED_BATCHES_SQL, [[lost], []]);
       expect(changed.rowCount).toBe(1);
       const rows = (await rig.direct.query(`SELECT id, state, reply, claim_batch FROM smdb_data.guild_requests WHERE id = ANY($1::uuid[])`, [[first, second]])).rows;
@@ -294,7 +297,7 @@ describe('the settle and the claim', () => {
     const started = await insertRow({ forProcess: 'p-b' });
     const fresh = await insertRow({ forProcess: 'p-b' });
     const lost = randomUUID();
-    expect((await rig.direct.query(REQUEST_CLAIM_SQL, ['p-b', lost, [2], [1], [b.claim], 16])).rows.map(r => r.id).sort()).toEqual([started, fresh].sort());
+    expect((await rig.direct.query(REQUEST_CLAIM_SQL, ['p-b', lost, [2], [1], [b.claim], DATA_OPS, 16, ACTION_OPS, 8, READ_OPS, 64])).rows.map(r => r.id).sort()).toEqual([started, fresh].sort());
     const changed = await rig.direct.query(UNANSWERED_BATCHES_SQL, [[lost], [started, randomUUID()]]);
     expect(changed.rowCount).toBe(1);
     const rows = (await rig.direct.query(`SELECT id, state, reply, claim_batch, done_at FROM smdb_data.guild_requests WHERE id = ANY($1::uuid[])`, [[started, fresh]])).rows;

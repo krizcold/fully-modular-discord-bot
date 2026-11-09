@@ -171,7 +171,10 @@ const HANDLERS: Record<string, Handler> = {
   'premium tiers': (c) => simple(c, 'GET', '/api/appstore/premium/tiers'),
 
   // --- panels (headless interaction surface) ---
-  'panels list': (c) => simple(c, 'GET', '/api/panels/list'),
+  'panels list': (c) => {
+    const guildId = flagStr(c.flags, 'guild');
+    return simple(c, 'GET', guildId ? `/api/panels/list?guildId=${encodeURIComponent(guildId)}` : '/api/panels/list');
+  },
   'panels exec': (c) => simple(c, 'POST', '/api/panels/execute', { panelId: need(c, 0, 'panelId'), ...panelContext(c) }),
   'panels press': (c) =>
     simple(c, 'POST', '/api/panels/button', { panelId: need(c, 0, 'panelId'), buttonId: need(c, 1, 'buttonId'), ...panelContext(c) }),
@@ -356,21 +359,43 @@ async function cmdInvoke(ctx: Ctx): Promise<void> {
   if (repeat <= 1 && repeatRaw !== 'forever') {
     return simple(ctx, 'POST', '/api/commands/invoke', body);
   }
-  let ok = 0;
-  let failed = 0;
+  const counts = { ok: 0, failed: 0, unconfirmed: 0 };
   for (let i = 0; i < repeat; i++) {
     try {
       const res = await ctx.client.request('POST', '/api/commands/invoke', { body });
-      const b = res.body as { success?: boolean } | null;
-      if (res.ok && !(b && b.success === false)) ok++;
-      else failed++;
-    } catch {
-      failed++;
+      counts[classifyInvokeAnswer(res.status, res.body)]++;
+    } catch (error) {
+      counts[classifyInvokeError(error)]++;
     }
     if (intervalMs > 0 && i < repeat - 1) await new Promise((r) => setTimeout(r, intervalMs));
   }
-  printJson({ command, repeated: ok + failed, ok, failed });
-  process.exit(failed > 0 ? EXIT_ERR : EXIT_OK);
+  printJson({ command, repeated: counts.ok + counts.failed + counts.unconfirmed, ...counts });
+  process.exit(counts.failed > 0 || counts.unconfirmed > 0 ? EXIT_ERR : EXIT_OK);
+}
+
+/** NB15 decision 19 and the oracle's rule: the codes that prove nothing ran. */
+export const DEFINITE_CODES = ['not-taken', 'no-holder', 'backend-unavailable', 'invalid', 'not-allowed', 'member-panel-off', 'not-ready', 'insecure-transport', 'not-held'];
+const UNKNOWN_TRUTHS = ['pending', 'held', 'unavailable'];
+
+/**
+ * One invoke answer: 'ok' for a 2xx without success false; 'failed' only for an answer that proves the outcome;
+ * 'unconfirmed' for everything else.
+ */
+export function classifyInvokeAnswer(status: number, body: unknown): 'ok' | 'failed' | 'unconfirmed' {
+  const b = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>;
+  if (status >= 200 && status < 300 && b.success !== false) return 'ok';
+  if (b.code === 'no-answer' || b.noAnswer !== undefined || b.pending === true) return 'unconfirmed';
+  if (typeof b.truth === 'string' && UNKNOWN_TRUTHS.includes(b.truth)) return 'unconfirmed';
+  if (b.ran === false) return 'failed';
+  if (typeof b.code === 'string' && DEFINITE_CODES.includes(b.code)) return 'failed';
+  if (b.ran === true) return typeof b.truth === 'string' ? 'failed' : 'unconfirmed';
+  if (status === 400 || status === 413 || status === 429) return 'failed';
+  return 'unconfirmed';
+}
+
+/** A request that threw: refused before it reached the web UI proves nothing ran; any other throw does not. */
+export function classifyInvokeError(error: unknown): 'failed' | 'unconfirmed' {
+  return (error as { code?: unknown })?.code === 'ECONNREFUSED' ? 'failed' : 'unconfirmed';
 }
 
 async function bundleExport(ctx: Ctx): Promise<void> {

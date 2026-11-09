@@ -198,6 +198,11 @@ export class DataReadinessDriver {
     return this.lease !== null;
   }
 
+  /** The count and the shards of the lease once it is set (NB15's membership answer); null before. */
+  leasedShards(): { shardCount: number; shardIds: number[] } | null {
+    return this.lease === null ? null : { shardCount: this.shardCount, shardIds: [...this.shardIds] };
+  }
+
   private fenceFor(guildId: string): FenceToken {
     const lease = this.lease;
     const shardId = guildIdToShardId(guildId, this.shardCount || 1);

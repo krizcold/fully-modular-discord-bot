@@ -1,9 +1,12 @@
 import {
   ANSWER_READ_BACK_SQL,
   ANSWER_SQL,
+  CLEANUP_BODIES_SQL,
   CLEANUP_SQL,
   REQUEST_CLAIM_SQL,
   REQUEST_INSERT_SQL,
+  POLL_SET_SQL,
+  REPLY_READ_SQL,
   REQUEST_POLL_SQL,
   SETTLE_INSERT_SQL,
   SETTLE_UPDATE_SQL,
@@ -48,7 +51,9 @@ export interface Bites {
 }
 
 const lostError = () => new Error('Connection terminated unexpectedly');
-const SENDER_SQL = new Set([REQUEST_INSERT_SQL, REQUEST_POLL_SQL, SETTLE_INSERT_SQL, SETTLE_UPDATE_SQL]);
+const SENDER_SQL = new Set([REQUEST_INSERT_SQL, REQUEST_POLL_SQL, POLL_SET_SQL, REPLY_READ_SQL, SETTLE_INSERT_SQL, SETTLE_UPDATE_SQL]);
+/** The request ids a sender statement is for: the poll per pool carries every id of its set. */
+const idsOf = (sql: string, values: any[]): string[] => (sql === POLL_SET_SQL ? values[0] : [values[0]]);
 const clone = (rows: Map<string, Row>) => new Map([...rows].map(([id, r]) => [id, { ...r }]));
 
 export class ModelDb {
@@ -146,27 +151,45 @@ export class ModelDb {
       const r = row(v[0]);
       if (!r) {
         if (!this.bites.settleHoldsNothing) this.rows.set(v[0], { state: 'expired', op: v[5], forProcess: v[4], shardCount: v[2], shardId: v[3], claimBy: this.now, answerBy: this.now, batch: null, reply: null });
-        return { rows: [{ state: 'expired' }], rowCount: 1 };
+        return { rows: [{ state: 'expired', pickup_over: true }], rowCount: 1 };
       }
       if (r.state !== 'pending' || this.bites.settleLeavesPending) return { rows: [], rowCount: 0 };
       r.state = 'expired';
-      return { rows: [{ state: 'expired' }], rowCount: 1 };
+      return { rows: [{ state: 'expired', pickup_over: this.now >= r.claimBy }], rowCount: 1 };
     }
     if (sql === SETTLE_UPDATE_SQL) {
       const r = row(v[0]);
       if (!r || r.state !== 'pending' || this.bites.settleLeavesPending) return { rows: [], rowCount: 0 };
       r.state = 'expired';
-      return { rows: [{ state: 'expired' }], rowCount: 1 };
+      return { rows: [{ state: 'expired', pickup_over: this.now >= r.claimBy }], rowCount: 1 };
+    }
+    if (sql === POLL_SET_SQL) {
+      const out: any[] = [];
+      for (const id of v[0] as string[]) {
+        const r = row(id);
+        if (!r) continue;
+        const state = this.bites.doneReadsApplying && r.state === 'done' ? 'applying' : r.state;
+        out.push({ id, state, pickup_over: this.now >= r.claimBy, answer_over: this.now >= r.answerBy + 5000 });
+      }
+      return { rows: out, rowCount: out.length };
+    }
+    if (sql === REPLY_READ_SQL) {
+      const r = row(v[0]);
+      return r && r.state === 'done' ? { rows: [{ reply: r.reply }], rowCount: 1 } : { rows: [], rowCount: 0 };
     }
     if (sql === REQUEST_CLAIM_SQL) {
-      const [pid, batch, counts, shards, claims, limit] = v;
+      const [pid, batch, counts, shards, claims, dataOps, dataLimit, actOps, actLimit, readOps, readLimit] = v;
       const c = this.claim;
       const paired = counts.some((n: number, i: number) => n === c.shardCount && shards[i] === c.shardId && claims[i] === c.claim);
       if (!paired || c.holderProcess !== pid || c.released) return { rows: [], rowCount: 0 };
       const out: any[] = [];
+      const taken = new Map<string, number>();
+      const pickOf = (op: string): [string, number] | null => (dataOps.includes(op) ? ['dat', dataLimit] : actOps.includes(op) ? ['act', actLimit] : readOps.includes(op) ? ['rd', readLimit] : null);
       for (const [id, r] of this.rows) {
-        if (out.length >= limit) break;
+        const pick = pickOf(r.op);
+        if (!pick || (taken.get(pick[0]) ?? 0) >= pick[1]) continue;
         if (r.state !== 'pending' || r.forProcess !== pid || r.claimBy <= this.now || r.shardCount !== c.shardCount || r.shardId !== c.shardId) continue;
+        taken.set(pick[0], (taken.get(pick[0]) ?? 0) + 1);
         r.state = 'applying';
         r.batch = batch;
         this.claimed.add(id);
@@ -201,7 +224,7 @@ export class ModelDb {
       const r = row(v[0]);
       return r ? { rows: [{ state: r.state, reply: r.reply }], rowCount: 1 } : { rows: [], rowCount: 0 };
     }
-    if (sql === CLEANUP_SQL) return { rows: [], rowCount: 0 };
+    if (sql === CLEANUP_SQL || sql === CLEANUP_BODIES_SQL) return { rows: [], rowCount: 0 };
     throw new Error(`the model has no statement ${sql.slice(0, 40)}`);
   }
 
@@ -226,15 +249,15 @@ export class ModelDb {
     if (sql === REQUEST_INSERT_SQL) this.sentInserts.push(values[0]);
     this.sentSql.push(sql);
     const sender = SENDER_SQL.has(sql);
-    if (sender && this.dead.has(values[0])) return Promise.reject(lostError());
+    if (sender && idsOf(sql, values).some(id => this.dead.has(id))) return Promise.reject(lostError());
     if (pid && this.deadPids.has(pid)) return Promise.reject(lostError());
     if (this.loginRefused) return Promise.reject(Object.assign(new Error('role is not permitted to log in'), { code: '28000' }));
     if (this.away) {
-      if (sender) this.senderLost.add(values[0]);
+      if (sender) for (const id of idsOf(sql, values)) this.senderLost.add(id);
       return Promise.reject(lostError());
     }
-    const fate = sql === CLEANUP_SQL ? 'ok' : this.nextFate(sql);
-    if (sender && fate !== 'ok' && fate !== 'wire') this.senderLost.add(values[0]);
+    const fate = sql === CLEANUP_SQL || sql === CLEANUP_BODIES_SQL ? 'ok' : this.nextFate(sql);
+    if (sender && fate !== 'ok' && fate !== 'wire') for (const id of idsOf(sql, values)) this.senderLost.add(id);
     let work = () => this.exec(sql, values);
     if (sql === UNANSWERED_BATCHES_SQL && this.bites.startedMap && pid) work = this.startedMapPass(pid, new Set(this.bites.startedMap()));
     if (fate === 'wire') {
@@ -249,7 +272,7 @@ export class ModelDb {
           },
           cut: (runIt: boolean) => {
             if (timer) clearTimeout(timer);
-            if (sender) this.senderLost.add(values[0]);
+            if (sender) for (const id of idsOf(sql, values)) this.senderLost.add(id);
             if (runIt) { try { work(); } catch { /* its answer is lost */ } }
             reject(lostError());
           },
@@ -258,7 +281,7 @@ export class ModelDb {
         // The client's bound ends the wait; the statement stays on the wire and may still run.
         if (boundMs !== undefined) {
           timer = setTimeout(() => {
-            if (sender) this.senderLost.add(values[0]);
+            if (sender) for (const id of idsOf(sql, values)) this.senderLost.add(id);
             entry.run = () => { try { work(); } catch { /* nobody waits for it */ } };
             entry.cut = (runIt: boolean) => { if (runIt) { try { work(); } catch { /* nobody waits */ } } };
             reject(Object.assign(new Error('Query read timeout')));

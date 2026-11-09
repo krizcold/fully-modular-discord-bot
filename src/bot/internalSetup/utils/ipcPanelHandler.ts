@@ -1,14 +1,98 @@
-// IPC Panel Handler - Handles IPC messages from Web-UI for panel operations
+// IPC Panel Handler - Handles IPC messages from Web-UI for panel operations, and the same requests when another
+// machine's web UI sends them through a request row (NB15 decision 7: one answer function for both).
 
+import { Status } from 'discord.js';
 import { extractModuleNameFromPanel, getPanelManager } from './panelManager';
 import { getConfigProperty } from './configManager';
 import { admitGuildAction, ENTRY_WAIT_MS, gateCauseText, servedElsewhere } from './dataBackends/boot';
-import { notServedHereText } from '../fleet/guildRequests';
+import { getDataReadiness } from './dataBackends/dataReadiness';
 import { runSealed } from './dataBackends/writeLedger';
-import { operatorRefusalText, truthText, verdictOf } from './dataBackends/replyGate';
+import { ranTruthText, verdictOf } from './dataBackends/replyGate';
 import { broadcastWebUIPanelUpdate } from './panel/panelWebUIAdapter';
+import { runFromRequest } from './panel/panelPermissions';
 import { maintenanceIpcRefusal } from './maintenance';
 import { runTracked } from './maintenanceGate';
+import { STOPPED_SERVING_TEXT, stoppedServing } from './servingGate';
+import { shardOfGuild } from './panelRequestShape';
+import { toTransport } from './transportJson';
+import { liveAnswer, registerInterest } from '../fleet/panelLive';
+import { resolveDataBackend } from '../../../utils/envLoader';
+
+export type AnswerFrom = 'ipc' | 'request';
+
+export const NOT_HELD = { success: false, code: 'not-held', error: "This machine's bot does not run this server." };
+export const SERVER_NOT_READY = {
+  success: false, ran: false, code: 'not-ready',
+  error: 'This server is not ready on the bot that runs it yet; nothing was run. Try again in a moment.',
+};
+export const CHANNEL_INVALID = {
+  success: false, ran: false, code: 'invalid',
+  error: "The request for this server was malformed (the channel is not one of this server's channels); nothing was run.",
+};
+const CHANNEL_FETCH_MS = 5000;
+const READ_ONLY_TYPES = ['panel:list', 'dev:check', 'bot:guilds', 'panel:live'];
+
+// Token bucket rate limiting: userId -> { tokens, lastRefill }, one bucket per user for every machine's requests.
+// Configurable via config.json: system.rateLimit.bucketCapacity, system.rateLimit.refillRateMs
+const tokenBuckets = new Map<string, { tokens: number; lastRefill: number }>();
+let lastPrune = -Infinity;
+const PRUNE_EVERY_MS = 60_000;
+
+export function consumeToken(userId: string): boolean {
+  const bucketCapacity = getConfigProperty<number>('system.rateLimit.bucketCapacity') || 5;
+  const refillRateMs = getConfigProperty<number>('system.rateLimit.refillRateMs') || 1000;
+
+  const now = Date.now();
+  if (now - lastPrune >= PRUNE_EVERY_MS) {
+    lastPrune = now;
+    const maxAge = getConfigProperty<number>('system.rateLimit.cleanupAgeMs') || 300000;
+    for (const [uid, bucket] of tokenBuckets.entries()) {
+      if (now - bucket.lastRefill > maxAge) tokenBuckets.delete(uid);
+    }
+  }
+
+  let bucket = tokenBuckets.get(userId);
+  if (!bucket) {
+    bucket = { tokens: bucketCapacity, lastRefill: now };
+    tokenBuckets.set(userId, bucket);
+  }
+
+  // Refill tokens based on elapsed time
+  const elapsed = now - bucket.lastRefill;
+  const tokensToAdd = Math.floor(elapsed / refillRateMs);
+  if (tokensToAdd > 0) {
+    bucket.tokens = Math.min(bucketCapacity, bucket.tokens + tokensToAdd);
+    bucket.lastRefill = now - (elapsed % refillRateMs);
+  }
+
+  if (bucket.tokens > 0) {
+    bucket.tokens--;
+    return true;
+  }
+  return false;
+}
+
+/** Tests read and reset the buckets. */
+export function _bucketCount(): number {
+  return tokenBuckets.size;
+}
+
+export function _resetPanelHandler(): void {
+  tokenBuckets.clear();
+  lastPrune = -Infinity;
+  guildWebUi = null;
+}
+
+let guildWebUi: boolean | null = null;
+
+/** NB15 decision 3: the last 'control:guild-webui' value this process's web UI sent; null before the first. */
+export function guildWebUiEnabled(): boolean | null {
+  return guildWebUi;
+}
+
+export function noteGuildWebUi(enabled: unknown): void {
+  if (typeof enabled === 'boolean') guildWebUi = enabled;
+}
 
 /**
  * Set up IPC message handlers for Web-UI panel integration
@@ -16,55 +100,19 @@ import { runTracked } from './maintenanceGate';
 export function setupPanelIPCHandlers(): void {
   if (!process.send) {
     console.warn('[IPCPanelHandler] process.send not available - IPC handlers not registered');
+    // NB15 decision 3: with no web UI parent, no member web panel runs for this process.
+    guildWebUi = false;
     return;
   }
 
   console.log('[IPCPanelHandler] Setting up IPC handlers for panel system');
 
-  // Token bucket rate limiting: userId -> { tokens, lastRefill }
-  // Configurable via config.json: system.rateLimit.bucketCapacity, system.rateLimit.refillRateMs
-  const tokenBuckets = new Map<string, { tokens: number; lastRefill: number }>();
-
-  function consumeToken(userId: string): boolean {
-    const bucketCapacity = getConfigProperty<number>('system.rateLimit.bucketCapacity') || 5;
-    const refillRateMs = getConfigProperty<number>('system.rateLimit.refillRateMs') || 1000;
-
-    const now = Date.now();
-    let bucket = tokenBuckets.get(userId);
-
-    if (!bucket) {
-      bucket = { tokens: bucketCapacity, lastRefill: now };
-      tokenBuckets.set(userId, bucket);
-    }
-
-    // Refill tokens based on elapsed time
-    const elapsed = now - bucket.lastRefill;
-    const tokensToAdd = Math.floor(elapsed / refillRateMs);
-    if (tokensToAdd > 0) {
-      bucket.tokens = Math.min(bucketCapacity, bucket.tokens + tokensToAdd);
-      bucket.lastRefill = now - (elapsed % refillRateMs);
-    }
-
-    if (bucket.tokens > 0) {
-      bucket.tokens--;
-      return true; // Allowed
-    }
-    return false; // Rate limited
-  }
-
-  // Cleanup old buckets periodically
-  setInterval(() => {
-    const now = Date.now();
-    const maxAge = getConfigProperty<number>('system.rateLimit.cleanupAgeMs') || 300000;
-    for (const [uid, bucket] of tokenBuckets.entries()) {
-      if (now - bucket.lastRefill > maxAge) {
-        tokenBuckets.delete(uid);
-      }
-    }
-  }, 5 * 60 * 1000);
-
-
   process.on('message', async (message: any) => {
+    if (message && typeof message === 'object' && message.type === 'control:guild-webui') {
+      noteGuildWebUi(message.data?.enabled);
+      return;
+    }
+
     // Validate message structure
     if (!validateMessage(message)) {
       return;
@@ -76,48 +124,77 @@ export function setupPanelIPCHandlers(): void {
     const ownedPrefixes = ['panel:', 'dev:', 'bot:', 'guild:'];
     if (!ownedPrefixes.some(p => type.startsWith(p))) return;
 
-    const refusal = maintenanceIpcRefusal(type);
-    if (refusal) {
-      process.send!({ requestId, data: refusal });
-      return;
+    const response = await answerPanelMessage(type, data, 'ipc');
+    process.send!({ requestId, data: toTransport(response).answer });
+  });
+}
+
+/**
+ * The answer to one panel, list or guild message, from this machine's web UI ('ipc') or from a request row another
+ * machine's web UI wrote ('request'), in one order: the maintenance refusal, NB4's stopped-serving refusal, not-held,
+ * the rate limit, then the tracked run with the channel check before the action.
+ */
+export async function answerPanelMessage(type: string, data: any, from: AnswerFrom): Promise<any> {
+  const refusal = maintenanceIpcRefusal(type);
+  if (refusal) return refusal;
+  const guildId = data?.guildId ? String(data.guildId) : null;
+  if (guildId && type !== 'bot:guilds' && type !== 'dev:check') {
+    if (stoppedServing()) return { success: false, error: STOPPED_SERVING_TEXT };
+    if (servedElsewhere(guildId)) return NOT_HELD;
+  }
+
+  if (!READ_ONLY_TYPES.includes(type) && data && data.userId) {
+    if (!consumeToken(String(data.userId))) {
+      console.warn(`[IPCPanelHandler] Rate limit exceeded for user ${data.userId}`);
+      return { success: false, ran: false, error: 'Rate limit exceeded. Please wait before trying again.' };
     }
+  }
 
-    const panelManager = getPanelManager();
-
-    // Rate limiting check (skip for read-only operations that don't modify state)
-    const readOnlyOperations = ['panel:list', 'dev:check', 'bot:guilds'];
-    const shouldRateLimit = !readOnlyOperations.includes(type) && data && data.userId;
-
-    if (shouldRateLimit) {
-      if (!consumeToken(data.userId)) {
-        console.warn(`[IPCPanelHandler] Rate limit exceeded for user ${data.userId}`);
-        process.send!({
-          requestId,
-          data: {
-            success: false,
-            error: 'Rate limit exceeded. Please wait before trying again.'
-          }
-        });
-        return;
-      }
-    }
-
-    try {
-      const response = PANEL_ACTIONS.has(type)
-        ? await runTracked(() => runPanelAction(type, data, panelManager))
-        : await handleIPCMessage(type, data, panelManager);
-      process.send!({ requestId, data: response });
-    } catch (error) {
-      console.error(`[IPCPanelHandler] Error handling IPC message ${type}:`, error);
-      process.send!({
-        requestId,
-        data: {
-          success: false,
-          error: error instanceof Error ? error.message : 'Unknown error'
+  const panelManager = getPanelManager();
+  const run = async () => {
+    if (PANEL_ACTIONS.has(type)) {
+      return runTracked(async () => {
+        if (guildId && data?.channelId) {
+          const wrong = await channelRefusal(panelManager.getClient?.(), guildId, String(data.channelId));
+          if (wrong) return wrong;
         }
+        return runPanelAction(type, data, panelManager);
       });
     }
+    return handleIPCMessage(type, data, panelManager, from);
+  };
+  try {
+    return from === 'request' ? await runFromRequest(run) : await run();
+  } catch (error) {
+    console.error(`[IPCPanelHandler] Error handling IPC message ${type}:`, error);
+    return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+  }
+}
+
+function within<T>(work: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`no answer within ${ms / 1000} s`)), ms);
+    (timer as any).unref?.();
+    work.then(value => { clearTimeout(timer); resolve(value); }, error => { clearTimeout(timer); reject(error); });
   });
+}
+
+/**
+ * NB15 decision 7: a channel named with a guild must be one of that guild's. The guild first, since the listener
+ * answers before the shards are ready; a channel the cache lacks is asked of Discord, bounded by 5 s.
+ */
+async function channelRefusal(client: any, guildId: string, channelId: string): Promise<object | null> {
+  const guild = client?.guilds?.cache?.get(guildId);
+  if (!guild || guild.available === false) return SERVER_NOT_READY;
+  const cached = client.channels?.cache?.get(channelId);
+  if (cached) return cached.guildId === guildId ? null : CHANNEL_INVALID;
+  try {
+    const channel = await within(Promise.resolve(client.channels.fetch(channelId)), CHANNEL_FETCH_MS);
+    if (!channel) return SERVER_NOT_READY;
+    return (channel as { guildId?: unknown }).guildId === guildId ? null : CHANNEL_INVALID;
+  } catch (error) {
+    return (error as { code?: unknown })?.code === 10003 ? CHANNEL_INVALID : SERVER_NOT_READY;
+  }
 }
 
 /**
@@ -160,20 +237,19 @@ function panelModule(panelManager: any, panelId: unknown): string | null {
 /**
  * A panel action from the web UI or the CLI (BT-4). Its writes are recorded in its own ledger, sealed once it answers,
  * and the verdict over them is taken first, on every exit: the answer claims success, and the live update goes out,
- * only when every write landed and none was refused; otherwise the answer is the truth. A guild that cannot take
- * writes holds the action first (R1-J2), before its ledger opens, so its writes and its confirmSaved start at
- * admission.
+ * only when every write landed and none was refused; otherwise the answer says the action ran and what happened to its
+ * writes. A guild that cannot take writes holds the action first (R1-J2), before its ledger opens, so its writes and
+ * its confirmSaved start at admission.
  */
 export async function runPanelAction(type: string, data: any, panelManager: any): Promise<any> {
   if (PANEL_ACTIONS.has(type) && data?.guildId) {
     const held = await admitGuildAction(String(data.guildId), performance.now() + ENTRY_WAIT_MS);
-    if (held.cause === 'not-served' && servedElsewhere(String(data.guildId))) return { success: false, error: await notServedHereText(String(data.guildId), 'panel') };
-    if (held.cause !== 'admit') return { success: false, error: gateCauseText(held.cause) };
+    if (held.cause !== 'admit') return { success: false, ran: false, error: gateCauseText(held.cause) };
   }
   return runSealed('panel', null, panelModule(panelManager, data?.panelId), async ledger => {
     let response: any;
     try {
-      response = await handleIPCMessage(type, data, panelManager);
+      response = await handleIPCMessage(type, data, panelManager, 'ipc');
     } catch (error) {
       response = { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
     }
@@ -181,23 +257,76 @@ export async function runPanelAction(type: string, data: any, panelManager: any)
     const verdict = await verdictOf([ledger]);
     if (!verdict.ok) {
       if (answer.success === false) console.warn(`[IPCPanelHandler] ${type} failed with its writes not confirmed: ${answer.error}`);
-      return { success: false, error: verdict.answer === 'unstorable' ? operatorRefusalText(verdict) : truthText(verdict.answer, verdict.partial, verdict.changed) };
+      const failed: Record<string, unknown> = { success: false, ran: true, truth: verdict.answer, partial: verdict.partial, error: ranTruthText(verdict) };
+      if (verdict.answer === 'pending' || verdict.answer === 'held') failed.pending = true;
+      return failed;
     }
     if (liveUpdate) broadcastWebUIPanelUpdate(liveUpdate.panelId, liveUpdate.response, liveUpdate.guildId);
     return answer;
   });
 }
 
+/** Whether a panel may run from a request row (NB15 decision 3): guild scope and not for developers. */
+export function runsFromRequest(panel: { panelScope?: string; devOnly?: boolean } | undefined): boolean {
+  return !!panel && (panel.panelScope ?? 'guild') === 'guild' && !panel.devOnly;
+}
+
+/**
+ * NB15 decisions 8 and 14: whether some of the lease's shards (every shard of the client on a JSON bot) are not ready,
+ * or hold a guild that is not available, so a list read from the cache may be missing servers.
+ */
+export function cacheIncomplete(client: any, shardIds?: number[]): boolean {
+  const shards: Map<number, { status?: unknown }> | undefined = client?.ws?.shards;
+  let ids = shardIds;
+  let count = 0;
+  if (!ids) {
+    const lease = resolveDataBackend() === 'postgres' ? getDataReadiness()?.leasedShards() ?? null : null;
+    if (lease) {
+      ids = lease.shardIds;
+      count = lease.shardCount;
+    } else {
+      ids = shards ? [...shards.keys()] : [];
+      count = typeof client?.options?.shardCount === 'number' ? client.options.shardCount : 0;
+    }
+  }
+  if (ids.length === 0) return true;
+  for (const id of ids) {
+    const shard = shards?.get(id);
+    if (!shard || shard.status !== Status.Ready) return true;
+  }
+  const watched = new Set(ids);
+  for (const guild of client?.guilds?.cache?.values?.() ?? []) {
+    if (guild?.available !== false) continue;
+    const shardId = typeof guild.shardId === 'number' ? guild.shardId : count > 0 ? shardOfGuild(String(guild.id), count) : null;
+    if (shardId === null || watched.has(shardId)) return true;
+  }
+  return false;
+}
+
 /**
  * Handle IPC message and return response
  */
-async function handleIPCMessage(type: string, data: any, panelManager: any): Promise<any> {
+async function handleIPCMessage(type: string, data: any, panelManager: any, from: AnswerFrom): Promise<any> {
   switch (type) {
-    case 'panel:list':
+    case 'panel:list': {
+      const panels = panelManager.getWebUIPanelList();
       return {
         success: true,
-        panels: panelManager.getWebUIPanelList()
+        panels: from === 'request'
+          ? panels.filter((p: { id: string }) => runsFromRequest(panelManager.getPanel?.(p.id)))
+          : panels
       };
+    }
+
+    case 'panel:live': {
+      if (!data || !data.guildId || typeof data.panelId !== 'string') {
+        return { success: false, error: 'Missing required fields: guildId and panelId' };
+      }
+      const since = registerInterest(String(data.guildId), data.panelId);
+      const haveVersion = Number.isSafeInteger(data.haveVersion) && data.haveVersion > 0 ? data.haveVersion : 0;
+      const haveSince = typeof data.haveSince === 'number' && Number.isFinite(data.haveSince) ? data.haveSince : null;
+      return liveAnswer(String(data.guildId), data.panelId, since, haveVersion, haveSince);
+    }
 
     case 'panel:execute':
       if (!data || !data.panelId || !data.userId) {
@@ -293,10 +422,9 @@ async function handleIPCMessage(type: string, data: any, panelManager: any): Pro
           memberCount: guild.memberCount
         }));
 
-        return {
-          success: true,
-          guilds
-        };
+        const answer: Record<string, unknown> = { success: true, guilds };
+        if (cacheIncomplete(client)) answer.incomplete = true;
+        return answer;
       } catch (error) {
         console.error('[IPCPanelHandler] Error getting bot guilds:', error);
         return {

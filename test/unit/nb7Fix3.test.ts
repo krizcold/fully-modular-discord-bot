@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { pollShim } from '../helpers/nb15PollShim';
 
 import {
   _resetGuildRequests,
@@ -116,6 +117,7 @@ describe('NB7-R2-1 and NB7-R3-M1: after the exit, an answer the holder already g
   };
   const pollRow = (state: string, reply: string | null = null) => ({ rows: [{ state, reply, pickup_over: false, answer_over: false }] });
   let script: (sql: string) => unknown;
+  const shim = pollShim(() => script);
 
   beforeEach(() => {
     script = () => undefined;
@@ -128,8 +130,8 @@ describe('NB7-R2-1 and NB7-R3-M1: after the exit, an answer the holder already g
       requestDb: (): RequestDb => ({
         connect: async () => ({
           server: 'S1',
-          query: (sql: string) => {
-            const value = script(sql);
+          query: (sql: string, values: unknown[]) => {
+            const value = shim(sql, values);
             return value instanceof Promise ? value : Promise.resolve(value ?? { rows: [], rowCount: 0 });
           },
           release: () => undefined,

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { pollShim } from '../helpers/nb15PollShim';
 
 import {
   _resetGuildRequests,
@@ -113,6 +114,7 @@ describe('NB7-R4-DL1: a second claim of a started request never gets the unappli
 
 describe('NB7-R4-2: a change the exit withdrew says the panel withdrew it as it shut down', () => {
   let script: (sql: string) => unknown = () => undefined;
+  const shim = pollShim(() => script);
 
   beforeEach(() => {
     script = () => undefined;
@@ -125,8 +127,8 @@ describe('NB7-R4-2: a change the exit withdrew says the panel withdrew it as it 
       requestDb: (): RequestDb => ({
         connect: async () => ({
           server: 'S1',
-          query: (sql: string) => {
-            const value = script(sql);
+          query: (sql: string, values: unknown[]) => {
+            const value = shim(sql, values);
             if (value instanceof Error) return Promise.reject(value);
             if (value instanceof Promise) return value as Promise<any>;
             return Promise.resolve(value ?? { rows: [], rowCount: 0 });

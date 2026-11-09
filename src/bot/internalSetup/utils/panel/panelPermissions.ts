@@ -3,6 +3,16 @@
 import { PanelOptions, PanelContext } from '../../../types/panelTypes';
 import { loadCredentials } from '../../../../utils/envLoader';
 import { getConfigProperty } from '../configManager';
+import { AsyncLocalStorage } from 'async_hooks';
+
+const requestScope = new AsyncLocalStorage<true>();
+
+/** NB15 decision 3: runs a request row's action; its web UI contexts carry fromRequest. */
+export function runFromRequest<T>(fn: () => T): T {
+  return requestScope.run(true, fn);
+}
+
+export const isFromRequest = (): boolean => requestScope.getStore() === true;
 
 /**
  * Check if a user has permission to access a panel
@@ -11,7 +21,7 @@ export function checkPanelPermissions(panel: PanelOptions, context: PanelContext
   // Web-UI access - check using accessMethod (more reliable than checking interaction)
   // Web-UI may have a mock interaction for modal support, so we can't rely on !interaction
   if (context.accessMethod === 'web_ui') {
-    return checkWebUIPermissions(panel, context.userId);
+    return checkWebUIPermissions(panel, context.userId, context.fromRequest === true);
   }
 
   // Discord interaction - check guild and permissions
@@ -22,10 +32,10 @@ export function checkPanelPermissions(panel: PanelOptions, context: PanelContext
  * Check Web-UI specific permissions (no Discord interaction).
  * Web-UI always operates in MAIN_GUILD_ID context, so system-scope panels are allowed.
  */
-function checkWebUIPermissions(panel: PanelOptions, userId: string): boolean {
+function checkWebUIPermissions(panel: PanelOptions, userId: string, fromRequest: boolean): boolean {
   // Main Web-UI uses 'web-ui-owner' - it's already authenticated at the deployment boundary (AppShield / localhost)
-  // No permission checks needed - owner has full access
-  if (userId === 'web-ui-owner') {
+  // No permission checks needed - owner has full access. A request row from another machine gets no such pass.
+  if (userId === 'web-ui-owner' && !fromRequest) {
     return true;
   }
 

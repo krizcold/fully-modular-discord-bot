@@ -178,11 +178,19 @@ as room nor give it shards; when it would restart (after it could not renew, los
 saves what it can, releases its shards and stops, so the other machines take them after the takeover delay; started
 again by hand, it takes back those still free. A JSON bot runs every shard in one process and takes no claims.
 
-`smdb_data.guild_requests` holds the changes one machine's web panel sends to the machine that runs a server's shard
-(see "Editing a server another machine runs" in the web UI docs, WebUI.md). A row names the bot process the panel
-found holding the shard and is taken only by that process, only within 5 seconds of its sending; rows are deleted
-after an hour.
-This table came with a new schema version, so a database made by an earlier version of the bot is refused at boot.
+`smdb_data.guild_requests` holds the requests one machine's web panel sends to the machine that runs a server's shard:
+data changes (see "Editing a server another machine runs" in the web UI docs, WebUI.md), and panel actions, console
+invokes, the lists a panel needs and the fetch of a panel's new state (see "Panels and commands for a server another
+machine runs" there). A row names the bot process the panel found holding the shard and is taken only by that process,
+only within 5 seconds of its sending. A request's body is emptied when it is taken, or by the next cleanup when nobody
+took it; an answered row is deleted about two minutes after its answer, and every row within an hour. A request of any
+kind is sent and taken only on a connection that checks the database's certificate (sslmode=verify-full with
+sslrootcert), or on a local one: a database on the same machine reached over loopback or a Unix socket, or a database
+reached with TLS that does not check the certificate at an address on a network the machine is attached to directly (its
+Docker network, or the LAN for a bot run outside Docker). On every other connection no request is sent or taken. The
+channel `smdb_panel_changed` carries "panel P of server G changed" for the panels some web panel watches, and no panel
+state. The operations of this table came with new schema versions, so a database made by an earlier version of the bot is
+refused at boot.
 
 ## Resharding
 

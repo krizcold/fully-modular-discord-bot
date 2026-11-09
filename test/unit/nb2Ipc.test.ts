@@ -67,7 +67,7 @@ describe('ruling F: the IPC refusals through the real handlers', () => {
     const open = await ask('command:invoke', { command: 'nothing-here' }, 'open');
     expect(open).not.toEqual(REFUSAL);
     closeMaintenanceGate('hook', MESSAGE);
-    expect(await ask('command:invoke', { command: 'nothing-here' }, 'closed')).toEqual(REFUSAL);
+    expect(await ask('command:invoke', { command: 'nothing-here' }, 'closed')).toEqual({ ...REFUSAL, ran: false });
   });
 
   it('panel actions are refused with the message', async () => {

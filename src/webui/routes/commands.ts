@@ -6,6 +6,8 @@
 
 import { Router, Request, Response } from 'express';
 import { BotManager } from '../botManager';
+import { validGuildId } from '../../bot/internalSetup/utils/panelRequestShape';
+import { sendPanelOp } from './panelRequestRoute';
 
 const SNOWFLAKE = /^[0-9]{5,20}$/;
 const COMMAND_NAME = /^[\w-]{1,64}$/;
@@ -36,21 +38,19 @@ export function createCommandRoutes(botManager: BotManager): Router {
         return;
       }
 
-      if (!botManager.isRunning()) {
-        res.status(503).json({ success: false, error: 'Bot is not running' });
+      // NB15 decisions 9 and 12: a guild's invoke goes to the machine that runs it; 200 for success, 400 when the
+      // command did not start, 500 when it ran and failed, 503 for an answer the bot never gave.
+      const guild = guildId === undefined || guildId === null ? null : String(guildId);
+      if (guild !== null && !validGuildId(guild)) {
+        res.status(400).json({ success: false, error: 'Invalid guild ID format' });
         return;
       }
-
-      const result = await botManager.invokeCommand({
-        command,
-        guildId: guildId ?? null,
-        channelId: channelId ?? null,
-        userId: userId ?? null,
-        options: options ?? {},
-        force: Boolean(force),
+      await sendPanelOp(botManager, res, {
+        op: 'command:invoke', guildId: guild, audience: 'owner', userId: userId ?? null,
+        payload: { command, channelId: channelId ?? null, userId: userId ?? null, options: options ?? {}, force: Boolean(force) },
+        success: reply => reply, failureText: 'The command failed',
+        failureStatus: reply => (reply.ran === false || reply.maintenance === true ? 400 : 500),
       });
-
-      res.status(result?.success ? 200 : 400).json(result);
     } catch (error) {
       res.status(500).json({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
     }

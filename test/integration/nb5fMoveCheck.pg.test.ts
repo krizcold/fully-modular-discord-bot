@@ -104,7 +104,7 @@ describe("NB5F P1 to P3: the move's check refuses W", () => {
     await sleep(15_000);
     const target = showEntry(entryW);
     expect(refusals(target)).toEqual([
-      `[Database] Not moving to ${target}: the database's smdb_data differs from this bot's schema (version 9): smdb_data.guild_data_graveyard column reason allows NULL, where this bot's schema has NOT NULL; this process keeps its unsaved changes and stays stopped`,
+      `[Database] Not moving to ${target}: the database's smdb_data differs from this bot's schema (version 10): smdb_data.guild_data_graveyard column reason allows NULL, where this bot's schema has NOT NULL; this process keeps its unsaved changes and stays stopped`,
     ]);
     expect(vi.mocked(console.error).mock.calls.map(c => String(c[0])).filter(line => line.includes('schema difference: smdb_data.guild_data_graveyard column reason allows NULL'))).toHaveLength(1);
     expect(r.moved).toEqual([]);
@@ -131,7 +131,7 @@ describe("NB5F P1 to P3: the move's check refuses W", () => {
     await waitFor(() => refusals(target).length > 0, 30_000);
     await sleep(10_000);
     expect(refusals(target)).toEqual([
-      `[Database] Not moving to ${target}: this bot's database role ${ROLE} lacks privileges on smdb_data, which matches this bot's schema (version 9): this bot's database role ${ROLE} lacks INSERT on smdb_data.guild_data; this process keeps its unsaved changes and stays stopped`,
+      `[Database] Not moving to ${target}: this bot's database role ${ROLE} lacks privileges on smdb_data, which matches this bot's schema (version 10): this bot's database role ${ROLE} lacks INSERT on smdb_data.guild_data; this process keeps its unsaved changes and stays stopped`,
     ]);
     expect(r.moved).toEqual([]);
     expect(await rowsOf(directW)).toEqual(before);

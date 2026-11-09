@@ -15,7 +15,7 @@ import { sha } from '../helpers/sharedRows';
 
 // NB6 test 26 [pg] (wip-redesign/sheets/NB6.md rows 18, 40 and 98; decisions 30 and 49 step 3, C3 as D14 words it;
 // part 8): NB5's move to a second database that holds an older row. Both databases are copies of a template the bot's
-// own boot provisioned at version 9 (nb16Rig.ts `newDatabase`), the older row written in the template before the
+// own boot provisioned at the current version (nb16Rig.ts `newDatabase`), the older row written in the template before the
 // copies; the newer one is stored on the first by the bot's flush. After the move a queued write built on the newer
 // version is refused, and the pass with the new main tag moves the newer mirror aside and writes the second's row,
 // both live through the listener and in a process restarted before its first pass.

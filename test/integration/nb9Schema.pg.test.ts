@@ -20,8 +20,8 @@ const columns = async (table: string) => (await rig.direct.query(
 
 describe('a store provisioned at version 9', () => {
   it('holds reshard row 1 with failures 0 and every other column NULL, the columns of C9 and identify_slots', async () => {
-    expect(SCHEMA_VERSION).toBe(9);
-    expect((await rig.direct.query(`SELECT value FROM smdb_data.meta WHERE key = 'schema_version'`)).rows[0].value).toBe('{"v":9}');
+    expect(SCHEMA_VERSION).toBe(10);
+    expect((await rig.direct.query(`SELECT value FROM smdb_data.meta WHERE key = 'schema_version'`)).rows[0].value).toBe('{"v":10}');
     expect((await rig.direct.query(`SELECT * FROM smdb_data.reshard`)).rows).toEqual([{
       id: 1, target: null, target_by: null, target_at: null, attempt: null, from_count: null, to_count: null, method: null,
       state: null, started_by: null, started_at: null, until_at: null, flipped_at: null, ended_at: null, reason: null,
@@ -89,7 +89,7 @@ describe('a store at version 8', () => {
       expect(await second.provisionVerdict()).toEqual({ state: 'mismatch', found: '{"v":8}' });
       const until = Date.now() + 30_000;
       while (!lines.some(l => l.includes('schema-mismatch')) && Date.now() < until) await new Promise(resolve => { setTimeout(resolve, 100); });
-      expect(lines).toContain('[PostgresBackend] schema-mismatch: smdb_data.meta schema_version is {"v":8}, expected {"v":9}; refusing to serve');
+      expect(lines).toContain('[PostgresBackend] schema-mismatch: smdb_data.meta schema_version is {"v":8}, expected {"v":10}; refusing to serve');
       expect(second.servesData()).toBe(false);
     } finally {
       await second.stop();

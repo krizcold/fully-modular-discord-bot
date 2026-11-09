@@ -25,17 +25,17 @@ import { MARK, hashOf, presentState } from './oracle.mjs';
 /** @typedef {import('./oracle.mjs').FleetFacts} FleetFacts */
 /**
  * @typedef {{ log: number, id: number, lane: string, op: 'write' | 'delete', kind: 'u' | 'h', key: string, c: number,
- *   h: string | null, at: number, cls: AnswerClass, definite: boolean, ansAt: number, status: number }} Op
+ *   h: string | null, at: number, cls: AnswerClass, definite: boolean, ansAt: number, status: number, remote?: boolean }} Op
  * @typedef {{ log: number, id: number, lane: string, key: string, kind: 'u' | 'h', at0: number, at1: number, state: DocState }} Read
  * @typedef {{ log: number, name: string, begin: number, end: number }} Window
  * @typedef {{ kind: 'u' | 'h', writes: Op[], deletes: Op[] }} KeyHistory
  * @typedef {{ run: string, guild: string, keys: Map<string, KeyHistory>, reads: Read[], windows: Window[], ops: Op[],
- *   logs: { lanes: string[], ended: boolean }[], problems: string[] }} History
+ *   logs: { lanes: string[], ended: boolean, startedAt: string | null, endedAt: string | null }[], problems: string[] }} History
  * @typedef {{ name: string, mode: 'judged' | 'lagging', complete: boolean, docs: Map<string, DocState>,
  *   run?: string, guild?: string, sample?: boolean }} Copy
  * @typedef {{ v: string, key?: string, copy?: string, during?: boolean, detail: string }} Verdict
- * @typedef {{ id: string, op: string, state: string, key: string, h: string | null, taken: boolean, reply: string | null }} RequestRow
- * @typedef {{ name: string, rows: RequestRow[] }} RequestListing
+ * @typedef {{ id: string, op: string, state: string, key: string | null, h: string | null, taken: boolean, reply: string | null }} RequestRow
+ * @typedef {{ name: string, rows: RequestRow[], snapshots?: string[] }} RequestListing
  * @typedef {'none' | 'open' | 'ok' | 'held' | 'refused'} RequestOutcome
  */
 
@@ -64,7 +64,7 @@ export function buildHistory(logs) {
   const guilds = new Set();
   /** @type {Map<string, number>} */
   const laneLog = new Map();
-  /** @type {{ lanes: string[], ended: boolean }[]} */
+  /** @type {{ lanes: string[], ended: boolean, startedAt: string | null, endedAt: string | null }[]} */
   const logInfo = [];
 
   logs.forEach((events, log) => {
@@ -82,7 +82,12 @@ export function buildHistory(logs) {
     if (!ended && start.sink === 'stream') {
       throw new Error(`log ${log + 1} is a streamed copy with no end line, which may have lost requests the store saw: judge the writer's own log file instead`);
     }
-    logInfo.push({ lanes, ended });
+    const endLine = events.find(e => e.t === 'end');
+    logInfo.push({
+      lanes, ended,
+      startedAt: typeof start.startedAt === 'string' ? start.startedAt : null,
+      endedAt: typeof endLine?.endedAt === 'string' ? endLine.endedAt : null,
+    });
 
     /** @type {Map<number, any>} */
     const answers = new Map();
@@ -103,6 +108,8 @@ export function buildHistory(logs) {
           definite: ans ? ans.definite === true : false,
           ansAt: ans ? ans.at : Infinity,
           status: ans ? ans.status : 0,
+          // Answered with the name of the machine that ran it: the send went through a request row.
+          remote: ans ? ans.remote === true : false,
         };
         ops.push(op);
         let entry = keys.get(op.key);
@@ -750,18 +757,34 @@ export function judgeFleet(nodes, listing = null, reshard = null) {
   return controlVerdicts(controlFacts(nodes, listing), reshard);
 }
 
+/** NB15 decision 16: the holder's cleanup deletes an answered row this long after its answer. */
+export const ANSWERED_ROW_KEPT_S = 120;
+/** The longest gap between two snapshots of the request rows that no answered row can fall through. */
+export const SNAPSHOT_GAP_MAX_S = 110;
+/** The slack between the writer's clock and the database's, as for the listing's span. */
+export const SNAPSHOT_CLOCK_SLACK_S = 30;
+
 /**
- * The request listing (oracle.mjs sql requests under psql -At): one line per
- * guild_requests row of the run, {"id", "op", "state", "k": the body's
- * filename, "c": its contentJson or null, "taken": bool, "reply": text or null}.
- * A row's content is judged by its hash, as a copy's doc is.
+ * The request listing (oracle.mjs sql requests under psql -At, taken every
+ * 30 s during the run and once at its end, appended to one file). Each
+ * snapshot is one line per guild_requests row of the run, {"id", "op",
+ * "state", "k": the body's filename, "c": its contentJson or null, "taken":
+ * bool, "reply": text or null}, then {"snapshot": the database's time, "rows":
+ * how many row lines it holds}. A row's content is judged by its hash, as a
+ * copy's doc is. A row a holder claimed has an empty body (NB15 decision 16),
+ * so its "k" and "c" are null; the cleanup deletes it 2 minutes after its
+ * answer. The rows are the union of the snapshots by row id: a row keeps the
+ * key and hash any snapshot showed, and takes its state and reply from the
+ * latest. Lines with no snapshot line at all are one snapshot of unknown time.
  * @param {string} name
  * @param {string} text
  * @returns {RequestListing}
  */
 export function parseRequests(name, text) {
+  /** @type {{ at: string | null, rows: RequestRow[] }[]} */
+  const snaps = [];
   /** @type {RequestRow[]} */
-  const rows = [];
+  let current = [];
   text.split('\n').forEach((line, i) => {
     if (line.trim() === '') return;
     /** @type {any} */
@@ -771,10 +794,22 @@ export function parseRequests(name, text) {
     } catch {
       throw new Error(`${name} line ${i + 1} is not a JSON row`);
     }
-    if (typeof row?.id !== 'string' || typeof row.op !== 'string' || typeof row.state !== 'string' || typeof row.k !== 'string'
-      || typeof row.taken !== 'boolean' || (row.c !== null && typeof row.c !== 'string') || (row.reply !== null && typeof row.reply !== 'string')) {
+    if (row !== null && typeof row === 'object' && 'snapshot' in row) {
+      if (typeof row.snapshot !== 'string' || !Number.isFinite(Date.parse(row.snapshot)) || !Number.isInteger(row.rows)) {
+        throw new Error(`${name} line ${i + 1} is a snapshot line that needs "snapshot" (a time) and "rows" (a count)`);
+      }
+      if (row.rows !== current.length) {
+        throw new Error(`${name} line ${i + 1} ends a snapshot of ${current.length} rows, but counts ${row.rows}: the snapshot is not whole`);
+      }
+      snaps.push({ at: row.snapshot, rows: current });
+      current = [];
+      return;
+    }
+    if (typeof row?.id !== 'string' || typeof row.op !== 'string' || typeof row.state !== 'string' || (row.k !== null && typeof row.k !== 'string')
+      || (row.k === null && row.c !== null) || typeof row.taken !== 'boolean' || (row.c !== null && typeof row.c !== 'string') || (row.reply !== null && typeof row.reply !== 'string')) {
       throw new Error(`${name} line ${i + 1} needs "id", "op", "state", "k", "c", "taken" and "reply"`);
     }
+    if (current.some(r => r.id === row.id)) throw new Error(`${name} line ${i + 1} lists row ${row.id} twice in one snapshot`);
     /** @type {string | null} */
     let h = null;
     if (row.c !== null) {
@@ -784,9 +819,67 @@ export function parseRequests(name, text) {
         h = `unparseable:${row.c.length}`;
       }
     }
-    rows.push({ id: row.id, op: row.op, state: row.state, key: row.k, h, taken: row.taken, reply: row.reply });
+    current.push({ id: row.id, op: row.op, state: row.state, key: row.k, h, taken: row.taken, reply: row.reply });
   });
-  return { name, rows };
+  if (current.length > 0) {
+    if (snaps.length > 0) throw new Error(`${name} ends with ${current.length} rows and no snapshot line: its last snapshot was cut short`);
+    snaps.push({ at: null, rows: current });
+  }
+  const ordered = snaps.map((snap, i) => ({ ...snap, i })).sort((a, b) => (a.at === null || b.at === null ? 0 : Date.parse(a.at) - Date.parse(b.at)) || a.i - b.i);
+  /** @type {Map<string, RequestRow>} */
+  const byId = new Map();
+  for (const snap of ordered) {
+    for (const row of snap.rows) {
+      const seen = byId.get(row.id);
+      if (!seen) {
+        byId.set(row.id, row);
+        continue;
+      }
+      if (seen.op !== row.op) throw new Error(`${name} lists row ${row.id} as ${seen.op} and as ${row.op}`);
+      if (row.key !== null && seen.key !== null && (row.key !== seen.key || row.h !== seen.h)) {
+        throw new Error(`${name} lists row ${row.id} with two different bodies, but a body is only ever emptied`);
+      }
+      byId.set(row.id, {
+        ...row,
+        key: seen.key ?? row.key, h: seen.key !== null ? seen.h : row.h, taken: seen.taken || row.taken,
+      });
+    }
+  }
+  return { name, rows: [...byId.values()], snapshots: snaps.flatMap(s => (s.at === null ? [] : [s.at])) };
+}
+
+/**
+ * Whether the snapshots of a request listing hold every row of the run. The
+ * cleanup deletes a row 2 minutes after its answer, so a row answered before
+ * the first snapshot, or between two snapshots more than 110 s apart, may be
+ * gone from all of them, and one answered after the last may be missing too.
+ * Each is a reason the run cannot pass, never a verdict.
+ * @param {History} history
+ * @param {RequestListing} listing
+ * @returns {string[]}
+ */
+export function requestCoverage(history, listing) {
+  const times = (listing.snapshots ?? []).map(t => Date.parse(t)).sort((a, b) => a - b);
+  if (times.length === 0) {
+    return [`${listing.name} holds no snapshot line (oracle.mjs sql requests ends each snapshot with one), so whether the cleanup deleted rows of the run before it was taken is unknown`];
+  }
+  /** @type {string[]} */
+  const reasons = [];
+  const starts = history.logs.flatMap(l => (l.startedAt === null ? [] : [Date.parse(l.startedAt)])).filter(Number.isFinite);
+  const first = Math.min(...starts);
+  if (starts.length > 0 && times[0] > first + (ANSWERED_ROW_KEPT_S - SNAPSHOT_CLOCK_SLACK_S) * 1000) {
+    reasons.push(`${listing.name}'s first snapshot was taken ${Math.round((times[0] - first) / 1000)} s after the run started, more than ${ANSWERED_ROW_KEPT_S - SNAPSHOT_CLOCK_SLACK_S} s: rows answered before it may have been deleted`);
+  }
+  let gap = 0;
+  for (let i = 1; i < times.length; i++) gap = Math.max(gap, times[i] - times[i - 1]);
+  if (gap > SNAPSHOT_GAP_MAX_S * 1000) {
+    reasons.push(`${listing.name} has ${Math.round(gap / 1000)} s between two snapshots, more than ${SNAPSHOT_GAP_MAX_S} s: rows answered between them may have been deleted`);
+  }
+  const ends = history.logs.map(l => (l.endedAt === null ? NaN : Date.parse(l.endedAt)));
+  if (ends.length > 0 && (!ends.every(Number.isFinite) || times[times.length - 1] < Math.max(...ends) + SNAPSHOT_CLOCK_SLACK_S * 1000)) {
+    reasons.push(`${listing.name}'s last snapshot was not taken at least ${SNAPSHOT_CLOCK_SLACK_S} s after the run's last end line, so rows of its last requests may have changed or gone missing after it`);
+  }
+  return reasons;
 }
 
 /**
@@ -822,19 +915,39 @@ export function requestOutcome(row) {
  * by a holder. FALSE-ANSWER: a 200 with no row the holder answered ok, a 202
  * with no row it answered accepted, or a refusal given as never applied whose
  * row a holder started and did not refuse. PHANTOM: a started row no writer
- * sent.
+ * sent. A row with no key (no snapshot showed its body before the claim emptied it) can carry any send
+ * of its op that no keyed row shows started, one each: they are judged by
+ * count. More started keyless rows than such sends is TWICE; more than such
+ * sends not refused as never applied is FALSE-ANSWER; fewer keyless rows
+ * answered ok (or accepted) than such sends answered 200 (or 202) with the
+ * name of the machine that ran them (servedBy: through a row) is
+ * FALSE-ANSWER. When the snapshots may have missed rows (requestCoverage),
+ * the run is INCONCLUSIVE for those reasons, and no verdict that a missing
+ * row can cause is given: none from counts, and no FALSE-ANSWER for an
+ * acknowledged or held send whose rows show no such answer. The verdicts that
+ * the rows the snapshots hold prove (TWICE of one send, PHANTOM, a refusal
+ * whose row a holder started) still stand.
  * @param {History} history
  * @param {RequestListing} listing
- * @returns {Verdict[]}
+ * @returns {{ verdicts: Verdict[], reasons: string[] }}
  */
 export function judgeRequests(history, listing) {
   /** @type {Verdict[]} */
   const verdicts = [];
+  const reasons = requestCoverage(history, listing);
+  const complete = reasons.length === 0;
+  if (!complete) reasons.push(`${listing.name}: the answers of sends that no listed row proves, and the counts of rows with no key, were not judged, because the snapshots may have missed rows`);
   const add = (/** @type {string} */ v, /** @type {string} */ key, /** @type {string} */ detail) => verdicts.push({ v, key, copy: listing.name, detail });
   /** @type {Map<Op, RequestRow[]>} */
   const bySend = new Map();
+  /** @type {Record<string, RequestRow[]>} */
+  const loose = { write: [], delete: [] };
   for (const row of listing.rows) {
     if (row.op !== 'write' && row.op !== 'delete') continue;
+    if (row.key === null) {
+      loose[row.op].push(row);
+      continue;
+    }
     const entry = history.keys.get(row.key);
     const send = row.op === 'write' ? entry?.writes.find(w => w.h === row.h) : entry?.deletes[0];
     if (!send) {
@@ -844,19 +957,55 @@ export function judgeRequests(history, listing) {
     bySend.set(send, [...(bySend.get(send) ?? []), row]);
   }
   const rowsText = (/** @type {RequestRow[]} */ rows) => rows.map(r => `${r.id} ${r.state}${r.taken ? ' taken' : ''}${r.reply ? ` ${r.reply.slice(0, 80)}` : ''}`).join('; ');
+  const anyLoose = loose.write.length + loose.delete.length > 0;
+  /** @type {Record<string, Op[]>} */
+  const free = { write: [], delete: [] };
+  for (const [, entry] of history.keys) {
+    for (const send of [...entry.writes, ...entry.deletes]) {
+      const rows = bySend.get(send) ?? [];
+      const outcomes = rows.map(requestOutcome);
+      if (!outcomes.some(o => o !== 'none')) free[send.op].push(send);
+    }
+  }
+  /** @type {Set<Op>} */
+  const unmatched = new Set();
   for (const [send, rows] of bySend) {
     const outcomes = rows.map(requestOutcome);
     const started = rows.filter((_, i) => outcomes[i] !== 'none');
     if (started.length > 1) add('TWICE', send.key, `${send.op} #${send.id} was started by holders ${started.length} times: ${rowsText(started)}`);
-    if (send.cls === 'ACKED' && !outcomes.includes('ok')) {
-      add('FALSE-ANSWER', send.key, `${send.op} #${send.id} was acknowledged, but no holder answered ok in its request: ${rowsText(rows)}`);
-    } else if (send.cls === 'HELD' && !outcomes.includes('held')) {
-      add('FALSE-ANSWER', send.key, `${send.op} #${send.id} was held, but no holder answered it accepted in its request: ${rowsText(rows)}`);
+    if (complete && send.cls === 'ACKED' && !outcomes.includes('ok')) {
+      if (anyLoose && started.length === 0) unmatched.add(send);
+      else add('FALSE-ANSWER', send.key, `${send.op} #${send.id} was acknowledged, but no holder answered ok in its request: ${rowsText(rows)}`);
+    } else if (complete && send.cls === 'HELD' && !outcomes.includes('held')) {
+      if (anyLoose && started.length === 0) unmatched.add(send);
+      else add('FALSE-ANSWER', send.key, `${send.op} #${send.id} was held, but no holder answered it accepted in its request: ${rowsText(rows)}`);
     } else if (send.cls === 'REFUSED' && send.definite && outcomes.some(o => o === 'open' || o === 'ok' || o === 'held')) {
       add('FALSE-ANSWER', send.key, `${send.op} #${send.id} was refused as never applied (${send.status}), but a holder started its request: ${rowsText(rows)}`);
     }
   }
-  return verdicts;
+  if (!anyLoose || !complete) return { verdicts, reasons };
+  for (const op of /** @type {const} */ (['write', 'delete'])) {
+    const rows = loose[op];
+    const outcomes = rows.map(requestOutcome);
+    const started = outcomes.filter(o => o !== 'none').length;
+    const carriers = free[op];
+    const startable = carriers.filter(send => !(send.cls === 'REFUSED' && send.definite)).length;
+    const what = `${started} ${op} rows a holder started have no key left to name their send`;
+    if (started > carriers.length) {
+      add('TWICE', `(${op} rows with no key)`, `${what}, more than the ${carriers.length} ${op} sends no keyed row shows started: ${rowsText(rows.filter((_, i) => outcomes[i] !== 'none'))}`);
+    } else if (started > startable) {
+      add('FALSE-ANSWER', `(${op} rows with no key)`, `${what}, more than the ${startable} ${op} sends that were not refused as never applied`);
+    }
+    for (const [cls, outcome, words] of /** @type {const} */ ([['ACKED', 'ok', 'acknowledged'], ['HELD', 'held', 'held']])) {
+      const need = carriers.filter(send => send.cls === cls && send.remote && (unmatched.has(send) || !bySend.has(send)));
+      const have = outcomes.filter(o => o === outcome).length;
+      if (need.length > have) {
+        const keys = need.map(send => `${send.key} #${send.id}`).join(', ');
+        add('FALSE-ANSWER', `(${op} rows with no key)`, `${need.length} ${op} sends were ${words} with no keyed row answering them, but only ${have} rows with no key were answered ${outcome}: ${keys}`);
+      }
+    }
+  }
+  return { verdicts, reasons };
 }
 
 /**
@@ -979,7 +1128,9 @@ export function judge(input) {
   inconclusive.push(...reads.reasons);
   verdicts.push(...judgeForks(history, copies, input.agree ?? []));
   for (const listing of input.requests ?? []) {
-    verdicts.push(...judgeRequests(history, listing));
+    const judged = judgeRequests(history, listing);
+    verdicts.push(...judged.verdicts);
+    inconclusive.push(...judged.reasons);
     if (listing.rows.length === 0) notes.push(`${listing.name} holds no request row of this run, so no answer was compared with one`);
   }
 

@@ -980,6 +980,34 @@ describe('NB7 test 12: changes sent to the machine that runs the guild, its hold
     fs.writeFileSync(marks, '');
     let nothingSavedWhileDead = 0;
     let ackedAfterLastTake = 0;
+    // The cleanup deletes an answered row 2 minutes after its answer: the request rows are snapshotted every 30 s.
+    const requests = file('l6-requests.jsonl');
+    fs.writeFileSync(requests, '');
+    const snapshot = async (span: { from: string; to: string | null }, name = 'l6-requests-one.jsonl') => {
+      const one = await dumpQuery(L6, requestsSql(GUILD, RUN, span), name);
+      fs.appendFileSync(requests, fs.readFileSync(one));
+      return one;
+    };
+    let snapping = true;
+    const snapshots = (async () => {
+      let from: string | undefined;
+      while (snapping) {
+        if (from === undefined) {
+          try {
+            from = parseLog(fs.readFileSync(file(`${RUN}.jsonl`), 'utf8')).find(e => e.t === 'start')?.startedAt;
+          } catch {
+            from = undefined;
+          }
+        }
+        if (from !== undefined) await snapshot({ from, to: null });
+        await waitFor(() => !snapping, from === undefined ? 200 : 30_000);
+      }
+    })();
+    snapshots.catch(() => undefined);
+    closers.push(async () => {
+      snapping = false;
+      await snapshots.catch(() => undefined);
+    });
     const log = await write(RUN, [`a=${alphaUi.url}`, `c=${charlieUi.url}`],
       ['--duration', '400', '--rate', '4', '--limiter', 'off', '--hot', '1', '--delete-ratio', '0.1', '--read-every', '4', '--max-size', '512',
         '--timeout', '45000', '--seed', '12', '--marks', marks],
@@ -1019,12 +1047,22 @@ describe('NB7 test 12: changes sent to the machine that runs the guild, its hold
       expect((await runNode([ORACLE, 'fleet', '--target', ui.url, '--name', name, '--limiter', 'off', '--out', file(`l6-fleet-${name}.json`)])).code).toBe(0);
     }
     const printed = await runNode([ORACLE, 'sql', 'requests', '--log', log]);
-    expect(printed.stdout).toBe(`${requestsSql(GUILD, RUN)}\n`);
+    const span = { from: events.find(e => e.t === 'start').startedAt, to: events.find(e => e.t === 'end')?.endedAt ?? null };
+    expect(printed.stdout).toBe(`${requestsSql(GUILD, RUN, span)}\n`);
     const db = await dump(L6, RUN, 'l6-db.jsonl');
-    const requests = await dumpQuery(L6, requestsSql(GUILD, RUN), 'l6-requests.jsonl');
+    if (span.to !== null) {
+      const due = async () => (await pool.query(`SELECT now() >= $1::timestamptz + interval '30 seconds' AS due`, [span.to])).rows[0].due === true;
+      const began = Date.now();
+      while (!(await due()) && Date.now() - began < 60_000) await sleep(1000);
+    }
+    snapping = false;
+    await snapshots;
+    const last = await snapshot(span);
     const claims = await dumpQuery(L6, claimsSql(), 'l6-claims.jsonl');
     const ownership = await dumpQuery(L6, ownershipSql(), 'l6-ownership.jsonl');
-    const rows = parseRequests('requests', fs.readFileSync(requests, 'utf8')).rows;
+    const listing = parseRequests('requests', fs.readFileSync(requests, 'utf8'));
+    expect(listing.snapshots?.length).toBeGreaterThanOrEqual(2);
+    const rows = listing.rows;
     // Each kill left a row its process took and never answered.
     expect(rows.filter(row => row.state === 'applying' && row.taken).length).toBeGreaterThanOrEqual(windows.length);
 
@@ -1036,22 +1074,41 @@ describe('NB7 test 12: changes sent to the machine that runs the guild, its hold
     expect(r.result.notes).toEqual([]);
     expect(r.code).toBe(0);
 
-    // Bites: a second started row of one acknowledged write is TWICE, and an acknowledged write whose row the holder
-    // answered as never applied is FALSE-ANSWER.
-    const deleted = new Set(events.filter(e => e.t === 'send' && e.op === 'delete').map(e => e.key));
-    const rowOf = (key: string) => rows.find(row => row.op === 'write' && row.key === key && row.state === 'done');
-    const ackedWrites = answeredSends(events).filter(s => s.op === 'write' && s.kind === 'u' && s.ans.cls === 'ACKED' && !deleted.has(s.key) && rowOf(s.key));
-    expect(ackedWrites.length).toBeGreaterThanOrEqual(2);
-    const [twice, untrue] = ackedWrites;
+    // A holder's claim empties the body (NB15 decision 16): every taken row of the last snapshot is listed with no key.
+    // The bites copy its newest one, which the cleanup still keeps.
+    const taken = parseRequests('last', fs.readFileSync(last, 'utf8')).rows.filter(row => row.op === 'write' && row.taken && row.state === 'done');
+    expect(taken.length).toBeGreaterThan(0);
+    expect(taken.every(row => row.key === null && row.h === null)).toBe(true);
+    const copied = taken[taken.length - 1].id;
+    const withSnapshots = (one: string, name: string) => {
+      fs.writeFileSync(file(name), Buffer.concat([fs.readFileSync(requests), fs.readFileSync(one)]));
+      return file(name);
+    };
+    const ackedRemote = answeredSends(events).filter(s => s.op === 'write' && s.ans.cls === 'ACKED' && s.ans.remote === true);
+    expect(ackedRemote.length).toBeGreaterThanOrEqual(2);
+
+    // Bites: more started write rows than writes sent is TWICE; acknowledged writes whose rows the holder answered as
+    // never applied are FALSE-ANSWER.
+    const writesSent = events.filter(e => e.t === 'send' && e.op === 'write').length;
     await psql(L6, `INSERT INTO smdb_data.guild_requests (id, guild_id, shard_count, shard_id, for_process, op, body, requested_by, state, created_at,
       claim_by, answer_by, claim_batch, applier_claim, taken_at, reply, done_at)
       SELECT gen_random_uuid(), guild_id, shard_count, shard_id, for_process, op, body, requested_by, state, created_at, claim_by, answer_by,
-        gen_random_uuid(), applier_claim, taken_at, reply, done_at FROM smdb_data.guild_requests WHERE id = '${rowOf(twice.key)!.id}'`);
-    await psql(L6, `UPDATE smdb_data.guild_requests SET reply = '{"ok":false,"code":"not-taken","unapplied":true}' WHERE id = '${rowOf(untrue.key)!.id}'`);
-    const bitten = await dumpQuery(L6, requestsSql(GUILD, RUN), 'l6-requests-bitten.jsonl');
-    const b = await check([...judged, '--requests', `requests=${bitten}`]);
-    expect(b.code).toBe(1);
-    expect(b.result.verdicts.map((v: any) => `${v.v} ${v.key}`).sort()).toEqual([`FALSE-ANSWER ${untrue.key}`, `TWICE ${twice.key}`].sort());
+        gen_random_uuid(), applier_claim, taken_at, reply, done_at FROM smdb_data.guild_requests, generate_series(1, ${writesSent + 1})
+       WHERE id = '${copied}'`);
+    const doubled = withSnapshots(await dumpQuery(L6, requestsSql(GUILD, RUN, span), 'l6-requests-twice-one.jsonl'), 'l6-requests-twice.jsonl');
+    const b1 = await check([...judged, '--requests', `requests=${doubled}`]);
+    expect(b1.code).toBe(1);
+    expect(b1.result.verdicts.map((v: any) => `${v.v} ${v.key}`)).toEqual(['TWICE (write rows with no key)']);
+    await psql(L6, `DELETE FROM smdb_data.guild_requests WHERE claim_batch IS NOT NULL AND id <> '${copied}' AND body = '' AND op = 'write'
+      AND reply = (SELECT reply FROM smdb_data.guild_requests WHERE id = '${copied}') AND created_at = (SELECT created_at FROM smdb_data.guild_requests WHERE id = '${copied}')`);
+    await psql(L6, `UPDATE smdb_data.guild_requests SET reply = '{"ok":false,"code":"not-taken","unapplied":true}'
+      WHERE id IN (${taken.map(row => `'${row.id}'`).join(', ')})`);
+    const untrue = withSnapshots(await dumpQuery(L6, requestsSql(GUILD, RUN, span), 'l6-requests-untrue-one.jsonl'), 'l6-requests-untrue.jsonl');
+    const b2 = await check([...judged, '--requests', `requests=${untrue}`]);
+    expect(b2.code).toBe(1);
+    // A row an earlier snapshot caught with its body is judged by its own key.
+    expect(b2.result.verdicts.map((v: any) => `${v.v} ${v.key}`)).toContain('FALSE-ANSWER (write rows with no key)');
+    expect(b2.result.verdicts.every((v: any) => v.v === 'FALSE-ANSWER')).toBe(true);
   }, 420_000);
 });
 

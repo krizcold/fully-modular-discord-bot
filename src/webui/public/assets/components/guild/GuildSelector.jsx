@@ -6,6 +6,7 @@ function GuildSelector({ user, onGuildSelected, onLogout }) {
   const [guilds, setGuilds] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [notice, setNotice] = useState(null);
   const [logoutError, setLogoutError] = useState(null);
 
   useEffect(() => {
@@ -38,6 +39,7 @@ function GuildSelector({ user, onGuildSelected, onLogout }) {
 
       if (result.success) {
         setGuilds(result.guilds || []);
+        setNotice(result.notice || null);
       } else {
         setError(result.error || 'Failed to load guilds');
       }
@@ -109,6 +111,7 @@ function GuildSelector({ user, onGuildSelected, onLogout }) {
     return (
       <div className="guild-selector-empty">
         <h2>No Guilds Available</h2>
+        {notice && <p className="guild-selector-notice">{notice}</p>}
         <p>You don't have administrator access to any guilds where this bot is present.</p>
         <p>To use this panel, you must:</p>
         <ul>
@@ -123,6 +126,7 @@ function GuildSelector({ user, onGuildSelected, onLogout }) {
 
   return (
     <div className="guild-selector">
+      {notice && <p className="guild-selector-notice">{notice}</p>}
       <div className="guild-selector-header">
         <div className="user-info">
           {user.avatar ? (

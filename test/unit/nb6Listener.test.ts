@@ -8,8 +8,11 @@ import { listenRig, type FakeListenClient } from '../helpers/nb6Listen';
 // emits 'notification', 'error' and 'end', with fake timers. NB6 builds the connect-failure halves of rows 36 and 37;
 // the 'unprotected' halves are NB15's (C27). Row 100's pass is in test 6 (nb6Reconcile.test.ts).
 
-const ENTRY_A = 'postgres://bot@db-a.example:5432/bot';
-const ENTRY_B = 'postgres://bot@db-b.example:5432/bot';
+// NB15 decision 21: these entries check the server's certificate ('verified'), so both channels are heard.
+const ENTRY_A = 'postgres://bot@db-a.example:5432/bot?sslmode=require';
+const ENTRY_B = 'postgres://bot@db-b.example:5432/bot?sslmode=require';
+const UNCHECKED = 'postgres://bot@db-c.example:5432/bot?sslmode=no-verify';
+const LOOPBACK = 'postgres://bot@127.0.0.1:5432/bot';
 const CANT = "[Shared] Can't listen for changes from other machines";
 const AGAIN = '[Shared] Listening for changes from other machines again';
 
@@ -210,6 +213,42 @@ describe('rows 26, 30, 41 and 101: notifications', () => {
     client.notify('smdb_shared', 'not json');
     client.notify('smdb_shared', JSON.stringify({ k: 'doc' }));
     expect(calls.docs).toEqual([]);
+  });
+});
+
+describe("rows 36, 37 and 100, the 'unprotected' halves (NB15 decision 21, gatekeeper rulings 4 and 20)", () => {
+  it('a no-verify connection outside every attached subnet LISTENs smdb_shared only, hears shared changes and runs the pass', async () => {
+    entry = UNCHECKED;
+    startSharedListener(deps());
+    await settle();
+    const client = rig.last();
+    expect(client.queries).toEqual(['LISTEN smdb_shared']);
+    expect(channelsFor(client as never)).toEqual(['smdb_shared']);
+    expect(calls.connected).toBe(1);
+    client.notify('smdb_shared', JSON.stringify({ k: 'doc', key: 'g/1/m/a.json', by: 'another' }));
+    expect(calls.docs).toEqual(['g/1/m/a.json']);
+    client.notify('smdb_guild_requests', processId());
+    expect(calls.guild).toBe(0);
+    expect(lines.some(l => l.startsWith(CANT))).toBe(false);
+    expect(lines).toEqual([]);
+  });
+
+  it('a loopback connection is local: both channels', async () => {
+    entry = LOOPBACK;
+    startSharedListener(deps());
+    await settle();
+    expect(rig.last().queries).toEqual(['LISTEN smdb_shared', 'LISTEN smdb_guild_requests']);
+  });
+
+  it('a reconnect classes the new connection again', async () => {
+    entry = UNCHECKED;
+    startSharedListener(deps());
+    await settle();
+    expect(rig.last().queries).toEqual(['LISTEN smdb_shared']);
+    entry = ENTRY_B;
+    changed.forEach(cb => cb());
+    await settle();
+    expect(rig.last().queries).toEqual(['LISTEN smdb_shared', 'LISTEN smdb_guild_requests']);
   });
 });
 

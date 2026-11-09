@@ -43,10 +43,6 @@ export default function getLocalCommands(exceptions: string[] = []): any[] {
           recordLoadFailure(file);
         }
       }
-
-      if (localCommands.length > 0) {
-        console.log(`[getLocalCommands] Loaded ${localCommands.length} internal commands`);
-      }
     }
   } catch (error) {
     console.error('[getLocalCommands] Error loading internal commands:', error);
@@ -57,7 +53,6 @@ export default function getLocalCommands(exceptions: string[] = []): any[] {
   try {
     const registry = getModuleRegistry();
     const modules = registry.getAllModules();
-    let moduleCommandCount = 0;
 
     for (const module of modules) {
       for (const command of module.commands) {
@@ -69,13 +64,8 @@ export default function getLocalCommands(exceptions: string[] = []): any[] {
           }
           gateCommandCallback(command);
           localCommands.push(command);
-          moduleCommandCount++;
         }
       }
-    }
-
-    if (modules.length > 0) {
-      console.log(`[getLocalCommands] Loaded ${moduleCommandCount} commands from ${modules.length} modules`);
     }
 
     // Check for duplicate command names

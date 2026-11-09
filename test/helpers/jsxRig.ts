@@ -34,6 +34,7 @@ export function mount(file: string, name: string, props: Record<string, any>, gl
   const hooks: any[] = [];
   let index = 0;
   let effects: Array<() => void> = [];
+  const cleanups = new Map<number, () => void>();
   let scheduled = false;
   let tree: El | null = null;
 
@@ -67,7 +68,14 @@ export function mount(file: string, name: string, props: Record<string, any>, gl
       const before = hooks[i];
       const changed = !before || !deps || deps.length !== before.deps.length || deps.some((d, k) => !Object.is(d, before.deps[k]));
       hooks[i] = { deps: deps ?? [] };
-      if (changed) effects.push(effect);
+      if (changed) {
+        effects.push(() => {
+          cleanups.get(i)?.();
+          cleanups.delete(i);
+          const cleanup = (effect as () => unknown)();
+          if (typeof cleanup === 'function') cleanups.set(i, cleanup as () => void);
+        });
+      }
     },
     createElement(type: any, elProps: Record<string, any> | null, ...children: any[]): any {
       const flat = children.flat(Infinity).filter(c => c !== null && c !== undefined && c !== false && c !== true);
@@ -115,6 +123,8 @@ export function mount(file: string, name: string, props: Record<string, any>, gl
     button: (label: RegExp) => all(el => el.type === 'button' && label.test(text(el)))[0],
     selects: () => all(el => el.type === 'select'),
     textarea: () => all(el => el.type === 'textarea')[0],
+    /** Runs every effect cleanup, as React does when the component leaves the page. */
+    unmount: () => { for (const cleanup of cleanups.values()) cleanup(); cleanups.clear(); },
   };
 }
 

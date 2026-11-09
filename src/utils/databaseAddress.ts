@@ -1,4 +1,5 @@
 import net from 'net';
+import os from 'os';
 import type { ClientConfig } from 'pg';
 import { parseIntoClientConfig } from 'pg-connection-string';
 import { loadCredentials } from './envLoader';
@@ -56,6 +57,83 @@ export function pgConfig(entry: string): ClientConfig {
     }
   }
   return config;
+}
+
+/**
+ * NB15 decision 21: how a connection that has connected is protected. 'verified': TLS with the server's certificate
+ * checked. 'local': a loopback host or a Unix socket, or TLS to a peer inside a subnet of one of this process's own
+ * interfaces (the machine's Docker network, inside a container). 'unprotected': every other connection.
+ */
+export type TransportClass = 'verified' | 'local' | 'unprotected';
+
+type Interfaces = ReturnType<typeof os.networkInterfaces>;
+
+const LOOPBACK_V4 = /^127\./;
+
+function isLoopbackHost(host: string): boolean {
+  const h = host.replace(/^\[(.*)\]$/, '$1').toLowerCase();
+  return h === 'localhost' || h === '::1' || LOOPBACK_V4.test(h) || h.startsWith('/');
+}
+
+function plainAddress(address: string): string {
+  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(address);
+  return mapped ? mapped[1] : address;
+}
+
+function inAttachedSubnet(peer: string, interfaces: Interfaces): boolean {
+  const family = net.isIP(peer);
+  if (family === 0) return false;
+  const list = new net.BlockList();
+  let any = false;
+  for (const entries of Object.values(interfaces)) {
+    for (const entry of entries ?? []) {
+      if (entry.internal || !entry.cidr) continue;
+      const [address, prefix] = entry.cidr.split('/');
+      const type = net.isIP(address) === 6 ? 'ipv6' : 'ipv4';
+      try {
+        list.addSubnet(address, Number(prefix), type);
+        any = true;
+      } catch { /* an address the list cannot hold is no subnet */ }
+    }
+  }
+  return any && list.check(peer, family === 6 ? 'ipv6' : 'ipv4');
+}
+
+/** Classes one connected client from its parsed config and its socket's peer; no name lookup runs. */
+export function transportOf(config: ClientConfig, client: unknown, interfaces: Interfaces = os.networkInterfaces()): TransportClass {
+  const ssl = config.ssl;
+  // node-postgres takes an empty host as unset: PGHOST, else localhost.
+  const host = typeof config.host === 'string' && config.host !== '' ? config.host : process.env.PGHOST || 'localhost';
+  if (ssl && (ssl === true || (typeof ssl === 'object' && ssl.rejectUnauthorized !== false))) return 'verified';
+  if (isLoopbackHost(host)) return 'local';
+  if (!ssl) return 'unprotected';
+  const remote = (client as { connection?: { stream?: { remoteAddress?: unknown } } } | null)?.connection?.stream?.remoteAddress;
+  if (typeof remote !== 'string') return 'unprotected';
+  const peer = plainAddress(remote);
+  if (LOOPBACK_V4.test(peer) || peer === '::1') return 'local';
+  return inAttachedSubnet(peer, interfaces) ? 'local' : 'unprotected';
+}
+
+const classes = new WeakMap<object, TransportClass>();
+
+/** The class kept on a client at its connect; none for a client nobody classed. */
+export function transportClassOf(client: object): TransportClass | undefined {
+  return classes.get(client);
+}
+
+export function keepTransportClass(client: object, cls: TransportClass): void {
+  classes.set(client, cls);
+}
+
+/** Classes every new client of a pool at its connect, before the pool hands it out; the class ends with the client. */
+export function classifyPoolClients(pool: { on(event: 'connect', listener: (client: any) => void): unknown }, config: ClientConfig): void {
+  pool.on('connect', client => {
+    try {
+      classes.set(client, transportOf(config, client));
+    } catch {
+      classes.set(client, 'unprotected');
+    }
+  });
 }
 
 function certificatePath(raw: string): string | null {

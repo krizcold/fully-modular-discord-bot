@@ -6,6 +6,9 @@ import { requireOAuth, requireGuildAccess, saveRefreshedUser } from '../auth/oau
 import { DiscordUser } from '../auth/oauthConfig';
 import { refreshUserGuilds } from '../auth/guildPermissionRefresher';
 import { hasGuildAccess as permHasGuildAccess } from '../auth/permissionChecker';
+import { sendPanelOp } from './panelRequestRoute';
+import { resolveDataBackend } from '../../utils/envLoader';
+import { memberServerList, realMemberDeps } from '../utils/memberGuilds';
 
 // Dev-user check cache: avoids IPC to bot on every request.
 // Keyed by user id; 5-minute TTL keeps permission changes relatively fresh.
@@ -89,39 +92,14 @@ export function createGuildPanelRoutes(botManager: BotManager): Router {
         }
       }
 
-      if (!botManager.isRunning()) {
-        res.status(503).json({
-          success: false,
-          error: 'Bot is not running'
-        });
-        return;
-      }
-
-      // Get all panels
-      const result = await botManager.getPanelList();
-
-      if (result.success) {
-        // Filter panels based on context
-        let filteredPanels;
-        if (isSystemPanels) {
-          // System panels - filter to system scope only
-          filteredPanels = (result.panels || []).filter((p: any) => p.scope === 'system');
-        } else {
-          // Guild panels - filter to guild-scope only
-          filteredPanels = (result.panels || []).filter((p: any) => p.scope === 'guild' || !p.scope);
-        }
-
-        res.json({
-          success: true,
-          panels: filteredPanels,
-          guildId: isSystemPanels ? null : guildId
-        });
-      } else {
-        res.status(500).json({
-          success: false,
-          error: result.error || 'Failed to get panel list'
-        });
-      }
+      await sendPanelOp(botManager, res, {
+        op: 'panel:list', guildId: isSystemPanels ? null : guildId, payload: {}, audience: 'member', userId: user.id,
+        success: reply => ({
+          panels: (reply.panels || []).filter((p: any) => (isSystemPanels ? p.scope === 'system' : p.scope === 'guild' || !p.scope)),
+          guildId: isSystemPanels ? null : guildId,
+        }),
+        failureText: 'Failed to get panel list',
+      });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({
@@ -184,33 +162,11 @@ export function createGuildPanelRoutes(botManager: BotManager): Router {
         }
       }
 
-      if (!botManager.isRunning()) {
-        res.status(503).json({
-          success: false,
-          error: 'Bot is not running'
-        });
-        return;
-      }
-
-      // Execute panel with appropriate context (null for system, guildId for guild)
-      const result = await botManager.executePanel(
-        panelId,
-        user.id,
-        isSystemPanel ? null : guildId,
-        channelId || null
-      );
-
-      if (result.success) {
-        res.json({
-          success: true,
-          panel: result.data
-        });
-      } else {
-        res.status(500).json({
-          success: false,
-          error: result.error || 'Failed to execute panel'
-        });
-      }
+      await sendPanelOp(botManager, res, {
+        op: 'panel:execute', guildId: isSystemPanel ? null : guildId, audience: 'member', userId: user.id,
+        payload: { panelId, userId: user.id, channelId: channelId || null },
+        success: reply => ({ panel: reply.data ?? null }), failureText: 'Failed to execute panel',
+      });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({
@@ -280,34 +236,11 @@ export function createGuildPanelRoutes(botManager: BotManager): Router {
         }
       }
 
-      if (!botManager.isRunning()) {
-        res.status(503).json({
-          success: false,
-          error: 'Bot is not running'
-        });
-        return;
-      }
-
-      // Handle button with appropriate context
-      const result = await botManager.handlePanelButton(
-        panelId,
-        buttonId,
-        user.id,
-        isSystemPanel ? null : guildId,
-        channelId || null
-      );
-
-      if (result.success) {
-        res.json({
-          success: true,
-          panel: result.data
-        });
-      } else {
-        res.status(500).json({
-          success: false,
-          error: result.error || 'Failed to handle button'
-        });
-      }
+      await sendPanelOp(botManager, res, {
+        op: 'panel:button', guildId: isSystemPanel ? null : guildId, audience: 'member', userId: user.id,
+        payload: { panelId, buttonId, userId: user.id, channelId: channelId || null },
+        success: reply => ({ panel: reply.data ?? null }), failureText: 'Failed to handle button',
+      });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({
@@ -385,35 +318,11 @@ export function createGuildPanelRoutes(botManager: BotManager): Router {
         }
       }
 
-      if (!botManager.isRunning()) {
-        res.status(503).json({
-          success: false,
-          error: 'Bot is not running'
-        });
-        return;
-      }
-
-      // Handle dropdown with appropriate context
-      const result = await botManager.handlePanelDropdown(
-        panelId,
-        values,
-        user.id,
-        isSystemPanel ? null : guildId,
-        dropdownId,
-        channelId || null
-      );
-
-      if (result.success) {
-        res.json({
-          success: true,
-          panel: result.data
-        });
-      } else {
-        res.status(500).json({
-          success: false,
-          error: result.error || 'Failed to handle dropdown'
-        });
-      }
+      await sendPanelOp(botManager, res, {
+        op: 'panel:dropdown', guildId: isSystemPanel ? null : guildId, audience: 'member', userId: user.id,
+        payload: { panelId, values, userId: user.id, dropdownId, channelId: channelId || null },
+        success: reply => ({ panel: reply.data ?? null }), failureText: 'Failed to handle dropdown',
+      });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({
@@ -491,35 +400,11 @@ export function createGuildPanelRoutes(botManager: BotManager): Router {
         }
       }
 
-      if (!botManager.isRunning()) {
-        res.status(503).json({
-          success: false,
-          error: 'Bot is not running'
-        });
-        return;
-      }
-
-      // Handle modal with appropriate context
-      const result = await botManager.handlePanelModal(
-        panelId,
-        modalId,
-        fields,
-        user.id,
-        isSystemPanel ? null : guildId,
-        channelId || null
-      );
-
-      if (result.success) {
-        res.json({
-          success: true,
-          panel: result.data
-        });
-      } else {
-        res.status(500).json({
-          success: false,
-          error: result.error || 'Failed to handle modal'
-        });
-      }
+      await sendPanelOp(botManager, res, {
+        op: 'panel:modal', guildId: isSystemPanel ? null : guildId, audience: 'member', userId: user.id,
+        payload: { panelId, modalId, fields, userId: user.id, channelId: channelId || null },
+        success: reply => ({ panel: reply.data ?? null }), failureText: 'Failed to handle modal',
+      });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({
@@ -557,27 +442,10 @@ export function createGuildPanelRoutes(botManager: BotManager): Router {
         return;
       }
 
-      if (!botManager.isRunning()) {
-        res.status(503).json({
-          success: false,
-          error: 'Bot is not running'
-        });
-        return;
-      }
-
-      const result = await botManager.getGuildChannels(guildId);
-
-      if (result.success) {
-        res.json({
-          success: true,
-          channels: result.channels
-        });
-      } else {
-        res.status(500).json({
-          success: false,
-          error: result.error || 'Failed to get channels'
-        });
-      }
+      await sendPanelOp(botManager, res, {
+        op: 'guild:channels', guildId, payload: {}, audience: 'member', userId: user.id,
+        success: reply => ({ channels: reply.channels }), failureText: 'Failed to get channels',
+      });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({
@@ -615,27 +483,10 @@ export function createGuildPanelRoutes(botManager: BotManager): Router {
         return;
       }
 
-      if (!botManager.isRunning()) {
-        res.status(503).json({
-          success: false,
-          error: 'Bot is not running'
-        });
-        return;
-      }
-
-      const result = await botManager.getGuildRoles(guildId);
-
-      if (result.success) {
-        res.json({
-          success: true,
-          roles: result.roles
-        });
-      } else {
-        res.status(500).json({
-          success: false,
-          error: result.error || 'Failed to get roles'
-        });
-      }
+      await sendPanelOp(botManager, res, {
+        op: 'guild:roles', guildId, payload: {}, audience: 'member', userId: user.id,
+        success: reply => ({ roles: reply.roles }), failureText: 'Failed to get roles',
+      });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({
@@ -653,8 +504,9 @@ export function createGuildPanelRoutes(botManager: BotManager): Router {
   router.get('/guilds', requireOAuth, async (req: Request, res: Response) => {
     try {
       const user = req.user as DiscordUser;
+      const postgres = resolveDataBackend() === 'postgres';
 
-      if (!botManager.isRunning()) {
+      if (!postgres && !botManager.isRunning()) {
         res.status(503).json({
           success: false,
           error: 'Bot is not running'
@@ -664,21 +516,33 @@ export function createGuildPanelRoutes(botManager: BotManager): Router {
 
       // Refresh user guilds from Discord API (with caching) and persist to session.
       const refreshedUser = await refreshAndSaveUser(req, user);
+      const userGuilds = refreshedUser.guilds || [];
+      let botGuildIds: Set<string>;
+      let notice: string | null = null;
 
-      // Get bot's guild list
-      const botGuildsResult = await botManager.getBotGuilds();
+      if (postgres) {
+        // NB15 decision 14: this machine's servers and every other machine's, asked of the bot that runs them.
+        const adminIds = userGuilds.filter(g => permHasGuildAccess(refreshedUser, g.id)).map(g => g.id);
+        const listed = await memberServerList(user.id, adminIds, realMemberDeps(async () => (
+          botManager.writerRoute('guild', { postgresGuild: true }).route === 'child' ? botManager.getBotGuilds() : null
+        )));
+        botGuildIds = listed.ids;
+        notice = listed.notice;
+      } else {
+        // Get bot's guild list
+        const botGuildsResult = await botManager.getBotGuilds();
 
-      if (!botGuildsResult.success) {
-        res.status(500).json({
-          success: false,
-          error: 'Failed to get bot guilds'
-        });
-        return;
+        if (!botGuildsResult.success) {
+          res.status(500).json({
+            success: false,
+            error: 'Failed to get bot guilds'
+          });
+          return;
+        }
+        botGuildIds = new Set((botGuildsResult.guilds || []).map((g: any) => g.id));
       }
 
       // Intersect user-admin guilds with bot-present guilds.
-      const userGuilds = refreshedUser.guilds || [];
-      const botGuildIds = new Set((botGuildsResult.guilds || []).map((g: any) => g.id));
       const accessibleGuilds = userGuilds
         .filter(g => botGuildIds.has(g.id) && permHasGuildAccess(refreshedUser, g.id));
 
@@ -703,7 +567,8 @@ export function createGuildPanelRoutes(botManager: BotManager): Router {
       res.json({
         success: true,
         guilds: guildsResponse,
-        isDev: isDev  // Include dev status in response
+        isDev: isDev,  // Include dev status in response
+        ...(notice ? { notice } : {})
       });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';

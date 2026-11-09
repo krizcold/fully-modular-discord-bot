@@ -17,6 +17,7 @@ import {
   MessageFlags,
 } from 'discord.js';
 import { PanelContext, PanelResponse, PanelOptions, PersistentPanelInstance } from '@bot/types/panelTypes';
+import { sendLiveUpdate } from './panelWebUIAdapter';
 import {
   getPersistentPanel,
   storePersistentPanel,
@@ -224,21 +225,11 @@ export async function updatePersistentPanel(
     if (outcome === 'refused') return false;
 
     // Send IPC notification for Web-UI real-time update
-    if (process.send) {
-      try {
-        const serialized = serializePanelResponse(injectedResponse);
-        process.send({
-          type: 'panel:live_update',
-          data: {
-            panelId,
-            guildId: guildId || null,
-            sessionId: sessionId || null,
-            response: serialized
-          }
-        });
-      } catch (ipcError) {
-        console.error('[PersistentPanel] Error sending IPC live update:', ipcError);
-      }
+    try {
+      const serialized = serializePanelResponse(injectedResponse);
+      sendLiveUpdate({ panelId, guildId: guildId || null, sessionId: sessionId || null, response: serialized });
+    } catch (ipcError) {
+      console.error('[PersistentPanel] Error sending IPC live update:', ipcError);
     }
 
     const stamped = newState
@@ -464,22 +455,9 @@ export function broadcastPanelUpdate(
   guildId?: string,
   sessionId?: string
 ): void {
-  if (!process.send) {
-    return;
-  }
-
   try {
     const serialized = serializePanelResponse(response);
-
-    process.send({
-      type: 'panel:live_update',
-      data: {
-        panelId,
-        guildId: guildId || null,
-        sessionId: sessionId || null,
-        response: serialized
-      }
-    });
+    sendLiveUpdate({ panelId, guildId: guildId || null, sessionId: sessionId || null, response: serialized });
   } catch (error) {
     console.error('[PersistentPanel] Error broadcasting panel update:', error);
   }

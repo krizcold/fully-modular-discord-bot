@@ -145,7 +145,7 @@ function logsOf(world: World, split = false): any[][] {
       if (e.t === 'read') counts.reads += 1;
       if (e.t === 'read' && e.s === 'error') counts.readErrors += 1;
     }
-    log.push({ t: 'end', counts });
+    log.push({ t: 'end', endedAt: '2026-11-09T09:59:30.000Z', counts });
   }
   return logs;
 }
@@ -226,14 +226,14 @@ function rowOf(o: Op, shape: Shape, id: string) {
   const state = shape === 'pending' || shape === 'expired' || shape === 'applying' ? shape : 'done';
   return { id, op: o.op, state, key: o.key, h: o.h, taken: shape !== 'pending' && shape !== 'expired', reply: REPLIES[shape] ?? null };
 }
-/** A request listing of a world, each op's row picked from the ones a correct route leaves. */
+/** A request listing of a world in one snapshot, each op's row picked from the ones a correct route leaves. */
 function requestsOf(world: World, picks: number[]) {
   const shapes = new Map<Op, Shape>(world.ops.map((o, i) => {
     const allowed = shapesFor(o);
     return [o, allowed[picks[i % picks.length] % allowed.length]];
   }));
   const rows = world.ops.filter(o => shapes.get(o) !== 'no-row').map(o => rowOf(o, shapes.get(o) as Shape, `r${o.id}`));
-  return { shapes, listing: { name: 'requests', rows } };
+  return { shapes, listing: { name: 'requests', rows, snapshots: ['2026-11-09T10:00:00.000Z'] } };
 }
 const picksArb = fc.array(fc.nat(), { minLength: 50, maxLength: 50 });
 
@@ -917,10 +917,11 @@ export function checks(): Check[] {
         { t: 'send', id: 2, lane: 'a', op: 'delete', kind: 'u', key: u('a', 1), c: 0, h: null, at: 20 }, ans(2, 25),
         write(3, 3, 30), { t: 'ans', id: 3, at: 35, status: 503, cls: 'REFUSED', definite: true },
         write(4, 4, 40), ans(4, 45, 'HELD'),
-        { t: 'end' },
+        { t: 'end', endedAt: '2026-11-09T09:59:30.000Z' },
       ];
       const copies = [copyOf('db', new Map([[u('a', 4), hashOf(content(4))]]))];
-      const judged = (lines: string[]) => J.judge({ history: J.buildHistory([log]), copies, k: 0, noFleet: true, requests: [J.parseRequests('req', lines.join('\n'))] });
+      const whole = (lines: string[]) => [...lines, JSON.stringify({ snapshot: '2026-11-09T10:00:00.000Z', rows: lines.length })].join('\n');
+      const judged = (lines: string[]) => J.judge({ history: J.buildHistory([log]), copies, k: 0, noFleet: true, requests: [J.parseRequests('req', whole(lines))] });
       const verdicts = (lines: string[]) => judged(lines).verdicts.map(v => `${v.v} ${v.key}`);
       const good = [
         line('r1', 'write', 'done', 1, true, REPLIES.ok as string),
@@ -962,6 +963,88 @@ export function checks(): Check[] {
       const empty = judged([]);
       expect(empty.verdicts).toEqual([]);
       expect(empty.notes.join('\n')).toMatch(/req holds no request row of this run/);
+    } },
+    { name: 'request rows are the union of their snapshots by row id', run: J => {
+      const T0 = Date.parse('2026-11-09T10:00:00.000Z');
+      const iso = (s: number) => new Date(T0 + s * 1000).toISOString();
+      const content = (n: number) => ({ run: RUN, lane: 'a', kind: 'u', key: u('a', n), c: n });
+      const remote = (id: number, at: number, cls = 'ACKED') => ({ ...ans(id, at, cls), remote: true });
+      // Four remote writes over 300 s: the holder answered 1 to 3 ok and held 4.
+      const log = [
+        { ...start(['a']), startedAt: iso(0) },
+        ...[1, 2, 3].flatMap(n => [send(n, 'a', u('a', n), n, hashOf(content(n)), n * 60_000), remote(n, n * 60_000 + 500)]),
+        send(4, 'a', u('a', 4), 4, hashOf(content(4)), 240_000), remote(4, 240_500, 'HELD'),
+        { t: 'end', endedAt: iso(275) },
+      ];
+      const history = J.buildHistory([log]);
+      const copies = [copyOf('db', new Map([1, 2, 3, 4].map(n => [u('a', n), hashOf(content(n))])))];
+      const keyless = (id: string, reply: string | null = REPLIES.ok as string, state = 'done') => JSON.stringify({ id, op: 'write', state, k: null, c: null, taken: true, reply });
+      const keyed = (id: string, n: number) => JSON.stringify({ id, op: 'write', state: 'pending', k: u('a', n), c: JSON.stringify(content(n), null, 2), taken: false, reply: null });
+      const snap = (s: number, rows: string[]) => [...rows, JSON.stringify({ snapshot: iso(s), rows: rows.length })];
+      const listing = (...snaps: string[][]) => J.parseRequests('req', snaps.flat().join('\n'));
+      const judged = (...snaps: string[][]) => J.judge({ history, copies, k: 0, noFleet: true, requests: [listing(...snaps)] });
+      const verdicts = (...snaps: string[][]) => judged(...snaps).verdicts.map(v => `${v.v} ${v.key}`);
+      const held = REPLIES.held as string;
+      // Snapshots at 5, 35, ... 305 s; each row is listed from its answer until the cleanup deletes it 120 s later.
+      const answeredAt = new Map([['q1', 60], ['q2', 120], ['q3', 180], ['q4', 240], ['q5', 200], ['q9', 70]]);
+      const every30 = (rows: Map<string, string>) => Array.from({ length: 11 }, (_, i) => i * 30 + 5).map(s => snap(s,
+        [...rows].filter(([id]) => s >= (answeredAt.get(id) as number) && s < (answeredAt.get(id) as number) + 120).map(([, line]) => line)));
+      const good = new Map([['q1', keyless('q1')], ['q2', keyless('q2')], ['q3', keyless('q3')], ['q4', keyless('q4', held)]]);
+
+      // A run whose early rows were deleted before its end passes; its last snapshot alone is INCONCLUSIVE, never a FAIL.
+      const run = every30(good);
+      const last = run[run.length - 1];
+      expect(last).toEqual(snap(305, [good.get('q4') as string]));
+      const passed = judged(...run);
+      expect(passed.verdicts).toEqual([]);
+      expect(passed.inconclusive).toEqual([]);
+      expect(listing(...run).rows.map(r => r.id)).toEqual(['q1', 'q2', 'q3', 'q4']);
+      expect(listing(...run).snapshots).toHaveLength(11);
+      expect(verdicts(last)).toEqual([]);
+      expect(judged(last).result).toBe('INCONCLUSIVE');
+      // One row seen in many snapshots is one row; a started row with a new id is a second start.
+      expect(verdicts(...every30(new Map([...good, ['q5', keyless('q5')]])))).toEqual(['TWICE (write rows with no key)']);
+      // The held send's row answered ok instead, though deleted before the end, is FALSE-ANSWER.
+      expect(verdicts(...every30(new Map([...good, ['q4', keyless('q4')]])))).toEqual(['FALSE-ANSWER (write rows with no key)']);
+
+      // A snapshot that caught a row's body before the claim judges that row by its key.
+      const caught = [snap(1, [keyed('q1', 1), keyed('q9', 1)]), ...run.slice(1)];
+      const union = listing(...caught).rows;
+      expect(union.find(r => r.id === 'q1')).toEqual({ id: 'q1', op: 'write', state: 'done', key: u('a', 1), h: hashOf(content(1)), taken: true, reply: REPLIES.ok });
+      expect(union.find(r => r.id === 'q9')).toEqual({ id: 'q9', op: 'write', state: 'pending', key: u('a', 1), h: hashOf(content(1)), taken: false, reply: null });
+      expect(verdicts(...caught)).toEqual([]);
+      const caughtTwice = [snap(1, [keyed('q1', 1), keyed('q9', 1)]), ...every30(new Map([...good, ['q9', keyless('q9', null, 'applying')]])).slice(1)];
+      expect(verdicts(...caughtTwice)).toEqual([`TWICE ${u('a', 1)}`]);
+      // The latest snapshot gives the state, whatever order the file holds them in.
+      const later = listing(snap(65, [keyless('q1')]), snap(35, [keyless('q1', null, 'applying')])).rows;
+      expect(later).toEqual([{ id: 'q1', op: 'write', state: 'done', key: null, h: null, taken: true, reply: REPLIES.ok }]);
+
+      // Snapshots that may have missed a deleted row are inconclusive, never a pass.
+      const reasons = (...snaps: string[][]) => judged(...snaps).inconclusive.join('\n');
+      expect(reasons(last)).toMatch(/first snapshot was taken 305 s after the run started/);
+      expect(reasons(...run.filter((_, i) => i < 4 || i > 6))).toMatch(/120 s between two snapshots, more than 110 s/);
+      expect(reasons(...run.slice(0, 9))).toMatch(/last snapshot was not taken at least 30 s after the run's last end line/);
+      expect(reasons(...run.slice(0, 10)), 'a last snapshot at the end, less than 30 s after it').toMatch(/last snapshot was not taken at least 30 s after the run's last end line/);
+      expect(reasons(...run)).toBe('');
+      expect(reasons([...good.values()])).toMatch(/req holds no snapshot line/);
+      // Over such snapshots no count verdict is given; a verdict the listed rows prove by their ids still is.
+      const gapped = run.filter((_, i) => i < 4 || i > 8);
+      expect(listing(...gapped).rows.map(r => r.id)).toEqual(['q1', 'q3', 'q4']);
+      const gap = judged(...gapped);
+      expect(gap.verdicts).toEqual([]);
+      expect(gap.result).toBe('INCONCLUSIVE');
+      expect(gap.inconclusive.join('\n')).toMatch(/180 s between two snapshots, more than 110 s/);
+      expect(gap.inconclusive.join('\n')).toMatch(/req: the answers of sends that no listed row proves, and the counts of rows with no key, were not judged/);
+      const phantom = JSON.stringify({ id: 'q7', op: 'write', state: 'done', k: u('a', 7), c: JSON.stringify(content(7)), taken: true, reply: REPLIES.ok });
+      expect(verdicts(...gapped.slice(0, 4), snap(250, [phantom]), ...gapped.slice(4))).toEqual([`PHANTOM ${u('a', 7)}`]);
+      const twice = [snap(1, [keyed('q1', 1), keyed('q9', 1)]), ...every30(new Map([...good, ['q9', keyless('q9', null, 'applying')]])).filter((_, i) => i < 4 || i > 8)];
+      expect(verdicts(...twice), 'two started rows of one keyed send').toEqual([`TWICE ${u('a', 1)}`]);
+      // A snapshot cut short, miscounted or contradicting another is refused.
+      expect(() => listing(...run, [keyless('q8')])).toThrow(/cut short/);
+      expect(() => J.parseRequests('req', [keyless('q8'), JSON.stringify({ snapshot: iso(5), rows: 2 })].join('\n'))).toThrow(/counts 2/);
+      expect(() => J.parseRequests('req', JSON.stringify({ snapshot: 'soon', rows: 0 }))).toThrow(/snapshot line that needs/);
+      expect(() => listing(snap(5, [keyless('q1'), keyless('q1')]))).toThrow(/row q1 twice in one snapshot/);
+      expect(() => listing(snap(5, [keyed('q1', 1)]), snap(35, [keyed('q1', 2)]))).toThrow(/two different bodies/);
     } },
   ];
 }

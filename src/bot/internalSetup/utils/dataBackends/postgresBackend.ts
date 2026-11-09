@@ -33,7 +33,7 @@ import type {
   RetireOutcome,
 } from './backend';
 
-export const SCHEMA_VERSION = 9;
+export const SCHEMA_VERSION = 10;
 const PROVISION_VERDICT_POLL_MS = 250;
 const PARTITION_COUNT = 32;
 const MAX_ROWS_PER_STATEMENT = 200;
@@ -204,7 +204,9 @@ export function provisionDdl(s: string): string[] {
     shard_count   integer     NOT NULL,
     shard_id      integer     NOT NULL,
     for_process   text        NOT NULL,
-    op            text        NOT NULL CHECK (op IN ('write','delete','delete-namespace','restore-graveyard')),
+    op            text        NOT NULL CHECK (op IN ('write','delete','delete-namespace','restore-graveyard',
+                                'panel:execute','panel:button','panel:dropdown','panel:modal','command:invoke',
+                                'guild:channels','guild:roles','panel:list','panel:live','guild:membership')),
     body          text        NOT NULL,
     requested_by  text        NOT NULL,
     state         text        NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','applying','done','expired')),

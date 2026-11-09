@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { pollShim } from '../helpers/nb15PollShim';
 
 import {
   _resetGuildRequests,
@@ -32,6 +33,7 @@ const lost = () => new Error('Connection terminated unexpectedly');
 
 let sent: Sent[] = [];
 let script: (sql: string) => unknown = () => undefined;
+const shim = pollShim(() => script);
 
 function answerOf(value: unknown): Promise<any> {
   if (value instanceof Error) return Promise.reject(value);
@@ -48,9 +50,9 @@ function install(): void {
     requestDb: (): RequestDb => ({
       connect: async () => ({
         server: 'S1',
-        query: (sql: string) => {
+        query: (sql: string, values: unknown[]) => {
           sent.push({ sql, server: 'S1' });
-          return answerOf(script(sql));
+          return answerOf(shim(sql, values));
         },
         release: () => undefined,
       }),

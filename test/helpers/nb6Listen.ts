@@ -12,10 +12,12 @@ export class FakeListenClient extends EventEmitter {
   destroyed = false;
   /** A query's answer: undefined answers at once, an Error rejects, 'hang' never answers. */
   answer: (text: string) => Step | undefined = () => undefined;
-  readonly connection = { stream: { destroy: () => { this.destroyed = true; } } };
+  readonly connection: { stream: { remoteAddress?: string; destroy: () => void } };
 
-  constructor(readonly config: Record<string, unknown>, private readonly connectStep: Step) {
+  /** remoteAddress: the peer the connected socket reports (NB15 decision 21); unset when none is known. */
+  constructor(readonly config: Record<string, unknown>, private readonly connectStep: Step, remoteAddress?: string) {
     super();
+    this.connection = { stream: { remoteAddress, destroy: () => { this.destroyed = true; } } };
   }
 
   connect(): Promise<void> {
@@ -45,11 +47,14 @@ export class FakeListenClient extends EventEmitter {
 export function listenRig() {
   const clients: FakeListenClient[] = [];
   const plan: Step[] = [];
+  /** The peer of each next client, in order; none known once it runs out. */
+  const peers: string[] = [];
   return {
     clients,
     plan,
+    peers,
     factory: (config: Record<string, unknown>) => {
-      const client = new FakeListenClient(config, plan.shift() ?? 'ok');
+      const client = new FakeListenClient(config, plan.shift() ?? 'ok', peers.shift());
       clients.push(client);
       return client;
     },

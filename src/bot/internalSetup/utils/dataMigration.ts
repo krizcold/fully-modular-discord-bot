@@ -47,6 +47,8 @@ export const MAX_BATCH_BYTES = 16 * 1024 * 1024;
 const BIGINT_MAX = 9223372036854775807n;
 const KEEPALIVES = '-c tcp_keepalives_idle=30 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=3';
 const WEBUI_READER_APP = 'smdb-webui-reader';
+/** NB15 decision 15: the web UI's panel listener reads and writes no data. */
+export const WEBUI_LISTEN_APP = 'smdb-webui-listen';
 const MIGRATE_APP = 'smdb-migrate:';
 const GUILD_TABLES = 'smdb_data.guild_data, smdb_data.guild_append, smdb_data.guild_data_graveyard, smdb_data.guild_ownership';
 /** NB6 decision 39: the shared tables the SHARE lock and the retirement's ACCESS EXCLUSIVE lock also name. */
@@ -971,7 +973,7 @@ async function candidateSessions(session: PgSession, jobId: string): Promise<Arr
   await session.query('SELECT pg_stat_clear_snapshot()');
   const res = await session.query(
     `SELECT pid, ${BACKEND_START} AS started, coalesce(application_name, '') AS app FROM pg_stat_activity WHERE usename = current_user AND backend_type = 'client backend' AND pid <> pg_backend_pid() AND coalesce(application_name, '') <> ALL($1::text[])`,
-    [[`smdb-migrate:${jobId}`, WEBUI_READER_APP]]);
+    [[`smdb-migrate:${jobId}`, WEBUI_READER_APP, WEBUI_LISTEN_APP]]);
   return res.rows.map(r => ({ pid: Number(r.pid), started: String(r.started ?? ''), app: String(r.app ?? '') }));
 }
 

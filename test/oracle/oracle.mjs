@@ -5,6 +5,8 @@
  * section 5). Subcommands:
  *   write    numbered saves through each lane's operator data route, every
  *            answer logged as ACKED, HELD, REFUSED or UNKNOWN
+ *   act      panel button presses and command invokes, each answer classed
+ *            by the panel and invoke routes' rule (NB15 test 12)
  *   read     the run's docs through one node's app read path (a copy)
  *   fleet    the control facts the checker needs, from one node
  *   mirror   one machine's mirror files of the run's shared files (a copy)
@@ -211,11 +213,14 @@ const DEFINITE_REFUSALS = [
  * The operator route's answer (routes/config.ts sendHopReply): 200 is
  * committed, 202 is accepted but not yet durable, anything else refused, and
  * no answer at all is unknown.
+ * The panel and invoke routes (NB15 ruling 10, route 'panel') are judged by the answer's code and ran: a holder's text
+ * after "On <name>: " can be a module's own words, so no substring makes their failure definite.
  * @param {number} status
  * @param {any} body
+ * @param {'data' | 'panel'} [route]
  * @returns {Answer}
  */
-export function classifyAnswer(status, body) {
+export function classifyAnswer(status, body, route = 'data') {
   if (status === 0) return { cls: 'UNKNOWN', definite: false };
   const ok = body !== null && typeof body === 'object' && body.success === true;
   if (status === 200 && ok && body.pending !== true) return { cls: 'ACKED', definite: true };
@@ -223,8 +228,17 @@ export function classifyAnswer(status, body) {
   const error = body !== null && typeof body === 'object' && typeof body.error === 'string' ? body.error : '';
   // 400 is validation, 413 a body limit in front of the app and 429 the rate limiter: all before the route runs.
   const early = status === 400 || status === 413 || status === 429;
+  if (route === 'panel') {
+    const b = body !== null && typeof body === 'object' ? body : {};
+    if (b.code === 'no-answer' || b.noAnswer !== undefined) return { cls: 'UNKNOWN', definite: false };
+    if (b.ran === false || (typeof b.code === 'string' && DEFINITE_CODES.includes(b.code))) return { cls: 'REFUSED', definite: true };
+    return { cls: 'REFUSED', definite: early && b.ran !== true };
+  }
   return { cls: 'REFUSED', definite: early || DEFINITE_REFUSALS.some(text => error.includes(text)) };
 }
+
+// NB15: the codes of a panel or invoke answer that prove nothing ran.
+const DEFINITE_CODES = ['not-taken', 'no-holder', 'backend-unavailable', 'invalid', 'not-allowed', 'member-panel-off', 'not-ready', 'insecure-transport', 'not-held'];
 
 /**
  * A token bucket mirroring the web UI's limiter: taking a token before every
@@ -485,34 +499,9 @@ async function write(argv) {
   const buckets = new Map();
   for (const l of lanes) if (!buckets.has(l.base)) buckets.set(l.base, bucket(limiterSpec));
 
-  // A file log gets each line before the request it names goes out, so it
-  // holds every request even if the writer is killed. A stream (stdout) can
-  // be cut on its way, so the checker refuses one with no end line.
-  const sinks = (a.log.length > 0 ? a.log : ['-']).map((/** @type {string} */ target) => ({ write: openOut(target), sink: target === '-' ? 'stream' : 'file' }));
-  // A line that cannot be written ends the writer at once: no lane goes on,
-  // nothing follows the half line, and no end line can claim a whole log.
-  /** @param {(sink: string) => object} lineFor */
-  const writeAll = lineFor => {
-    try {
-      for (const s of sinks) s.write(lineFor(s.sink));
-    } catch (error) {
-      console.error(`oracle write: a log line could not be written, so the writer stops at once: ${error instanceof Error ? error.message : String(error)}`);
-      process.exit(64);
-    }
-  };
-  const emit = (/** @type {object} */ event) => writeAll(() => event);
-  const clock = () => Math.round(performance.now() * 1000) / 1000;
-  // stop: no new requests; cut: in-flight requests end, logged as unknown.
-  const stop = new AbortController();
-  const cut = new AbortController();
-  const halt = () => {
-    if (stop.signal.aborted) return;
-    stop.abort();
-    setTimeout(() => cut.abort(), STOP_GRACE_MS).unref();
-  };
+  const frame = writerFrame('write', a.log);
+  const { writeAll, emit, clock, stop, cut, openWindows, sleep } = frame;
   let seq = 0;
-  /** @type {string[]} */
-  const openWindows = [];
   /** @type {Record<string, any>} */
   const counts = { ACKED: 0, HELD: 0, REFUSED: 0, UNKNOWN: 0, reads: 0, readErrors: 0 };
   // The shared writes' own counts: the guild checks count only the guild lines.
@@ -546,26 +535,8 @@ async function write(argv) {
     return content;
   };
 
-  /** @param {number} ms */
-  const sleep = async ms => {
-    try {
-      await delay(ms, undefined, { signal: stop.signal });
-    } catch {
-      // stopped
-    }
-  };
-
   /** A token for this lane's node, or false once the writer is stopping. @param {{ base: string }} lane */
-  const ready = async lane => {
-    // Checked first: a bucket with tokens left answers at once without looking at the signal.
-    if (stop.signal.aborted) return false;
-    try {
-      await /** @type {Bucket} */ (buckets.get(lane.base)).take(stop.signal);
-      return true;
-    } catch {
-      return false;
-    }
-  };
+  const ready = lane => frame.ready(/** @type {Bucket} */ (buckets.get(lane.base)));
 
   /**
    * The loadedSha a guild write sends, as the editor gets it: the sha of the node's read, 'absent' when the read
@@ -599,10 +570,11 @@ async function write(argv) {
       ? await call('POST', `${lane.base}/api/config/data/update`, { file: fileId(op.key), guildId: guild, data: op.content, loadedSha }, timeoutMs, cut.signal)
       : await call('POST', `${lane.base}/api/config/data/delete`, { file: fileId(op.key), guildId: guild }, timeoutMs, cut.signal);
     if (r.status === 429) buckets.get(lane.base)?.empty();
-    const answer = classifyAnswer(r.status, r.body);
+    const answer = classifyAnswer(r.status, r.body, 'data');
     counts[answer.cls] += 1;
     const err = r.err ?? (r.body && typeof r.body.error === 'string' ? r.body.error.slice(0, 200) : undefined);
-    emit({ t: 'ans', id, at: clock(), status: r.status, cls: answer.cls, definite: answer.definite, err, date: r.date });
+    const remote = r.body !== null && typeof r.body === 'object' && typeof r.body.servedBy === 'string' ? { remote: true } : {};
+    emit({ t: 'ans', id, at: clock(), status: r.status, cls: answer.cls, definite: answer.definite, err, date: r.date, ...remote });
     return answer;
   };
 
@@ -657,7 +629,7 @@ async function write(argv) {
     emit({ t: 'shared-send', id, lane: lane.name, key, c, h: hashOf(content), prev, base: r.body.sha, size: canonical(content).length, content, at: clock() });
     const w = await call('POST', `${lane.base}/api/config/data/update`, { file: key, data: content, loadedSha: r.body.sha }, timeoutMs, cut.signal);
     if (w.status === 429) buckets.get(lane.base)?.empty();
-    const answer = classifyAnswer(w.status, w.body);
+    const answer = classifyAnswer(w.status, w.body, 'data');
     sharedCounts[answer.cls] += 1;
     const err = w.err ?? (w.body && typeof w.body.error === 'string' ? w.body.error.slice(0, 200) : undefined);
     emit({ t: 'shared-ans', id, at: clock(), status: w.status, cls: answer.cls, definite: answer.definite, err, date: w.date });
@@ -734,11 +706,80 @@ async function write(argv) {
     }
   };
 
+  await runFrame(frame, { marks: a.marks, marksEvery, duration }, () => ({ counts }), () => Promise.all(lanes.map(runLane)));
+}
+
+/**
+ * What `write` and `act` share: the log sinks, the clock, the stop and the windows the marks file has open.
+ * @param {string} command
+ * @param {string[]} targets
+ */
+function writerFrame(command, targets) {
+  // A file log gets each line before the request it names goes out, so it
+  // holds every request even if the writer is killed. A stream (stdout) can
+  // be cut on its way, so the checker refuses one with no end line.
+  const sinks = (targets.length > 0 ? targets : ['-']).map(target => ({ write: openOut(target), sink: target === '-' ? 'stream' : 'file' }));
+  // A line that cannot be written ends the writer at once: no lane goes on,
+  // nothing follows the half line, and no end line can claim a whole log.
+  /** @param {(sink: string) => object} lineFor */
+  const writeAll = lineFor => {
+    try {
+      for (const s of sinks) s.write(lineFor(s.sink));
+    } catch (error) {
+      console.error(`oracle ${command}: a log line could not be written, so the writer stops at once: ${error instanceof Error ? error.message : String(error)}`);
+      process.exit(64);
+    }
+  };
+  const emit = (/** @type {object} */ event) => writeAll(() => event);
+  const clock = () => Math.round(performance.now() * 1000) / 1000;
+  // stop: no new requests; cut: in-flight requests end, logged as unknown.
+  const stop = new AbortController();
+  const cut = new AbortController();
+  const halt = () => {
+    if (stop.signal.aborted) return;
+    stop.abort();
+    setTimeout(() => cut.abort(), STOP_GRACE_MS).unref();
+  };
+  /** @type {string[]} */
+  const openWindows = [];
+  /** @param {number} ms */
+  const sleep = async ms => {
+    try {
+      await delay(ms, undefined, { signal: stop.signal });
+    } catch {
+      // stopped
+    }
+  };
+  /** A token from the node's bucket, or false once the writer is stopping. @param {Bucket} limit */
+  const ready = async limit => {
+    // Checked first: a bucket with tokens left answers at once without looking at the signal.
+    if (stop.signal.aborted) return false;
+    try {
+      await limit.take(stop.signal);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  return { writeAll, emit, clock, stop, cut, halt, openWindows, sleep, ready };
+}
+
+/**
+ * Runs a writer's lanes until they stop, with the marks file polled, the stop signals and --duration, then writes the
+ * end line.
+ * @param {ReturnType<typeof writerFrame>} frame
+ * @param {{ marks?: string, marksEvery: number, duration: number }} opts
+ * @param {() => object} endFields
+ * @param {() => Promise<unknown>} runLanes
+ */
+async function runFrame(frame, opts, endFields, runLanes) {
+  const { emit, clock, halt, openWindows } = frame;
+  const { marksEvery, duration } = opts;
   /** @type {NodeJS.Timeout | undefined} */
   let marksTimer;
   let pollMarks = () => {};
-  if (a.marks) {
-    const marksFile = /** @type {string} */ (a.marks);
+  if (opts.marks) {
+    const marksFile = opts.marks;
     if (!fs.existsSync(marksFile)) fs.writeFileSync(marksFile, '');
     let offset = fs.statSync(marksFile).size;
     let partial = '';
@@ -776,7 +817,7 @@ async function write(argv) {
   const finish = () => {
     // An end mark written just before the stop is not lost between two polls.
     pollMarks();
-    emit({ t: 'end', at: clock(), endedAt: new Date().toISOString(), counts });
+    emit({ t: 'end', at: clock(), endedAt: new Date().toISOString(), ...endFields() });
   };
   let signals = 0;
   const onSignal = () => {
@@ -794,11 +835,136 @@ async function write(argv) {
   /** @type {NodeJS.Timeout | undefined} */
   const timer = duration > 0 ? setTimeout(halt, duration * 1000) : undefined;
 
-  await Promise.all(lanes.map(runLane));
+  await runLanes();
   if (timer) clearTimeout(timer);
   if (marksTimer) clearInterval(marksTimer);
   finish();
   for (const signal of STOP_SIGNALS) process.off(signal, onSignal);
+}
+
+/**
+ * The nonce one action carries (NB15 test 12): a panel button sends it after a colon in its button id, an invoke as
+ * a command option. It starts with `act_`, which no run's `<run>-` prefix can match, so the guild listing never
+ * holds an action's docs.
+ * @param {string} run @param {string} lane @param {number} n
+ */
+export const actionNonce = (run, lane, n) => `act_${run}_${lane}_${n}`;
+/** A doc the oracle's action module saves for one run of an action: `<nonce>.<tag>.json`, one per run. */
+export const ACTION_DOC = /^(act_[a-z0-9]+_[a-z0-9]+_\d+)\.[A-Za-z0-9_-]+\.json$/;
+const PANEL_ID = /^[a-zA-Z0-9._-]{1,99}$/;
+const BUTTON_ID = /^[a-zA-Z0-9._\-/:]{1,100}$/;
+const COMMAND = /^[\w-]{1,64}$/;
+const OPTION = /^[a-z0-9_-]{1,32}$/;
+
+/**
+ * The listing of one run's action docs, one {"k": filename, "d": doc} line per row under `psql -At`: the input
+ * check.mjs takes as --actions.
+ * @param {string} guild
+ * @param {string} run
+ */
+export function actionsSql(guild, run) {
+  if (!/^\d{5,20}$/.test(guild) || !RUN_ID.test(run)) throw new Error('actionsSql needs a guild id and a run id');
+  const prefix = `act_${run}_`;
+  return `SELECT json_build_object('k', filename, 'd', doc) FROM smdb_data.guild_data WHERE guild_id = '${guild}' AND module = '${MODULE}' AND left(filename, ${prefix.length}) = '${prefix}' ORDER BY filename`;
+}
+
+const ACT_USAGE = `oracle.mjs act --run ID --guild ID --lane NAME=URL [--lane NAME=URL ...] --panel ID --button ID --command NAME
+  [--option NAME (nonce)] [--channel ID] [--button-ratio R (0.5)] [--duration S (600, 0 = until stopped)]
+  [--rate ACTIONS_PER_S (0.5, per lane)] [--seed N] [--marks FILE] [--marks-every MS (50)] [--burst X (4)]
+  [--limiter CAPACITY/MS (${LIMITER}) | off] [--timeout MS (100000)] [--log FILE (- = stdout, the default; may repeat)]`;
+
+/**
+ * NB15 test 12: panel button presses and command invokes through each lane's web UI, for a guild another bot process
+ * may hold, each answer classed by the panel and invoke routes' rule (classifyAnswer's 'panel' route).
+ * @param {string[]} argv
+ */
+async function act(argv) {
+  const a = parseArgs(argv, {
+    run: 'one', guild: 'one', lane: 'many', panel: 'one', button: 'one', command: 'one', option: 'one', channel: 'one',
+    'button-ratio': 'one', duration: 'one', rate: 'one', seed: 'one', marks: 'one', 'marks-every': 'one', burst: 'one',
+    limiter: 'one', timeout: 'one', log: 'many',
+  });
+  if (!RUN_ID.test(a.run ?? '')) throw new Error('--run must be 1 to 24 of a-z and 0-9');
+  checkGuild(a.guild);
+  if (!PANEL_ID.test(a.panel ?? '')) throw new Error('--panel must be a panel id');
+  if (!BUTTON_ID.test(a.button ?? '')) throw new Error('--button must be a button id of at most 100 characters');
+  if (!COMMAND.test(a.command ?? '')) throw new Error('--command must be a command name');
+  const option = a.option ?? 'nonce';
+  if (!OPTION.test(option)) throw new Error('--option must be a command option name');
+  if (a.channel !== undefined && !/^\d{17,19}$/.test(a.channel)) throw new Error('--channel must be a channel id');
+  if (a.lane.length === 0) throw new Error('at least one --lane NAME=URL is needed');
+  const lanes = a.lane.map((/** @type {string} */ spec, /** @type {number} */ index) => {
+    const eq = spec.indexOf('=');
+    const name = spec.slice(0, eq);
+    if (eq < 0 || !LANE_NAME.test(name)) throw new Error(`--lane ${spec}: NAME must be 1 to 12 of a-z and 0-9`);
+    return { name, base: checkBase(spec.slice(eq + 1)), index };
+  });
+  if (new Set(lanes.map((/** @type {{ name: string }} */ l) => l.name)).size !== lanes.length) throw new Error('lane names must differ');
+  const run = /** @type {string} */ (a.run);
+  const guild = /** @type {string} */ (a.guild);
+  const duration = num(a.duration, 'duration', 600);
+  const rate = num(a.rate, 'rate', 0.5);
+  const buttonRatio = num(a['button-ratio'], 'button-ratio', 0.5);
+  const burst = Math.max(1, num(a.burst, 'burst', 4));
+  const limiterSpec = a.limiter ?? LIMITER;
+  // Above the routes' own bound (a 30 s local wait plus T, 60 s): the route answers before the writer gives up.
+  const timeoutMs = num(a.timeout, 'timeout', 100000);
+  const marksEvery = Math.max(1, num(a['marks-every'], 'marks-every', 50));
+  const seed = a.seed !== undefined ? Math.floor(num(a.seed, 'seed', 0)) : Math.floor(Math.random() * 2 ** 31);
+  if (rate <= 0) throw new Error('--rate must be above 0');
+  if (buttonRatio > 1) throw new Error('--button-ratio must stay at or under 1');
+  /** @type {Map<string, Bucket>} */
+  const buckets = new Map();
+  for (const l of lanes) if (!buckets.has(l.base)) buckets.set(l.base, bucket(limiterSpec));
+
+  const frame = writerFrame('act', a.log);
+  const { writeAll, emit, clock, stop, cut, openWindows, sleep } = frame;
+  let seq = 0;
+  // The end line's guild counts stay zero: an act log holds no data write, and its own counts go under `act`.
+  /** @type {Record<string, number>} */
+  const actCounts = { ACKED: 0, HELD: 0, REFUSED: 0, UNKNOWN: 0 };
+  const counts = { ACKED: 0, HELD: 0, REFUSED: 0, UNKNOWN: 0, reads: 0, readErrors: 0, act: actCounts };
+  const startLine = {
+    t: 'start', v: LOG_VERSION, mode: 'act', run, guild, module: MODULE, seed, startedAt: new Date().toISOString(),
+    lanes: lanes.map((/** @type {{ name: string, base: string }} */ l) => ({ name: l.name, route: 'act', base: l.base })),
+    settings: {
+      duration, rate, buttonRatio, burst, limiter: limiterSpec, timeoutMs, marksEvery,
+      panel: a.panel, button: a.button, command: a.command, option, ...(a.channel ? { channel: a.channel } : {}),
+    },
+  };
+  writeAll(sink => ({ ...startLine, sink }));
+
+  /** @param {{ name: string, base: string, index: number }} lane */
+  const runLane = async lane => {
+    const rand = prng((seed ^ Math.imul(lane.index + 1, 0x9e3779b1)) >>> 0);
+    let n = 0;
+    while (!stop.signal.aborted) {
+      const kind = rand() < buttonRatio ? 'button' : 'invoke';
+      if (!(await frame.ready(/** @type {Bucket} */ (buckets.get(lane.base))))) break;
+      n += 1;
+      const nonce = actionNonce(run, lane.name, n);
+      const id = ++seq;
+      const channel = a.channel ? { channelId: a.channel } : {};
+      emit({ t: 'act-send', id, lane: lane.name, kind, nonce, at: clock() });
+      const r = kind === 'button'
+        ? await call('POST', `${lane.base}/api/panels/button`, { panelId: a.panel, buttonId: `${a.button}:${nonce}`, userId: 'web-ui-owner', guildId: guild, ...channel }, timeoutMs, cut.signal)
+        : await call('POST', `${lane.base}/api/commands/invoke`, { command: a.command, guildId: guild, options: { [option]: nonce }, ...channel }, timeoutMs, cut.signal);
+      if (r.status === 429) buckets.get(lane.base)?.empty();
+      const answer = classifyAnswer(r.status, r.body, 'panel');
+      actCounts[answer.cls] += 1;
+      const b = r.body !== null && typeof r.body === 'object' ? r.body : {};
+      const err = r.err ?? (typeof b.error === 'string' ? b.error.slice(0, 200) : undefined);
+      emit({
+        t: 'act-ans', id, at: clock(), status: r.status, cls: answer.cls, definite: answer.definite, err, date: r.date,
+        ...(typeof b.code === 'string' ? { code: b.code } : {}), ...(typeof b.ran === 'boolean' ? { ran: b.ran } : {}),
+        ...(typeof b.truth === 'string' ? { truth: b.truth } : {}),
+      });
+      const interval = 1000 / rate / (openWindows.length > 0 ? burst : 1);
+      await sleep(interval * (0.5 + rand()));
+    }
+  };
+
+  await runFrame(frame, { marks: a.marks, marksEvery, duration }, () => ({ counts }), () => Promise.all(lanes.map(runLane)));
 }
 
 /**
@@ -813,17 +979,30 @@ function keysFromLogs(files) {
   const runs = new Set();
   /** @type {Set<string>} */
   const guilds = new Set();
+  /** @type {string[]} */
+  const starts = [];
+  /** @type {string[]} */
+  const ends = [];
+  let unended = false;
   for (const file of files) {
+    let ended = false;
     for (const e of parseLog(fs.readFileSync(file, 'utf8'))) {
       if (e.t === 'start') {
         runs.add(e.run);
         guilds.add(e.guild);
+        if (typeof e.startedAt === 'string') starts.push(e.startedAt);
+      }
+      if (e.t === 'end' && typeof e.endedAt === 'string') {
+        ends.push(e.endedAt);
+        ended = true;
       }
       if (e.t === 'send') keys.add(e.key);
     }
+    if (!ended) unended = true;
   }
   if (runs.size !== 1 || guilds.size !== 1) throw new Error('the logs must hold exactly one run on one guild');
-  return { keys: [...keys].sort(), run: [...runs][0], guild: [...guilds][0] };
+  const span = { from: starts.sort()[0] ?? null, to: unended ? null : ends.sort().at(-1) ?? null };
+  return { keys: [...keys].sort(), run: [...runs][0], guild: [...guilds][0], span };
 }
 
 /** @param {string} what @param {number} count */
@@ -950,7 +1129,7 @@ async function cleanup(argv) {
   const tally = {};
   for (const key of keys) {
     const r = await paced(limiter, () => call('POST', `${base}/api/config/data/delete`, { file: fileId(key), guildId: guild }, timeoutMs));
-    const cls = classifyAnswer(r.status, r.body).cls;
+    const cls = classifyAnswer(r.status, r.body, 'data').cls;
     tally[cls] = (tally[cls] ?? 0) + 1;
   }
   console.error(`cleanup of ${keys.length} docs: ${JSON.stringify(tally)}`);
@@ -985,20 +1164,37 @@ export function reshardSql() {
   return `SELECT jsonb_build_object('rows', COALESCE((SELECT jsonb_agg(jsonb_build_object('attempt', r.attempt::text, 'state', r.state, 'from', r.from_count, 'to', r.to_count, 'fromRows', (SELECT count(*) FROM smdb_data.shard_claims c WHERE c.shard_count = r.from_count)) ORDER BY r.id) FROM smdb_data.reshard r WHERE r.attempt IS NOT NULL), '[]'::jsonb), 'meta', (SELECT (m.value::jsonb ->> 'count')::int FROM smdb_data.meta m WHERE m.key = 'shard_count'))`;
 }
 
+export const ISO_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$/;
+
 /**
- * The request listing of one run, one line per smdb_data.guild_requests row
- * of a write or a delete of the run's docs under `psql -At`: its id, op and
- * state, the body's filename ("k") and contentJson ("c", null for a delete),
- * whether a holder took it ("taken") and the holder's reply. The input
- * check.mjs takes as --requests.
+ * One snapshot of the request rows of one run, one line per
+ * smdb_data.guild_requests row of a write or a delete of the run's docs under
+ * `psql -At`: its id, op and state, the body's filename ("k") and contentJson
+ * ("c", null for a delete), whether a holder took it ("taken") and the
+ * holder's reply; then one line with the database's time ("snapshot") and the
+ * count of row lines ("rows"). A holder's claim empties the body (NB15
+ * decision 16), so a row a holder took is listed with "k" and "c" null when it
+ * was made inside the run's span (the logs' first start and last end, 30 s
+ * either side for the clocks of two hosts; no end bounds nothing). The
+ * cleanup deletes an answered row 2 minutes after its answer, so the snapshots
+ * are taken every 30 s during the run and once at its end, appended to one
+ * file: the input check.mjs takes as --requests.
  * @param {string} guild
  * @param {string} run
+ * @param {{ from: string | null, to: string | null }} span
  */
-export function requestsSql(guild, run) {
+export function requestsSql(guild, run, span) {
   if (!/^\d{5,20}$/.test(guild) || !RUN_ID.test(run)) throw new Error('requestsSql needs a guild id and a run id');
+  if (!span || typeof span.from !== 'string' || !ISO_TIME.test(span.from) || (span.to !== null && (typeof span.to !== 'string' || !ISO_TIME.test(span.to)))) {
+    throw new Error("requestsSql needs the run's span: the start line's startedAt and the end line's endedAt or null");
+  }
   const prefix = `${run}-`;
-  const field = (/** @type {string} */ name) => `(body::jsonb ->> '${name}')`;
-  return `SELECT json_build_object('id', id, 'op', op, 'state', state, 'k', ${field('filename')}, 'c', ${field('contentJson')}, 'taken', taken_at IS NOT NULL, 'reply', reply) FROM smdb_data.guild_requests WHERE guild_id = '${guild}' AND op IN ('write', 'delete') AND ${field('module')} = '${MODULE}' AND left(${field('filename')}, ${prefix.length}) = '${prefix}' ORDER BY created_at, id`;
+  const field = (/** @type {string} */ name) => `(r.b ->> '${name}')`;
+  const ours = `${field('module')} = '${MODULE}' AND left(${field('filename')}, ${prefix.length}) = '${prefix}'`;
+  const inSpan = `r.created_at >= '${span.from}'::timestamptz - interval '30 seconds'${span.to === null ? '' : ` AND r.created_at <= '${span.to}'::timestamptz + interval '30 seconds'`}`;
+  const rows = `SELECT r.created_at, r.id, json_build_object('id', r.id, 'op', r.op, 'state', r.state, 'k', ${field('filename')}, 'c', ${field('contentJson')}, 'taken', r.taken_at IS NOT NULL, 'reply', r.reply) AS line FROM (SELECT q.*, NULLIF(q.body, '')::jsonb AS b FROM smdb_data.guild_requests q WHERE q.guild_id = '${guild}' AND q.op IN ('write', 'delete')) r WHERE (r.b IS NOT NULL AND ${ours}) OR (r.b IS NULL AND r.taken_at IS NOT NULL AND ${inSpan})`;
+  const snapshot = `json_build_object('snapshot', to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'), 'rows', (SELECT count(*) FROM l))`;
+  return `WITH l AS (${rows}) SELECT s.line FROM (SELECT 0 AS o, l.created_at, l.id, l.line FROM l UNION ALL SELECT 1, NULL, NULL, ${snapshot}) s ORDER BY s.o, s.created_at, s.id`;
 }
 
 /** @param {string[]} argv */
@@ -1021,10 +1217,16 @@ async function sql(argv) {
     process.stdout.write(`${sharedDumpSql(sharedIdsOf(r.log.map((/** @type {string} */ f) => parseLog(fs.readFileSync(f, 'utf8')))))}\n`);
     return;
   }
-  if (argv[0] === 'requests') {
+  if (argv[0] === 'actions') {
     const r = parseArgs(argv.slice(1), { log: 'many' });
     const { run, guild } = keysFromLogs(r.log);
-    process.stdout.write(`${requestsSql(guild, run)}\n`);
+    process.stdout.write(`${actionsSql(guild, run)}\n`);
+    return;
+  }
+  if (argv[0] === 'requests') {
+    const r = parseArgs(argv.slice(1), { log: 'many' });
+    const { run, guild, span } = keysFromLogs(r.log);
+    process.stdout.write(`${requestsSql(guild, run, span)}\n`);
     return;
   }
   const a = parseArgs(argv, { log: 'many' });
@@ -1090,13 +1292,15 @@ async function bite(argv) {
 }
 
 const USAGE = `${WRITE_USAGE}
+${ACT_USAGE}
 oracle.mjs read --log FILE [--log FILE ...] --target URL --name COPY --out FILE [--limit N] [--limiter SPEC] [--timeout MS]
 oracle.mjs fleet --target URL --name NODE --out FILE [--limiter SPEC] [--timeout MS]
 oracle.mjs sql --log FILE      the psql query that lists the run's docs
 oracle.mjs sql ownership       the psql query that lists the claim sequence and the highest stored claims
 oracle.mjs sql claims          the psql query that lists shard_claims
 oracle.mjs sql reshard         the psql query that lists the reshard attempt, its old rows and meta 'shard_count'
-oracle.mjs sql requests --log FILE  the psql query that lists the run's rows of guild_requests
+oracle.mjs sql requests --log FILE  the psql query that lists one snapshot of the run's rows of guild_requests
+oracle.mjs sql actions --log FILE   the psql query that lists the docs an act run's actions saved
 oracle.mjs sql shared --log FILE    the psql query that lists the run's shared files in smdb_data.shared_docs
 oracle.mjs mirror --log FILE [--log FILE ...] --data DIR --name MACHINE --out FILE  one machine's mirror files of the run's shared files
 oracle.mjs bite --log FILE     the bite test's two tamperings, as SQL
@@ -1105,7 +1309,7 @@ oracle.mjs cleanup --log FILE [--log FILE ...] --target URL [--limiter SPEC]`;
 /** @param {string[]} argv */
 export async function main(argv) {
   const [command, ...rest] = argv;
-  const commands = { write, read, fleet, sql, mirror, bite, cleanup };
+  const commands = { write, act, read, fleet, sql, mirror, bite, cleanup };
   const fn = /** @type {Record<string, (argv: string[]) => Promise<void>>} */ (commands)[command ?? ''];
   if (!fn) {
     console.error(USAGE);

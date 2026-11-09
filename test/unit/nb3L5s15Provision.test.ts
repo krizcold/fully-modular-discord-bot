@@ -49,7 +49,7 @@ describe('provisionStoreInTransaction', () => {
 
   it('stores the schema version and the store id it answers', async () => {
     const { id, sent } = await provision();
-    expect(SCHEMA_VERSION).toBe(9);
+    expect(SCHEMA_VERSION).toBe(10);
     expect(sent.slice(-2)).toEqual([
       { text: `INSERT INTO smdb_data.meta (key, value) VALUES ('schema_version', $1)`, params: [JSON.stringify({ v: SCHEMA_VERSION })] },
       { text: `INSERT INTO smdb_data.meta (key, value) VALUES ('store_id', $1)`, params: [JSON.stringify(id)] },

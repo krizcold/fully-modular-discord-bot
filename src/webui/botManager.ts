@@ -26,6 +26,7 @@ import { heldClauses } from '../bot/internalSetup/utils/heldWords';
 import type { RunningMigration } from '../bot/internalSetup/utils/dataMigration';
 import { standbyAskVerdict, untilSeconds } from '../bot/internalSetup/fleet/reshardRules';
 import { IDENTIFY_SPACING_MS } from '../bot/internalSetup/fleet/constants';
+import { isGuildWebUIEnabled } from './auth/oauthConfig';
 
 const MIGRATION_RUNNING = 'A data migration is running';
 
@@ -178,8 +179,14 @@ const waitingDiskText = (errno: string): string =>
 export const waitingReadText = (errno: string): string =>
   `The bot cannot tell which process holds the data files (${writerLockPath()}: ${errno}); nothing was saved. Check that the bot can read that file.`;
 
+/** NB15 decision 12: a panel IPC reply the child never gave carries noAnswer, so the route answers can't confirm. */
+function panelIpcFailure(error: unknown): { success: false; error: string; noAnswer?: 'timeout' | 'stopped' } {
+  const cause = noAnswerOf(error);
+  return { success: false, error: error instanceof Error ? error.message : 'Unknown error', ...(cause === 'failed' ? {} : { noAnswer: cause }) };
+}
+
 /** A shared-op or guild-write reply the child never answered. */
-function noAnswerOf(error: unknown): 'timeout' | 'stopped' | 'failed' {
+export function noAnswerOf(error: unknown): 'timeout' | 'stopped' | 'failed' {
   const reason = error instanceof Error ? error.message : String(error);
   return reason.startsWith('IPC request timed out') ? 'timeout' : /^bot process (exited|was stopped) before replying$/.test(reason) ? 'stopped' : 'failed';
 }
@@ -574,23 +581,44 @@ export class BotManager {
    * Emit panel update to all WebSocket clients
    * Called when bot process sends panel:live_update IPC message
    */
-  private emitPanelUpdate(data: {
+  emitPanelUpdate(data: {
     panelId: string;
     guildId: string | null;
     sessionId: string | null;
     response: any;
-  }): void {
+    servedBy?: string;
+  }): number {
     if (!this.wsManager) {
-      return;
+      return 0;
     }
 
-    this.wsManager.broadcast('panel:updated', {
+    return this.wsManager.broadcast('panel:updated', {
       panelId: data.panelId,
       guildId: data.guildId,
       sessionId: data.sessionId,
       panel: data.response,
+      ...(data.servedBy ? { servedBy: data.servedBy } : {}),
       timestamp: new Date().toISOString()
     });
+  }
+
+  /** NB15 decision 15: a remote panel's live state for this web UI's clients. */
+  emitPanelLiveStatus(data: { guildId: string; panelId: string; live: boolean; reason: string | null; checking?: true }): void {
+    this.wsManager?.broadcast('panel:live_status', data as unknown as WSEventData);
+  }
+
+  /**
+   * NB15 decision 3: tells the bot process whether this machine's member web panel is on; sent at the child's guild
+   * report and after every credentials save.
+   */
+  sendGuildWebUiSetting(): void {
+    const child = this.isRunning() ? this.botProcess : null;
+    if (!child) return;
+    try {
+      child.send({ type: 'control:guild-webui', data: { enabled: isGuildWebUIEnabled() } });
+    } catch (error) {
+      console.warn(`[BotManager] Could not tell the bot whether the member web panel is on: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   /**
@@ -2265,6 +2293,7 @@ export class BotManager {
       this.childWaitReadCause = null;
     }
     this.childStage = stage === 'opening' ? 'none' : stage;
+    if (stage === 'guild' && child === this.botProcess) this.sendGuildWebUiSetting();
     for (const waiter of [...this.stageWaiters]) {
       if (waiter.child === child && this.stageReached(waiter.stage)) {
         this.stageWaiters.splice(this.stageWaiters.indexOf(waiter), 1);
@@ -2349,15 +2378,21 @@ export class BotManager {
     }
   }
 
-  /**
-   * Get list of panels from bot
-   */
+  /** NB15: one panel, list or invoke message to the child; a reply it never gave carries noAnswer. */
+  async panelIpc(type: string, data: any): Promise<any> {
+    try {
+      return await this.sendIPCMessage(type, data);
+    } catch (error) {
+      return panelIpcFailure(error);
+    }
+  }
+
   async getPanelList(): Promise<any> {
     try {
       return await this.sendIPCMessage('panel:list', {});
     } catch (error) {
       console.error('[BotManager] Error getting panel list:', error);
-      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+      return panelIpcFailure(error);
     }
   }
 
@@ -2429,7 +2464,7 @@ export class BotManager {
       return await this.sendIPCMessage('panel:execute', { panelId, userId, guildId, channelId });
     } catch (error) {
       console.error('[BotManager] Error executing panel:', error);
-      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+      return panelIpcFailure(error);
     }
   }
 
@@ -2441,7 +2476,7 @@ export class BotManager {
       return await this.sendIPCMessage('panel:button', { panelId, buttonId, userId, guildId, channelId });
     } catch (error) {
       console.error('[BotManager] Error handling panel button:', error);
-      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+      return panelIpcFailure(error);
     }
   }
 
@@ -2453,7 +2488,7 @@ export class BotManager {
       return await this.sendIPCMessage('panel:dropdown', { panelId, values, userId, guildId, dropdownId, channelId });
     } catch (error) {
       console.error('[BotManager] Error handling panel dropdown:', error);
-      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+      return panelIpcFailure(error);
     }
   }
 
@@ -2465,7 +2500,7 @@ export class BotManager {
       return await this.sendIPCMessage('panel:modal', { panelId, modalId, fields, userId, guildId, channelId });
     } catch (error) {
       console.error('[BotManager] Error handling panel modal:', error);
-      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+      return panelIpcFailure(error);
     }
   }
 
@@ -2477,7 +2512,7 @@ export class BotManager {
       return await this.sendIPCMessage('guild:channels', { guildId });
     } catch (error) {
       console.error('[BotManager] Error getting guild channels:', error);
-      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+      return panelIpcFailure(error);
     }
   }
 
@@ -2486,7 +2521,7 @@ export class BotManager {
       return await this.sendIPCMessage('guild:roles', { guildId });
     } catch (error) {
       console.error('[BotManager] Error getting guild roles:', error);
-      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+      return panelIpcFailure(error);
     }
   }
 

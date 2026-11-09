@@ -1,7 +1,7 @@
 import { vi } from 'vitest';
 
 import { _resetGuildRequests, _setGuildRequestDeps, planGuildChange, type RequestConn, type RequestDb } from '../../src/webui/utils/guildRequests';
-import { REQUEST_INSERT_SQL, REQUEST_POLL_SQL, SETTLE_INSERT_SQL, SETTLE_UPDATE_SQL } from '../../src/bot/internalSetup/utils/dataBackends/guildRequestSql';
+import { POLL_SET_SQL, REPLY_READ_SQL, REQUEST_INSERT_SQL, REQUEST_POLL_SQL, SETTLE_INSERT_SQL, SETTLE_UPDATE_SQL } from '../../src/bot/internalSetup/utils/dataBackends/guildRequestSql';
 import { setBackendKind } from './backendKind';
 
 // NB7's web UI rig: the request route over scripted databases, one per URL, a scripted holder check and database
@@ -11,7 +11,7 @@ export type Script = (sql: string, values: unknown[]) => unknown;
 export interface Statement { url: string; sql: string; values: unknown[]; boundMs: number }
 
 export const isInsert = (s: Statement) => s.sql === REQUEST_INSERT_SQL;
-export const isPoll = (s: Statement) => s.sql === REQUEST_POLL_SQL;
+export const isPoll = (s: Statement) => s.sql === REQUEST_POLL_SQL || s.sql === POLL_SET_SQL;
 export const isSettleInsert = (s: Statement) => s.sql === SETTLE_INSERT_SQL;
 export const isSettleUpdate = (s: Statement) => s.sql === SETTLE_UPDATE_SQL;
 
@@ -42,6 +42,10 @@ export interface Rig {
   nodeId: string | null;
   /** The server instance a connection of the URL reaches, as the request pool reads it at the hand-out. */
   server: { [url: string]: string | undefined };
+  /** NB15 decision 21: the class a connection of the URL has; unset is not 'unprotected'. */
+  transport: { [url: string]: 'verified' | 'local' | 'unprotected' | undefined };
+  /** NB15 decision 22: the reply read's answer for an id; unset reads the row the last poll read. */
+  replyRead?: (id: string) => unknown;
 }
 
 /** Answers a scripted statement as the server would: a value, an Error to throw, or HANG for no answer by the bound. */
@@ -52,11 +56,33 @@ function answerOf(value: unknown, boundMs: number): Promise<any> {
   return Promise.resolve(value ?? { rows: [], rowCount: 0 });
 }
 
+/**
+ * NB15 decision 22: the poll per pool, answered from the scripts written for one poll per request (each id asked as
+ * REQUEST_POLL_SQL); the reply read answers from the row the last poll read.
+ */
+const lastPolled = new Map<string, any>();
+
+async function pollSet(script: Script, ids: string[], boundMs: number): Promise<any> {
+  const rows: any[] = [];
+  for (const id of ids) {
+    const res = await answerOf(script(REQUEST_POLL_SQL, [id]), boundMs);
+    const row = res?.rows?.[0];
+    if (row) {
+      lastPolled.set(id, row);
+      const { reply: _reply, ...states } = row;
+      rows.push({ id, ...states });
+    }
+  }
+  return { rows, rowCount: rows.length };
+}
+
 export function nb7Rig(): Rig {
   _resetGuildRequests();
+  lastPolled.clear();
   const rig: Rig = {
     statements: [], ended: [], connects: [], script: {}, connectFails: {},
     holder: () => ({ rows: [heldRow()] }), holderCalls: [], docs: new Map(), readDocCalls: [], url: 'postgres://one', nodeId: 'n-a', server: {},
+    transport: {},
   };
   const dbFor = (url: string): RequestDb => ({
     connect: async (_boundMs: number): Promise<RequestConn> => {
@@ -65,9 +91,17 @@ export function nb7Rig(): Rig {
       if (fail) throw fail;
       return {
         server: rig.server[url],
+        get transport() { return rig.transport[url]; },
         query: (sql: string, values: unknown[], boundMs: number) => {
           rig.statements.push({ url, sql, values, boundMs });
-          return answerOf((rig.script[url] ?? (() => undefined))(sql, values), boundMs);
+          const script = rig.script[url] ?? (() => undefined);
+          if (sql === POLL_SET_SQL) return pollSet(script, values[0] as string[], boundMs);
+          if (sql === REPLY_READ_SQL) {
+            if (rig.replyRead) return answerOf(rig.replyRead(values[0] as string), boundMs);
+            const row = lastPolled.get(values[0] as string);
+            return Promise.resolve(row && row.state === 'done' ? { rows: [{ reply: row.reply }], rowCount: 1 } : { rows: [], rowCount: 0 });
+          }
+          return answerOf(script(sql, values), boundMs);
         },
         release: () => undefined,
       };

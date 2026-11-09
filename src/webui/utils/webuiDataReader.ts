@@ -7,7 +7,7 @@ import type { PoolClient, QueryConfig } from 'pg';
 import { guardPoolClients } from '../../bot/internalSetup/utils/pgClient';
 import { loadCredentials } from '../../utils/envLoader';
 import { canonicalGuildKey } from '../../bot/internalSetup/utils/dataKeys';
-import { HOLDER_CHECK_SQL } from '../../bot/internalSetup/utils/dataBackends/guildRequestSql';
+import { HOLDER_CHECK_SQL, HOLDER_MAP_SQL } from '../../bot/internalSetup/utils/dataBackends/guildRequestSql';
 import { addressListInUse, parseAddressList, pgConfig, showEntry, type ListEntry } from '../../utils/databaseAddress';
 import { decideMain, mainTagOf, probePass, type NoticeRead, type ProbeAnswer, type StoreReport } from '../../bot/internalSetup/utils/dataBackends/mainDatabase';
 import { MarkerUnreadable, readMarkerStoreId } from '../../bot/internalSetup/utils/dataBackends/recognitionGuard';
@@ -366,6 +366,11 @@ export class WebuiDataReader {
    */
   async holderOf(guildId: string, boundMs = QUERY_BOUND_MS): Promise<{ rows: any[]; url: string }> {
     return this.boundedQuery(HOLDER_CHECK_SQL, [guildId], boundMs);
+  }
+
+  /** NB15 decision 14: every shard of the stored count with its claim row, for the member's server list. */
+  async holderMap(boundMs = QUERY_BOUND_MS): Promise<{ rows: any[]; url: string }> {
+    return this.boundedQuery(HOLDER_MAP_SQL, [], boundMs);
   }
 
   /** NB5 decision 23: the owner_channel row's value, null for no row (or no meta table yet). */

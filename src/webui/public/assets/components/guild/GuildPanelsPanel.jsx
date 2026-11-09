@@ -10,6 +10,7 @@ function GuildPanelsPanel({ guild, user, onBack }) {
   const [preModalPanelData, setPreModalPanelData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [note, setNote] = useState(null);
   const [categoryFilter, setCategoryFilter] = useState('All');
   // Channel selection for channel-required panels
   const [selectedChannel, setSelectedChannel] = useState(null);
@@ -96,6 +97,7 @@ function GuildPanelsPanel({ guild, user, onBack }) {
       if (result.success) {
         setSelectedPanel(panelId);
         setPanelData(result.panel);
+        setNote(result.panel ? null : result.note || null);
       } else {
         setError(result.error || 'Failed to execute panel');
       }
@@ -132,6 +134,7 @@ function GuildPanelsPanel({ guild, user, onBack }) {
           setPreModalPanelData(null);
         }
         setPanelData(result.panel);
+        setNote(result.panel ? null : result.note || null);
       } else {
         setError(result.error || 'Failed to handle button');
       }
@@ -162,6 +165,7 @@ function GuildPanelsPanel({ guild, user, onBack }) {
           return;
         }
         setPanelData(result.panel);
+        setNote(result.panel ? null : result.note || null);
       } else {
         setError(result.error || 'Failed to handle dropdown');
       }
@@ -192,6 +196,7 @@ function GuildPanelsPanel({ guild, user, onBack }) {
           return;
         }
         setPanelData(result.panel);
+        setNote(result.panel ? null : result.note || null);
       } else {
         setError(result.error || 'Failed to handle modal');
       }
@@ -331,6 +336,15 @@ function GuildPanelsPanel({ guild, user, onBack }) {
       </div>
     );
   };
+
+  if (note && !panelData) {
+    return (
+      <div className="panel-note">
+        <p>{note}</p>
+        <button onClick={() => { setNote(null); loadPanels(); }}>Back to Panels</button>
+      </div>
+    );
+  }
 
   if (error) {
     return (

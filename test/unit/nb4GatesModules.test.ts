@@ -312,7 +312,7 @@ describe('a console invoke and a panel action whose hold crosses D', () => {
     await r.stop();
     r.data.releaseHydrations('ok');
     const answer = await invoke;
-    expect(answer).toEqual({ success: false, error: `guild ${G0}'s data is not served by this bot process right now; try again in a moment` });
+    expect(answer).toEqual({ success: false, ran: false, error: `guild ${G0}'s data is not served by this bot process right now; try again in a moment` });
     expect(h.handleCommands).toBe(0);
     await r.end();
   });
@@ -324,7 +324,7 @@ describe('a console invoke and a panel action whose hold crosses D', () => {
     await tick(20);
     await r.stop();
     r.data.releaseHydrations('ok');
-    expect(await action).toEqual({ success: false, error: gateCauseText('not-served') });
+    expect(await action).toEqual({ success: false, ran: false, error: gateCauseText('not-served') });
     expect(panelManager.handlePanelExecute).not.toHaveBeenCalled();
     expect(panelManager.getWebUIPanelList).not.toHaveBeenCalled();
     await r.end();
@@ -412,7 +412,10 @@ describe('IPC requests that run module code, sent through the installed handlers
       expect(stoppedServing()).toBe(true);
       for (const [type, data] of REQUESTS) ipc.send(type, data, `${how}-${type}`);
       await tick(50);
-      for (const [type] of REQUESTS) expect(ipc.repliesTo(`${how}-${type}`)).toEqual([{ success: false, error: STOPPED_SERVING_TEXT }]);
+      for (const [type] of REQUESTS) {
+        const refusal = type === 'command:invoke' ? { success: false, error: STOPPED_SERVING_TEXT, ran: false } : { success: false, error: STOPPED_SERVING_TEXT };
+        expect(ipc.repliesTo(`${how}-${type}`)).toEqual([refusal]);
+      }
       expect(h.compiles).toHaveLength(0);
       expect(h.handleCommands).toBe(0);
       expect(ipc.panelExecute).not.toHaveBeenCalled();

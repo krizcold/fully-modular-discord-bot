@@ -18,11 +18,57 @@ function PanelsPanel() {
   const [selectedChannel, setSelectedChannel] = useState(null);
   const [availableChannels, setAvailableChannels] = useState([]);
   const [loadingChannels, setLoadingChannels] = useState(false);
+  // NB15: the machine that ran the shown panel, a note shown in its place, and whether the view is live
+  const [servedBy, setServedBy] = useState(null);
+  const [note, setNote] = useState(null);
+  const [liveStatus, setLiveStatus] = useState(null);
 
   useEffect(() => {
     loadGuildContextOptions();
-    loadPanels();
   }, []);
+
+  // The list follows the context: a server another machine runs lists the panels that machine runs
+  useEffect(() => {
+    loadPanels();
+  }, [guildContext, guildContextOptions]);
+
+  const currentGuildId = () => guildContextOptions.find(o => o.value === guildContext)?.guildId || null;
+
+  // A panel answer: the panel, or its note when the panel cannot be shown here, and the machine that ran it
+  function showAnswer(res) {
+    setPanelData(res.panel || null);
+    setNote(res.panel ? null : res.note || null);
+    setServedBy(res.servedBy || null);
+  }
+
+  // A panel another machine runs stays up to date: a watch call now and every 60 s while it is shown
+  useEffect(() => {
+    const guildId = currentGuildId();
+    if (!selectedPanel || !servedBy || !guildId) {
+      setLiveStatus(null);
+      return undefined;
+    }
+    let stopped = false;
+    const watch = async () => {
+      try {
+        const res = await api.post('/panels/watch', { guildId, panelId: selectedPanel, userId: 'web-ui-owner', servedBy });
+        if (!stopped && res.success) setLiveStatus({ live: res.live, reason: res.reason, checking: res.checking === true });
+      } catch (err) {
+        if (!stopped) setLiveStatus({ live: false, reason: 'the latest change could not be fetched' });
+      }
+    };
+    watch();
+    const timer = setInterval(watch, 60000);
+    return () => { stopped = true; clearInterval(timer); };
+  }, [selectedPanel, servedBy, guildContext, guildContextOptions]);
+
+  useEffect(() => {
+    if (typeof wsClient === 'undefined') return undefined;
+    const unsubscribe = wsClient.on('panel:live_status', (data) => {
+      if (data.panelId === selectedPanel && data.guildId === currentGuildId()) setLiveStatus({ live: data.live, reason: data.reason, checking: data.checking === true });
+    });
+    return () => unsubscribe();
+  }, [selectedPanel, guildContext, guildContextOptions]);
 
   // Subscribe to real-time panel updates via WebSocket
   useEffect(() => {
@@ -37,6 +83,7 @@ function PanelsPanel() {
 
         if (data.guildId === currentGuildId || data.guildId === null) {
           setPanelData(data.panel);
+          if (data.servedBy) setServedBy(data.servedBy);
         }
       }
     });
@@ -94,7 +141,8 @@ function PanelsPanel() {
     try {
       setLoading(true);
       setError(null);
-      const res = await api.get('/panels/list');
+      const listGuildId = currentGuildId();
+      const res = await api.get(listGuildId ? `/panels/list?guildId=${listGuildId}` : '/panels/list');
 
       if (res.success) {
         setPanels(res.panels || []);
@@ -174,7 +222,7 @@ function PanelsPanel() {
 
       if (res.success) {
         setSelectedPanel(panelId);
-        setPanelData(res.panel);
+        showAnswer(res);
       } else {
         setError(res.error || 'Failed to execute panel');
       }
@@ -236,7 +284,7 @@ function PanelsPanel() {
           // Clear pre-modal state when showing regular panel
           setPreModalPanelData(null);
         }
-        setPanelData(res.panel);
+        showAnswer(res);
       } else {
         setError(res.error || 'Failed to handle button');
       }
@@ -273,7 +321,7 @@ function PanelsPanel() {
       });
 
       if (res.success) {
-        setPanelData(res.panel);
+        showAnswer(res);
       } else {
         setError(res.error || 'Failed to handle dropdown');
       }
@@ -326,7 +374,7 @@ function PanelsPanel() {
 
         } else {
           // Normal panel response - show it
-          setPanelData(res.panel);
+          showAnswer(res);
         }
       } else {
         setError(res.error || 'Failed to handle modal');
@@ -392,6 +440,9 @@ function PanelsPanel() {
     setSelectedPanel(null);
     setSelectedPanelInfo(null);
     setPanelData(null);
+    setServedBy(null);
+    setNote(null);
+    setLiveStatus(null);
     setPreModalPanelData(null);
     setSelectedChannel(null);
     setAvailableChannels([]);
@@ -474,6 +525,16 @@ function PanelsPanel() {
     );
   };
 
+  // A panel that ran but cannot be shown here: its note in place of the panel
+  if (selectedPanel && !panelData && note) {
+    return (
+      <div className="panel">
+        <p className="panel-note">{note}</p>
+        <button onClick={goBack}>Back to Panels</button>
+      </div>
+    );
+  }
+
   // If viewing a panel, show PanelViewer
   if (selectedPanel && panelData) {
     // Determine if interactions should be disabled (channel-required panel without channel selected)
@@ -497,6 +558,13 @@ function PanelsPanel() {
           disabled={interactionsDisabled}
           guildId={guildContextOptions.find(o => o.value === guildContext)?.guildId}
         />
+        {servedBy && <p className="panel-served-by">This server runs on {servedBy}.</p>}
+        {servedBy && liveStatus && liveStatus.checking && (
+          <p className="panel-live-checking">Checking whether changes made on {servedBy} are shown here by themselves.</p>
+        )}
+        {servedBy && liveStatus && !liveStatus.live && !liveStatus.checking && (
+          <p className="panel-out-of-date">This panel may be out of date: changes made on {servedBy} are not shown here by themselves right now ({liveStatus.reason}). It updates when you use it.</p>
+        )}
       </div>
     );
   }

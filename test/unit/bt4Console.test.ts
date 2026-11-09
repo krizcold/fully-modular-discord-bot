@@ -36,7 +36,9 @@ vi.mock('../../src/bot/internalSetup/utils/premiumManager', async importOriginal
 import { confirmWrite, saveData, saveDataOutcome } from '../../src/bot/internalSetup/utils/dataManager';
 import { freezeGuildWrites, unfreezeGuildWrites } from '../helpers/freezeGuild';
 import { ledgerOf } from '../../src/bot/internalSetup/utils/dataBackends/writeLedger';
-import { CONFIRM_MS, truthText } from '../../src/bot/internalSetup/utils/dataBackends/replyGate';
+import { CONFIRM_MS, ranTruthText } from '../../src/bot/internalSetup/utils/dataBackends/replyGate';
+
+const ranText = (answer: Parameters<typeof ranTruthText>[0]['answer'], partial: boolean) => ranTruthText({ answer, partial });
 import { handleInvoke } from '../../src/bot/internalSetup/utils/ipcCommandHandler';
 import { createPersistentPanel } from '../../src/bot/internalSetup/utils/panel/persistentPanelResponse';
 import { notReadyGuild, storeGuild, tick } from '../helpers/gateRig';
@@ -95,7 +97,7 @@ describe('a console run whose writes are not confirmed', () => {
       saveDataOutcome('x.json', notReadyGuild(), { v: 1 });
       await i.reply({ content: 'Saved!' });
     });
-    expect(answer).toMatchObject({ success: false, error: truthText('not-ready', false), truth: 'not-ready', captured: [reply('Saved!')] });
+    expect(answer).toMatchObject({ success: false, error: ranText('not-ready', false), truth: 'not-ready', captured: [reply('Saved!')] });
     expect(answer).not.toHaveProperty('pending');
   });
 
@@ -105,7 +107,7 @@ describe('a console run whose writes are not confirmed', () => {
     const { answer } = await invoke(async () => {
       saveData('x.json', options, { v: 1 });
     }, {}, guildId);
-    expect(answer).toMatchObject({ success: false, error: truthText('held', false), truth: 'held', pending: true });
+    expect(answer).toMatchObject({ success: false, error: ranText('held', false), truth: 'held', pending: true });
   });
 
   it('a held write while the bot stops says the change may be lost, still marked pending', async () => {
@@ -115,7 +117,7 @@ describe('a console run whose writes are not confirmed', () => {
       saveData('x.json', options, { v: 1 });
       stop.on = true;
     }, {}, guildId);
-    expect(answer).toMatchObject({ success: false, error: 'The bot is restarting and could not confirm your change was saved; it may be lost. Please check once it is back.', truth: 'held', pending: true });
+    expect(answer).toMatchObject({ success: false, error: 'The action ran, but the bot is restarting and could not confirm its changes were saved; they may be lost. Check the server before you run it again.', truth: 'held', pending: true });
   });
 
   it('a guild taken over answers deposed, not pending', async () => {
@@ -124,7 +126,7 @@ describe('a console run whose writes are not confirmed', () => {
     const { answer } = await invoke(async () => {
       saveData('x.json', options, { v: 1 });
     }, {}, guildId);
-    expect(answer).toMatchObject({ success: false, error: truthText('deposed', false), truth: 'deposed' });
+    expect(answer).toMatchObject({ success: false, error: ranText('deposed', false), truth: 'deposed' });
     expect(answer).not.toHaveProperty('pending');
   });
 
@@ -136,7 +138,7 @@ describe('a console run whose writes are not confirmed', () => {
       unfreezeGuildWrites(guildId);
       saveDataOutcome('x.json', options, { v: 2 });
     }, {}, guildId);
-    expect(answer).toMatchObject({ success: false, error: truthText('unavailable', true), truth: 'unavailable' });
+    expect(answer).toMatchObject({ success: false, error: ranText('unavailable', true), truth: 'unavailable' });
   });
 
   it('a write still unconfirmed at the confirm bound answers pending', async () => {
@@ -150,7 +152,7 @@ describe('a console run whose writes are not confirmed', () => {
     await tick(40);
     vi.advanceTimersByTime(CONFIRM_MS + 2000);
     const { answer } = await done;
-    expect(answer).toMatchObject({ success: false, error: truthText('pending', false), truth: 'pending', pending: true });
+    expect(answer).toMatchObject({ success: false, error: ranText('pending', false), truth: 'pending', pending: true });
     store.release();
   });
 });
@@ -175,7 +177,7 @@ describe('the command throws (R1-J22)', () => {
       saveDataOutcome('x.json', notReadyGuild(), { v: 1 });
       throw new Error('boom');
     });
-    expect(answer).toMatchObject({ success: false, error: truthText('not-ready', false), truth: 'not-ready', handlerError: 'boom' });
+    expect(answer).toMatchObject({ success: false, error: ranText('not-ready', false), truth: 'not-ready', handlerError: 'boom' });
   });
 });
 
@@ -198,7 +200,8 @@ describe('the dispatcher refuses the command (R1-J22)', () => {
       if (Array.isArray(premium.overrides._disabledCommands)) premium.overrides._disabledCommands = [name];
       local.commands = [{ name, callback: async () => { throw new Error('dispatched'); }, ...extra }];
       const answer = await handleInvoke({ command: name, guildId: '555', force: true });
-      expect(answer).toMatchObject({ success: false, error: text });
+      expect(answer).toMatchObject({ success: false, ran: false, error: text });
+      expect(answer).not.toHaveProperty('truth');
       expect((answer.captured as Array<{ payload: { content: string; flags: number } }>).map(c => [c.payload.content, c.payload.flags])).toEqual([[text, 64]]);
     } finally {
       bot.client = null;
