@@ -568,20 +568,35 @@ async function write(argv) {
   };
 
   /**
+   * The loadedSha a guild write sends, as the editor gets it: the sha of the node's read, 'absent' when the read
+   * finds no file. A failed read gives none, and the route refuses that write with a 400 (definite, nothing applied).
+   * @param {{ name: string, base: string }} lane @param {string} key @returns {Promise<string | undefined>}
+   */
+  const baseSha = async (lane, key) => {
+    const r = await call('GET', readUrl(lane.base, guild, key), undefined, timeoutMs, cut.signal);
+    if (r.status === 429) buckets.get(lane.base)?.empty();
+    if (r.status === 404) return 'absent';
+    return r.status === 200 && r.body && typeof r.body.sha === 'string' ? r.body.sha : undefined;
+  };
+
+  /**
    * @param {{ name: string, base: string }} lane
    * @param {{ op: 'write' | 'delete', kind: 'u' | 'h', key: string, c: number, content?: object }} op
    * @returns {Promise<Answer | null>} null when stopped before sending
    */
   const send = async (lane, op) => {
     if (!(await ready(lane))) return null;
+    const reads = op.op === 'write' && op.kind === 'h';
+    if (reads && !(await ready(lane))) return null;
     const id = ++seq;
     const h = op.content ? hashOf(op.content) : null;
     const size = op.content ? canonical(op.content).length : 0;
     // Hot docs are small and logged whole, so an older version can be put back to prove ROLLBACK bites.
     const logged = op.kind === 'h' ? { content: op.content } : {};
     emit({ t: 'send', id, lane: lane.name, op: op.op, kind: op.kind, key: op.key, c: op.c, h, size, ...logged, at: clock() });
+    const loadedSha = reads ? await baseSha(lane, op.key) : op.op === 'write' ? 'absent' : undefined;
     const r = op.op === 'write'
-      ? await call('POST', `${lane.base}/api/config/data/update`, { file: fileId(op.key), guildId: guild, data: op.content }, timeoutMs, cut.signal)
+      ? await call('POST', `${lane.base}/api/config/data/update`, { file: fileId(op.key), guildId: guild, data: op.content, loadedSha }, timeoutMs, cut.signal)
       : await call('POST', `${lane.base}/api/config/data/delete`, { file: fileId(op.key), guildId: guild }, timeoutMs, cut.signal);
     if (r.status === 429) buckets.get(lane.base)?.empty();
     const answer = classifyAnswer(r.status, r.body);

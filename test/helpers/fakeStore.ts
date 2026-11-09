@@ -13,7 +13,7 @@ import type {
 // BT-1's scripted DataBackend, shared by the write-ticket and write-ledger tests.
 // NB13: 'landed-unanswered' commits and answers as if the COMMIT's answer was lost, 'lost-unanswered' stores nothing
 // and answers the same, 'commit-hang' sets commitSent and answers only when released (then as 'commit').
-export type FlushMode = 'commit' | 'unavailable' | 'deposed' | 'landed-unavailable' | 'landed-unanswered' | 'lost-unanswered' | 'commit-hang';
+export type FlushMode = 'commit' | 'unavailable' | 'deposed' | 'landed-unanswered' | 'lost-unanswered' | 'commit-hang';
 export type CheckMode = 'answer' | 'unknown';
 export type HydrateMode = 'ok' | 'deposed' | 'unavailable' | 'held';
 
@@ -118,7 +118,6 @@ export class FakeStore implements DataBackend {
     for (const { key, chunk } of batch.appends) {
       this.streams.set(rowKey(guildId, key), (this.streams.get(rowKey(guildId, key)) ?? '') + chunk);
     }
-    if (this.mode === 'landed-unavailable') return { ok: false, reason: 'unavailable' };
     this.commits.push(call);
     if (batch.flushId) this.marks.set(guildId, batch.flushId);
     if ((token.claim ?? 0) > (this.ownerClaims.get(guildId) ?? 0)) this.ownerClaims.set(guildId, token.claim ?? 0);

@@ -191,6 +191,9 @@ export async function startFakeApp(options: FakeAppOptions): Promise<{ url: stri
           const [status, payload] = await sharedWrite(b);
           return send(status, payload);
         }
+        if (typeof b.loadedSha !== 'string' || b.loadedSha.length === 0) {
+          return send(400, { success: false, error: 'This page is out of date; nothing was saved. Reload the page and open the file again.' });
+        }
         const { module, filename } = split(String(b.file));
         const pool = options.pools[route(filename)];
         const fault = options.writeFault?.(filename, b.data) ?? 'normal';
@@ -234,7 +237,7 @@ export async function startFakeApp(options: FakeAppOptions): Promise<{ url: stri
         if (rows.length === 0) return send(404, { success: false, error: 'Data file not found' });
         const versions = previous.get(filename) ?? [];
         const doc = options.staleRead?.(filename) && versions.length >= 2 ? versions[0] : rows[0].doc;
-        return send(200, { success: true, data: JSON.parse(doc), exists: true });
+        return send(200, { success: true, data: JSON.parse(doc), exists: true, sha: shaOfText(doc) });
       }
       if (req.method === 'GET' && url.pathname === '/api/fleet/state') {
         return send(200, { success: true, ...(options.fleetState?.() as object ?? {}) });

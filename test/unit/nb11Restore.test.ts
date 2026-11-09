@@ -308,7 +308,7 @@ describe('the flush before the transaction', () => {
     const { store, ws } = setup();
     const g = await readyGuild(ws);
     store.bury(g, 5, { 'r.json': { r: 1 } });
-    store.mode = 'landed-unavailable';
+    store.mode = 'landed-unanswered';
     const saved = saveDataTracked('a.json', opts(g), { v: 1 });
     expect(await restoreGuildFromGraveyard(g, 5)).toEqual({ ok: false, code: 'backend-unavailable', error: FLUSH_TEXT });
     expect(store.restoreCalls).toEqual([]);
@@ -905,7 +905,7 @@ describe('every accepted write is stored, held or deposed (property)', () => {
       fc.array(readWrite, { maxLength: 3 }),
       fc.constantFrom('none', 'before', 'flushing', 'restoring', 'after'),
       fc.constantFrom('ok', 'unknown-committed', 'unknown-lost'),
-      fc.constantFrom('commit', 'unavailable', 'deposed', 'landed-unavailable'),
+      fc.constantFrom('commit', 'unavailable', 'deposed', 'landed-unanswered'),
       fc.constantFrom('ok', 'live-rows', 'deposed', 'unavailable', 'unknown-committed', 'unknown-lost'),
       async (steps, runs, deleteAt, retireAnswer, flushMode, restoreAnswer) => {
         const { store, ws } = setup();

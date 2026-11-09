@@ -267,15 +267,14 @@ async function endProcess(w: World, p: Proc, how: 'leave' | 'stop'): Promise<voi
   (process as { send?: unknown }).send = undefined;
   exitTarget = p;
   try {
-    const handler = dm.stopHandler(stopSteps({
+    const handler = stopSteps(dm, {
       claims: () => ({ beginStop: () => undefined, finishStop: () => release(w, p) }),
-      drainForExit: async () => {
+      drain: async () => {
         if (!reaches(w, p)) return;
         await p.ws.flushAllDirty();
         p.dropLines.push(...p.ws.takeDropLines());
       },
-      hasWorkingSet: () => true,
-    }));
+    });
     if (how === 'leave') m.startLeave(p.leaving ? 'Maintenance ended' : 'The claims lapsed');
     else await handler();
     await vi.waitFor(() => expect(p.exitCodes.length).toBeGreaterThan(0), { timeout: 5_000, interval: 1 });
@@ -322,11 +321,10 @@ async function refuseAtBoot(w: World, q: Proc): Promise<void> {
     let fire: () => void = () => undefined;
     m.watchDataBackend({ onLoginRefused: cb => { fire = cb; }, askDatabase: async () => 'refused' }, { retryMs: 3_600_000 });
     if (!q.webUi) {
-      dm.stopHandler(stopSteps({
+      stopSteps(dm, {
         claims: () => ({ beginStop: () => undefined, finishStop: () => release(w, q) }),
-        drainForExit: async () => { await q.ws.flushAllDirty(); },
-        hasWorkingSet: () => true,
-      }));
+        drain: async () => { await q.ws.flushAllDirty(); },
+      });
     }
     fire();
     q.lastFailure = 'refused';

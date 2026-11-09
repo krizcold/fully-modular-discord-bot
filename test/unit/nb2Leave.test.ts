@@ -365,8 +365,14 @@ describe('ruling L: a change the database refuses for its content', () => {
     const { at } = watchedDatabase('answers');
     await at(0);
     closeMaintenanceGate('hook', 'm');
-    await handleMaintenanceIpc({ type: 'maintenance:leave', requestId: 'g4', data: {} });
-    await vi.waitFor(() => expect(restarts()).toHaveLength(1), { timeout: 10_000 });
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      await handleMaintenanceIpc({ type: 'maintenance:leave', requestId: 'g4', data: {} });
+      for (let step = 0; step < 50 && restarts().length === 0; step++) await vi.advanceTimersByTimeAsync(30);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(restarts()).toHaveLength(1);
     expect(errorsWith('does not restart until')).toHaveLength(0);
     const held = errorsWith('the database refuses these for their content');
     expect(held).toHaveLength(1);

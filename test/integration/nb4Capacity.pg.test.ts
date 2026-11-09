@@ -383,7 +383,6 @@ describe('a node with no web UI leaves through its own stop handler (NB4-R6-T2, 
     const dm = await import('../../src/bot/internalSetup/utils/dataManager');
     const gate = await import('../../src/bot/internalSetup/utils/maintenanceGate');
     const FreshShardClaims = (await import('../../src/bot/internalSetup/fleet/shardClaims')).ShardClaims;
-    const { getWorkingSet } = await import('../../src/bot/internalSetup/utils/dataBackends/workingSet');
     m._setMaintenanceTiming({ leaveRetryMs: 500, filePollMs: 300, leaveSaveBoundMs: 2000 });
     const inner = new ClaimStore(rig.url, T6);
     const { api, s } = hangable(inner);
@@ -397,7 +396,7 @@ describe('a node with no web UI leaves through its own stop handler (NB4-R6-T2, 
       noteLost: lost => m.startLeave(`Shard ${lost.map(p => p.shardId).join(', ')} ${lost.length > 1 ? 'are' : 'is'} no longer held by this process`),
       restartForShards: reason => m.restartForShards(reason, m.maintenanceUnfit),
     });
-    dm.stopHandler(stopSteps({ claims: () => claims, drainForExit: dm.drainForExit, hasWorkingSet: () => getWorkingSet() !== null }));
+    stopSteps(dm, { claims: () => claims });
     const watcher = m.watchDataBackend(rig.backend, { retryMs: 600_000 })!;
     const released = () => lines.filter(l => l.startsWith('[Shards] Released shards'));
     const cleanup = async () => {

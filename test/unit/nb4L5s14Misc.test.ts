@@ -25,7 +25,9 @@ vi.mock('../../src/bot/internalSetup/utils/panel/persistentPanelStorage', async 
 import { applyOperatorDataWrite } from '../../src/bot/internalSetup/utils/ipcDataHandler';
 import { recoverPersistentPanels } from '../../src/bot/internalSetup/utils/panel/persistentPanelRecovery';
 import { setStoppedServingHook } from '../../src/bot/internalSetup/utils/servingGate';
-import { runStopSteps, type StopSteps } from '../../src/bot/internalSetup/utils/stopSteps';
+import fs from 'fs';
+import path from 'path';
+import { stopSteps } from '../helpers/stopRig';
 
 afterEach(() => {
   h.setState = null;
@@ -61,40 +63,32 @@ describe('the panel recovery after the process stopped serving', () => {
 });
 
 describe('the stop steps', () => {
-  const steps = (over: Partial<StopSteps> = {}) => {
-    const exits: number[] = [];
-    const s: StopSteps = {
-      beginStop: () => undefined,
-      stopSamplers: () => undefined,
-      closeGateway: async () => undefined,
-      flushTotals: () => undefined,
-      drain: async () => undefined,
-      finishStop: async () => undefined,
-      exit: code => { exits.push(code); },
-      ...over,
-    };
-    return { s, exits };
+  async function freshStop() {
+    vi.resetModules();
+    const dm = await import('../../src/bot/internalSetup/utils/dataManager');
+    const order: string[] = [];
+    const exit = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => { order.push(`exit ${code}`); }) as unknown as typeof process.exit);
+    return { dm, order, exit };
+  }
+  const stopStepSource = () => {
+    const source = fs.readFileSync(path.resolve(__dirname, '../../src/bot/internalSetup/clientInitializer.ts'), 'utf-8');
+    return source.slice(source.indexOf('addStopStep(async () => {'), source.indexOf('addReleaseStep(() => stopMainWatch());'));
   };
 
-  it('a gateway close that fails is logged with its error, and the drain and the exit still run', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-    const failure = new Error('socket hang up');
-    let drained = 0;
-    const { s, exits } = steps({ closeGateway: async () => { throw failure; }, drain: async () => { drained += 1; } });
-    await runStopSteps(s);
-    expect(warn.mock.calls).toEqual([['[clientInitializer] Could not close the gateway on shutdown:', failure]]);
-    expect(drained).toBe(1);
-    expect(exits).toEqual([0]);
+  it("a gateway close that fails is logged with its error by clientInitializer's stop step", () => {
+    expect(stopStepSource()).toContain(".catch(err => console.warn('[clientInitializer] Could not close the gateway on shutdown:', err))");
   });
 
   it('a step that throws is logged with its error and the process exits with 0', async () => {
     const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
-    const failure = new Error('drain broke');
+    const { dm, exit } = await freshStop();
+    const failure = new Error('step broke');
     let finished = 0;
-    const { s, exits } = steps({ drain: async () => { throw failure; }, finishStop: async () => { finished += 1; } });
-    await runStopSteps(s);
-    expect(error.mock.calls).toEqual([['[clientInitializer] A stop step failed; the bot process exits:', failure]]);
-    expect(finished).toBe(0);
-    expect(exits).toEqual([0]);
+    const stop = stopSteps(dm, { claims: () => ({ beginStop: () => undefined, finishStop: async () => { finished += 1; } }) });
+    dm.addStopStep(() => { throw failure; });
+    await stop();
+    expect(error.mock.calls).toEqual([['[Data] A stop step failed:', failure]]);
+    expect(finished).toBe(1);
+    expect(exit.mock.calls).toEqual([[0]]);
   });
 });

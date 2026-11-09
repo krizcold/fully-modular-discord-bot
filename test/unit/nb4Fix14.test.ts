@@ -190,7 +190,7 @@ describe('a completed release after a stop before the grant never lists the kept
       h.stopping = true;
       return answer;
     }) as typeof store.take;
-    const steps = stopSteps({ claims: () => mod.getShardClaims(), drainForExit: dm.drainForExit, hasWorkingSet: () => true });
+    const steps = stopSteps(dm, { claims: () => mod.getShardClaims() });
     await vi.advanceTimersByTimeAsync(100);
     expect(h.plans).toEqual([]);
     const stopped = steps();
@@ -231,7 +231,7 @@ describe('a boot take acknowledged after its deadline whose renewal fails (NB4-R
       store.renewMode = Object.assign(new Error('timeout'), { code: '57014' });
       return answer;
     }) as typeof store.take;
-    const steps = stopSteps({ claims: () => mod.getShardClaims(), drainForExit: dm.drainForExit, hasWorkingSet: () => true });
+    const steps = stopSteps(dm, { claims: () => mod.getShardClaims() });
     await vi.advanceTimersByTimeAsync(T.deadlineMs + 2000);
     await ready;
     expect(h.plans.at(-1)).toEqual({ shards: [], shardCount: 4 });

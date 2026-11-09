@@ -521,6 +521,16 @@ export function installStopHandler(): void {
   process.on('SIGINT', () => void stopRunner?.());
 }
 
+/** Tests only: forgets the stop handler, its steps and a stop that ran, as a fresh process has them. */
+export function _resetStopHandler(): void {
+  stopBegun = false;
+  processStop = null;
+  stopRunner = null;
+  finalStepsRan = false;
+  stopExitCode = 0;
+  for (const steps of [stopSteps, finalStopSteps, releaseSteps]) steps.length = 0;
+}
+
 /** Starts the stop as a signal would; deposed: another process took the lock, so the exit code is EXIT_DEPOSED. */
 export function beginStop(deposed = false): Promise<void> {
   if (deposed && !stopBegun) stopExitCode = EXIT_DEPOSED;

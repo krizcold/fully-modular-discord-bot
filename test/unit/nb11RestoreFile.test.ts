@@ -56,6 +56,12 @@ const freshGuild = () => String(++guilds);
 const entryDir = (g: string, ms: number) => dataPath('_graveyard', `${g}-${ms}`);
 const tick = (ms = 5) => new Promise<void>(resolve => setTimeout(resolve, ms));
 const monoIn = (ms: number) => process.hrtime.bigint() + BigInt(Math.round(ms * 1e6));
+/** The monotonic clock the deadlines read, held still until the test moves it, so load cannot pass a deadline early. */
+const frozenMono = () => {
+  let now = process.hrtime.bigint();
+  vi.spyOn(process.hrtime, 'bigint').mockImplementation(() => now);
+  return { at: (ms: number) => now + BigInt(ms) * 1_000_000n, advance: (ms: number) => { now += BigInt(ms) * 1_000_000n; } };
+};
 const opts = (guildId: string) => ({ guildId, category: 'm' });
 const deferred = <T = void>() => {
   let resolve!: (value: T) => void;
@@ -543,8 +549,10 @@ describe('restore and delete on JSON', () => {
       return (open as any)(p, ...rest);
     }) as any);
     saveData('b.json', opts(g), { b: 1 });
-    const deleting = deleteGuildNamespace(g, 'test', 5000, monoIn(50));
+    const clock = frozenMono();
+    const deleting = deleteGuildNamespace(g, 'test', 5000, clock.at(50));
     await tick(100);
+    clock.advance(100);
     wire.resolve();
     expect(await deleting).toEqual({ ok: false, code: 'backend-unavailable', error: DELETE_OUT_OF_TIME });
     expect(fs.existsSync(dataPath(g, 'm', 'a.json'))).toBe(true);
@@ -552,13 +560,14 @@ describe('restore and delete on JSON', () => {
 
     const rename = fs.promises.rename.bind(fs.promises);
     let tries = 0;
+    const later = frozenMono();
     vi.spyOn(fs.promises, 'rename').mockImplementation((async (from: any, to: any) => {
       if (!same(from, dataPath(g))) return rename(from, to);
       tries += 1;
-      await tick(80);
+      later.advance(80);
       throw errno('EPERM');
     }) as any);
-    expect(await deleteGuildNamespace(g, 'test', 5000, monoIn(50))).toEqual({ ok: false, code: 'backend-unavailable', error: DELETE_OUT_OF_TIME });
+    expect(await deleteGuildNamespace(g, 'test', 5000, later.at(50))).toEqual({ ok: false, code: 'backend-unavailable', error: DELETE_OUT_OF_TIME });
     expect(tries).toBe(1);
 
     tries = 0;

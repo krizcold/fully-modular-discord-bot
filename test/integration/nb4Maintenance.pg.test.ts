@@ -60,7 +60,6 @@ describe('a boot whose login is refused before its first renewal (sheet [pg] 12,
     const m = await import('../../src/bot/internalSetup/utils/maintenance');
     const dm = await import('../../src/bot/internalSetup/utils/dataManager');
     const gate = await import('../../src/bot/internalSetup/utils/maintenanceGate');
-    const { getWorkingSet } = await import('../../src/bot/internalSetup/utils/dataBackends/workingSet');
     const exit = vi.spyOn(process, 'exit').mockImplementation(((() => undefined) as unknown) as typeof process.exit);
     const lines: string[] = [];
     const capture = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
@@ -84,7 +83,7 @@ describe('a boot whose login is refused before its first renewal (sheet [pg] 12,
         restartForShards: reason => m.restartForShards(reason, m.maintenanceUnfit),
         log: { log: capture, warn: capture, error: capture },
       });
-      dm.stopHandler(stopSteps({ claims: () => claims, drainForExit: dm.drainForExit, hasWorkingSet: () => getWorkingSet() !== null }));
+      stopSteps(dm, { claims: () => claims });
       claims.start();
       const first = claims.firstRenewal();
       const got = await a.take({ me: A, capacity: 4, ttlMs: TIMINGS.ttlMs, boot: true, known: [], localCount: 2, reserve: false });

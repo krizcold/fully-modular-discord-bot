@@ -42,7 +42,7 @@ async function rig(opts: { ipc?: boolean; fitness?: () => string | null } = {}) 
   const m = await import('../../src/bot/internalSetup/utils/maintenance');
   const dm = await import('../../src/bot/internalSetup/utils/dataManager');
   const gate = await import('../../src/bot/internalSetup/utils/maintenanceGate');
-  const { initWorkingSet, getWorkingSet } = await import('../../src/bot/internalSetup/utils/dataBackends/workingSet');
+  const { initWorkingSet } = await import('../../src/bot/internalSetup/utils/dataBackends/workingSet');
   const { ShardClaims } = await import('../../src/bot/internalSetup/fleet/shardClaims');
   m._setMaintenanceTiming({ leaveRetryMs: 1000, filePollMs: 600_000, leaveSaveBoundMs: 2000 });
   if (opts.ipc) m._setMaintenanceSender(message => { sent.push(message); });
@@ -60,7 +60,7 @@ async function rig(opts: { ipc?: boolean; fitness?: () => string | null } = {}) 
     noteLost: lost => m.startLeave(`Shard ${lost.map(p => p.shardId).join(', ')} ${lost.length > 1 ? 'are' : 'is'} no longer held by this process`),
     restartForShards: reason => m.restartForShards(reason, fitness),
   });
-  const stop = dm.stopHandler(stopSteps({ claims: () => claims, drainForExit: dm.drainForExit, hasWorkingSet: () => getWorkingSet() !== null }));
+  const stop = stopSteps(dm, { claims: () => claims });
   const released = () => lines.filter(l => l.startsWith('[Shards] Released shards'));
   /** A guild holding a write whose flush fails; the fitness function then names the failing save. */
   const hold = async () => {

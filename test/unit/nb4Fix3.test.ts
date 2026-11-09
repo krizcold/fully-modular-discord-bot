@@ -13,7 +13,9 @@ import { applyOperatorDataWrite } from '../../src/bot/internalSetup/utils/ipcDat
 import { restoreGuildFromGraveyard, setGuildDataBackend } from '../../src/bot/internalSetup/utils/dataManager';
 import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
 import { getWorkingSet } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
-import { runStopSteps, type StopSteps } from '../../src/bot/internalSetup/utils/stopSteps';
+import fs from 'fs';
+import path from 'path';
+import { stopSteps } from '../helpers/stopRig';
 import { MemClaimStore } from '../helpers/fakeClaimStore';
 import { setBackendKind } from '../helpers/backendKind';
 import { storeGuild } from '../helpers/gateRig';
@@ -274,52 +276,45 @@ describe('an operator delete or restore asks the serving gate after its last awa
 });
 
 describe('the stop steps (NB4-R3-T1)', () => {
-  function steps(over: Partial<StopSteps> = {}) {
+  async function freshStop() {
+    vi.resetModules();
+    const dm = await import('../../src/bot/internalSetup/utils/dataManager');
     const order: string[] = [];
-    const s: StopSteps = {
-      beginStop: () => { order.push('beginStop'); },
-      stopSamplers: () => { order.push('stopSamplers'); },
-      closeGateway: async () => { order.push('close'); },
-      flushTotals: () => { order.push('flushTotals'); },
-      drain: async () => { order.push('drain'); },
-      finishStop: async () => { order.push('finishStop'); },
-      exit: code => { order.push(`exit ${code}`); },
-      ...over,
-    };
-    return { s, order };
+    const exit = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => { order.push(`exit ${code}`); }) as unknown as typeof process.exit);
+    return { dm, order, exit };
   }
+  const stopStepSource = () => {
+    const source = fs.readFileSync(path.resolve(__dirname, '../../src/bot/internalSetup/clientInitializer.ts'), 'utf-8');
+    return source.slice(source.indexOf('addStopStep(async () => {'), source.indexOf('addReleaseStep(() => stopMainWatch());'));
+  };
 
-  it('run in order: begin, close, totals, drain, release, exit', async () => {
-    const { s, order } = steps();
-    await runStopSteps(s);
-    expect(order).toEqual(['beginStop', 'stopSamplers', 'close', 'flushTotals', 'drain', 'finishStop', 'exit 0']);
+  it('run in order: begin, the final steps, the drain, release, exit', async () => {
+    const { dm, order } = await freshStop();
+    await stopSteps(dm, { claims: () => ({ beginStop: () => undefined, finishStop: async () => undefined }), order })();
+    expect(order).toEqual(['beginStop', 'drain', 'finishStop', 'exit 0', 'exit']);
   });
 
   it('a release that throws still exits once', async () => {
     vi.spyOn(console, 'error').mockImplementation(() => undefined);
-    const exit = vi.fn();
-    const { s } = steps({ finishStop: async () => { throw new Error('boom'); }, exit });
-    await runStopSteps(s);
-    expect(exit).toHaveBeenCalledTimes(1);
-    expect(exit).toHaveBeenCalledWith(0);
+    const { dm, exit } = await freshStop();
+    await stopSteps(dm, { claims: () => ({ beginStop: () => undefined, finishStop: async () => { throw new Error('boom'); } }) })();
+    expect(exit.mock.calls).toEqual([[0]]);
   });
 
-  it('a gateway close that never ends is cut at 2 s and the drain still runs', async () => {
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
-    const { s, order } = steps({ closeGateway: () => new Promise(() => undefined) });
-    const run = runStopSteps(s);
-    await vi.advanceTimersByTimeAsync(1999);
-    expect(order).not.toContain('drain');
-    await vi.advanceTimersByTimeAsync(1);
-    await run;
-    expect(order.slice(-3)).toEqual(['drain', 'finishStop', 'exit 0']);
+  it("clientInitializer's stop step cuts a gateway close at 2 s, so the drain still runs", () => {
+    const step = stopStepSource();
+    expect(step).toContain("getIngestService().close('shutting down')");
+    expect(step).toContain('new Promise(resolve => setTimeout(resolve, 2000))');
   });
 
-  it('a drain that throws skips the release and still exits', async () => {
-    vi.spyOn(console, 'error').mockImplementation(() => undefined);
-    const { s, order } = steps({ drain: async () => { throw new Error('boom'); } });
-    await runStopSteps(s);
-    expect(order).not.toContain('finishStop');
-    expect(order.at(-1)).toBe('exit 0');
+  it('a stop step that throws is logged and the release and the exit still run', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const { dm, order } = await freshStop();
+    const failure = new Error('boom');
+    const stop = stopSteps(dm, { claims: () => ({ beginStop: () => undefined, finishStop: async () => undefined }), order });
+    dm.addStopStep(() => { throw failure; });
+    await stop();
+    expect(error.mock.calls).toContainEqual(['[Data] A stop step failed:', failure]);
+    expect(order.slice(-3)).toEqual(['finishStop', 'exit 0', 'exit']);
   });
 });

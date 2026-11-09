@@ -85,7 +85,7 @@ async function rig() {
   const gate = await import('../../src/bot/internalSetup/utils/maintenanceGate');
   m._setMaintenanceTiming({ leaveRetryMs: 1000, filePollMs: 1000, leaveSaveBoundMs: 2000 });
   shardBoot._setClaimStoreFactory(() => store);
-  dm.stopHandler(stopSteps({ claims: () => shardBoot.getShardClaims(), drainForExit: dm.drainForExit, hasWorkingSet: () => false }));
+  stopSteps(dm, { claims: () => shardBoot.getShardClaims() });
   return { store, shardBoot, m, gate };
 }
 

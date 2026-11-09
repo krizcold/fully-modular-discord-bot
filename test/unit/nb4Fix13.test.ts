@@ -194,7 +194,7 @@ describe('a loss writes the shards served minus the lost ones, under the lost pa
       afterTake?.(mod);
       return answer;
     }) as typeof store.take;
-    const steps = stopSteps({ claims: () => mod.getShardClaims(), drainForExit: dm.drainForExit, hasWorkingSet: () => true });
+    const steps = stopSteps(dm, { claims: () => mod.getShardClaims() });
     return { mod, ready, steps };
   }
 
@@ -272,7 +272,7 @@ describe('the none-held release line once a take answered (NB4-R13-T-NONEHELD, N
     vi.spyOn(process, 'exit').mockImplementation(((() => undefined) as unknown) as typeof process.exit);
     const dm = await import('../../src/bot/internalSetup/utils/dataManager');
     const { mod, ready } = await boot();
-    const steps = stopSteps({ claims: () => mod.getShardClaims(), drainForExit: dm.drainForExit, hasWorkingSet: () => true });
+    const steps = stopSteps(dm, { claims: () => mod.getShardClaims() });
     await ready;
     return { steps };
   }

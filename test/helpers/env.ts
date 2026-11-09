@@ -5,7 +5,8 @@ import { fileURLToPath } from 'url';
 // What a test, and a child process it starts, keeps of the environment it was
 // started in: the platform's own variables, vitest's, the active Stryker
 // mutant, Docker's and testcontainers' (the integration tier starts its
-// containers from the tests), and this suite's own (SMDB_). Every other
+// containers from the tests), and this suite's own (SMDB_, less the SMDB_
+// names src reads, below). Every other
 // variable is taken out, whoever would read it (src by name or through
 // configManager's process.env[key], pg, dotenv, discord.js, git), so a
 // developer's shell can point no run at a real fleet, database, manager,
@@ -23,10 +24,13 @@ const KEPT_NAMES = new Set([
   'CI', 'FORCE_COLOR', 'NO_COLOR', 'TEST',
 ]);
 const KEPT_PREFIXES = ['LC_', 'XDG_', 'VITEST', 'SMDB_', 'DOCKER_', 'TESTCONTAINERS_', '__STRYKER_'];
+// The SMDB_ names src reads (the manager's reshard standby), which a shell must not hand a test.
+const SRC_PREFIXES = ['SMDB_RESHARD_'];
 
 // Windows names its variables in any case.
 export function kept(key: string): boolean {
   const name = key.toUpperCase();
+  if (SRC_PREFIXES.some(prefix => name.startsWith(prefix))) return false;
   return KEPT_NAMES.has(name) || KEPT_PREFIXES.some(prefix => name.startsWith(prefix));
 }
 

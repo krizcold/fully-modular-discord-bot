@@ -4,8 +4,8 @@ import type { FenceToken, FlushOutcome } from '../../src/bot/internalSetup/utils
 import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
 import { fixedDatabase } from '../helpers/fixedDatabase';
 import { initWorkingSet, WorkingSetManager } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
-import { drainForExit } from '../../src/bot/internalSetup/utils/dataManager';
-import { runStopSteps } from '../../src/bot/internalSetup/utils/stopSteps';
+import * as dm from '../../src/bot/internalSetup/utils/dataManager';
+import { stopSteps } from '../helpers/stopRig';
 import { FakeStore, tokenFor } from '../helpers/fakeStore';
 
 // Round 4: commitUnanswered as NB13 decision 3 defines it, and the drop lines printed on every exit.
@@ -101,15 +101,8 @@ describe('NB4-R4-DL-1: a stop before the leave ends still logs the drop lines', 
 
     const order: string[] = [];
     error.mockImplementation((line: unknown) => { if (String(line).startsWith('[Shards]')) order.push(String(line)); });
-    await runStopSteps({
-      beginStop: () => {},
-      stopSamplers: () => {},
-      closeGateway: async () => {},
-      flushTotals: () => {},
-      drain: () => drainForExit(2000),
-      finishStop: async () => { order.push('finishStop'); },
-      exit: code => { order.push(`exit ${code}`); },
-    });
+    vi.spyOn(process, 'exit').mockImplementation(((code?: number) => { order.push(`exit ${code}`); }) as unknown as typeof process.exit);
+    await stopSteps(dm, { claims: () => ({ beginStop: () => undefined, finishStop: async () => { order.push('finishStop'); } }) })();
     expect(order).toEqual([dropLine(g), 'finishStop', 'exit 0']);
     expect(ws.takeDropLines()).toEqual([]);
   });

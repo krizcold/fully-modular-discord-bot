@@ -13,7 +13,7 @@ import { markMetricsReady, setupMetricsIPCHandlers } from './utils/ipcMetricsHan
 import { setupFleetIPCHandlers } from './utils/ipcFleetHandler';
 import { getMetricsCollector } from './utils/metrics/metricsCollector';
 import { startSamplers, stopSamplers } from './utils/metrics/samplers';
-import { addReleaseStep, addStopStep, getGuildDataBackend,sweepGraveyard, DataBackendUnavailableError } from './utils/dataManager';
+import { addReleaseStep, addStopStep, getGuildDataBackend, sweepGraveyard, DataBackendUnavailableError } from './utils/dataManager';
 import { setupSharedOpsIPC } from './utils/sharedOps';
 import { reportWriterStage } from './utils/writerLock';
 import { initDataBackendLayer, awaitDataStartupBarrier, dispatchGated, dataUnavailableMessage } from './utils/dataBackends/boot';

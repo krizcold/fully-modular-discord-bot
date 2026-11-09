@@ -9,23 +9,27 @@ import { pastBudget } from '../mutation/control.mjs';
 import { PASSES } from '../mutation/passes.mjs';
 
 // The L5 bite (VERIFY.md L5 and [A2]): one run of the gate on two lines of
-// nodeIdentity.ts. getAppVersion's read is in-process code, so the fast tier
-// kills its mutants in pass A. What getNodeId writes to node.json only shows
-// across a restart, which no in-process test makes, so its mutants survive
-// pass A and must die in pass B through the child scenario: proof that the
-// active mutant reaches a child process and that the child loads the sandbox's
-// own build. One mutant of the first line is equivalent (package.json has a
-// version, so the '0.0.0' fallback is never read), so the run also shows the
-// failing verdict and how a survivor is reported.
+// the bot process's entry, bot/index.ts, which no src file imports, so the
+// tests related to it are the few that boot it and stay so however src grows.
+// Its boot's standby check is in-process code, so the fast tier kills its
+// mutants in pass A. The base the entry registers the path aliases on matters
+// only to a real process that loads an aliased import, which no in-process
+// test makes (each mocks tsconfig-paths), so its mutants survive pass A and
+// must die in pass B through the NB10 child scenarios: proof that the active
+// mutant reaches a child process and that the child loads the sandbox's own
+// build. One mutant of the first line survives every test (no test boots the
+// entry as a standby, so the check made false changes nothing they see), so
+// the run also shows the failing verdict and how a survivor is reported.
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-const TARGET = 'src/bot/internalSetup/fleet/nodeIdentity.ts';
+const TARGET = 'src/bot/index.ts';
+const FAST = 'if (process.env.SMDB_RESHARD_STANDBY) return standbyBoot();';
 
 interface Pass { id: string | null; dir?: string; status: string; killedBy?: string; inconclusive?: string; recheck?: string }
 
 // The ids a pass ran tests for (targets.mjs), as runner.mjs read them.
 const ranFor = (reportDir: string, dir: string) => (JSON.parse(fs.readFileSync(path.join(root, reportDir, dir, 'run-ids.json'), 'utf8')) as string[]).sort();
-interface Mutant { location: { start: { line: number } }; mutator: string; original: string; passes: { a: Pass; b?: Pass; b2?: Pass } }
+interface Mutant { location: { start: { line: number } }; mutator: string; original: string; replacement: string; passes: { a: Pass; b?: Pass; b2?: Pass } }
 
 function lineOf(text: string): number {
   const index = readSourceText(root, TARGET).split('\n').findIndex(line => line.includes(text));
@@ -93,8 +97,8 @@ describe('the touched-line mutation gate', () => {
   });
 
   it('kills in-process code in pass A and restart-only code in pass B through a child', { timeout: 1_850_000 }, () => {
-    const fast = lineOf("cachedAppVersion = String(JSON.parse(fs.readFileSync(pkgPath, 'utf-8')).version || '0.0.0');");
-    const child = lineOf('atomicWriteFileSync(file, JSON.stringify({ nodeId, createdAt: Date.now() }, null, 2));');
+    const fast = lineOf(FAST);
+    const child = lineOf("const baseUrl = path.join(__dirname, '..');");
     const run = spawnSync(process.execPath, [
       path.join(root, 'test', 'mutation', 'touched.mjs'),
       '--mutate', `${TARGET}:${fast}-${fast}`,
@@ -106,16 +110,17 @@ describe('the touched-line mutation gate', () => {
     const { mutants } = JSON.parse(fs.readFileSync(path.join(root, reportDir!, 'mutants.json'), 'utf8')) as { mutants: Mutant[] };
     const on = (line: number) => mutants.filter(m => m.location.start.line === line && m.passes.a.status !== 'CompileError');
 
-    const equivalent = (m: Mutant) => m.mutator === 'StringLiteral' && m.original === "'0.0.0'";
-    expect(on(fast).filter(equivalent)).toHaveLength(1);
-    for (const m of on(fast).filter(m => !equivalent(m))) {
-      expect(m.passes.a, `${m.mutator} ${m.original}`).toMatchObject({ status: 'Killed', killedBy: expect.stringMatching(/^unit\/nodeIdentity\.test\.ts > /) });
+    const survivor = (m: Mutant) => m.mutator === 'ConditionalExpression' && m.replacement === 'false';
+    expect(on(fast).filter(survivor)).toHaveLength(1);
+    expect(on(fast).filter(m => !survivor(m)).length).toBeGreaterThan(0);
+    for (const m of on(fast).filter(m => !survivor(m))) {
+      expect(m.passes.a, `${m.mutator} ${m.original}`).toMatchObject({ status: 'Killed', killedBy: expect.stringMatching(/^unit\/\w+\.test\.ts > /) });
     }
-    for (const m of on(fast).filter(equivalent)) expect(m).toMatchObject({ passes: { a: { status: 'Survived' }, b: { status: 'Survived' } } });
+    for (const m of on(fast).filter(survivor)) expect(m).toMatchObject({ passes: { a: { status: 'Survived' }, b: { status: 'Survived' } } });
 
     expect(on(child).length).toBeGreaterThan(0);
     for (const m of on(child)) {
-      const byChild = { status: 'Killed', killedBy: expect.stringMatching(/^child\/nodeIdentity\.test\.ts > /) };
+      const byChild = { status: 'Killed', killedBy: expect.stringMatching(/^child\/nb10Scenarios\.test\.ts > /) };
       expect(m.passes.a.status, `${m.mutator} ${m.original}`).toBe('Survived');
       expect(m.passes.b, `${m.mutator} ${m.original}`).toMatchObject(byChild);
       expect(m.passes.b2, `${m.mutator} ${m.original}: pass B's kill rerun alone`).toMatchObject(byChild);
@@ -124,9 +129,9 @@ describe('the touched-line mutation gate', () => {
     expect(run.status).toBe(1);
     // One fast-check seed for the whole run, named in the report.
     expect(run.stdout).toMatch(/^Scope: the patterns .*; fast-check seed \d+$/m);
-    expect(run.stdout).toMatch(/^Survivors .*\n {2}src\/bot\/internalSetup\/fleet\/nodeIdentity\.ts:\d+:\d+ StringLiteral: `'0\.0\.0'`/m);
-    expect(run.stdout).not.toContain(`nodeIdentity.ts:${child}:`);
-    const killedInA = on(fast).filter(m => !equivalent(m)).length;
+    expect(run.stdout).toMatch(/^Survivors .*\n {2}src\/bot\/index\.ts:\d+:\d+ ConditionalExpression: `process\.env\.SMDB_RESHARD_STANDBY` -> `false`/m);
+    expect(run.stdout).not.toContain(`${TARGET}:${child}:`);
+    const killedInA = on(fast).filter(m => !survivor(m)).length;
     expect(run.stdout).toContain(`\n  killed in pass A: ${killedInA}; run in pass B: ${on(child).length + 1}, killed there: ${on(child).length}\n`);
     expect(run.stdout).toMatch(/^Runs with no mutant that checked what a pass counted:\n {2}after pass A, each file that killed a mutant there, alone: \d+ of \d+ passed .*\n {2}after pass b2: passed /m);
     expect(run.stdout).toMatch(/^Verdict: FAIL$/m);
@@ -160,7 +165,7 @@ describe('the touched-line mutation gate', () => {
    * bite's target.
    */
   function standInRun(code: string, patterns?: string[]) {
-    const line = lineOf("cachedAppVersion = String(JSON.parse(fs.readFileSync(pkgPath, 'utf-8')).version || '0.0.0');");
+    const line = lineOf(FAST);
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-control-'));
     const fake = path.join(dir, 'vitest.cjs');
     // Git-ignored files in the checkout (*.log), which no sandbox may hold: one
@@ -240,7 +245,7 @@ describe('the touched-line mutation gate', () => {
     expect(run.stdout).toMatch(/^Stopped:\n {2}the run with no mutant after pass a2 failed \(There were failed tests in the initial test run\.\), so what its reruns counted cannot be told from the machine's failures$/m);
     expect(run.stdout).toMatch(/^ {2}the run with no mutant failed in unit\/x\.test\.ts: Error: the database went away$/m);
     expect(run.stdout).toContain(`\nChanged during the run (so no one tree was tested):\n  ${added}, ${lock}\n`);
-    expect(run.stdout).toMatch(/^Inconclusive .*\n {2}src\/bot\/internalSetup\/fleet\/nodeIdentity\.ts:\d+:\d+ .*\(the run with no mutant after pass a2 failed\)$/m);
+    expect(run.stdout).toMatch(/^Inconclusive .*\n {2}src\/bot\/index\.ts:\d+:\d+ .*\(the run with no mutant after pass a2 failed\)$/m);
     expect(run.stdout).not.toMatch(/^Timeouts /m);
     expect(run.stdout).not.toMatch(/^Runs with no mutant that checked what a pass counted:/m);
   });
@@ -481,15 +486,17 @@ describe('the touched-line mutation gate', () => {
     expect(unknown.stdout).toMatch(/^Stopped:\n {2}the gate stopped: Command failed: git .*merge-base no-such-ref-anywhere HEAD/m);
     expect(unknown.stdout).toMatch(/^Verdict: NO RESULT \(the gate stopped before it finished\)$/m);
 
-    // The file's opening comment and first import: no mutant can be made there.
+    // The file's first two imports: no mutant can be made there.
     // Spelled the way a shell may complete it (on Windows, in another case too),
     // it is taken under the name it has on disk.
+    const first = lineOf("import * as tsConfigPaths from 'tsconfig-paths';");
+    expect(lineOf("import * as path from 'path';")).toBe(first + 1);
     const spelled = process.platform === 'win32' ? `.\\${TARGET.replace(/^src/, 'SRC').split('/').join('\\')}` : `./${TARGET}`;
-    const nothing = gate('--mutate', `${spelled}:1-4`, '--concurrency', '1');
+    const nothing = gate('--mutate', `${spelled}:${first}-${first + 1}`, '--concurrency', '1');
     clean(nothing.stdout);
     expect(nothing.status, nothing.stderr).toBe(2);
-    expect(nothing.stdout).toMatch(/^Patterns that made no mutant:\n {2}src\/bot\/internalSetup\/fleet\/nodeIdentity\.ts:1-4$/m);
-    expect(nothing.stdout).toMatch(/^Changed lines of code no mutant lies wholly on .*\n {2}src\/bot\/internalSetup\/fleet\/nodeIdentity\.ts: 4$/m);
+    expect(nothing.stdout).toMatch(new RegExp(`^Patterns that made no mutant:\\n {2}src/bot/index\\.ts:${first}-${first + 1}$`, 'm'));
+    expect(nothing.stdout).toMatch(new RegExp(`^Changed lines of code no mutant lies wholly on .*\\n {2}src/bot/index\\.ts: ${first}, ${first + 1}$`, 'm'));
     expect(nothing.stdout).toMatch(/^Verdict: NO RESULT \(no gating mutant was made/m);
 
     // dataRoot.ts is never mutated.

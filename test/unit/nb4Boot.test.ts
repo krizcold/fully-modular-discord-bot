@@ -606,7 +606,7 @@ describe('during module loading (unit 6, R2-T4)', () => {
     const dm = await import('../../src/bot/internalSetup/utils/dataManager');
     const { mod, ready } = await boot();
     const order: string[] = [];
-    const handler = dm.stopHandler(stopSteps({ claims: () => mod.getShardClaims(), drainForExit: dm.drainForExit, hasWorkingSet: () => true, order }));
+    const handler = stopSteps(dm, { claims: () => mod.getShardClaims(), order });
     const ctx = await ready;
     h.stopping = true;
     const stopped = handler();
@@ -616,7 +616,7 @@ describe('during module loading (unit 6, R2-T4)', () => {
     expect(lines).toContain("[Shards] Released shards 0, 1: kept for this machine's next start for 30 s, then free to any machine with room");
     expect([...store.rows.values()].filter(r => r.holderProcess !== 'p-x').every(r => r.released)).toBe(true);
     expect(exit.mock.calls).toEqual([[0]]);
-    expect(order).toEqual(['beginStop', 'stopSamplers', 'closeGateway', 'flushTotals', 'drain', 'finishStop', 'exit']);
+    expect(order).toEqual(['beginStop', 'drain', 'finishStop', 'exit']);
     expect(lines.some(l => l.includes('A stop step failed'))).toBe(false);
     ctx.startIngest('token');
     expect(h.starts).toBe(0);
@@ -681,7 +681,7 @@ describe("the last start's record through the boot wiring (NB4-R7-T2)", () => {
     vi.spyOn(process, 'exit').mockImplementation(((() => undefined) as unknown) as typeof process.exit);
     const dm = await import('../../src/bot/internalSetup/utils/dataManager');
     const { mod, ready } = await boot();
-    const steps = stopSteps({ claims: () => mod.getShardClaims(), drainForExit: dm.drainForExit, hasWorkingSet: () => true });
+    const steps = stopSteps(dm, { claims: () => mod.getShardClaims() });
     await ready;
     expect(h.plans.at(-1)).toEqual({ shards: [2], shardCount: 4 });
     expect(stored()).toMatchObject({ shardCount: 4, shardIds: [2] });

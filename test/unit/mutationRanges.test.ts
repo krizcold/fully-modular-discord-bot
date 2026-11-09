@@ -985,6 +985,7 @@ describe('the change', () => {
     // A change: see that each check that picks a root still holds the root it picks, as dataRoot.ts does, and route a
     // fixed path through src/utils/dataRoot.ts; then set the list. The config page is on it for its data routes.
     expect(named.sort()).toEqual([
+      'src/bot/internalSetup/utils/dataBackends/mainDatabase.ts',
       'src/bot/internalSetup/utils/pathHelpers.ts',
       'src/index.ts',
       'src/utils/autoSnapshot.ts',

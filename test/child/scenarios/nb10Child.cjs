@@ -43,12 +43,14 @@ fs.promises.open = async (file, flags, mode) => {
   });
 };
 
+// The real module exports main, which index.js calls once the writer lock is taken.
 function replacement() {
-  void run().catch(error => {
-    console.error('[nb10Child] failed:', error);
-    process.exit(1);
-  });
-  return {};
+  return {
+    main: () => run().catch(error => {
+      console.error('[nb10Child] failed:', error);
+      process.exit(1);
+    }),
+  };
 }
 
 async function run() {

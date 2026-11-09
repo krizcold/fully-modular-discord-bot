@@ -7,7 +7,8 @@ import { FakeStore, tokenFor } from '../helpers/fakeStore';
 import { setBackendKind } from '../helpers/backendKind';
 import { stopSteps } from '../helpers/stopRig';
 import { initWorkingSet } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
-import { drainForExit, saveData } from '../../src/bot/internalSetup/utils/dataManager';
+import * as dm from '../../src/bot/internalSetup/utils/dataManager';
+import { saveData } from '../../src/bot/internalSetup/utils/dataManager';
 
 // NB4 decision 11 (R2-RETURNS): which held shard goes back to its home at the next stop, and which moves to a node
 // with room when this process is above its target. A receiver is fit, has a web UI, has been healthy for 300 s, was
@@ -131,11 +132,11 @@ describe('the work cycle with FLEET_SHARD_RETURN on and off', () => {
     data.mode = 'unavailable';
     saveData('g.json', { guildId, category: 'm' }, { v: 1 });
     const order: string[] = [];
-    const stop = stopSteps({ claims: () => r.claims, drainForExit, hasWorkingSet: () => true, order });
+    const stop = stopSteps(dm, { claims: () => r.claims, order });
     const stopped = stop();
     await vi.advanceTimersByTimeAsync(40_000);
     await stopped;
-    expect(order).toEqual(['beginStop', 'stopSamplers', 'closeGateway', 'flushTotals', 'drain', 'finishStop', 'exit']);
+    expect(order).toEqual(['beginStop', 'drain', 'finishStop', 'exit']);
     expect(warns).toContain(`[Data] Shutdown drain left 1 guild(s) with unflushed writes: ${guildId}`);
     expect(ws.dirtyGuildIds()).toEqual([guildId]);
     expect(data.doc(guildId, 'g.json')).toBeUndefined();

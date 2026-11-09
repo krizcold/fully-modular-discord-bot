@@ -186,7 +186,7 @@ describe('the shard record lists the shards served minus every shard lost or han
     vi.spyOn(process, 'exit').mockImplementation(((() => undefined) as unknown) as typeof process.exit);
     const dm = await import('../../src/bot/internalSetup/utils/dataManager');
     const { mod, ready } = await boot();
-    const steps = stopSteps({ claims: () => mod.getShardClaims(), drainForExit: dm.drainForExit, hasWorkingSet: () => true });
+    const steps = stopSteps(dm, { claims: () => mod.getShardClaims() });
     await ready;
     expect(h.plans.at(-1)).toEqual({ shards: [0, 1], shardCount: 4 });
     expect(stored()).toMatchObject({ shardCount: 4, shardIds: [0, 1] });

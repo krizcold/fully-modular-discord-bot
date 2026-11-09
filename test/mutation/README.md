@@ -638,12 +638,13 @@ removed source file.
 
 ## Proven locally
 
-- The bite, integration/mutationBite.test.ts: one gate run on two lines of nodeIdentity.ts. getAppVersion's read
-  dies in pass A to unit/nodeIdentity.test.ts; what getNodeId writes to node.json, which only a restart shows, survives
-  pass A and dies in pass B to child/nodeIdentity.test.ts, again when rerun alone, and the run with no mutant after that
-  rerun passes. One mutant of the first line is equivalent (package.json has a version, so the `'0.0.0'` fallback is
-  never read), so the run also shows the FAIL verdict and how
-  a survivor is listed. Each of its real passes leaves
+- The bite, integration/mutationBite.test.ts: one gate run on two lines of src/bot/index.ts, the bot process's entry,
+  which no src file imports, so its related tests stay the few that boot it however many files import the rest. The
+  boot's standby check dies in pass A to those in-process tests; the base the entry registers the path aliases on,
+  which every in-process test mocks away and only a real process that loads an aliased import uses, survives pass A
+  and dies in pass B to child/nb10Scenarios.test.ts, again when rerun alone, and the run with no mutant after that
+  rerun passes. One mutant of the first line survives every test (no test boots the entry as a standby), so the run
+  also shows the FAIL verdict and how a survivor is listed. Each of its real passes leaves
   Stryker's own time for its run with no mutant and runner.mjs's monotonic one, and the two agree, so a sound run is
   never taken for a clock step. The same file checks that an unknown
   base and a pattern that makes no mutant both end NO RESULT, exit 2, and that a glob, a missing file, a pattern with
