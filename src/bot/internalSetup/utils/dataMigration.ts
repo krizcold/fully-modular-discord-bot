@@ -968,21 +968,61 @@ export async function closeSession(session: PgSession, boundMs = CLOSE_BOUND_MS)
   if (!ended) destroySession(session);
 }
 
-/** The other sessions of the role; the statistics snapshot is cleared first, so a read inside a transaction sees the sessions of now. */
-async function candidateSessions(session: PgSession, jobId: string): Promise<Array<{ pid: number; started: string; app: string }>> {
+/**
+ * NB21: a backend on this database that has a role. `own` is a session of the job's login role; `kind` is null when
+ * the reader's role may not see it.
+ */
+export interface SessionRow {
+  pid: number;
+  started: string;
+  app: string;
+  role: string;
+  own: boolean;
+  kind: string | null;
+}
+
+type SessionFacts = Pick<SessionRow, 'app' | 'role' | 'own' | 'kind'>;
+
+/** NB21 decision 4: a session of migration id, as only the job itself opens one. */
+export function isJobSession(row: Pick<SessionRow, 'app' | 'own' | 'kind'>, id: string): boolean {
+  return row.own && row.kind === 'client backend' && row.app === `${MIGRATE_APP}${id}`;
+}
+
+/** NB21 decision 2: every backend counts but a parallel worker (its leader counts) and the bot role's own three clients. */
+export function countsAsOther(row: Pick<SessionRow, 'app' | 'own' | 'kind'>, jobId: string): boolean {
+  if (row.kind === 'parallel worker') return false;
+  if (isJobSession(row, jobId)) return false;
+  return !(row.own && row.kind === 'client backend' && (row.app === WEBUI_READER_APP || row.app === WEBUI_LISTEN_APP));
+}
+
+function sessionLabel(row: SessionFacts): string {
+  const kind = row.kind !== null && row.kind !== 'client backend' ? ` (${row.kind})` : '';
+  return `${row.app === '' ? 'unnamed' : row.app}${kind}${row.own ? '' : ` as ${row.role}`}`;
+}
+
+/** The counted backends; the statistics snapshot is cleared first, so a read inside a transaction sees the sessions of now. */
+async function candidateSessions(session: PgSession, jobId: string): Promise<SessionRow[]> {
   await session.query('SELECT pg_stat_clear_snapshot()');
   const res = await session.query(
-    `SELECT pid, ${BACKEND_START} AS started, coalesce(application_name, '') AS app FROM pg_stat_activity WHERE usename = current_user AND backend_type = 'client backend' AND pid <> pg_backend_pid() AND coalesce(application_name, '') <> ALL($1::text[])`,
-    [[`smdb-migrate:${jobId}`, WEBUI_READER_APP, WEBUI_LISTEN_APP]]);
-  return res.rows.map(r => ({ pid: Number(r.pid), started: String(r.started ?? ''), app: String(r.app ?? '') }));
+    `SELECT pid, ${BACKEND_START} AS started, coalesce(application_name, '') AS app, coalesce(usename, 'role ' || usesysid::text) AS role, coalesce(usename = session_user, false) AS own, backend_type AS kind FROM pg_stat_activity WHERE datname = current_database() AND usesysid IS NOT NULL AND pid <> pg_backend_pid()`);
+  return res.rows
+    .map(r => ({
+      pid: Number(r.pid),
+      started: String(r.started ?? ''),
+      app: String(r.app ?? ''),
+      role: String(r.role ?? ''),
+      own: r.own === true,
+      kind: r.kind === null || r.kind === undefined ? null : String(r.kind),
+    }))
+    .filter(r => countsAsOther(r, jobId));
 }
 
 /**
- * The other sessions of the role by application_name, counting only a backend (pid and backend_start) present at the
- * last two of up to MAX_LOOKS looks, secondLookMs apart, so a login that comes and goes (pg_isready) does not count.
- * A look that finds a backend the look before it did not is followed by another look.
+ * The counted backends present at the last two of up to MAX_LOOKS looks (pid and backend_start), secondLookMs apart,
+ * so a login that comes and goes (pg_isready) does not count. A look that finds a backend the look before it did not
+ * is followed by another look.
  */
-async function otherSessions(session: PgSession, jobId: string, secondLookMs: number): Promise<Array<{ app: string; n: number }>> {
+async function otherSessions(session: PgSession, jobId: string, secondLookMs: number): Promise<SessionRow[]> {
   const key = (c: { pid: number; started: string }) => `${c.pid}/${c.started}`;
   let last = await candidateSessions(session, jobId);
   if (last.length === 0) return [];
@@ -993,11 +1033,33 @@ async function otherSessions(session: PgSession, jobId: string, secondLookMs: nu
     last = await candidateSessions(session, jobId);
     if (last.every(c => seen.has(key(c)))) break;
   }
+  return last.filter(c => seen.has(key(c)));
+}
+
+/**
+ * NB21 section 3: the refusal for the counted backends, or null when there are none. A job session of the bot's own
+ * role gives the migration session text; every other row is named by its label.
+ */
+export function otherSessionsRefusal(rows: SessionFacts[], lastJobId: string | null): string | null {
+  const jobs = new Set<string>();
   const by = new Map<string, number>();
-  for (const c of last) {
-    if (seen.has(key(c))) by.set(c.app, (by.get(c.app) ?? 0) + 1);
+  for (const row of rows) {
+    const id = row.app.startsWith(MIGRATE_APP) ? row.app.slice(MIGRATE_APP.length) : null;
+    if (id !== null && isJobSession(row, id)) {
+      jobs.add(id);
+      continue;
+    }
+    const label = sessionLabel(row);
+    by.set(label, (by.get(label) ?? 0) + 1);
   }
-  return [...by].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([app, n]) => ({ app, n }));
+  const parts: string[] = [];
+  const n = [...by.values()].reduce((sum, k) => sum + k, 0);
+  if (n > 0) {
+    const named = [...by].sort(([a], [b]) => byText(a, b)).map(([label, k]) => `${label}: ${k}`).join(', ');
+    parts.push(`${n} other session(s) or worker(s) are connected to this database (${named}); stop every bot and every other client of this database first`);
+  }
+  for (const id of [...jobs].sort(byText)) parts.push(sessionOpenText(id, lastJobId));
+  return parts.length > 0 ? parts.map(p => p.charAt(0).toUpperCase() + p.slice(1)).join('. ') : null;
 }
 
 /** Who holds the sessions S2 and later name: this bot's last job before this one; and the wait before the second look. */
@@ -1007,17 +1069,8 @@ interface SessionContext {
 }
 
 async function refuseOtherSessions(session: PgSession, jobId: string, known: SessionContext): Promise<void> {
-  const groups = await otherSessions(session, jobId, known.secondLookMs);
-  const jobs = groups.filter(g => g.app.startsWith(MIGRATE_APP));
-  const bots = groups.filter(g => !g.app.startsWith(MIGRATE_APP));
-  const parts: string[] = [];
-  const n = bots.reduce((sum, g) => sum + g.n, 0);
-  if (n > 0) {
-    const named = bots.map(g => `${g.app === '' ? 'unnamed' : g.app}: ${g.n}`).join(', ');
-    parts.push(`${n} other session(s) of the bot's database role are connected (${named}); stop every bot on this database first`);
-  }
-  for (const g of jobs) parts.push(sessionOpenText(g.app.slice(MIGRATE_APP.length), known.lastJobId));
-  if (parts.length > 0) throw new Refusal(parts.map(p => p.charAt(0).toUpperCase() + p.slice(1)).join('. '));
+  const text = otherSessionsRefusal(await otherSessions(session, jobId, known.secondLookMs), known.lastJobId);
+  if (text !== null) throw new Refusal(text);
 }
 
 /**

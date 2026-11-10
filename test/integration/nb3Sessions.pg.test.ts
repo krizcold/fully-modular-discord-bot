@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Client } from 'pg';
-import { otherSession, provisionedStore, realService, resetDatabase, startRig, stopRig, jsonBot, type PgRig } from '../helpers/pgMigrationRig';
+import { otherSession, provisionedStore, realService, resetDatabase, sessionsGone, startRig, stopRig, jsonBot, type PgRig } from '../helpers/pgMigrationRig';
 import { openJobSession } from '../../src/bot/internalSetup/utils/dataMigration';
 import { FakeHost, JOURNAL, seedFile, snapshotRoot, useDatabaseUrl, wipeRoot, writeJson, why } from '../helpers/migrationRig';
 
@@ -45,7 +45,7 @@ describe('another session of the role', () => {
     const { job } = await run('file', async p => { if (p === 'S4') other = await otherSession(rig); });
     await (other as Client | null)?.end();
     expect(job, why(job)).toMatchObject({ state: 'failed', stage: 'reading' });
-    expect(job.error).toMatch(/^1 other session\(s\) of the bot's database role are connected \(unnamed: 1\)/);
+    expect(job.error).toMatch(/^1 other session\(s\) or worker\(s\) are connected to this database \(unnamed: 1\)/);
   });
 
   it('refuses before the stage committing', async () => {
@@ -55,28 +55,40 @@ describe('another session of the role', () => {
     const { job } = await run('postgres', async p => { if (p === 'before-commit') other = await otherSession(rig); });
     await (other as Client | null)?.end();
     expect(job, why(job)).toMatchObject({ state: 'failed', stage: 'rereading' });
-    expect(job.error).toMatch(/^1 other session\(s\) of the bot's database role are connected \(unnamed: 1\)/);
+    expect(job.error).toMatch(/^1 other session\(s\) or worker\(s\) are connected to this database \(unnamed: 1\)/);
     const { rows } = await rig.admin.query(`SELECT count(*)::int AS n FROM pg_namespace WHERE nspname = 'smdb_data'`);
     expect(rows[0].n).toBe(0);
   });
 
-  it('the web UI reader\'s, another role\'s and the job\'s own sessions do not count; one named for another jobId does', async () => {
+  it('the web UI reader\'s and the job\'s own sessions do not count; another role\'s does (NB21), and one named for another jobId does', async () => {
     jsonBot();
     seedFile(`${G}/m/a.json`, '{}');
     await rig.admin.query(`DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'other_role') THEN CREATE ROLE other_role LOGIN PASSWORD 'pw'; END IF; END $$`);
-    const url = new URL(rig.url);
-    url.username = 'other_role';
-    url.password = 'pw';
-    const otherRole = new Client({ connectionString: url.toString() });
-    await otherRole.connect();
     const reader = await otherSession(rig, 'smdb-webui-reader');
     try {
       const { job } = await run('postgres');
       expect(job?.state, why(job)).toBe('done');
     } finally {
-      await otherRole.end();
       await reader.end();
     }
+    wipeRoot();
+    await resetDatabase(rig);
+    await sessionsGone(rig);
+    jsonBot();
+    seedFile(`${G}/m/a.json`, '{}');
+    const url = new URL(rig.url);
+    url.username = 'other_role';
+    url.password = 'pw';
+    const otherRole = new Client({ connectionString: url.toString() });
+    await otherRole.connect();
+    try {
+      const { job } = await run('postgres');
+      expect(job, why(job)).toMatchObject({ state: 'failed', stage: 'checking' });
+      expect(job.error).toBe('1 other session(s) or worker(s) are connected to this database (unnamed as other_role: 1); stop every bot and every other client of this database first');
+    } finally {
+      await otherRole.end();
+    }
+    await sessionsGone(rig);
     wipeRoot();
     await resetDatabase(rig);
     jsonBot();

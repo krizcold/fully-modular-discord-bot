@@ -149,6 +149,6 @@ describe('a move to Postgres', () => {
     db.sessions.push(undefined as unknown as string);
     const job = await runJob(db, 'job-s3-null-01');
     expect(job, why(job)).toMatchObject({ state: 'failed', stage: 'checking' });
-    expect(job.error).toBe("1 other session(s) of the bot's database role are connected (unnamed: 1); stop every bot on this database first");
+    expect(job.error).toBe("1 other session(s) or worker(s) are connected to this database (unnamed: 1); stop every bot and every other client of this database first");
   });
 });

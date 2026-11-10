@@ -51,14 +51,14 @@ export async function provisionedStore(rig: PgRig): Promise<string> {
 }
 
 /**
- * Waits until no session of the role but the rig's own is left (a closed client's backend exits a moment later).
- * Throws after boundMs, naming each session still open.
+ * Waits until no backend that the job's session check reads (NB21: every role on this database) is left but the rig's
+ * own pool (a closed client's backend exits a moment later). Throws after boundMs, naming each session still open.
  */
 export async function sessionsGone(rig: PgRig, boundMs = 10_000): Promise<void> {
   const until = Date.now() + boundMs;
   for (;;) {
     const { rows } = await rig.admin.query(
-      `SELECT application_name, state, wait_event, left(query, 80) AS query FROM pg_stat_activity WHERE usename = current_user AND backend_type = 'client backend' AND coalesce(application_name, '') <> 'smdb-webui-reader'`,
+      `SELECT application_name, state, wait_event, left(query, 80) AS query FROM pg_stat_activity WHERE datname = current_database() AND usesysid IS NOT NULL AND pid <> pg_backend_pid() AND NOT (usename = session_user AND coalesce(application_name, '') = 'smdb-webui-reader')`,
     );
     if (rows.length === 0) return;
     if (Date.now() > until) {

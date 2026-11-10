@@ -601,8 +601,8 @@ describe('NB3-R3-5 and NB3-R4-T1: the best-effort session settings and the one s
 });
 
 describe('the second look: a session counts only when the same backend is there at both reads', () => {
-  const OTHER = (named: string) => `1 other session(s) of the bot's database role are connected (${named}: 1); stop every bot on this database first`;
-  const isCandidateRead = (sql: string) => /FROM pg_stat_activity WHERE usename = current_user/.test(sql);
+  const OTHER = (named: string) => `1 other session(s) or worker(s) are connected to this database (${named}: 1); stop every bot and every other client of this database first`;
+  const isCandidateRead = (sql: string) => /FROM pg_stat_activity WHERE datname = current_database\(\) AND usesysid IS NOT NULL/.test(sql);
   const candidateReads = (seen: Seen[]) => seen.filter(s => isCandidateRead(s.sql));
   /** A session that logs in for one read only, as pg_isready does. */
   const blip = (db: FakeDb, at: (read: number) => boolean) => {
@@ -639,7 +639,7 @@ describe('the second look: a session counts only when the same backend is there 
     expect(job, why(job)).toMatchObject({
       state: 'failed',
       stage: 'checking',
-      error: "2 other session(s) of the bot's database role are connected (late-bot: 1, other-bot: 1); stop every bot on this database first",
+      error: "2 other session(s) or worker(s) are connected to this database (late-bot: 1, other-bot: 1); stop every bot and every other client of this database first",
     });
     expect(db.sessionReads).toBe(3);
   });

@@ -4,7 +4,7 @@ import { closeSession, jobSessionSettings, openJobSession, probeBackend, watchSe
 import {
   insertDoc, otherSession, provisionedStore, realService, resetDatabase, sessionsGone, startRig, stopRig, jsonBot, type PgRig,
 } from '../helpers/pgMigrationRig';
-import { FakeHost, MARKER, readJson, seedFile, useDatabaseUrl, wipeRoot, why } from '../helpers/migrationRig';
+import { FakeHost, JOURNAL, MARKER, readJson, seedFile, useDatabaseUrl, wipeRoot, why } from '../helpers/migrationRig';
 
 // NB3 code review rounds 3 and 4 against a real Postgres: the session settings by server version (R3-5, R4-T1), the
 // stream read-back guild by guild, a busy statement kept over the probe (R3-4) and the probe's pid and start (R4-RUN-4).
@@ -195,19 +195,22 @@ describe('NB3-R3-4: the read-back and the probe', () => {
 });
 
 describe('the second look at the sessions of the role', () => {
-  const OTHER = (named: string) => `1 other session(s) of the bot's database role are connected (${named}: 1); stop every bot on this database first`;
+  const OTHER = (named: string) => `1 other session(s) or worker(s) are connected to this database (${named}: 1); stop every bot and every other client of this database first`;
 
   it('a client that logs in and out within the first look does not refuse the job; one that stays does', async () => {
     jsonBot();
     seedFile(`${G1}/m/a.json`, '{"a":1}');
     let reads = 0;
+    const readStages: string[] = [];
     const service = realService(new FakeHost(), {
       secondLookMs: 3000,
       connect: async (url, app, kind) => {
         const session = await openJobSession(url, app, kind, 2000);
         const blipping = {
           query: async (text: string, params?: unknown[]) => {
-            if (!/FROM pg_stat_activity WHERE usename = current_user/.test(text) || reads++ > 0) return session.query(text, params);
+            if (!/FROM pg_stat_activity WHERE datname = current_database\(\) AND usesysid IS NOT NULL/.test(text)) return session.query(text, params);
+            readStages.push(readJson(JOURNAL).stage);
+            if (reads++ > 0) return session.query(text, params);
             const probe = await otherSession(rig, 'pg-probe');
             try {
               return await session.query(text, params);
@@ -224,7 +227,7 @@ describe('the second look at the sessions of the role', () => {
     await service.post({ jobId: 'job-r6pg-0001', to: 'postgres' });
     await service.idle();
     expect(service.status().body.job, why(service.status().body.job)).toMatchObject({ state: 'done' });
-    expect(reads).toBeGreaterThanOrEqual(2);
+    expect(readStages.filter(st => st === 'checking').length).toBeGreaterThanOrEqual(2);
     await sessionsGone(rig);
 
     await resetDatabase(rig);

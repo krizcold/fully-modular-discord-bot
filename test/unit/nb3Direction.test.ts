@@ -96,9 +96,12 @@ describe('a JSON bot that never booted', () => {
     await service.idle();
     expect(readJson(MARKER).live).toBe('postgres');
     expect(db.schemas.get('smdb_data')?.data).toHaveLength(1);
-    const counts = db.log.map(e => e.sql).filter(sql => /pg_stat_activity/.test(sql) && /<> ALL/.test(sql));
+    const counts = db.log.map(e => e.sql).filter(sql => /pg_stat_activity/.test(sql) && /usesysid IS NOT NULL/.test(sql));
     expect(counts.length).toBeGreaterThan(0);
-    for (const sql of counts) expect(sql).toMatch(/backend_type = 'client backend'/);
+    for (const sql of counts) {
+      expect(sql).toMatch(/datname = current_database\(\)/);
+      expect(sql).not.toMatch(/backend_type =/);
+    }
   });
 
   it('a failed marker write refuses, naming the file, and leaves no journal', async () => {

@@ -59,6 +59,8 @@ export class FakeDb {
   /** Reads of the role's other sessions so far; beforeSessionRead runs before each, so a test can add or drop a session for one read. */
   sessionReads = 0;
   beforeSessionRead: ((read: number) => void) | null = null;
+  /** The role and kind of every session of a name, as the session check reads them; by default the job's role and a client backend. */
+  sessionMeta = new Map<string, { role?: string; own?: boolean; kind?: string | null }>();
   /** shared_rev_seq: the revs of shared docs and modules and the seq of shared lines. */
   revSeq = 1;
   /** The values' bytes of each shared insert, in order. */
@@ -201,19 +203,20 @@ export class FakeClient {
       return { rows: [this.db.backendState?.(params[0], target.app) ?? { state: 'idle', wait_event_type: 'Client' }] };
     }
     if (/pg_stat_clear_snapshot/.test(sql)) { this.statSnapshot = null; return { rows: [] }; }
-    if (/pg_stat_activity/.test(sql) && /<> ALL/.test(sql) && /AS started/.test(sql)) {
+    if (/pg_stat_activity/.test(sql) && /usesysid IS NOT NULL/.test(sql)) {
       this.db.beforeSessionRead?.(this.db.sessionReads);
       this.db.sessionReads += 1;
-      const excluded: string[] = params[0];
       const nth = new Map<string, number>();
       const all = this.activity().map(app => {
         const k = nth.get(app) ?? 0;
         nth.set(app, k + 1);
-        return { app, ...this.db.backendOf(app, k) };
+        const meta = this.db.sessionMeta.get(app) ?? {};
+        const own = meta.own ?? true;
+        return { app, ...this.db.backendOf(app, k), role: meta.role ?? (own ? 'bot' : 'other'), own, kind: meta.kind === undefined ? 'client backend' : meta.kind };
       });
       const self = all.findIndex(a => a.app === this.app);
       if (self >= 0) all.splice(self, 1);
-      return { rows: all.filter(a => !excluded.includes(a.app)) };
+      return { rows: all };
     }
     if (/pg_stat_activity/.test(sql)) {
       if (/<> ALL/.test(sql)) {

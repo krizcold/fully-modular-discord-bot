@@ -80,7 +80,7 @@ describe('NB3-DL-1: every session count clears the statistics snapshot first', (
     await service.post({ jobId: 'job-r1-dl1-01', to: 'postgres' });
     await service.idle();
     expect(service.status().body.job.state).toBe('done');
-    const counts = seen.map((s, i) => [s, i] as const).filter(([s]) => /pg_stat_activity/.test(s.sql) && /<> ALL/.test(s.sql));
+    const counts = seen.map((s, i) => [s, i] as const).filter(([s]) => /pg_stat_activity/.test(s.sql) && /usesysid IS NOT NULL/.test(s.sql));
     expect(counts.length).toBeGreaterThanOrEqual(2);
     for (const [s, i] of counts) expect(seen[i - 1]).toMatchObject({ app: s.app, sql: 'SELECT pg_stat_clear_snapshot()' });
   });
@@ -128,7 +128,7 @@ describe('the session refusal names the sessions', () => {
     await service.idle();
     const job = service.status().body.job;
     expect(job, why(job)).toMatchObject({ state: 'failed', stage: 'checking' });
-    expect(job.error).toBe("3 other session(s) of the bot's database role are connected (unnamed: 1, other-bot: 2); stop every bot on this database first");
+    expect(job.error).toBe("3 other session(s) or worker(s) are connected to this database (other-bot: 2, unnamed: 1); stop every bot and every other client of this database first");
   });
 });
 

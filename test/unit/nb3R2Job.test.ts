@@ -358,7 +358,7 @@ describe("NB3-R2-OPS-4: an earlier job's database session still open", () => {
     const mixed = serviceFor(db, new FakeHost());
     await mixed.post({ jobId: 'job-r2-op4-new5', to: 'postgres' });
     await mixed.idle();
-    expect(mixed.status().body.job.error).toBe(`1 other session(s) of the bot's database role are connected (other-bot: 1); stop every bot on this database first. Migration job-r2-op4-old's database session is still open; ${NEXT_STEP}`);
+    expect(mixed.status().body.job.error).toBe(`1 other session(s) or worker(s) are connected to this database (other-bot: 1); stop every bot and every other client of this database first. Migration job-r2-op4-old's database session is still open; ${NEXT_STEP}`);
   });
 
   it('an earlier job on another database is not read for', async () => {

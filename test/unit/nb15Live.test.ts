@@ -19,7 +19,7 @@ import { sendLiveUpdate } from '../../src/bot/internalSetup/utils/panel/panelWeb
 import { readSourceText } from '../helpers/sourceText';
 import { LIVE_REASONS, PanelLiveWatch, type FetchAnswer, type WatchDeps } from '../../src/webui/utils/panelLiveWatch';
 import { remotePanelAnswer } from '../../src/webui/utils/guildRequests';
-import { WEBUI_LISTEN_APP } from '../../src/bot/internalSetup/utils/dataMigration';
+import { countsAsOther, WEBUI_LISTEN_APP } from '../../src/bot/internalSetup/utils/dataMigration';
 
 const G = '4194304';
 
@@ -551,8 +551,9 @@ describe('the web UI', () => {
 describe("the migration's session count (NB3)", () => {
   it("does not count 'smdb-webui-listen' and still counts 'smdb-webui-requests'", () => {
     const src = readSourceText(__dirname, '../../src/bot/internalSetup/utils/dataMigration.ts');
-    expect(src).toMatch(/\[\[`smdb-migrate:\$\{jobId\}`, WEBUI_READER_APP, WEBUI_LISTEN_APP\]\]/);
     expect(WEBUI_LISTEN_APP).toBe('smdb-webui-listen');
+    expect(countsAsOther({ app: WEBUI_LISTEN_APP, own: true, kind: 'client backend' }, 'job-nb15-live')).toBe(false);
+    expect(countsAsOther({ app: 'smdb-webui-requests', own: true, kind: 'client backend' }, 'job-nb15-live')).toBe(true);
     expect(src).not.toContain('smdb-webui-requests');
   });
 });
