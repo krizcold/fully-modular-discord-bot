@@ -543,6 +543,10 @@ const SHARED_PLACES = 4;
 export const CHECK_STATEMENT_MS = 30_000;
 /** NB6 C4: a module fetch read's client bound over its server bound. */
 const READ_CLIENT_MARGIN_MS = 10_000;
+/** A DataRow's framing on the wire for three columns: type, length and count (7 bytes) plus 4 per column. */
+export const HYDRATE_ROW_OVERHEAD_BYTES = 19;
+/** The bytes a hydrate's reads (documents and append keys) carry, which size their statement_timeout as a flush's (NB20). */
+export const HYDRATE_BYTES_SQL = `SELECT ((SELECT coalesce(sum(octet_length(module) + octet_length(filename) + octet_length(doc) + ${HYDRATE_ROW_OVERHEAD_BYTES}), 0) FROM smdb_data.guild_data WHERE guild_id = $1) + (SELECT coalesce(sum(octet_length(module) + octet_length(filename) + ${HYDRATE_ROW_OVERHEAD_BYTES}), 0) FROM (SELECT DISTINCT module, filename FROM smdb_data.guild_append WHERE guild_id = $1) AS k))::text AS bytes`;
 
 /** NB6 C4 and D6: one statement of a shared transaction. */
 export interface SharedStatement<S = unknown> {
@@ -1687,6 +1691,8 @@ export class PostgresBackend implements DataBackend {
         this.noteSuccess();
         return { ok: false, reason: 'deposed', currentOwner: currentOwner ?? undefined };
       }
+      const size = await send(HYDRATE_BYTES_SQL, [guildId]);
+      await send(`SET LOCAL statement_timeout = ${flushBoundMs(Number(size.rows[0]?.bytes ?? 0))}`);
       const read = await this.readGuildDocs(lease, guildId);
       await send('COMMIT');
       // J1: documents read from a database this process stopped writing to serve nothing; the set hydrates again.
