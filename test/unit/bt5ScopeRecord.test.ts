@@ -480,7 +480,7 @@ describe('the scope record, over random runs', () => {
             check(step.scope, marks[step.mark % marks.length]);
           } else if (step.t === 'note') {
             const slot = slots[step.scope][step.slot];
-            const seq = Math.max(1, slot.top + step.step);
+            const seq = Math.max(1, slot.top + (slot.ws ? step.step : Math.max(0, step.step)));
             slot.top = Math.max(slot.top, seq);
             const ticket = slot.ws
               ? wsTicket(slot.key as WorkingSet, scopes[step.scope], seq)
