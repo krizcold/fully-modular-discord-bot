@@ -504,8 +504,8 @@ export function isSilence(error: unknown): boolean {
 /** NB5 decision 11: what made this process stop writing to its database. */
 export type LatchCause =
   | { kind: 'replaced'; machine: string; generation: number }
-  | { kind: 'tie'; generation: number }
-  | { kind: 'behind-notice'; machine: string; generation: number }
+  | { kind: 'tie'; generation: number; machines?: string[] }
+  | { kind: 'behind-notice'; machine: string; generation: number; machines?: string[] }
   | { kind: 'unknown-store'; other: string; generation: number; standing: Standing };
 
 /** How a database at a higher generation answered: accepting writes, a live copy (in recovery) or read-only. */
@@ -514,8 +514,13 @@ export type Standing = 'writable' | 'live copy' | 'read-only';
 const standingAt = (other: string, standing: Standing, generation: number) =>
   standing === 'writable' ? `${other} accepts writes at generation ${generation}` : `${other} is ${standing === 'live copy' ? 'a live copy' : 'read-only'} at generation ${generation}`;
 
+const listed = (names: string[]) => (names.length <= 1 ? names.join('') : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`);
+
 /** NB5 decision 11's `<why>` for a latch of the database at this address. */
 export function latchWords(cause: LatchCause, address: string): string {
+  if ((cause.kind === 'tie' || cause.kind === 'behind-notice') && cause.machines && cause.machines.length >= 2) {
+    return `can't confirm that ${address} is still the main (${cause.machines.length} machines announced generation ${cause.generation}: ${listed(cause.machines)})`;
+  }
   switch (cause.kind) {
     case 'replaced': return `${address} was replaced by ${cause.machine} (generation ${cause.generation})`;
     case 'tie': return `can't confirm that ${address} is still the main (another database accepts writes at generation ${cause.generation})`;

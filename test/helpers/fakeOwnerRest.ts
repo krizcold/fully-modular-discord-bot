@@ -42,6 +42,8 @@ export class FakeOwnerRest {
   pinned = new Map<string, Set<string>>();
   private scripts: Array<{ method: string; route: RegExp; answer: Script }> = [];
   private seq = 0;
+  /** Discord's nonce dedupe: a create in one channel by one author with an enforced nonce seen before answers that message. */
+  private nonces = new Map<string, any>();
   /** While false every request hangs until its signal aborts. */
   answering = true;
 
@@ -84,6 +86,11 @@ export class FakeOwnerRest {
     return m;
   }
 
+  /** Discord's nonce window has passed: every nonce may create a message again. */
+  expireNonces(): void {
+    this.nonces.clear();
+  }
+
   creates(channel?: string): RestCall[] {
     return this.calls.filter(c => c.method === 'post' && /^\/channels\/\d+\/messages$/.test(c.route) && (!channel || c.route === `/channels/${channel}/messages`));
   }
@@ -92,6 +99,22 @@ export class FakeOwnerRest {
     let set = this.pinned.get(channel);
     if (!set) this.pinned.set(channel, set = new Set());
     return set;
+  }
+
+  /** Waits ms for a scripted answer; the call's signal firing first rejects it as discord.js rejects an aborted request. */
+  delay(ms: number, call: RestCall): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const signal: AbortSignal | undefined = call.options?.signal;
+      const abort = () => {
+        clearTimeout(timer);
+        call.aborted = true;
+        this.aborted.push(call);
+        reject(Object.assign(new Error('This operation was aborted'), { name: 'AbortError' }));
+      };
+      const timer = setTimeout(() => { signal?.removeEventListener('abort', abort); resolve(); }, ms);
+      if (signal?.aborted) abort();
+      else signal?.addEventListener('abort', abort, { once: true });
+    });
   }
 
   private hangUntilAbort(call: RestCall): Promise<never> {
@@ -126,7 +149,11 @@ export class FakeOwnerRest {
     const create = /^\/channels\/(\d+)\/messages$/.exec(route);
     if (create && method === 'post') {
       const body = options.body ?? {};
-      return this.seed(create[1], { id: `msg${++this.seq}`, content: body.content, embeds: body.embeds ?? [], nonce: body.nonce });
+      const key = body.enforce_nonce === true && typeof body.nonce === 'string' ? JSON.stringify([create[1], BOT, body.nonce]) : null;
+      if (key !== null && this.nonces.has(key)) return this.nonces.get(key);
+      const message = this.seed(create[1], { id: `msg${++this.seq}`, content: body.content, embeds: body.embeds ?? [], nonce: body.nonce });
+      if (key !== null) this.nonces.set(key, message);
+      return message;
     }
     if (create && method === 'get') return [...(this.messages.get(create[1]) ?? [])];
     const pins = /^\/channels\/(\d+)\/messages\/pins$/.exec(route);

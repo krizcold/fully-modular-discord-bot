@@ -3,7 +3,7 @@ import { Client, type ClientConfig, type Pool } from 'pg';
 import { expect } from 'vitest';
 
 import { PostgresBackend, checkMoveTarget } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
-import { MainChooser, probePass, settleRetires, type ProbeAnswer, type RetireOnWire } from '../../src/bot/internalSetup/utils/dataBackends/mainDatabase';
+import { MainChooser, probePass, settleRetires, type NoticeRead, type ProbeAnswer, type RetireOnWire } from '../../src/bot/internalSetup/utils/dataBackends/mainDatabase';
 import { initWorkingSet, type WorkingSetManager } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
 import { parseAddressList, showEntry } from '../../src/utils/databaseAddress';
 import { fixedDatabase } from './fixedDatabase';
@@ -124,18 +124,21 @@ export interface BotRun {
 /**
  * A bot process's data side on real databases: the real chooser over `list`, the backend, the working set and the
  * move's steps, step (e) the real settleRetires as boot.ts wires it. The claims step answers true (the target holds
- * this process's claim rows) unless one is given.
+ * this process's claim rows) unless one is given; the switch notices read none unless a reader is given.
  */
-export async function startBot(list: string[], recordedStore: string, claims: (entry: string) => Promise<boolean> = async () => true): Promise<BotRun> {
+export async function startBot(
+  list: string[], recordedStore: string, claims: (entry: string) => Promise<boolean> = async () => true,
+  readNotice: () => Promise<NoticeRead> = async () => ({ kind: 'none' }), nodeName = 'node-a',
+): Promise<BotRun> {
   const r = { leaves: [] as string[], moved: [] as string[], retires: [] as RetireOnWire[], reached: [] as string[], list: [...list] } as BotRun;
   const chooser = new MainChooser({
     entries: () => parseAddressList(r.list.join(',')),
     probe: entries => probe(...entries.map(e => e.raw)),
-    readNotice: async () => ({ kind: 'none' }),
+    readNotice,
     sendWaitDm: async () => ({ ok: true }),
     markerStoreId: () => recordedStore,
     noticeCheckOff: () => false,
-    nodeName: () => 'node-a',
+    nodeName: () => nodeName,
     onWait: () => undefined,
   });
   const backend = new PostgresBackend({ chooser } as never);

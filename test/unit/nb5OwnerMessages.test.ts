@@ -165,7 +165,7 @@ describe('NB5 decision 8: the owner messages client', () => {
       pins: { items: [{ pinned_at: '2026-11-01T10:00:00.000Z', message: notice('2', 'A') }], has_more: false },
       recent: [notice('9', 'X', '999999999999999999'), notice('0'), notice('x'), notice('1.5'), notice('3', 'B'), notice('1', 'C')],
     });
-    expect(await readNewestNotice()).toEqual({ kind: 'notice', generation: 3, machine: 'B', date: '2026-11-01T10:00:00.000Z' });
+    expect(await readNewestNotice()).toEqual({ kind: 'notice', generation: 3, machine: 'B', date: '2026-11-01T10:00:00.000Z', machines: ['B'] });
   });
 
   it('answers none when no notice is found', async () => {

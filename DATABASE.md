@@ -80,6 +80,11 @@ it reaches holds means it cannot confirm its database is still the main: it stay
 announced machine and date. When it cannot read the conversation at boot, it waits, says "can't confirm", and DMs the
 owner once; `DATA_NOTICE_CHECK=off` makes it start on the databases alone.
 
+When the newest switch notices name two or more machines, the bot stays stopped on every one of them, this machine
+included, until a notice of a higher generation names one machine and a database it reaches holds that generation,
+unless DATA_NOTICE_CHECK is off. Keep this machine as the main in the Bot Manager raises the kept database's generation
+above the tie and posts that notice.
+
 Only the bot's own messages count, and only in the DM. When the owner has chosen a channel for owner messages (WebUI.md),
 the bot also posts a copy of the notice there, which no machine reads. The owner must share a server with the bot and
 accept DMs from it: otherwise the notice is not posted, and a machine whose database was the main must be kept off in

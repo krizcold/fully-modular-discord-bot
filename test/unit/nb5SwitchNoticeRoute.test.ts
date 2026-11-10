@@ -106,7 +106,7 @@ describe('decision 15: switch-notice', () => {
     const res = await post({ ...ok, generation: '2' });
     expect(res).toEqual({ status: 200, body: { success: true, posted: true, pinned: true, channel: 'none' } });
     const [create] = rest.creates(DM);
-    expect(create.options.body).toMatchObject({ nonce: 'smdb-main-2', enforce_nonce: true });
+    expect(create.options.body).toMatchObject({ nonce: hashNonce('["main",2,"M"]'), enforce_nonce: true });
     expect(create.options.body.embeds[0]).toMatchObject({ title: NOTICE_TITLE, fields: [{ name: 'Machine', value: 'M' }, { name: 'Generation', value: '2' }], timestamp: DATE });
     const posted = rest.messages.get(DM)![0];
     expect(rest.pinned.get(DM)!.has(posted.id)).toBe(true);
@@ -138,7 +138,7 @@ describe('decision 15: switch-notice', () => {
 
   it('a notice at or above the generation already pinned answers posted false', async () => {
     rest.seed(DM, noticeMessage(3, 'N'), true);
-    expect((await post(ok)).body).toEqual({ success: true, posted: false, channel: 'none', note: 'A switch notice of generation 3 (N) is already posted; this one was not posted.' });
+    expect((await post(ok)).body).toEqual({ success: true, posted: false, newer: { generation: 3, machines: ['N'] }, channel: 'none', note: 'A switch notice of generation 3 (N) is already posted; this one was not posted.' });
     expect(rest.creates()).toHaveLength(0);
   });
 
@@ -220,8 +220,8 @@ describe("decision 15 with decision 23: the copy in the chosen channel", () => {
     const res = await post(ok);
     expect(res.body).toEqual({ success: true, posted: true, pinned: true, channel: 'posted' });
     const [copy] = rest.creates(C);
-    expect(copy.options.body.nonce).toBe(hashNonce(`copy:${C}:2`));
-    expect(copy.options.body.nonce).not.toBe('smdb-main-2');
+    expect(copy.options.body.nonce).toBe(hashNonce(JSON.stringify(['copy', C, 2, 'M'])));
+    expect(copy.options.body.nonce).not.toBe(hashNonce(JSON.stringify(['main', 2, 'M'])));
     expect(copy.options.body.embeds[0].title).toBe(NOTICE_TITLE);
     expect(rest.pinned.get(C)?.size ?? 0).toBe(0);
   });

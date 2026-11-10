@@ -9,9 +9,9 @@ import { loadCredentials } from '../../utils/envLoader';
 import { canonicalGuildKey } from '../../bot/internalSetup/utils/dataKeys';
 import { HOLDER_CHECK_SQL, HOLDER_MAP_SQL } from '../../bot/internalSetup/utils/dataBackends/guildRequestSql';
 import { addressListInUse, parseAddressList, pgConfig, showEntry, type ListEntry } from '../../utils/databaseAddress';
-import { decideMain, mainTagOf, probePass, type NoticeRead, type ProbeAnswer, type StoreReport } from '../../bot/internalSetup/utils/dataBackends/mainDatabase';
+import { decideMain, mainTagOf, probePass, type ProbeAnswer, type StoreReport } from '../../bot/internalSetup/utils/dataBackends/mainDatabase';
 import { MarkerUnreadable, readMarkerStoreId } from '../../bot/internalSetup/utils/dataBackends/recognitionGuard';
-import { readNewestNotice } from '../../utils/ownerMessages';
+import { readNewestNotice, type NoticeRead } from '../../utils/ownerMessages';
 
 const READER_ERROR = 'data backend unreachable';
 const READER_MAX = 2;

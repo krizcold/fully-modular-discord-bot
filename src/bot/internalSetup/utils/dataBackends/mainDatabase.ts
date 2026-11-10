@@ -3,6 +3,9 @@ import type { ClientConfig, QueryConfig } from 'pg';
 import { parseAddressList, type ListEntry } from '../../../../utils/databaseAddress';
 import type { DatabaseChooser, LatchCause, PostgresBackend, Standing } from './postgresBackend';
 import type { RetireOutcome } from './backend';
+import { machineList, sortedMachines, type NoticeRead } from '../../../../utils/ownerMessages';
+
+export type { NoticeRead };
 
 /**
  * Choosing the main database among the addresses of DATA_BACKEND_URL (NB5 decisions 4 to 6 and 9).
@@ -40,11 +43,6 @@ export interface FailedProbe {
 }
 
 export type Probe = AnsweredProbe | RefusedProbe | FailedProbe;
-
-export type NoticeRead =
-  | { kind: 'none' }
-  | { kind: 'notice'; generation: number; machine: string; date: string }
-  | { kind: 'failed'; cause: string; status?: number; retryAfterMs?: number };
 
 export type WaitOutcome =
   | 'unreachable' | 'login-refused' | 'mixed-stores' | 'tie' | 'replaced' | 'no-main' | 'behind-notice' | 'cant-check'
@@ -186,6 +184,12 @@ export function decideMain(probes: Probe[], notice: NoticeRead | undefined, opts
     return wait('cant-check', cantCheckText(chosen.address, top, notice));
   }
   if (notice.kind === 'notice') {
+    const machines = machinesOf(notice);
+    if (machines.length >= 2) {
+      if (notice.generation > top) return wait('behind-notice', behindNoticeText(chosen.address, top, chosen.machine, { ...notice, machines }));
+      if (notice.generation === top) return wait('tie', noticeTieText(top, machines));
+      return wait('tie', noticeAboveTieText(notice.generation, machines, chosen.address, top, chosen.machine));
+    }
     if (notice.generation > top) {
       return wait('behind-notice', behindNoticeText(chosen.address, top, chosen.machine, notice));
     }
@@ -204,7 +208,29 @@ export function replacedText(address: string, generation: number, machine: strin
   return `The database at ${address} (generation ${generation}, ${machine ?? 'no machine named'}) was replaced by ${newMachine ?? 'another machine'} on ${date ?? 'an unknown date'} (generation ${newGeneration}); the bot stays stopped. If that database is on this machine, rejoin it as a live copy in the Bot Manager; otherwise join the new main's code, or add its address to DATA_BACKEND_URL`;
 }
 
-export function behindNoticeText(address: string, generation: number, rowMachine: string | null, notice: { generation: number; machine: string; date: string }): string {
+/** The machines a notice read names, its own machine when the read gave none. */
+export function machinesOf(notice: { machine: string; machines?: string[] }): string[] {
+  return notice.machines ?? [notice.machine];
+}
+
+const announced = (generation: number, machines: string[]) =>
+  `${machines.length} machines announced main generation ${generation} in the switch notices (${machineList(machines)})`;
+
+/** NB24: a tie in the switch notices at the generation of the database chosen. */
+export function noticeTieText(generation: number, machines: string[]): string {
+  return `${announced(generation, machines)}; can't confirm which is the main, so the bot stays stopped until the owner chooses one in the Bot Manager`;
+}
+
+/** NB24: a tie in the switch notices below the generation of the database chosen. */
+export function noticeAboveTieText(generation: number, machines: string[], address: string, held: number, machine: string | null): string {
+  return `${announced(generation, machines)}; ${address} holds generation ${held} (${machine ?? 'no machine named'}), but no switch notice above generation ${generation} naming one machine has been read, so the bot stays stopped until one is read. While the Bot Manager records two mains, Keep this machine as the main posts one; once one is posted, the Bot Manager posts it again at its next check of the switch notice if it is no longer among the owner's DMs`;
+}
+
+export function behindNoticeText(address: string, generation: number, rowMachine: string | null, notice: { generation: number; machine: string; date: string; machines?: string[] }): string {
+  const machines = machinesOf(notice);
+  if (machines.length >= 2) {
+    return `can't confirm that ${address} is the main: it holds generation ${generation} (${rowMachine ?? 'no machine named'}), but ${machines.length} machines announced generation ${notice.generation} in the switch notices (${machineList(machines)}), and no database in DATA_BACKEND_URL holds it. The bot stays stopped until the owner chooses one in the Bot Manager`;
+  }
   if (notice.machine === rowMachine) {
     return `can't confirm that ${address} is the main: it holds generation ${generation}, but generation ${notice.generation} was announced for this machine (${notice.machine}) on ${notice.date}; a restore may have lowered it. The bot stays stopped until the Bot Manager raises this database's generation to ${notice.generation} or above`;
   }
@@ -490,7 +516,7 @@ export class MainChooser implements DatabaseChooser {
   private noticeNextAt = 0;
   private noticeRetryAt = 0;
   private noticeFailingSince: number | null = null;
-  private highestNotice: { generation: number; machine: string; date: string } | null = null;
+  private highestNotice: { generation: number; machine: string; date: string; machines: string[] } | null = null;
   private noticeReading: Promise<NoticeRead> | null = null;
   private readonly logged = new Set<string>();
   private waitText: string | null = null;
@@ -642,7 +668,10 @@ export class MainChooser implements DatabaseChooser {
         continue;
       }
       let decision = decideMain(answers, undefined, this.options(marker.id));
-      if (decision.outcome === 'needs-notice') decision = decideMain(answers, await this.readNotice('boot'), this.options(marker.id));
+      if (decision.outcome === 'needs-notice') {
+        const read = await this.readNotice('boot');
+        decision = decideMain(answers, read.kind === 'failed' ? read : this.noticeHeld(), this.options(marker.id));
+      }
       if (this.stopped) break;
       this.logOnce(decision.logs);
       if (decision.outcome === 'chosen') {
@@ -707,6 +736,12 @@ export class MainChooser implements DatabaseChooser {
     return Date.now() >= this.noticeNextAt;
   }
 
+  /** The highest notice read, with every machine read at its generation (NB24 decision 5). */
+  private noticeHeld(): NoticeRead {
+    const held = this.highestNotice;
+    return held ? { kind: 'notice', generation: held.generation, machine: held.machine, date: held.date, machines: [...held.machines] } : { kind: 'none' };
+  }
+
   /** A read by the rule; `fresh` asks for one started now unless the last read failed and its retry is not due. */
   private readNotice(mode: 'boot' | 'watch', fresh = false): Promise<NoticeRead> {
     if (this.noticeReading) return this.noticeReading;
@@ -728,8 +763,13 @@ export class MainChooser implements DatabaseChooser {
         this.noticeNextAt = at + NOTICE_OK_MS;
         this.noticeRetryAt = 0;
         this.noticeFailingSince = null;
-        if (read.kind === 'notice' && (!this.highestNotice || read.generation > this.highestNotice.generation)) {
-          this.highestNotice = { generation: read.generation, machine: read.machine, date: read.date };
+        if (read.kind === 'notice') {
+          const highest = this.highestNotice;
+          if (!highest || read.generation > highest.generation) {
+            this.highestNotice = { generation: read.generation, machine: read.machine, date: read.date, machines: sortedMachines(machinesOf(read)) };
+          } else if (read.generation === highest.generation) {
+            highest.machines = sortedMachines([...highest.machines, ...machinesOf(read)]);
+          }
         }
       }
       return read;
@@ -856,7 +896,7 @@ export class MainChooser implements DatabaseChooser {
           `This bot process's database ${address} (generation ${this.generation}) was replaced by ${machine} on ${higher.since ?? 'an unknown date'} (generation ${higher.generation})`);
         return;
       } else {
-        this.step({ kind: 'behind-notice', machine: noticeAbove!.machine, generation: noticeAbove!.generation },
+        this.step({ kind: 'behind-notice', machine: noticeAbove!.machine, generation: noticeAbove!.generation, machines: [...noticeAbove!.machines] },
           behindNoticeText(address, this.generation, this.machine, noticeAbove!));
         return;
       }
@@ -888,10 +928,19 @@ export class MainChooser implements DatabaseChooser {
     if (backend.connectionState().state === 'confirming') await this.confirm(mine, address, rival, epoch);
   }
 
+  /** A tie in the notices at or below the chosen generation, or a notice at it naming another machine. */
   private noticeTie(mine: AnsweredProbe, address: string): boolean {
     const notice = this.highestNotice;
-    if (!notice || notice.generation !== this.generation || notice.machine === mine.machine) return false;
-    this.step({ kind: 'tie', generation: this.generation },
+    if (!notice) return false;
+    const cause: LatchCause = { kind: 'tie', generation: notice.generation, machines: [...notice.machines] };
+    if (notice.machines.length >= 2 && notice.generation <= this.generation) {
+      this.step(cause, notice.generation === this.generation
+        ? `${announced(notice.generation, notice.machines)}, the generation of this bot process's database ${address}; can't confirm which is the main`
+        : noticeAboveTieText(notice.generation, notice.machines, address, this.generation, this.machine));
+      return true;
+    }
+    if (notice.generation !== this.generation || notice.machine === mine.machine) return false;
+    this.step(cause,
       `Two databases accept writes at main generation ${this.generation} (${address}, ${notice.machine}); can't confirm which is the main`);
     return true;
   }
@@ -969,8 +1018,7 @@ export class MainChooser implements DatabaseChooser {
       this.logOnce([markerTexts.notMoving(marker.why)]);
       return;
     }
-    const notice: NoticeRead = this.highestNotice ? { kind: 'notice', ...this.highestNotice } : { kind: 'none' };
-    const decision = decideMain(answers, notice, this.options(marker.id));
+    const decision = decideMain(answers, this.noticeHeld(), this.options(marker.id));
     this.logOnce(decision.logs);
     if (decision.outcome !== 'chosen') return;
     this.moveGeneration = decision.generation;
