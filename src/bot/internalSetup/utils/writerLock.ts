@@ -9,6 +9,7 @@ import { cancelQueued, queuedFilePaths, queuedFileWrites, fileFlushOnTheWire } f
 import { closeSharedWritesLost, forgetSharedFileKnowledge, isSharedPath, reopenSharedWrites, useWriterLockCheck } from './dataManager';
 import { deposeRows, reopenRows } from './sharedStore';
 import { stopCrashWrites } from './moduleCrashes';
+import { syncWords, type SyncKind } from './folderChain';
 
 export type WriterRole = 'bot' | 'webui' | 'import';
 
@@ -84,7 +85,11 @@ export function deposedHolder(): LockHolder | null {
 }
 
 /** A cancelled path whose lines may be in the file (NB13 C9, D3), in the words of the deposition and the web UI logs. */
-export function unconfirmedWords(result: { path: string; errno: string | null; cut: boolean }): string {
+export function unconfirmedWords(result: { path: string; errno: string | null; cut: boolean; what?: 'lines' | 'whole'; kind?: SyncKind; dir?: string }): string {
+  if (result.kind) {
+    const done = result.what === 'whole' ? 'the file is in place whole' : 'its lines are in the file and synced';
+    return `[Data] Can't confirm whether ${result.path} is saved (${result.errno ?? 'no error code'}): ${done}, but ${syncWords(result.kind, result.dir!, result.errno ?? 'no error code').why}`;
+  }
   const what = result.cut
     ? 'a write of its lines was cut short, so some of them may be in the file, whole or in part, and the disk did not confirm them'
     : 'some of its lines are in the file, but the disk did not confirm them';

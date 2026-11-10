@@ -151,8 +151,11 @@ describe('NB3 L5 s2: the staging folder', () => {
       return handle;
     }) as any);
     await stageSnapshot(oneItem('m', 'a.json'), staging);
-    expect(opened).toContainEqual([path.resolve(staging), 'r']);
-    expect(synced).toContain(path.resolve(staging));
+    // Windows opens no folder for its sync (NB19 decision 1).
+    if (process.platform !== 'win32') {
+      expect(opened).toContainEqual([path.resolve(staging), 'r']);
+      expect(synced).toContain(path.resolve(staging));
+    }
     expect(synced).toContain(path.resolve(path.join(staging, G, 'm', 'a.json')));
   });
 });

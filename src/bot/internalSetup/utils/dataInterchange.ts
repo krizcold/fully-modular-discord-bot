@@ -16,6 +16,7 @@ import { MIGRATION_FILE, readDataFacts } from './dataBackends/recognitionGuard';
 import { resolveDataBackend, type DataBackendKind } from '../../../utils/envLoader';
 import { canonicalGuildKey, GuildKeyError } from './dataKeys';
 import { decodeStorable, keyRefusal, KeyTree, pathKeyOf } from './storableData';
+import { FolderSyncError, syncFolder, syncFolderChain, syncFoldersUnder, syncWords, writeFileSynced, type ChainAnswer } from './folderChain';
 
 export interface FileRecord {
   guildId: string;
@@ -156,8 +157,7 @@ export async function importNamespace(
     }
     const refusal = bundleRecordRefusal(record.relPath, record.bytes, tree);
     if (refusal) throw new Error(`[DataInterchange] ${guildId}/${record.relPath}: ${refusal}`);
-    await fs.promises.mkdir(path.dirname(target), { recursive: true });
-    await fs.promises.writeFile(target, record.bytes);
+    await writeFileSynced(target, record.bytes);
     fileCount += 1;
     totalBytes += record.size;
   }
@@ -487,6 +487,12 @@ async function importBundleHeld(filePath: string): Promise<BundleImportResult> {
     if (storeRecords() !== recordsAtCheck) {
       throw new Error('[DataInterchange] /data/.backend.json or /data/.migration.json changed while the import ran, so a data migration may have started');
     }
+    const stagedSync = await syncFoldersUnder(staging);
+    if (stagedSync.failed) {
+      const { why, next } = syncWords(stagedSync.kind, stagedSync.dir, stagedSync.errno);
+      const advice = stagedSync.kind === 'open' ? 'Run the import again.' : next;
+      throw new StagedImportUnconfirmed(`[DataInterchange] The staged import's folders can't be confirmed as stored: ${why}; the live guild dir was not touched. ${advice}`);
+    }
 
     const live = await fs.promises.stat(liveDir).catch(() => null);
     if (live) {
@@ -513,13 +519,27 @@ async function importBundleHeld(filePath: string): Promise<BundleImportResult> {
       swapping = true;
       await fs.promises.rename(staging, liveDir);
     }
+    let placed: ChainAnswer = await syncFolderChain(DATA_ROOT);
+    if (!placed.failed && moved) placed = await syncFolder(path.dirname(moved));
+    if (placed.failed) throw importUnconfirmed(guildId, liveDir, placed, moved);
     return { guildId, destDir: liveDir, fileCount: staged.fileCount, totalBytes: staged.totalBytes, namespaceHash: staged.namespaceHash, replaced: moved };
   } catch (error) {
-    if (swapping) throw error;
+    if (swapping || error instanceof StagedImportUnconfirmed) throw error;
     throw new Error(`${error instanceof Error ? error.message : String(error)}; the live guild dir was not touched`);
   } finally {
     await fs.promises.rm(staging, { recursive: true, force: true }).catch(() => undefined);
   }
+}
+
+class StagedImportUnconfirmed extends Error {}
+
+/** T12: the import is in place, but a folder sync after the swap failed; replaced names the server's previous data. */
+function importUnconfirmed(guildId: string, liveDir: string, answer: Extract<ChainAnswer, { failed: true }>, replaced: string | null): FolderSyncError {
+  const { why, next } = syncWords(answer.kind, answer.dir, answer.errno);
+  const advice = answer.kind === 'open' ? 'Check the guild\'s data before you import it again.' : next;
+  const error = new FolderSyncError(liveDir, answer, `Guild ${guildId} is imported, but ${why}, so can't confirm it is stored. ${advice}${replaced ? ` The previous copy is at ${replaced}.` : ''}`);
+  if (replaced) error.replaced = replaced;
+  return error;
 }
 
 async function readExact(fh: fs.promises.FileHandle, buffer: Buffer, position: number): Promise<void> {

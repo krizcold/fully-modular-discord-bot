@@ -8,7 +8,17 @@ import { setBackendKind } from './backendKind';
 import { DEAD_ENDS, scrubEnv } from './env';
 
 vi.mock('../../src/utils/envLoader', async orig => (await import('./backendKind')).withBackendKind(await orig<any>()));
-beforeEach(() => setBackendKind(null));
+// Every copy of folderChain a test file loaded, as vi.resetModules gives a new one beside the one older imports hold.
+const chains = new Set<{ resetFolderSyncFailureForTests(): void; forgetDurableFolders(): void }>();
+beforeEach(async () => {
+  setBackendKind(null);
+  // Loaded here, not at the top: a static import is hoisted above the DATA_DIR line below and fixes DATA_ROOT.
+  chains.add(await import('../../src/bot/internalSetup/utils/folderChain'));
+  for (const chain of chains) {
+    chain.resetFolderSyncFailureForTests();
+    chain.forgetDurableFolders();
+  }
+});
 
 // Every test file runs in its own fork: before any source module is imported,
 // keep only the variables helpers/env.ts lets through, point pg and git at

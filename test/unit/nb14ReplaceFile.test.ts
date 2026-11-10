@@ -55,6 +55,7 @@ import { applyOperatorDataWrite } from '../../src/bot/internalSetup/utils/ipcDat
 import { setMaintenanceGate } from '../../src/bot/internalSetup/utils/maintenanceGate';
 import { checkWriterLock, configureWriterLock, deposedText, releaseWriterLock, takeWriterLock, writerLockDepth, writerLockPath } from '../../src/bot/internalSetup/utils/writerLock';
 import { dataPath } from '../../src/utils/dataRoot';
+import { resetFolderSyncFailureForTests } from '../../src/bot/internalSetup/utils/folderChain';
 import { setBackendKind } from '../helpers/backendKind';
 
 const X = 1000;
@@ -1323,9 +1324,11 @@ describe.skipIf(process.platform === 'win32')('a failed directory sync (C2)', ()
     writeTree(dataPath(g), PREV);
     bury(g, X);
     failGraveyardSync(1);
-    expect(await replace(g, X)).toEqual({ ok: false, code: 'io-error', error: `the disk did not confirm the copy of entry ${X} (EIO); nothing was restored; check the disk, then try again` });
+    expect(await replace(g, X)).toEqual({ ok: false, code: 'io-error', error: `the disk did not confirm the copy of entry ${X} (EIO); nothing was restored; check the disk, then restart the machine and try again` });
     expect(tree(dataPath(g))).toEqual(PREV);
     vi.restoreAllMocks();
+    // NB19: the K3 error set the flag for the process's life; the second replace stands for a new process.
+    resetFolderSyncFailureForTests();
 
     const g2 = freshGuild();
     writeTree(dataPath(g2), PREV);

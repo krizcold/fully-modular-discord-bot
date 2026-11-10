@@ -409,7 +409,7 @@ describe("8.1 to 8.6 and 8.12: the bot's exit and deposition lines read each lin
     }
     const isCut = (ticket: FileTicket) => {
       expect(fileTicketState(ticket)).toBe('unconfirmed');
-      expect(fileTicketFailure(ticket)).toEqual({ errno: 'short write', cut: true });
+      expect(fileTicketFailure(ticket)).toEqual({ errno: 'short write', cut: true, what: 'lines' });
     };
 
     it('a journal line', async () => {

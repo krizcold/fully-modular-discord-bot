@@ -7,7 +7,7 @@ export interface HeldCounts {
   unsavedFiles: number;
   /** Guilds holding a save the database did not answer, which may have landed. */
   unansweredGuilds: number;
-  /** Files holding appended lines whose sync the disk did not confirm. */
+  /** Files holding lines or whole files whose sync the disk did not confirm. */
   unconfirmedFiles: number;
   /** Guilds pending re-save on the database written next (NB5 decision 12). */
   resaveGuilds?: number;
@@ -28,6 +28,6 @@ export function heldClauses(counts: Partial<HeldCounts>): string {
   if (resave > 0) clauses.push(`${resave} guild(s) are not re-saved yet on the bot's main database; their latest changes may exist only in the bot process`);
   if (unanswered > 0) clauses.push(`${unanswered} guild(s) hold a save the database did not answer, which may have landed`);
   if (unansweredFiles > 0) clauses.push(`${unansweredFiles} file(s) hold a save the database did not answer, which may have landed`);
-  if (unconfirmed > 0) clauses.push(`${unconfirmed} file(s) hold appended lines the disk did not confirm; can't confirm whether they are stored`);
+  if (unconfirmed > 0) clauses.push(`${unconfirmed} file(s) hold changes the disk did not confirm; can't confirm whether they are stored`);
   return clauses.join('; ');
 }

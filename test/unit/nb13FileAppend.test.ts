@@ -26,6 +26,7 @@ import {
 } from '../../src/bot/internalSetup/utils/dataBackends/fileBackend';
 import { appendData, appendDataTracked, confirmSaved, deleteData, drainForExit, saveMark } from '../../src/bot/internalSetup/utils/dataManager';
 import { DATA_ROOT, dataPath } from '../../src/utils/dataRoot';
+import { resetFolderSyncFailureForTests, syncWords } from '../../src/bot/internalSetup/utils/folderChain';
 import { setBackendKind } from '../helpers/backendKind';
 import { stubAppendHandles, type AppendStub } from '../helpers/fileHandleStub';
 
@@ -240,10 +241,12 @@ describe('4.5: every handle is closed once', () => {
     }
     expect(stub.dirCloses.length).toBe(stub.dirOpens.length);
     stub.failDirClose(path.dirname(p), 'EBADF');
+    const opens = stub.dirOpens.length;
     const t = append(p, L(99));
     await flushAll();
-    expect(errors.some(e => e.includes('EBADF'))).toBe(true);
-    expect(fileTicketState(t)).toBe('landed');
+    expect(stub.dirOpens.length).toBe(opens);
+    expect(errors.some(e => e.includes('EBADF'))).toBe(false);
+    expect(fileTicketState(t)).toBe('unconfirmed');
   });
 });
 
@@ -257,6 +260,8 @@ describe('4.6: the directory chain', () => {
     return dirs;
   };
   const synced = () => [...stub.dirSyncs];
+  const fwd = (p: string) => path.resolve(p).replace(/\\/g, '/').replace(/[.*+?^${}()|[\]]/g, '\\$&');
+  const folderBirth = () => stub.statAs(new RegExp(`^${fwd(DATA_ROOT)}(?!.*\\.jsonl(\\.tmp)?$)`), real => ({ birthtimeNs: real.birthtimeNs > 0n ? real.birthtimeNs : 7n }), 1_000_000);
 
   it.skipIf(POSIX)('on Windows no directory is opened', async () => {
     const p = fresh();
@@ -278,14 +283,27 @@ describe('4.6: the directory chain', () => {
     expect(synced()).toEqual([]);
   });
 
-  it.skipIf(!POSIX)('EIO on a directory leaves the lines not landed and the next append runs the chain again; EINVAL is skipped', async () => {
+  it.skipIf(!POSIX)('EIO on a directory leaves the lines not landed and sets the flag, so the next append opens no folder and is unconfirmed', async () => {
     const p = fresh();
     fs.writeFileSync(p, L(0));
     stub.failDirSync(path.dirname(p), 'EIO');
     const t = append(p, L(1));
     await flushAll();
     expect(fileTicketState(t)).toBe('unconfirmed');
+    const opens = stub.dirOpens.length;
     stub.dirSyncs.length = 0;
+    const t2 = append(p, L(2));
+    await flushAll();
+    expect(stub.dirOpens).toHaveLength(opens);
+    expect(synced()).toEqual([]);
+    expect(fileTicketState(t2)).toBe('unconfirmed');
+    expect(fs.readFileSync(p, 'utf8')).toBe(L(0) + L(1) + L(2));
+  });
+
+  it.skipIf(!POSIX)('EINVAL on a directory is skipped and the chain lands', async () => {
+    resetFolderSyncFailureForTests();
+    const p = fresh();
+    fs.writeFileSync(p, L(0));
     stub.failDirSync(path.dirname(p), 'EINVAL');
     const t2 = append(p, L(2));
     await flushAll();
@@ -293,20 +311,21 @@ describe('4.6: the directory chain', () => {
     expect(fileTicketState(t2)).toBe('landed');
   });
 
-  const again = async (p: string, between: () => Promise<void> | void) => {
+  const again = async (p: string, between: () => Promise<void> | void, chain = chainOf(p)) => {
     append(p, L(1));
     await flushAll();
     await between();
     stub.dirSyncs.length = 0;
     const t = append(p, L(2));
     await flushAll();
-    expect(synced(), 'the chain runs again').toEqual(chainOf(p));
+    expect(synced(), 'the chain runs again').toEqual(chain);
     expect(fileTicketState(t)).toBe('landed');
   };
 
   it.skipIf(!POSIX)('runs again after a delete of the stream', async () => {
+    folderBirth();
     const p = fresh();
-    await again(p, async () => { enqueueDelete(p); await flushAll(); });
+    await again(p, async () => { enqueueDelete(p); await flushAll(); }, [path.dirname(p)]);
   });
 
   it.skipIf(!POSIX)('runs again after a retire of the JSON guild re-creates its folder', async () => {
@@ -322,11 +341,13 @@ describe('4.6: the directory chain', () => {
   });
 
   it.skipIf(!POSIX)('runs again after a temp file was renamed over the path', async () => {
+    folderBirth();
     const p = fresh();
-    await again(p, () => { fs.writeFileSync(`${p}.tmp`, L(0)); fs.renameSync(`${p}.tmp`, p); });
+    await again(p, () => { fs.writeFileSync(`${p}.tmp`, L(0)); fs.renameSync(`${p}.tmp`, p); }, [path.dirname(p)]);
   });
 
   it.skipIf(!POSIX)('identity cases: a lock take, a reused inode number, a size of 0, a birth time of 0, a failed first try', async () => {
+    folderBirth();
     const p = fresh();
     append(p, L(1));
     await flushAll();
@@ -350,7 +371,7 @@ describe('4.6: the directory chain', () => {
     await flushAll();
     stub.dirSyncs.length = 0;
     await flushAll();
-    expect(synced()).toEqual(chainOf(q));
+    expect(synced()).toEqual([path.dirname(q)]);
   });
 });
 
@@ -468,8 +489,9 @@ describe('4.10 to 4.15: a failed fsync and the ticket states', () => {
     appendData('x.jsonl', opts, 'M');
     const t2 = fileTicket(p);
     await flushAll();
-    expect(fileTicketState(t2)).toBe('landed');
-    expect(unconfirmedFiles()).toBe(count - 1);
+    expect(fileTicketState(t2)).toBe('unconfirmed');
+    expect(stub.dirSyncs).toEqual([]);
+    expect(unconfirmedFiles()).toBe(count);
   });
 
   it.skipIf(!POSIX)('4.16 a whole write replaced during its failed chain adds no failed range and logs no line; the newer write answers for its lines', async () => {
@@ -489,21 +511,22 @@ describe('4.10 to 4.15: a failed fsync and the ticket states', () => {
     hold.release();
     await flushAll();
     expect(read(p)).toBe('L1\nL2\n');
-    expect(fileTicketState(t1)).toBe('landed');
-    expect(fileTicketState(t2)).toBe('landed');
-    expect(await confirmFile(t1, 1000)).toBe('ok');
-    expect(errors.some(e => e.includes('the disk did not confirm the sync'))).toBe(false);
-    expect(unconfirmedFiles()).toBe(before);
+    expect(fileTicketState(t1)).toBe('unconfirmed');
+    expect(fileTicketState(t2)).toBe('unconfirmed');
+    expect(await confirmFile(t1, 1000)).toBe('unavailable');
+    const { why, next } = syncWords('earlier', path.dirname(p), 'EIO');
+    expect(errors.filter(e => e.startsWith(`[Data] ${p}:`))).toEqual([`[Data] ${p}: the file is written whole, but ${why}; it is not written again; can't confirm it is stored. ${next}`]);
+    expect(unconfirmedFiles()).toBe(before + 1);
   });
 
   it.skipIf(!POSIX)('4.17 a deposition cancels the newer write before it lands: the replaced write\'s line is in the file, unconfirmed', async () => {
     const r = await replacedTry();
     const cancelled = cancelQueued([r.p], undefined, { freeze: true });
     r.hold.release();
-    expect(await cancelled).toEqual([{ path: r.p, outcome: 'unconfirmed', errno: 'EIO', cut: false }]);
+    expect(await cancelled).toMatchObject([{ path: r.p, outcome: 'unconfirmed', errno: 'EIO', cut: false }]);
     expect(read(r.p)).toBe('L1\n');
     expect(fileTicketState(r.t1)).toBe('unconfirmed');
-    expect(fileTicketFailure(r.t1)).toEqual({ errno: 'EIO', cut: false });
+    expect(fileTicketFailure(r.t1)).toMatchObject({ errno: 'EIO', cut: false });
     expect(fileTicketState(r.t2)).toBe('open');
     expect(await confirmFile(r.t1, 0)).toBe('unavailable');
     expect(unconfirmedFiles()).toBe(r.before + 1);
@@ -516,7 +539,7 @@ describe('4.10 to 4.15: a failed fsync and the ticket states', () => {
     r.hold.release();
     const results = await cancelled;
     mkdir.mockRestore();
-    expect(results).toEqual([{ path: r.p, outcome: 'unconfirmed', errno: 'EIO', cut: false }]);
+    expect(results).toMatchObject([{ path: r.p, outcome: 'unconfirmed', errno: 'EIO', cut: false }]);
     expect(read(r.p)).toBe('L1\n');
     expect(fileTicketState(r.t1)).toBe('unconfirmed');
     expect(fileTicketState(r.t2)).toBe('open');
@@ -531,9 +554,10 @@ describe('4.10 to 4.15: a failed fsync and the ticket states', () => {
     mkdir.mockRestore();
     await flushAll();
     expect(read(r.p)).toBe('L1\nL2\n');
-    expect(fileTicketState(r.t1)).toBe('landed');
-    expect(fileTicketState(r.t2)).toBe('landed');
-    expect(unconfirmedFiles()).toBe(r.before);
+    expect(fileTicketState(r.t1)).toBe('unconfirmed');
+    expect(fileTicketState(r.t2)).toBe('unconfirmed');
+    expect(errors.filter(e => e.startsWith(`[Data] ${r.p}:`) && e.includes('earlier in this process'))).toHaveLength(1);
+    expect(unconfirmedFiles()).toBe(r.before + 1);
   });
 
   it('4.13 cancelQueued while a try is on the wire', async () => {
@@ -551,9 +575,9 @@ describe('4.10 to 4.15: a failed fsync and the ticket states', () => {
     };
     const syncHold = (p: string) => { const h = stub.holdSync(p, 'EIO'); return { release: () => h.release(), reached: h.reached }; };
     const a = await run(syncHold, false);
-    expect(a.result).toEqual({ path: a.p, outcome: 'unconfirmed', errno: 'EIO', cut: false });
+    expect(a.result).toMatchObject({ path: a.p, outcome: 'unconfirmed', errno: 'EIO', cut: false });
     const b = await run(syncHold, true);
-    expect(b.result).toEqual({ path: b.p, outcome: 'unconfirmed', errno: 'EIO', cut: false });
+    expect(b.result).toMatchObject({ path: b.p, outcome: 'unconfirmed', errno: 'EIO', cut: false });
     expect(fileTicketState(b.tailTicket!)).toBe('open');
     expect(fileTicketState(b.t)).toBe('unconfirmed');
     const before = unconfirmedFiles();
@@ -562,8 +586,12 @@ describe('4.10 to 4.15: a failed fsync and the ticket states', () => {
     const tc = append(c, L(1) + L(2) + L(3));
     await tried(c);
     const [cr] = await cancelQueued([c]);
-    expect(cr).toEqual({ path: c, outcome: 'unconfirmed', errno: 'short write', cut: true });
+    expect(cr).toMatchObject({ path: c, outcome: 'unconfirmed', errno: 'short write', cut: true });
+    expect(cr).not.toHaveProperty('kind');
+    expect(cr).not.toHaveProperty('dir');
     expect(fileTicketState(tc)).toBe('unconfirmed');
+    expect(fileTicketFailure(tc)?.kind).toBeUndefined();
+    expect(fileTicketFailure(tc)?.dir).toBeUndefined();
     expect(unconfirmedFiles()).toBe(before + 1);
     expect(read(c)).toBe(L(1) + L(2).slice(0, 3));
     const d = fresh();
@@ -606,16 +634,23 @@ describe('4.10 to 4.15: a failed fsync and the ticket states', () => {
     const t = append(p, L(1));
     await flushAll();
     expect(fileTicketState(t)).toBe('unconfirmed');
-    expect(fileTicketFailure(t)).toEqual({ errno: 'EIO', cut: false });
+    expect(fileTicketFailure(t)).toMatchObject({ errno: 'EIO', cut: false });
+    expect(fileTicketFailure(t)?.kind).toBeUndefined();
+    expect(fileTicketFailure(t)?.dir).toBeUndefined();
     const q = fresh();
     stub.shortWrite(q, () => 3);
     const t1 = append(q, L(1));
     const t2 = append(q, L(2));
     await tried(q);
-    expect(await cancelQueued([q])).toEqual([{ path: q, outcome: 'unconfirmed', errno: 'short write', cut: true }]);
+    const cancelled = await cancelQueued([q]);
+    expect(cancelled).toMatchObject([{ path: q, outcome: 'unconfirmed', errno: 'short write', cut: true }]);
+    expect(cancelled[0]).not.toHaveProperty('kind');
+    expect(cancelled[0]).not.toHaveProperty('dir');
     for (const t of [t1, t2]) {
       expect(fileTicketState(t)).toBe('unconfirmed');
-      expect(fileTicketFailure(t)).toEqual({ errno: 'short write', cut: true });
+      expect(fileTicketFailure(t)).toMatchObject({ errno: 'short write', cut: true });
+      expect(fileTicketFailure(t)?.kind).toBeUndefined();
+      expect(fileTicketFailure(t)?.dir).toBeUndefined();
     }
   });
 });
@@ -634,7 +669,7 @@ describe("4.21 to 4.29: cancelQueued answers from the state of the seqs it drops
     await hold.reached;
     const cancelled = cancelQueued([p], undefined, { freeze: true });
     hold.release();
-    expect(await cancelled).toEqual([{ path: p, outcome: 'unconfirmed', errno: 'EIO', cut: false }]);
+    expect(await cancelled).toMatchObject([{ path: p, outcome: 'unconfirmed', errno: 'EIO', cut: false }]);
     expect(read(p)).toBe('L1\n');
     expect(fileTicketState(t1)).toBe('unconfirmed');
   });
@@ -642,16 +677,14 @@ describe("4.21 to 4.29: cancelQueued answers from the state of the seqs it drops
   it.skipIf(!POSIX)('4.22 after a replaced try, the newer write reaches the file and its own chain fails during the wait: unconfirmed', async () => {
     const r = await replacedTry();
     const d = path.dirname(r.p);
-    const syncs = () => stub.dirSyncs.filter(x => x === d).length;
-    const at = syncs();
     stub.failDirSync(d, 'EIO');
     // The cancel answers only once the newer write's chain has run and failed.
     const cancelled = cancelQueued([r.p], async ms => {
-      while (syncs() < at + 1) await sleep(5);
+      while (fileTicketState(r.t2) !== 'unconfirmed') await sleep(5);
       await sleep(ms);
     });
     r.hold.release();
-    expect(await cancelled).toEqual([{ path: r.p, outcome: 'unconfirmed', errno: 'EIO', cut: false }]);
+    expect(await cancelled).toMatchObject([{ path: r.p, outcome: 'unconfirmed', errno: 'EIO', cut: false }]);
     expect(read(r.p)).toBe('L1\nL2\n');
     expect(fileTicketState(r.t1)).toBe('unconfirmed');
     expect(fileTicketState(r.t2)).toBe('unconfirmed');
@@ -664,7 +697,7 @@ describe("4.21 to 4.29: cancelQueued answers from the state of the seqs it drops
     await hold.reached;
     const cancelled = cancelQueued([p], undefined, { freeze: true });
     hold.release();
-    expect(await cancelled).toEqual([{ path: p, outcome: 'unconfirmed', errno: 'EIO', cut: false }]);
+    expect(await cancelled).toMatchObject([{ path: p, outcome: 'unconfirmed', errno: 'EIO', cut: false }]);
     expect(read(p)).toBe(L(1));
   });
 
@@ -677,7 +710,7 @@ describe("4.21 to 4.29: cancelQueued answers from the state of the seqs it drops
     stub.failWrite(p, 'ENOSPC', 10);
     hold.release();
     await flushAll();
-    expect(await cancelQueued([p])).toEqual([{ path: p, outcome: 'unconfirmed', errno: 'EIO', cut: false }]);
+    expect(await cancelQueued([p])).toMatchObject([{ path: p, outcome: 'unconfirmed', errno: 'EIO', cut: false }]);
     expect(fileTicketState(t1)).toBe('unconfirmed');
     expect(fileTicketState(t2)).toBe('open');
     expect(read(p)).toBe(L(1));
@@ -750,7 +783,7 @@ describe("4.21 to 4.29: cancelQueued answers from the state of the seqs it drops
     hold.release();
     for (let i = 0; i < 200 && mkdir.mock.calls.length === 0; i++) await sleep(5);
     await sleep(10);
-    const line = (e: string) => e.includes(p) && e.includes('the disk did not confirm the sync of 1 appended line(s) (EIO)');
+    const line = (e: string) => e === `[Data] ${p}: the file is written whole, but ${syncWords('sync', g, 'EIO').why}; it is not written again; can't confirm it is stored. ${syncWords('sync', g, 'EIO').next}`;
     expect(errors.filter(line)).toHaveLength(0);
     dropPendingForGuild(guild);
     mkdir.mockRestore();
@@ -790,7 +823,7 @@ describe('4.30 to 4.38: a cancel reads every record its path had from its start 
       later.t2 = append(p, L(2) + L(3));
       await tried(p, 2);
     }));
-    expect(await cancelled).toEqual([{ path: p, outcome: 'unconfirmed', errno: 'short write', cut: true }]);
+    expect(await cancelled).toMatchObject([{ path: p, outcome: 'unconfirmed', errno: 'short write', cut: true }]);
     expect(fileTicketState(t1)).toBe('landed');
     expect(fileTicketState(later.t2!)).toBe('unconfirmed');
     expect(read(p)).toBe(L(1) + L(2) + L(3).slice(0, 3));
@@ -811,7 +844,7 @@ describe('4.30 to 4.38: a cancel reads every record its path had from its start 
       enqueueAppend(p, L(3));
       await tried(p, 3);
     }));
-    expect(await cancelled).toEqual([{ path: p, outcome: 'unconfirmed', errno: 'EIO', cut: false }]);
+    expect(await cancelled).toMatchObject([{ path: p, outcome: 'unconfirmed', errno: 'EIO', cut: false }]);
     expect(read(p)).toBe(L(1) + L(2));
   });
 
@@ -830,7 +863,7 @@ describe('4.30 to 4.38: a cancel reads every record its path had from its start 
       enqueueAppend(p, L(3));
       await tried(p, 2);
     }));
-    expect(await cancelled).toEqual([{ path: p, outcome: 'unconfirmed', errno: 'EIO', cut: false }]);
+    expect(await cancelled).toMatchObject([{ path: p, outcome: 'unconfirmed', errno: 'EIO', cut: false }]);
     expect(read(p)).toBe(L(1) + L(2));
   });
 
@@ -846,7 +879,7 @@ describe('4.30 to 4.38: a cancel reads every record its path had from its start 
     await sleep(10);
     const results = await cancelQueued([p]);
     mkdir.mockRestore();
-    expect(results).toEqual([{ path: p, outcome: 'unconfirmed', errno: 'EIO', cut: false }]);
+    expect(results).toMatchObject([{ path: p, outcome: 'unconfirmed', errno: 'EIO', cut: false }]);
     expect(read(p)).toBe(L(1));
   });
 
@@ -861,7 +894,7 @@ describe('4.30 to 4.38: a cancel reads every record its path had from its start 
     const t2 = append(p, L(2));
     const cancelled = cancelQueued([p]);
     hold.release();
-    expect(await cancelled).toEqual([{ path: p, outcome: 'unconfirmed', errno: 'EIO', cut: false }]);
+    expect(await cancelled).toMatchObject([{ path: p, outcome: 'unconfirmed', errno: 'EIO', cut: false }]);
     expect(read(p)).toBe(L(1));
     expect(fileTicketState(t2)).toBe('open');
   });
@@ -881,7 +914,7 @@ describe('4.30 to 4.38: a cancel reads every record its path had from its start 
     await tried(p, 3);
     expect(fileTicketState(t1)).toBe('unconfirmed');
     expect(fileTicketState(t2)).toBe('landed');
-    expect(await cancelQueued([p])).toEqual([{ path: p, outcome: 'unconfirmed', errno: 'EIO', cut: false }]);
+    expect(await cancelQueued([p])).toMatchObject([{ path: p, outcome: 'unconfirmed', errno: 'EIO', cut: false }]);
     expect(fileTicketState(t3)).toBe('open');
     expect(read(p)).toBe(L(1) + L(2));
   });
@@ -930,7 +963,7 @@ describe('4.30 to 4.38: a cancel reads every record its path had from its start 
       await tried(p);
       dropPendingForGuild(guild);
     }));
-    expect(await cancelled).toEqual([{ path: p, outcome: 'unconfirmed', errno: 'short write', cut: true }]);
+    expect(await cancelled).toMatchObject([{ path: p, outcome: 'unconfirmed', errno: 'short write', cut: true }]);
     expect(fileTicketState(t)).toBe('unconfirmed');
     expect(read(p)).toBe(L(1).slice(0, 3));
   });
@@ -948,8 +981,9 @@ describe('the exit with a replaced write whose newer write never landed', () => 
     mkdir.mockRestore();
     expect(read(r.p)).toBe('L1\n');
     expect(fileTicketState(r.t1)).toBe('unconfirmed');
-    expect(fileTicketFailure(r.t1)).toEqual({ errno: 'EIO', cut: false });
+    expect(fileTicketFailure(r.t1)).toEqual({ errno: 'EIO', cut: false, what: 'whole', kind: 'sync', dir: path.dirname(r.p) });
     expect(fileTicketState(r.t2)).toBe('open');
-    expect(errors.some(e => e.includes('the disk did not confirm the sync of 1 appended line(s) (EIO)'))).toBe(true);
+    expect(errors.some(e => e.startsWith(`[Data] ${r.p}: the file is written whole, but the disk did not confirm the sync of ${path.dirname(r.p)} (EIO)`))).toBe(true);
+    expect(errors.some(e => e.includes('appended line(s)'))).toBe(false);
   });
 });

@@ -727,6 +727,10 @@ describe('raw writes under a held guild (decision 1)', () => {
 
 describe.skipIf(process.platform === 'win32')('the directories are fsynced before the answer', () => {
   it('for a restore and for a delete each directory is synced once before the answer, and a sync that throws still answers ok, naming the unconfirmed move', async () => {
+    // NB19: the save comes before the stub, since its folder chain now syncs /data too.
+    const d = freshGuild();
+    saveData('a.json', opts(d), { a: 1 });
+    await flushAll();
     const synced = new Map<string, number>();
     let hold: ReturnType<typeof deferred<void>> | null = null;
     const open = fs.promises.open.bind(fs.promises);
@@ -745,11 +749,8 @@ describe.skipIf(process.platform === 'win32')('the directories are fsynced befor
     const once = new Map([[path.resolve(dataPath()), 1], [path.resolve(dataPath('_graveyard')), 1]]);
     const g = freshGuild();
     bury(g, 1000);
-    const d = freshGuild();
-    saveData('a.json', opts(d), { a: 1 });
-    await flushAll();
     const runs: [string, () => Promise<unknown>, unknown][] = [
-      ['restore', () => restoreGuildFromGraveyard(g, 1000), { ok: false, code: 'io-error', error: 'the disk did not confirm the copy of entry 1000 (EIO); nothing was restored; check the disk, then try again' }],
+      ['restore', () => restoreGuildFromGraveyard(g, 1000), { ok: false, code: 'io-error', error: 'the disk did not confirm the copy of entry 1000 (EIO); nothing was restored; check the disk, then restart the machine and try again' }],
       ['delete', () => deleteGuildNamespace(d, 'test', 5000), { ok: true, moveUnconfirmed: 'EIO' }],
     ];
     for (const [, run, expected] of runs) {

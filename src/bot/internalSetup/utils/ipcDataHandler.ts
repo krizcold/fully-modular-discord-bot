@@ -29,7 +29,8 @@ import {
   saveDataTracked,
 } from './dataManager';
 import type { WriteTicket } from './dataManager';
-import { filesPending } from './dataBackends/fileBackend';
+import { fileTicketFailure, filesPending } from './dataBackends/fileBackend';
+import { writtenUnconfirmedText } from './folderChain';
 import { carryWrites, NO_WRITES, type LedgerCause } from './dataBackends/writeLedger';
 import { maintenanceIpcRefusal } from './maintenance';
 import { maintenanceText, runTracked } from './maintenanceGate';
@@ -273,6 +274,9 @@ async function operatorDataWrite(req: GuildDataWriteRequest, own: { ticket?: Wri
   // Refused by the store, the write is kept and retried: no failure, and the
   // operator learns it is not durable yet.
   if (outcome === 'held') return { ok: true, pending: true, note: 'it is not saved yet; this node retries while it serves this guild, and loses it if the bot stops or loses its database first' };
+  // A ticket whose failed range carries a folder sync kind had its rename: the file holds the new bytes (NB19 D9).
+  const failure = outcome === 'unavailable' && ticket.kind === 'file' ? fileTicketFailure(ticket) : null;
+  if (failure?.kind) return { ok: false, code: 'backend-unavailable', error: writtenUnconfirmedText(filename, failure.kind, failure.dir!, failure.errno ?? 'no error code') };
   if (outcome === 'unavailable' && deposedHolder()) return { ok: false, code: 'held-elsewhere', error: deposedText(deposedHolder()!) };
   return { ok: false, code: 'backend-unavailable', error: 'this write left this node before it was confirmed saved (the guild was unloaded, its data was deleted or restored from the graveyard, or another bot process took the guild while the answer to a save was missing), so whether it was saved is unknown; reload the data to check' };
 }

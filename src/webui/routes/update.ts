@@ -62,13 +62,6 @@ function withTexts(head: string, texts: string[]): string {
   return `${head.endsWith('.') ? head : `${head}.`} ${texts.join(' ')}`;
 }
 
-/** The summary with a clause of the reload, before the sentences of updates the database did not answer (26b decision 3). */
-function withClause(result: BulkModuleUpdateResult, clause: string): string {
-  const unconfirmed = result.failed.filter(f => f.unconfirmed).map(f => f.error);
-  const head = `${describeBulkModuleUpdate({ ...result, failed: result.failed.filter(f => !f.unconfirmed) })}; ${clause}`;
-  return unconfirmed.length > 0 ? `${head}. ${unconfirmed.join(' ')}` : head;
-}
-
 /** The bot child applies each stored update in turn (decision 44); its answers by module, for the routes' answers. */
 async function applyEach(botManager: BotManager, updated: Array<Published & { moduleName: string }>): Promise<Array<ModuleApplyAnswer & { moduleName: string }>> {
   const answers: Array<ModuleApplyAnswer & { moduleName: string }> = [];
@@ -215,6 +208,8 @@ export function createUpdateRouter(botManager: BotManager): Router {
           apply: answer,
           message: answer.text ?? `Module ${name} updated successfully from ${result.oldVersion} to ${result.newVersion}`
         });
+      } else if (result.success && result.listUnconfirmed) {
+        res.json({ success: false, moduleName: result.moduleName, oldVersion: result.oldVersion, newVersion: result.newVersion, error: result.listUnconfirmed });
       } else if (result.success) {
         res.json({
           success: true,
@@ -310,7 +305,7 @@ export function createUpdateRouter(botManager: BotManager): Router {
           reload,
           apply: applies,
           message: reload.success
-            ? withClause(updateResult, 'reloaded the updated module(s)')
+            ? describeBulkModuleUpdate(updateResult, 'reloaded the updated module(s)')
             : withTexts(describeBulkModuleUpdate(updateResult), reload.failed.map(f => f.error))
         });
         return;
@@ -325,8 +320,8 @@ export function createUpdateRouter(botManager: BotManager): Router {
         download,
         reload: reloadResult,
         message: reloadResult?.success
-          ? withClause(updateResult, 'reloaded the updated module(s)')
-          : withClause(updateResult, 'reload had issues')
+          ? describeBulkModuleUpdate(updateResult, 'reloaded the updated module(s)')
+          : describeBulkModuleUpdate(updateResult, 'reload had issues')
       });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -375,6 +370,11 @@ export function createUpdateRouter(botManager: BotManager): Router {
 
       // Step 2: Hot-reload the module
       const reloadResult = await botManager.reloadModule(name);
+
+      if (updateResult.listUnconfirmed) {
+        res.json({ success: false, download, reload: reloadResult, error: updateResult.listUnconfirmed });
+        return;
+      }
 
       res.json({
         success: reloadResult?.success !== false,

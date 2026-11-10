@@ -24,7 +24,7 @@ import { updatePersistentPanelState, removePersistentPanel } from '../utils/pane
 import { DISCORD_EPHEMERAL_FLAG } from '../../constants';
 import { createV2Response, V2Colors } from '../utils/panel/v2';
 import { reloadModule, reloadModules } from '../utils/moduleReloader';
-import { getUpdaterType } from '@/updater';
+import { describeBulkModuleUpdate, getUpdaterType } from '@/updater';
 import { discordTimestamp } from '../utils/discordTimestamp';
 
 // Store panel owners for security
@@ -596,11 +596,14 @@ async function handleUpdateAllModules(context: PanelContext): Promise<PanelRespo
         if (updatedNames.length > 0 && context.client) {
           const reloadResult = await reloadModules(context.client, updatedNames);
           if (reloadResult.success) {
-            console.log(`[UpdateManagerPanel] Hot-reloaded ${reloadResult.reloaded.length} module(s)`);
+            const unconfirmed = new Set(toReload.filter(u => u.listUnconfirmed).map(u => u.moduleName));
+            const confirmed = reloadResult.reloaded.filter(name => !unconfirmed.has(name)).length;
+            if (confirmed > 0) console.log(`[UpdateManagerPanel] Hot-reloaded ${confirmed} module(s)`);
           } else {
             console.warn(`[UpdateManagerPanel] Hot-reload partial: ${reloadResult.reloaded.length} OK, ${reloadResult.failed.length} failed`);
           }
         }
+        for (const u of toReload) if (u.listUnconfirmed) console.warn(`[UpdateManagerPanel] ${u.listUnconfirmed}`);
       }
 
       // Re-check for updates after updating
@@ -635,7 +638,10 @@ async function handleUpdateEverything(context: PanelContext): Promise<PanelRespo
   setImmediate(async () => {
     try {
       const moduleResult = await triggerAllModuleUpdates();
-      if (moduleResult.totalUpdated > 0) {
+      const listUnconfirmed = moduleResult.updated.some(u => u.listUnconfirmed);
+      if (listUnconfirmed) {
+        console.warn(`[UpdateManagerPanel] ${describeBulkModuleUpdate(moduleResult)}`);
+      } else if (moduleResult.totalUpdated > 0) {
         console.log(`[UpdateManagerPanel] Updated ${moduleResult.totalUpdated} module(s) before system update`);
       }
 
@@ -652,7 +658,7 @@ async function handleUpdateEverything(context: PanelContext): Promise<PanelRespo
           .addTextDisplayComponents(
             new TextDisplayBuilder().setContent(
               `**Status:** Update requested\n\n` +
-              `${moduleResult.totalUpdated > 0 ? `${moduleResult.totalUpdated} module(s) updated. ` : ''}` +
+              `${listUnconfirmed ? `${describeBulkModuleUpdate(moduleResult)} ` : moduleResult.totalUpdated > 0 ? `${moduleResult.totalUpdated} module(s) updated. ` : ''}` +
               'The Bot Manager is pulling the latest code and rebuilding.\n' +
               'The bot will restart automatically when the new build is ready.\n' +
               'This panel will refresh after restart.'
@@ -698,12 +704,13 @@ async function handleUpdateSingleModule(context: PanelContext, moduleName: strin
         // Step 2: Hot-reload the module
         if (context.client) {
           const reloadResult = await reloadModule(context.client, moduleName);
-          if (reloadResult.success) {
-            console.log(`[UpdateManagerPanel] Hot-reloaded ${moduleName} (${reloadResult.duration}ms)`);
-          } else {
+          if (!reloadResult.success) {
             console.warn(`[UpdateManagerPanel] Hot-reload failed for ${moduleName}: ${reloadResult.error}`);
+          } else if (!result.listUnconfirmed) {
+            console.log(`[UpdateManagerPanel] Hot-reloaded ${moduleName} (${reloadResult.duration}ms)`);
           }
         }
+        if (result.listUnconfirmed) console.warn(`[UpdateManagerPanel] ${result.listUnconfirmed}`);
       } else if (result.unconfirmed) {
         console.warn(`[UpdateManagerPanel] ${result.error}`);
       } else {

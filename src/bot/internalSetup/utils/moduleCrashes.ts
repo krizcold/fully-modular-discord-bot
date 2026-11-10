@@ -6,6 +6,7 @@ import * as path from 'path';
 import { fileURLToPath } from 'url';
 import { dataPath } from '../../../utils/dataRoot';
 import { atomicWriteFileSync } from './atomicWrite';
+import { FolderSyncError, logFolderSyncError } from './folderChain';
 import { recordLoadFailure } from './loadFailures';
 import { readStoreRecord, writeStoreRecord } from './sharedRecords';
 
@@ -89,13 +90,18 @@ function readCrashLines(): CrashLines {
   }
 }
 
-/** The one write of the crash file; after a deposition it writes nothing and answers false. */
+/** The one write of the crash file; after a deposition it writes nothing and answers false. True when the bytes are in place. */
 function writeCrashLines(lines: CrashLines): boolean {
   if (crashWritesStopped) {
     console.error(`${COUNT_FAILED} (another process took the data files)`);
     return false;
   }
-  atomicWriteFileSync(crashFilePath(), JSON.stringify(lines, null, 2));
+  try {
+    atomicWriteFileSync(crashFilePath(), JSON.stringify(lines, null, 2));
+  } catch (error) {
+    if (!(error instanceof FolderSyncError)) throw error;
+    logFolderSyncError('[Error] The module crash count', error);
+  }
   return true;
 }
 

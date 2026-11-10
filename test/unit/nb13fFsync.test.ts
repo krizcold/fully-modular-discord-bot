@@ -90,13 +90,13 @@ describe.skipIf(process.platform === 'win32')('fsyncDataDirs answers a failed di
   it.each(['EIO', 'ENOSPC', 'EROFS', 'none'])('A2: a sync rejecting %s answers the folder and the code, and the other folder is still synced', async code => {
     const expected = code === 'none' ? 'EIO' : code;
     let handles = fakeOpen({ data: { sync: code } });
-    expect(await fsyncDataDirs()).toEqual({ failed: true, dir: DATA_ROOT, code: expected });
+    expect(await fsyncDataDirs()).toEqual({ failed: true, dir: DATA_ROOT, code: expected, kind: 'sync' });
     expect(handleOf(handles, DATA_ROOT)?.close).toHaveBeenCalledTimes(1);
     once(handleOf(handles, GRAVEYARD));
     vi.restoreAllMocks();
     quietConsole();
     handles = fakeOpen({ graveyard: { sync: code } });
-    expect(await fsyncDataDirs()).toEqual({ failed: true, dir: GRAVEYARD, code: expected });
+    expect(await fsyncDataDirs()).toEqual({ failed: true, dir: GRAVEYARD, code: expected, kind: 'sync' });
     once(handleOf(handles, DATA_ROOT));
     expect(handleOf(handles, GRAVEYARD)?.close).toHaveBeenCalledTimes(1);
   });
@@ -128,20 +128,20 @@ describe.skipIf(process.platform === 'win32')('fsyncDataDirs answers a failed di
 
   it('A5: a missing graveyard and an open of /data rejecting EIO are failures', async () => {
     let handles = fakeOpen({ graveyard: { open: 'ENOENT' } });
-    expect(await fsyncDataDirs()).toEqual({ failed: true, dir: GRAVEYARD, code: 'ENOENT' });
+    expect(await fsyncDataDirs()).toEqual({ failed: true, dir: GRAVEYARD, code: 'ENOENT', kind: 'open' });
     expect(handles.map(h => h.dir)).toEqual([path.resolve(DATA_ROOT)]);
     once(handles[0]);
     vi.restoreAllMocks();
     quietConsole();
     handles = fakeOpen({ data: { open: 'EIO' } });
-    expect(await fsyncDataDirs()).toEqual({ failed: true, dir: DATA_ROOT, code: 'EIO' });
+    expect(await fsyncDataDirs()).toEqual({ failed: true, dir: DATA_ROOT, code: 'EIO', kind: 'sync' });
     expect(handles.map(h => h.dir)).toEqual([path.resolve(GRAVEYARD)]);
     once(handles[0]);
   });
 
   it('A6: both syncs failing answers the first', async () => {
     const handles = fakeOpen({ data: { sync: 'EIO' }, graveyard: { sync: 'ENOSPC' } });
-    expect(await fsyncDataDirs()).toEqual({ failed: true, dir: DATA_ROOT, code: 'EIO' });
+    expect(await fsyncDataDirs()).toEqual({ failed: true, dir: DATA_ROOT, code: 'EIO', kind: 'sync' });
     for (const h of handles) expect(h.close).toHaveBeenCalledTimes(1);
   });
 
@@ -198,7 +198,7 @@ describe.skipIf(process.platform === 'win32')('a move whose directory fsync fail
   it.each([
     ['B1: the sync of /data', DATA_ROOT],
     ['B2: the sync of the graveyard', GRAVEYARD],
-  ])('%s fails on a restore: the answer names it, a line is logged and the next append runs the chain', async (_name, dir) => {
+  ])('%s fails on a restore: the answer names it, a line is logged and the next append opens no folder and is unconfirmed (NB19)', async (_name, dir) => {
     const g = freshGuild();
     const p = await start(g);
     const first = stub.holdDirSync(dir);
@@ -214,8 +214,8 @@ describe.skipIf(process.platform === 'win32')('a move whose directory fsync fail
     stub.dirSyncs.length = 0;
     const t = append(p, L(2));
     await flushAll();
-    expect(synced()).toEqual(chainOf(p));
-    expect(fileTicketState(t)).toBe('landed');
+    expect(synced()).toEqual([]);
+    expect(fileTicketState(t)).toBe('unconfirmed');
     expect(fs.readFileSync(p, 'utf8')).toBe(L(1) + L(2));
   });
 
@@ -280,10 +280,10 @@ describe.skipIf(process.platform === 'win32')('a move whose directory fsync fail
     stub.dirSyncs.length = 0;
     append(p, L(2));
     await flushAll();
-    expect(synced()).toEqual(chainOf(p));
+    expect(synced()).toEqual([]);
   });
 
-  it('B6: a delete whose fsync of /data fails answers it, logs it, and a later restore\'s append runs the chain', async () => {
+  it('B6: a delete whose fsync of /data fails answers it, logs it; under the flag it set a later restore restores nothing and an append opens no folder (NB19)', async () => {
     const g = freshGuild();
     const p = dataPath(g, 'm', 's.jsonl');
     fs.mkdirSync(path.dirname(p), { recursive: true });
@@ -293,12 +293,13 @@ describe.skipIf(process.platform === 'win32')('a move whose directory fsync fail
     expect(await deleteGuildNamespace(g, 'test', 5000)).toEqual({ ok: true, moveUnconfirmed: 'EIO' });
     expect(errors).toEqual([`[DataManager] Guild ${g} moved to graveyard, but the disk did not confirm the sync of ${DATA_ROOT} (EIO), so a power cut can bring its folder back live`]);
     const restored = await restoreGuildFromGraveyard(g);
-    expect(restored).toMatchObject({ ok: true });
-    expect(restored).not.toHaveProperty('moveUnconfirmed');
+    expect(restored).toMatchObject({ ok: false, code: 'io-error' });
+    expect((restored as { error: string }).error).toContain('is not trusted, since the disk did not confirm a folder sync earlier in this process (EIO); nothing was restored');
     stub.dirSyncs.length = 0;
-    append(p, L(2));
+    const t = append(p, L(2));
     await flushAll();
-    expect(synced()).toEqual(chainOf(p));
+    expect(synced()).toEqual([]);
+    expect(fileTicketState(t)).toBe('unconfirmed');
   });
 });
 

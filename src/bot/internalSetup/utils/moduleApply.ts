@@ -70,6 +70,8 @@ export interface ApplyResult {
   previousError?: string;
   /** An uninstall whose unload failed: the module keeps running until the bot restarts. */
   unloadFailed?: string;
+  /** 'fetch': a folder sync failed in this process, so no fetch is trusted until the machine restarts. */
+  restart?: true;
 }
 
 const deferred = (reason: ApplyReason, error: string | null = null, state?: StartState): ApplyResult =>
@@ -125,6 +127,7 @@ export function deferredText(operation: Operation, module: string, version: stri
     case 'main-changed':
       return current('the main database changed');
     case 'fetch':
+      if (result.restart) return `${done} This machine can't apply it until the machine is restarted (${result.error}). Check the disk, then restart the machine.`;
       return at(result.error ?? 'the database did not answer');
     case 'starting': {
       const state = result.state ?? 'd';
@@ -672,7 +675,8 @@ async function run(change: ModuleChange): Promise<ApplyResult> {
       const fetched = await fetchModule(module, into);
       if (!fetched.ok || fetched.sha !== change.to) {
         fs.rmSync(into, { recursive: true, force: true });
-        return fetched.ok ? deferred('changed') : deferred('fetch', fetched.cause);
+        if (fetched.ok) return deferred('changed');
+        return fetched.restart ? { ...deferred('fetch', fetched.cause), restart: true } : deferred('fetch', fetched.cause);
       }
       incoming = into;
     }

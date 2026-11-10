@@ -68,7 +68,7 @@ describe('T36', () => {
 
   it("after the guilds' clause, before the unconfirmed lines; absent at 0", () => {
     expect(heldClauses({ unansweredGuilds: 1, unansweredFiles: 1, unconfirmedFiles: 1 })).toBe(
-      "1 guild(s) hold a save the database did not answer, which may have landed; 1 file(s) hold a save the database did not answer, which may have landed; 1 file(s) hold appended lines the disk did not confirm; can't confirm whether they are stored",
+      "1 guild(s) hold a save the database did not answer, which may have landed; 1 file(s) hold a save the database did not answer, which may have landed; 1 file(s) hold changes the disk did not confirm; can't confirm whether they are stored",
     );
     expect(heldClauses({ unsavedFiles: 1, unansweredFiles: 0 })).toBe('0 guild(s) and 1 file(s) hold changes that could not be saved');
   });

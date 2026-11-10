@@ -252,12 +252,12 @@ describe('P5: a bundle import refused while it stages', () => {
     fs.writeFileSync(dataPath(guildId, 'keep', 'v.json'), '{"v":1}');
     const before = snapshot(dataPath(guildId));
     const file = bundleOf(guildId, [['m/a.json', Buffer.from('{"a":1}')], ['m/b.json', Buffer.from('{"b":2}')], ['m/c.json', Buffer.from('{"c":3}')]]);
-    const real = fs.promises.writeFile.bind(fs.promises);
+    const real = fs.promises.open.bind(fs.promises);
     let records = 0;
-    vi.spyOn(fs.promises, 'writeFile').mockImplementation((async (...args: Parameters<typeof fs.promises.writeFile>) => {
-      if (String(args[0]).includes('.bundle-import-') && ++records > 2) throw Object.assign(new Error('the process died (stub)'), { code: 'EIO' });
+    vi.spyOn(fs.promises, 'open').mockImplementation((async (...args: Parameters<typeof fs.promises.open>) => {
+      if (String(args[0]).includes('.bundle-import-') && args[1] === 'w' && ++records > 2) throw Object.assign(new Error('the process died (stub)'), { code: 'EIO' });
       return real(...args);
-    }) as typeof fs.promises.writeFile);
+    }) as typeof fs.promises.open);
     await expect(importBundle(file)).rejects.toThrow();
     expect(records).toBeGreaterThan(2);
     expect(snapshot(dataPath(guildId))).toEqual(before);

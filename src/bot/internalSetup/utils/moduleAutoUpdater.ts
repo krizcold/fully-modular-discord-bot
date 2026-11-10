@@ -84,13 +84,16 @@ async function runModuleUpdateCheck(): Promise<void> {
     // Hot-reload the updated modules
     const reloadResult = await reloadModules(clientRef, updatedNames);
     if (reloadResult.success) {
-      console.log(`[ModuleAutoUpdater] Hot-reloaded ${reloadResult.reloaded.length} module(s) in ${reloadResult.totalDuration}ms`);
+      const unconfirmed = new Set(updateResult.updated.filter(u => !u.applied && u.listUnconfirmed).map(u => u.moduleName));
+      const confirmed = reloadResult.reloaded.filter(name => !unconfirmed.has(name)).length;
+      if (confirmed > 0) console.log(`[ModuleAutoUpdater] Hot-reloaded ${confirmed} module(s) in ${reloadResult.totalDuration}ms`);
     } else {
       console.warn(`[ModuleAutoUpdater] Reload partial: ${reloadResult.reloaded.length} OK, ${reloadResult.failed.length} failed`);
       for (const f of reloadResult.failed) {
         console.warn(`[ModuleAutoUpdater]   Failed: ${f.moduleName}: ${f.error}`);
       }
     }
+    for (const u of updateResult.updated) if (!u.applied && u.listUnconfirmed) console.warn(`[ModuleAutoUpdater] ${u.listUnconfirmed}`);
   } catch (error) {
     console.error('[ModuleAutoUpdater] Error during auto-update check:', error);
   }

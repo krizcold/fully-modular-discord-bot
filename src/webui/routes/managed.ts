@@ -9,6 +9,7 @@ import { resolveDataBackend } from '../../utils/envLoader';
 import { checkAddressList } from '../../utils/databaseAddress';
 import { checkMemoryReading, refusedLine } from '../../utils/memoryReading';
 import { atomicWriteFileSync } from '../../bot/internalSetup/utils/atomicWrite';
+import { FolderSyncError, writeErrorText } from '../../bot/internalSetup/utils/folderChain';
 import { decideMain } from '../../bot/internalSetup/utils/dataBackends/mainDatabase';
 import {
   channelCause, discordWords, hashNonce, machineList, machinesAt, namesOf, noticeEmbed, pinMessage, placeWords, postInPlace,
@@ -224,7 +225,9 @@ async function notifyOwner(text: string, key: string, deadline: number): Promise
   try {
     writeKeyRecord(key);
   } catch (error) {
-    notes.push(`The repeat check could not be saved (${error instanceof Error ? error.message : String(error)}), so a repeat of this key would post again.`);
+    notes.push(error instanceof FolderSyncError
+      ? `${writeErrorText('The repeat check', error)}, so a repeat of this key may post again.`
+      : `The repeat check could not be saved (${error instanceof Error ? error.message : String(error)}), so a repeat of this key would post again.`);
   }
   if (inMain) {
     const answered = await beforeDeadline(recordOwnerMessageKey(key, postedAt), Math.max(deadline, Date.now() + KEY_READ_MS));
@@ -582,26 +585,34 @@ export function createManagedRoutes(botManager: BotManager, migration: Migration
     const given = typeof message === 'string' && message.trim() !== '' ? message : null;
     // Leaving keeps the saved message, which a later refused database login shows.
     const text = given ?? (state === 'running' ? before.message : DEFAULT_MAINTENANCE_MESSAGE);
+    // A FolderSyncError leaves the new state in the file: the bot follows the file, then the route answers 500.
+    let unconfirmed: string | null = null;
     try {
       writeMaintenanceFile(state, text);
     } catch (error) {
-      const cause = error instanceof Error ? error.message : String(error);
-      console.error(`[Maintenance] The maintenance state could not be saved: ${cause}`);
-      res.status(500).json({ success: false, error: `The maintenance state could not be saved: ${cause}` });
-      return;
+      if (!(error instanceof FolderSyncError)) {
+        const cause = error instanceof Error ? error.message : String(error);
+        console.error(`[Maintenance] The maintenance state could not be saved: ${cause}`);
+        res.status(500).json({ success: false, error: `The maintenance state could not be saved: ${cause}` });
+        return;
+      }
+      unconfirmed = writeErrorText('The maintenance state', error);
+      console.error(`[Maintenance] ${unconfirmed}`);
     }
+    const answer = (fields: Record<string, unknown>) => {
+      if (unconfirmed) res.status(500).json({ success: false, state, ...fields, error: unconfirmed });
+      else res.json({ success: true, state, ...fields });
+    };
     if (state === 'maintenance') {
-      const result = await botManager.enterMaintenance(text);
-      res.json({ success: true, state, ...result });
+      answer({ ...(await botManager.enterMaintenance(text)) });
       return;
     }
     if (before.state === 'running' && botManager.isServingNormally()) {
-      res.json({ success: true, state, restarting: false, note: 'The bot is already running.' });
+      answer({ restarting: false, note: 'The bot is already running.' });
       return;
     }
     console.log('[Maintenance] Leaving maintenance: asking the bot process to save what it holds and restart');
-    const result = await botManager.leaveMaintenance();
-    res.json({ success: true, state, ...result });
+    answer({ ...(await botManager.leaveMaintenance()) });
   });
 
   // Contract 7: a message for the bot's owner, posted once per key.

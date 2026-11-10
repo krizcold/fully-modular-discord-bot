@@ -769,7 +769,7 @@ function applyStoreKey(key: string, row: { body: Buffer | null; sha: string } | 
     head = movedHead(file, dest, held !== recSha ? 'a' : 'b', ctx);
   }
   try {
-    if (row) atomicWriteFileSync(file, row.body!);
+    if (row) atomicWriteFileSync(file, row.body!, undefined, { chain: false });
     else if (head === null) fs.unlinkSync(file);
   } catch (error) {
     if (head !== null) console.warn(head + t11WriteFailed(errnoOf(error)));

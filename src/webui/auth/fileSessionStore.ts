@@ -7,6 +7,7 @@ import * as path from 'path';
 import { Store, SessionData } from 'express-session';
 import { dataPath } from '../../utils/dataRoot';
 import { writeRawAtomic, readRaw, deleteRawAtomic, rawTicket, confirmWrite, DataBackendUnavailableError } from '../../bot/internalSetup/utils/dataManager';
+import { fileTicketFailure } from '../../bot/internalSetup/utils/dataBackends/fileBackend';
 
 // Path-traversal guard: a sid that fails this never touches the filesystem.
 const SID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
@@ -232,6 +233,11 @@ export class FileSessionStore extends Store {
       outcome => {
         if (outcome === 'ok' || outcome === 'pending' || outcome === 'held') {
           note?.(outcome === 'ok' ? 'ok' : 'pending');
+          return void callback?.();
+        }
+        // The session file is renamed into place, but a folder sync failed: can't confirm, not refused (NB19 D9).
+        if (outcome === 'unavailable' && ticket.kind === 'file' && fileTicketFailure(ticket)?.kind) {
+          note?.('pending');
           return void callback?.();
         }
         note?.('refused');

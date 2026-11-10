@@ -25,11 +25,11 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { FolderSyncError, syncFolderChainSync } from '../../bot/internalSetup/utils/folderChain';
 
 export const BEFORE_RESTORE = 'before_restore_';
 export const KEEP_BACKUPS = 10;
 const STAMP = '\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2}-\\d{3}Z';
-const IS_WINDOWS = process.platform === 'win32';
 
 export interface BackupEntry {
   filename: string;
@@ -152,18 +152,12 @@ function pruneBackups(dir: string, key: string, guildId: string | null, justWrit
   }
 }
 
-function fsyncDir(dir: string): void {
-  if (IS_WINDOWS) return;
-  try {
-    const fd = fs.openSync(dir, 'r');
-    try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-  } catch { /* directory fsync is best-effort */ }
-}
 
 /**
  * Writes one backup of the target durably (temp file, fsync, rename), then
- * prunes the target's own backups. created is read from the disk after the
- * prune. Throws when the backup could not be written.
+ * syncs the folders up to DATA_ROOT and prunes the target's own backups. created
+ * is read from the disk after the prune. Throws when the backup could not be
+ * written, and FolderSyncError when it is written but its folders' sync failed.
  */
 export function writeBackup(dir: string, key: string, guildId: string | null, body: string, beforeRestore = false): { filename: string; created: boolean } {
   fs.mkdirSync(dir, { recursive: true });
@@ -185,7 +179,8 @@ export function writeBackup(dir: string, key: string, guildId: string | null, bo
     try { fs.unlinkSync(tmp); } catch { /* nothing to clean */ }
     throw error;
   }
-  fsyncDir(dir);
+  const chain = syncFolderChainSync(dir);
+  if (chain.failed) throw new FolderSyncError(final, chain);
   pruneBackups(dir, key, guildId, filename);
   return { filename, created: fs.existsSync(final) };
 }

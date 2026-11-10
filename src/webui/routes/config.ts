@@ -33,6 +33,7 @@ import type { BotManager } from '../botManager';
 import { hopFailure, noAnswerText } from './hopFailure';
 import { graveyardRouteRefusal, moveUnconfirmedText } from './graveyard';
 import { shaOfRaw, CHANGED_SINCE_OPEN_TEXT } from '../../bot/internalSetup/utils/ipcDataHandler';
+import { FolderSyncError } from '../../bot/internalSetup/utils/folderChain';
 import { planGuildChange, remoteNoAnswerText, sendGuildChange, type Plan } from '../utils/guildRequests';
 
 const CONFIG_NOT_FOUND = 'Config file not found. It may not exist in any scanned directories.';
@@ -594,7 +595,12 @@ export function createConfigRoutes(botManager: BotManager): Router {
           backupCreated = backupCurrent(t, current.content);
         } catch (error) {
           const detail = error instanceof Error ? error.message : String(error);
-          res.status(500).json({ success: false, error: `Failed to update config: the backup could not be written (${detail}); nothing was saved` });
+          res.status(500).json({
+            success: false,
+            error: error instanceof FolderSyncError
+              ? `Failed to update config: nothing was saved, because the backup of ${t.key} can't be confirmed as saved: ${detail}`
+              : `Failed to update config: the backup could not be written (${detail}); nothing was saved`,
+          });
           return;
         }
 
@@ -772,7 +778,12 @@ export function createConfigRoutes(botManager: BotManager): Router {
           backupCreated = backupCurrent(t, current.content, true);
         } catch (error) {
           const detail = error instanceof Error ? error.message : String(error);
-          res.status(500).json({ success: false, error: `The current version could not be backed up (${detail}); nothing was restored` });
+          res.status(500).json({
+            success: false,
+            error: error instanceof FolderSyncError
+              ? `Nothing was restored, because the backup of the current version can't be confirmed as saved: ${detail}`
+              : `The current version could not be backed up (${detail}); nothing was restored`,
+          });
           return;
         }
 
@@ -983,7 +994,12 @@ export function createConfigRoutes(botManager: BotManager): Router {
           backupCreated = backupCurrent(t, current.content);
         } catch (error) {
           const detail = error instanceof Error ? error.message : String(error);
-          res.status(500).json({ success: false, error: `Failed to save data file: the backup could not be written (${detail}); nothing was saved` });
+          res.status(500).json({
+            success: false,
+            error: error instanceof FolderSyncError
+              ? `Failed to save data file: nothing was saved, because the backup of ${t.key} can't be confirmed as saved: ${detail}`
+              : `Failed to save data file: the backup could not be written (${detail}); nothing was saved`,
+          });
           return;
         }
 

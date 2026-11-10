@@ -13,6 +13,7 @@ import {
   type RowBackend,
 } from './sharedStore';
 import { FLUSH_STATEMENT_BYTES, globalKeyRefusal } from './storableData';
+import { flagAnswer, syncFolderSync, syncWords, type ChainAnswer } from './folderChain';
 
 export const INSTALLED_KEY = 'global/appstore/installed.json';
 
@@ -341,7 +342,14 @@ export async function unpublishModule(name: string, installedBody: string | Buff
 // ============================================================================
 
 /** The fetched folder's sha, file count and bytes, recomputed from the bytes written; or why the fetch stopped. */
-export type ModuleFetch = { ok: true; sha: string; files: number; bytes: number } | { ok: false; cause: string };
+export type ModuleFetch = { ok: true; sha: string; files: number; bytes: number } | { ok: false; cause: string; restart?: true };
+
+/** A folder sync of the fetch the device refused, or the flag one set: no fetch is trusted until the process restarts. */
+class FetchSyncStop extends Error {
+  constructor(readonly answer: Extract<ChainAnswer, { failed: true }>) {
+    super(syncWords(answer.kind, answer.dir, answer.errno).why);
+  }
+}
 
 class FetchStop extends Error {}
 
@@ -364,13 +372,10 @@ function writeAll(fd: number, data: Buffer): void {
 }
 
 function syncDir(dir: string): void {
-  if (process.platform === 'win32') return;
-  const fd = fs.openSync(dir, 'r');
-  try {
-    fs.fsyncSync(fd);
-  } finally {
-    fs.closeSync(fd);
-  }
+  const synced = syncFolderSync(dir);
+  if (!synced.failed) return;
+  if (synced.kind === 'open') throw new Error(syncWords(synced.kind, synced.dir, synced.errno).why);
+  throw new FetchSyncStop(synced);
 }
 
 /**
@@ -382,6 +387,8 @@ function syncDir(dir: string): void {
 export async function fetchModule(name: string, into: string): Promise<ModuleFetch> {
   const backend = rowBackend();
   if (!backend?.sharedRead) return { ok: false, cause: NO_DATABASE };
+  const flag = flagAnswer();
+  if (flag.failed) return { ok: false, cause: syncWords(flag.kind, flag.dir, flag.errno).why, restart: true };
   const read = async (text: string, values: unknown[]): Promise<any[]> => {
     const out = await backend.sharedRead!(text, values);
     if (out.kind === 'read') return out.rows;
@@ -471,6 +478,7 @@ export async function fetchModule(name: string, into: string): Promise<ModuleFet
     for (const dir of dirs) syncDir(dir);
     return { ok: true, sha: moduleShaOf(shas), files: shas.length, bytes };
   } catch (error) {
+    if (error instanceof FetchSyncStop) return { ok: false, cause: error.message, restart: true };
     return { ok: false, cause: messageOf(error) };
   }
 }

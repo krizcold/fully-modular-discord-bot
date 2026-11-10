@@ -70,6 +70,8 @@ export interface ModuleUpdateResult {
   unconfirmed?: true;
   applied?: StoreUpdateResult['applied'];
   published?: StoreUpdateResult['published'];
+  /** The new version is in place, but the list of installed modules can't be confirmed as saved (NB19 T9). */
+  listUnconfirmed?: string;
 }
 
 /** Result of bulk module updates */
@@ -77,17 +79,18 @@ export interface BulkModuleUpdateResult {
   success: boolean;
   totalAttempted: number;
   totalUpdated: number;
-  updated: Array<{ moduleName: string; oldVersion: string; newVersion: string; applied?: StoreUpdateResult['applied']; published?: StoreUpdateResult['published'] }>;
+  updated: Array<{ moduleName: string; oldVersion: string; newVersion: string; applied?: StoreUpdateResult['applied']; published?: StoreUpdateResult['published']; listUnconfirmed?: string }>;
   failed: Array<{ moduleName: string; error: string; unconfirmed?: true; changedElsewhere?: true }>;
   checkErrors: Array<{ moduleName: string; error: string }>;
   skipped: Array<{ moduleName: string; reason: string }>;
 }
 
 /**
- * Operator-facing sentence for a bulk module update; names every module that was not updated. An update the database
- * did not answer is told by its own can't confirm text (NB6 decision 35), after the sentence.
+ * Operator-facing sentence for a bulk module update; names every module that was not updated, then the clause when
+ * given. An update the database did not answer is told by its own can't confirm text (NB6 decision 35), and an update
+ * whose list of installed modules can't be confirmed as saved by its T9 (NB19), after the sentence.
  */
-export function describeBulkModuleUpdate(result: BulkModuleUpdateResult): string {
+export function describeBulkModuleUpdate(result: BulkModuleUpdateResult, clause?: string): string {
   const parts = [`Updated ${result.totalUpdated} module(s)`];
   const failed = result.failed.filter(f => !f.unconfirmed);
   if (failed.length > 0) {
@@ -99,7 +102,11 @@ export function describeBulkModuleUpdate(result: BulkModuleUpdateResult): string
   if (result.checkErrors.length > 0) {
     parts.push(`could not check: ${result.checkErrors.map(e => `${e.moduleName} (${e.error})`).join(', ')}`);
   }
-  const unconfirmed = result.failed.filter(f => f.unconfirmed).map(f => f.error);
+  if (clause) parts.push(clause);
+  const unconfirmed = [
+    ...result.failed.filter(f => f.unconfirmed).map(f => f.error),
+    ...result.updated.flatMap(u => (u.listUnconfirmed ? [u.listUnconfirmed] : [])),
+  ];
   return unconfirmed.length > 0 ? `${parts.join('; ')}. ${unconfirmed.join(' ')}` : parts.join('; ');
 }
 
@@ -390,7 +397,8 @@ export async function triggerModuleUpdate(moduleName: string): Promise<ModuleUpd
       error: updateResult.error,
       ...(updateResult.unconfirmed ? { unconfirmed: true as const } : {}),
       ...(updateResult.applied ? { applied: updateResult.applied } : {}),
-      ...(updateResult.published ? { published: updateResult.published } : {})
+      ...(updateResult.published ? { published: updateResult.published } : {}),
+      ...(updateResult.listUnconfirmed ? { listUnconfirmed: updateResult.listUnconfirmed } : {})
     };
   } catch (error) {
     return {
@@ -410,7 +418,7 @@ export async function triggerAllModuleUpdates(): Promise<BulkModuleUpdateResult>
     const result = await appStoreManager.updateAllModules();
 
     return {
-      success: result.failed.length === 0 && result.skipped.length === 0 && result.checkErrors.length === 0,
+      success: result.failed.length === 0 && result.skipped.length === 0 && result.checkErrors.length === 0 && !result.updated.some(u => u.listUnconfirmed),
       totalAttempted: result.updated.length + result.failed.length + result.skipped.length,
       totalUpdated: result.updated.length,
       updated: result.updated,

@@ -6,6 +6,7 @@ import { dataPath } from '../../utils/dataRoot';
 import { resolveDataBackend } from '../../utils/envLoader';
 import { pgConfig, showEntry } from '../../utils/databaseAddress';
 import { atomicWriteFileSync } from '../../bot/internalSetup/utils/atomicWrite';
+import { FolderSyncError, writeErrorText } from '../../bot/internalSetup/utils/folderChain';
 import { shortLivedClient } from '../../bot/internalSetup/utils/pgClient';
 import { ownerChannelFromFile, ownerChannelOf, type OwnerChannelValue } from '../../bot/internalSetup/utils/dataBackends/mainDatabase';
 import { channelCause, postInPlace } from '../../utils/ownerMessages';
@@ -320,6 +321,7 @@ async function putOnce(host: OwnerChannelHost, value: unknown): Promise<RouteAns
     try {
       writeOwnerChannelFile(channelId);
     } catch (error) {
+      if (error instanceof FolderSyncError) return refused(502, writeErrorText('The setting', error));
       return notSaved(causeOf(error));
     } finally {
       mark.end();

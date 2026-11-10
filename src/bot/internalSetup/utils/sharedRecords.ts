@@ -105,7 +105,7 @@ export function readDocRecord(): RecordRead<DocRecord> {
 }
 
 export function writeDocRecord(record: DocRecord): void {
-  atomicWriteFileSync(docRecordPath(), JSON.stringify(record, null, 2));
+  atomicWriteFileSync(docRecordPath(), JSON.stringify(record, null, 2), undefined, { chain: false });
 }
 
 export function readStoreRecord(): RecordRead<StoreRecord> {
@@ -113,5 +113,5 @@ export function readStoreRecord(): RecordRead<StoreRecord> {
 }
 
 export function writeStoreRecord(record: StoreRecord): void {
-  atomicWriteFileSync(storeRecordPath(), JSON.stringify(record, null, 2));
+  atomicWriteFileSync(storeRecordPath(), JSON.stringify(record, null, 2), undefined, { chain: false });
 }

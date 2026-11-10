@@ -56,10 +56,10 @@ describe('importBundle with a marker read that throws a value with no code', () 
 
   it('refuses when the marker read "[]" at the check and then throws a codeless Error', async () => {
     let staged = false;
-    const realWrite = fs.promises.writeFile;
-    vi.spyOn(fs.promises, 'writeFile').mockImplementation((async (p: any, ...rest: any[]) => {
-      if (String(p).includes('.bundle-import-')) staged = true;
-      return (realWrite as any)(p, ...rest);
+    const realOpen = fs.promises.open;
+    vi.spyOn(fs.promises, 'open').mockImplementation((async (p: any, ...rest: any[]) => {
+      if (String(p).includes('.bundle-import-') && rest[0] === 'w') staged = true;
+      return (realOpen as any)(p, ...rest);
     }) as any);
     stubMarkerRead(() => {
       if (staged) throw new Error('no code');

@@ -7,6 +7,7 @@
 
 import { Client, resolveTarget } from '../cli/client';
 import { bundleRefusal, importBundle, readBundle, writeBundle } from '../bot/internalSetup/utils/dataInterchange';
+import { FolderSyncError } from '../bot/internalSetup/utils/folderChain';
 
 async function refuseIfUnsafe(guildId: string): Promise<void> {
   const panel = await new Client(resolveTarget({})).panelAnswers();
@@ -46,7 +47,15 @@ async function main(): Promise<void> {
       return;
     }
     await refuseIfUnsafe(first.value.guildId);
-    const result = await importBundle(a);
+    let result: Awaited<ReturnType<typeof importBundle>>;
+    try {
+      result = await importBundle(a);
+    } catch (error) {
+      if (!(error instanceof FolderSyncError)) throw error;
+      console.error(`bundle import can't be confirmed: ${error.message}`);
+      process.exit(1);
+      return;
+    }
     console.log(`Imported guild ${result.guildId}: ${result.fileCount} file(s), ${result.totalBytes} bytes -> ${result.destDir}`
       + (result.replaced ? ` (the previous copy is at ${result.replaced})` : ''));
     return;

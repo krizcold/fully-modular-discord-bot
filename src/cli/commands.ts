@@ -12,6 +12,7 @@ import { flagStr, flagInt } from './args';
 import { waitForEvent, pollUntil } from './waiter';
 import { DATA_ROOT } from '../utils/dataRoot';
 import { bundleRefusal, importBundle, readBundle, writeBundle } from '../bot/internalSetup/utils/dataInterchange';
+import { FolderSyncError } from '../bot/internalSetup/utils/folderChain';
 import { restoreNoAnswerEnding } from '../bot/internalSetup/utils/dataManager';
 
 interface Ctx {
@@ -434,6 +435,10 @@ async function bundleImport(ctx: Ctx): Promise<void> {
   try {
     result = await importBundle(file);
   } catch (error) {
+    if (error instanceof FolderSyncError) {
+      if (jsonMode(ctx.flags)) printJson({ success: false, error: `bundle import can't be confirmed: ${error.message}`, ...(error.replaced ? { replaced: error.replaced } : {}) });
+      fail(`bundle import can't be confirmed: ${error.message}`, EXIT_ERR);
+    }
     fail(`bundle import failed: ${error instanceof Error ? error.message : String(error)}`, EXIT_ERR);
   }
   printJson(result);

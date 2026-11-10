@@ -7,6 +7,7 @@ import { randomUUID } from 'crypto';
 import { dataPath } from '../../../utils/dataRoot';
 import { FLEET_DIR } from './constants';
 import { atomicWriteFileSync } from '../utils/atomicWrite';
+import { FolderSyncError } from '../utils/folderChain';
 
 export { getNodeName } from './nodeName';
 
@@ -23,7 +24,12 @@ export function getNodeId(): string {
     }
   } catch { /* first boot */ }
   const nodeId = randomUUID();
-  atomicWriteFileSync(file, JSON.stringify({ nodeId, createdAt: Date.now() }, null, 2));
+  try {
+    atomicWriteFileSync(file, JSON.stringify({ nodeId, createdAt: Date.now() }, null, 2));
+  } catch (error) {
+    if (error instanceof FolderSyncError) cachedNodeId = nodeId;
+    throw error;
+  }
   cachedNodeId = nodeId;
   return nodeId;
 }

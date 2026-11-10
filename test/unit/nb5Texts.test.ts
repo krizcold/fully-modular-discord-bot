@@ -174,7 +174,7 @@ describe('NB5F: the texts of a marker that cannot be read, the move check and th
 describe("C3: the held clauses with the re-save clause second", () => {
   it('all four counts, in the order g and f, r, u, c', () => {
     expect(seen(heldClauses({ unsavedGuilds: 2, unsavedFiles: 1, resaveGuilds: 40, unansweredGuilds: 3, unconfirmedFiles: 4 }))).toBe(
-      "2 guild(s) and 1 file(s) hold changes that could not be saved; 40 guild(s) are not re-saved yet on the bot's main database; their latest changes may exist only in the bot process; 3 guild(s) hold a save the database did not answer, which may have landed; 4 file(s) hold appended lines the disk did not confirm; can't confirm whether they are stored",
+      "2 guild(s) and 1 file(s) hold changes that could not be saved; 40 guild(s) are not re-saved yet on the bot's main database; their latest changes may exist only in the bot process; 3 guild(s) hold a save the database did not answer, which may have landed; 4 file(s) hold changes the disk did not confirm; can't confirm whether they are stored",
     );
   });
   it('only flags', () => {

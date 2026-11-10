@@ -54,10 +54,10 @@ describe('importBundle', () => {
   it('refuses when the journal changed between its check and its swap', async () => {
     const file = await bundle();
     fs.writeFileSync(path.join(root, G, 'mod', 'a.json'), '{"a":"live"}');
-    const real = fs.promises.writeFile;
+    const real = fs.promises.open;
     let once = false;
-    vi.spyOn(fs.promises, 'writeFile').mockImplementation((async (p: any, ...rest: any[]) => {
-      if (!once && String(p).includes('.bundle-import-')) {
+    vi.spyOn(fs.promises, 'open').mockImplementation((async (p: any, ...rest: any[]) => {
+      if (!once && String(p).includes('.bundle-import-') && rest[0] === 'w') {
         once = true;
         writeJson(JOURNAL, { jobId: 'job-bundle-03', to: 'postgres', stage: 'checking', startedAt: 1 });
       }
@@ -70,10 +70,10 @@ describe('importBundle', () => {
 
   it('refuses when the marker changed between its check and its swap', async () => {
     const file = await bundle();
-    const real = fs.promises.writeFile;
+    const real = fs.promises.open;
     let once = false;
-    vi.spyOn(fs.promises, 'writeFile').mockImplementation((async (p: any, ...rest: any[]) => {
-      if (!once && String(p).includes('.bundle-import-')) {
+    vi.spyOn(fs.promises, 'open').mockImplementation((async (p: any, ...rest: any[]) => {
+      if (!once && String(p).includes('.bundle-import-') && rest[0] === 'w') {
         once = true;
         writeJson(MARKER, { live: 'postgres', storeId: 'x', flippedAt: 2 });
       }

@@ -13,6 +13,7 @@ import { listGuilds } from './fileBackend';
 import { readStoreId, PostgresUnreachableError, PostgresInRecoveryError } from './postgresBackend';
 import type { ClientConfig } from 'pg';
 import { atomicWriteFileSync } from '../atomicWrite';
+import { FolderSyncError, logFolderSyncError } from '../folderChain';
 
 export const MARKER_FILE = path.join(DATA_ROOT, '.backend.json');
 export const MIGRATION_FILE = path.join(DATA_ROOT, '.migration.json');
@@ -79,6 +80,8 @@ export interface MigrationJournal {
   shadow?: string[];
   /** Streams whose last line had no newline, copied with one added (NB13 decision 12). */
   closedTails?: string[];
+  /** T15: the marker or the .env names the job, but its folder sync failed; kept until a done write clears it (NB19). */
+  unconfirmed?: string;
 }
 
 export type DataFacts =
@@ -202,7 +205,8 @@ export function writeFileMarker(marker: BackendStateMarker): void {
   try {
     atomicWriteFileSync(MARKER_FILE, JSON.stringify(marker, null, 2));
   } catch (error) {
-    console.error('[Data] Failed to write backend marker:', error);
+    if (error instanceof FolderSyncError) logFolderSyncError('[Data] The backend marker', error);
+    else console.error('[Data] Failed to write backend marker:', error);
   }
 }
 

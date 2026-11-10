@@ -273,7 +273,7 @@ describe('5.8: a JSON append whose file fsync failed', () => {
     await flushAllFiles();
     expect(unconfirmedFiles()).toBe(before + 1);
     expect(await enterMaintenance('m', { saveBoundMs: 200 })).toEqual({ saved: null, unansweredGuilds: 0, unconfirmedFiles: before + 1 });
-    expect(logs).toContain(`[Maintenance] ${before + 1} file(s) hold appended lines the disk did not confirm; can't confirm whether they are stored; can't confirm whether every change this process held is saved`);
+    expect(logs).toContain(`[Maintenance] ${before + 1} file(s) hold changes the disk did not confirm; can't confirm whether they are stored; can't confirm whether every change this process held is saved`);
     _resetMaintenance();
     appendData('nb13m.jsonl', { guildId: g, category: 'm' }, 'y');
     await flushAllFiles();

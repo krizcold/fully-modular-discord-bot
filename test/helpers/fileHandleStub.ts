@@ -5,7 +5,8 @@ import { vi } from 'vitest';
 // For an 'a+' open of a matched path it can hold or reject the open, and wraps the real handle so that write can
 // hold, pass only the first k bytes and return k, or reject before any byte; sync, stat and the positional read can
 // reject or answer otherwise; close is counted. Directory opens ('r' on a directory) are recorded, and their sync can
-// reject, so a test sees the append branch's directory chain.
+// reject, so a test sees the append branch's directory chain. NB19: a directory's open can be rejected or held, its
+// stat follows the same stat rules as a file's, and its close can be held.
 
 type Match = RegExp | string;
 type Rule<T> = { match: Match; times: number; value: T };
@@ -45,6 +46,8 @@ export function stubAppendHandles() {
   const dirSyncRules: Rule<string>[] = [];
   const dirSyncHolds: Rule<{ code?: string; hold: () => Promise<void> }>[] = [];
   const dirCloseRules: Rule<string>[] = [];
+  const dirOpenRules: Rule<string>[] = [];
+  const dirCloseHolds: Rule<() => Promise<void>>[] = [];
   const closeRules: Rule<string>[] = [];
   const appendOpens: string[] = [];
   const appendCloses: string[] = [];
@@ -70,6 +73,10 @@ export function stubAppendHandles() {
       try { isDir = fs.statSync(p).isDirectory(); } catch { /* not there: the real open answers */ }
       if (isDir) {
         dirOpens.push(p);
+        const held = take(openRules.filter(r => r.value.hold), p);
+        if (held?.hold) await held.hold();
+        const code = take(dirOpenRules, p);
+        if (code) throw errnoError(code, 'open');
         const dh = await realOpen(file, flags, mode);
         return wrapDir(p, dh);
       }
@@ -162,9 +169,23 @@ export function stubAppendHandles() {
             return target.sync();
           };
         }
+        if (prop === 'stat') {
+          return async (opts?: fs.StatOptions) => {
+            const rule = take(statRules, p);
+            if (rule?.code) throw errnoError(rule.code, 'fstat');
+            const real = await target.stat({ bigint: true });
+            if (rule?.as) {
+              const over = rule.as(real);
+              return new Proxy(real, { get: (s, key) => (key in over ? (over as Record<string | symbol, unknown>)[key] : Reflect.get(s, key)) });
+            }
+            return opts?.bigint ? real : target.stat(opts);
+          };
+        }
         if (prop === 'close') {
           return async () => {
             dirCloses.push(p);
+            const hold = take(dirCloseHolds, p);
+            if (hold) await hold();
             const code = take(dirCloseRules, p);
             await target.close();
             if (code) throw code === 'none' ? new Error('stubbed close') : errnoError(code, 'close');
@@ -180,7 +201,7 @@ export function stubAppendHandles() {
     appendOpens, appendCloses, dirOpens, dirCloses, dirSyncs, writes, writeCalls,
     /** Rejects the next `times` 'a+' opens of a matched path with code ('undefined' rejects with undefined). */
     rejectOpen(match: Match, code: string, times = 1) { openRules.push({ match, times, value: { code } }); },
-    /** Holds the next 'a+' open of a matched path until released. */
+    /** Holds the next 'a+' open, or 'r' open of a directory, of a matched path until released. */
     holdOpen(match: Match): Hold { const h = holdPoint(); openRules.push({ match, times: 1, value: { hold: h.wait } }); return h.hold; },
     /** Holds every 'a+' open of a matched path for ever. */
     holdOpenForever(match: Match, times = 1_000) { openRules.push({ match, times, value: { holdForever: true } }); },
@@ -219,6 +240,10 @@ export function stubAppendHandles() {
       return h.hold;
     },
     failDirClose(match: Match, code: string, times = 1) { dirCloseRules.push({ match, times, value: code }); },
+    /** The next `times` 'r' opens of a matched directory reject with code. */
+    rejectDirOpen(match: Match, code: string, times = 1) { dirOpenRules.push({ match, times, value: code }); },
+    /** Holds the next close of a matched directory's handle until released; the handle closes after. */
+    holdDirClose(match: Match): Hold { const h = holdPoint(); dirCloseHolds.push({ match, times: 1, value: h.wait }); return h.hold; },
     restore() { spy.mockRestore(); },
   };
 }

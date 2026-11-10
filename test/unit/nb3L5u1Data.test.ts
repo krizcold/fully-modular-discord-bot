@@ -18,7 +18,7 @@ afterEach(() => {
 describe('the staging folder fsync', () => {
   beforeEach(() => wipeRoot());
 
-  it('closes every handle it opened, the staging folder\'s included, when its fsync succeeds or fails', async () => {
+  it('closes every handle it opened, the staging folder\'s included, when its fsync succeeds or fails; a failed fsync fails the stage (NB19)', async () => {
     for (const failSync of [false, true]) {
       const staging = path.join(root, failSync ? '.migrate-u1b' : '.migrate-u1a');
       const opened: string[] = [];
@@ -29,6 +29,7 @@ describe('the staging folder fsync', () => {
         opened.push(where);
         if (where === path.resolve(staging)) {
           return {
+            stat: async () => ({ dev: 1n, ino: 2n, birthtimeNs: 3n }),
             sync: async () => { if (failSync) throw Object.assign(new Error('EPERM'), { code: 'EPERM' }); },
             close: async () => { closed.push(where); },
           };
@@ -42,9 +43,13 @@ describe('the staging folder fsync', () => {
         items: [{ guildId: G, grave: false, module: 'm', filename: 'a.json', kind: 'doc', bytes: Buffer.from('{"a":1}') }],
         graves: [], guilds: [G], leftOut: [], shadow: [],
       };
-      await stageSnapshot(snap, staging);
+      const staged = stageSnapshot(snap, staging);
+      // Windows opens no folder for its sync (NB19 decision 1).
+      const posix = process.platform !== 'win32';
+      if (failSync && posix) await expect(staged).rejects.toThrow("the migration's folders can't be confirmed as stored: the disk did not confirm the sync of");
+      else await staged;
       spy.mockRestore();
-      expect(opened).toContain(path.resolve(staging));
+      if (posix) expect(opened).toContain(path.resolve(staging));
       expect(closed.sort()).toEqual(opened.sort());
       expect(fs.readFileSync(path.join(staging, G, 'm', 'a.json'), 'utf8')).toBe('{"a":1}');
     }

@@ -30,6 +30,7 @@ import {
 import { readStoreRecord } from './sharedRecords';
 import { credentialsKeyOf, INSTALLED_KEY, moduleRelRefusal, publishModule, unpublishModule, type ModuleSaveAnswer } from './sharedModules';
 import type { ApplyLater, PublisherAnswer } from './moduleApply';
+import { FolderSyncError, logFolderSyncError, logSyncLine, syncFolderChainSync, syncFolderSync, syncStepError, writeErrorText } from './folderChain';
 
 /**
  * Find a Dev module whose manifest name matches. Installing a store module
@@ -441,6 +442,19 @@ export interface ModuleUpdateResult {
   elsewhere?: ElsewhereChange;
   published?: PublishedChange;
   applied?: PublisherAnswer;
+  /** The new version is in place, but the list of installed modules can't be confirmed as saved (T9). */
+  listUnconfirmed?: string;
+}
+
+/** T9: the module's change is in place, but installed.json's folder chain failed. */
+function listUnconfirmedText(moduleName: string, done: 'installed' | 'uninstalled' | 'updated', error: FolderSyncError, backupDir?: string): string {
+  return `Module ${moduleName} is ${done}, but the list of installed modules can't be confirmed as saved: ${error.message}${backupDir ? ` Its backup is kept at ${backupDir}.` : ''}`;
+}
+
+/** T11 as the message of the same FolderSyncError, so every catch still sees a FolderSyncError. */
+function repoListUnconfirmed(error: FolderSyncError, name: string, done: 'added' | 'updated' | 'removed'): FolderSyncError {
+  error.message = `Repository ${name} is ${done}, but the repository list can't be confirmed as saved: ${error.message}`;
+  return error;
 }
 
 /** by: the machine that stored the version the refused update met, null when the refusal does not name one. */
@@ -566,9 +580,8 @@ function fsyncTree(dir: string): void {
     const fd = fs.openSync(abs, 'r+');
     try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
   }
-  if (process.platform === 'win32') return;
-  const fd = fs.openSync(dir, 'r');
-  try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  const synced = syncFolderSync(dir);
+  if (synced.failed) throw syncStepError(synced);
 }
 
 function dropStaged(dir: string): void {
@@ -648,10 +661,8 @@ function writeJsonAtomic(file: string, value: unknown): void {
     try { fs.unlinkSync(tmp); } catch { /* never created */ }
     throw error;
   }
-  try {
-    const dirFd = fs.openSync(path.dirname(file), 'r');
-    try { fs.fsyncSync(dirFd); } finally { fs.closeSync(dirFd); }
-  } catch { /* directories cannot be fsynced on Windows */ }
+  const chain = syncFolderChainSync(path.dirname(file));
+  if (chain.failed) throw new FolderSyncError(file, chain);
 }
 
 function isReposConfig(value: any): value is ReposConfig {
@@ -862,7 +873,14 @@ export class AppStoreManager {
       this.unawaited(() => this.locked(() => {
         this.readRepos();
         this.readInstalled();
-        if (this.reposState === 'missing') this.saveRepos();
+        if (this.reposState === 'missing') {
+          try {
+            this.saveRepos();
+          } catch (error) {
+            if (!(error instanceof FolderSyncError)) throw error;
+            logFolderSyncError('[AppStoreManager] The repos config', error);
+          }
+        }
         if (!isSharedStoreDoc(INSTALLED_CONFIG_PATH)) this.reconcileInstalledModules();
       }));
     } catch (error) {
@@ -1065,7 +1083,13 @@ export class AppStoreManager {
       }
     }
 
-    if (changed) this.saveInstalled();
+    if (!changed) return;
+    try {
+      this.saveInstalled();
+    } catch (error) {
+      if (!(error instanceof FolderSyncError)) throw error;
+      logFolderSyncError('[AppStoreManager] The installed config', error);
+    }
   }
 
   /**
@@ -1093,6 +1117,11 @@ export class AppStoreManager {
       this.reposStamp = fileStamp(REPOS_CONFIG_PATH);
       return true;
     } catch (error) {
+      if (error instanceof FolderSyncError) {
+        this.reposState = 'read';
+        this.reposStamp = fileStamp(REPOS_CONFIG_PATH);
+        throw error;
+      }
       console.error('[AppStoreManager] Failed to save repos config:', error);
       this.readRepos();
       return false;
@@ -1113,6 +1142,11 @@ export class AppStoreManager {
       this.installedStamp = fileStamp(INSTALLED_CONFIG_PATH);
       return true;
     } catch (error) {
+      if (error instanceof FolderSyncError) {
+        this.installedState = 'read';
+        this.installedStamp = fileStamp(INSTALLED_CONFIG_PATH);
+        throw error;
+      }
       console.error('[AppStoreManager] Failed to save installed config:', error);
       this.readInstalled();
       return false;
@@ -1193,7 +1227,14 @@ export class AppStoreManager {
       this.readRepos();
       this.requireReposReadable();
       this.reposConfig.repositories.push(repo);
-      if (!this.saveRepos()) {
+      let saved: boolean;
+      try {
+        saved = this.saveRepos();
+      } catch (error) {
+        if (error instanceof FolderSyncError) throw repoListUnconfirmed(error, repo.name, 'added');
+        throw error;
+      }
+      if (!saved) {
         throw new Error('The repository list could not be saved, so the repository was not added.');
       }
       return repo;
@@ -1247,7 +1288,12 @@ export class AppStoreManager {
         id // Ensure ID cannot be changed
       };
 
-      return this.saveRepos();
+      try {
+        return this.saveRepos();
+      } catch (error) {
+        if (error instanceof FolderSyncError) throw repoListUnconfirmed(error, this.reposConfig.repositories[index].name, 'updated');
+        throw error;
+      }
     });
   }
 
@@ -1271,8 +1317,14 @@ export class AppStoreManager {
       const index = this.reposConfig.repositories.findIndex(r => r.id === id);
       if (index === -1) return false;
 
-      this.reposConfig.repositories.splice(index, 1);
-      if (!this.saveRepos()) return false;
+      const [removed] = this.reposConfig.repositories.splice(index, 1);
+      let unconfirmed: FolderSyncError | null = null;
+      try {
+        if (!this.saveRepos()) return false;
+      } catch (error) {
+        if (!(error instanceof FolderSyncError)) throw error;
+        unconfirmed = repoListUnconfirmed(error, removed.name, 'removed');
+      }
 
       // Clear cache for this repo
       this.moduleCache.delete(id);
@@ -1284,6 +1336,7 @@ export class AppStoreManager {
       } catch (error) {
         console.error(`[AppStoreManager] Removed repository ${id} but could not delete its cached clone:`, error);
       }
+      if (unconfirmed) throw unconfirmed;
       return true;
     });
   }
@@ -1361,9 +1414,14 @@ export class AppStoreManager {
       this.moduleCache.set(repoId, modules);
 
       // Update last refreshed timestamp
-      this.updateRepository(repoId, {
-        lastRefreshed: new Date().toISOString()
-      });
+      try {
+        this.updateRepository(repoId, {
+          lastRefreshed: new Date().toISOString()
+        });
+      } catch (error) {
+        if (!(error instanceof FolderSyncError)) throw error;
+        logSyncLine(error.file, error.kind, `[AppStoreManager] ${error.message}`);
+      }
 
       return modules;
     } catch (error) {
@@ -1626,6 +1684,7 @@ export class AppStoreManager {
       takeAutoSnapshot(`install ${moduleName}`);
 
       const commitHash = this.getRepoCacheCommit(repoId) || undefined;
+      let unconfirmed: FolderSyncError | null = null;
       try {
         this.copyDirectory(moduleInfo.repoPath, sourceTargetDir);
 
@@ -1643,7 +1702,15 @@ export class AppStoreManager {
           commitHash
         };
 
-        if (!this.saveInstalled()) {
+        let saved: boolean;
+        try {
+          saved = this.saveInstalled();
+        } catch (error) {
+          if (!(error instanceof FolderSyncError)) throw error;
+          unconfirmed = error;
+          saved = true;
+        }
+        if (!saved) {
           throw new Error(`Module ${moduleName} was not installed: the installed modules list could not be saved.`);
         }
 
@@ -1651,7 +1718,6 @@ export class AppStoreManager {
         moduleInfo.installedVersion = copiedVersion;
 
         console.log(`[AppStoreManager] Installed module: ${moduleName} v${copiedVersion}`);
-        return true;
       } catch (error) {
         delete this.installedConfig.modules[moduleName];
         if (fs.existsSync(sourceTargetDir)) {
@@ -1662,6 +1728,11 @@ export class AppStoreManager {
         }
         throw error;
       }
+      if (unconfirmed) {
+        unconfirmed.message = listUnconfirmedText(moduleName, 'installed', unconfirmed);
+        throw unconfirmed;
+      }
+      return true;
     });
   }
 
@@ -1859,7 +1930,17 @@ export class AppStoreManager {
       if (hasFiles) takeAutoSnapshot(`uninstall ${moduleName}`);
 
       delete this.installedConfig.modules[moduleName];
-      if (!this.saveInstalled()) {
+      let unconfirmed: FolderSyncError | null = null;
+      let saved: boolean;
+      try {
+        saved = this.saveInstalled();
+      } catch (error) {
+        if (!(error instanceof FolderSyncError)) throw error;
+        unconfirmed = error;
+        unconfirmed.message = listUnconfirmedText(moduleName, 'uninstalled', error);
+        saved = true;
+      }
+      if (!saved) {
         throw new Error(`Module ${moduleName} was not uninstalled: the installed modules list could not be saved.`);
       }
 
@@ -1873,6 +1954,7 @@ export class AppStoreManager {
 
       if (!hasFiles) {
         this.deleteCredentials(moduleName);
+        if (unconfirmed) throw unconfirmed;
         return true;
       }
 
@@ -1890,6 +1972,7 @@ export class AppStoreManager {
       this.deleteCredentials(moduleName);
 
       console.log(`[AppStoreManager] Uninstalled module: ${moduleName}`);
+      if (unconfirmed) throw unconfirmed;
       return true;
     });
   }
@@ -2358,12 +2441,25 @@ export class AppStoreManager {
           installedAt: new Date().toISOString(),
           commitHash
         };
-        if (!this.saveInstalled()) {
+        let unconfirmed: FolderSyncError | null = null;
+        let saved: boolean;
+        try {
+          saved = this.saveInstalled();
+        } catch (error) {
+          if (!(error instanceof FolderSyncError)) throw error;
+          unconfirmed = error;
+          saved = true;
+        }
+        if (!saved) {
           throw new Error('the installed modules list could not be saved');
         }
 
         moduleInfo.installed = true;
         moduleInfo.installedVersion = copiedVersion;
+
+        if (unconfirmed) {
+          return { success: true, newVersion: copiedVersion, listUnconfirmed: listUnconfirmedText(moduleName, 'updated', unconfirmed, backupDir) };
+        }
 
         try {
           fs.rmSync(backupDir, { recursive: true, force: true });
@@ -2377,6 +2473,7 @@ export class AppStoreManager {
         console.error(`[AppStoreManager] Install failed, rolling back:`, installError);
 
         let restored = false;
+        let rollbackUnconfirmed: FolderSyncError | null = null;
         try {
           if (fs.existsSync(sourceDir)) fs.rmSync(sourceDir, { recursive: true, force: true });
           this.copyDirectory(backupDir, sourceDir);
@@ -2388,7 +2485,15 @@ export class AppStoreManager {
           this.readInstalled();
           if (this.installedConfig.modules[moduleName]?.version !== previousInstalled.version) {
             this.installedConfig.modules[moduleName] = previousInstalled;
-            if (!this.saveInstalled()) throw new Error('the installed modules list could not be saved');
+            let saved: boolean;
+            try {
+              saved = this.saveInstalled();
+            } catch (error) {
+              if (!(error instanceof FolderSyncError)) throw error;
+              rollbackUnconfirmed = error;
+              saved = true;
+            }
+            if (!saved) throw new Error('the installed modules list could not be saved');
           }
           restored = true;
         } catch (rollbackError) {
@@ -2398,6 +2503,9 @@ export class AppStoreManager {
         const reason = installError instanceof Error ? installError.message : String(installError);
         if (!restored) {
           return { success: false, error: `Install failed: ${reason}. The previous version could not be restored; its backup is at ${backupDir}` };
+        }
+        if (rollbackUnconfirmed) {
+          return { success: false, error: `Install failed: ${reason}. The previous version is back in place, but the list of installed modules can't be confirmed as saved: ${rollbackUnconfirmed.message} Its backup is kept at ${backupDir}.` };
         }
 
         // The backup is only removed once the previous version is back in place
@@ -2482,14 +2590,14 @@ export class AppStoreManager {
    */
   async updateAllModules(): Promise<{
     success: boolean;
-    updated: Array<{ moduleName: string; oldVersion: string; newVersion: string; applied?: PublisherAnswer; published?: PublishedChange }>;
+    updated: Array<{ moduleName: string; oldVersion: string; newVersion: string; applied?: PublisherAnswer; published?: PublishedChange; listUnconfirmed?: string }>;
     failed: Array<{ moduleName: string; error: string; unconfirmed?: true; changedElsewhere?: true; elsewhere?: ElsewhereChange }>;
     checkErrors: Array<{ moduleName: string; error: string }>;
     skipped: Array<{ moduleName: string; reason: string }>;
   }> {
     const result = {
       success: true,
-      updated: [] as Array<{ moduleName: string; oldVersion: string; newVersion: string; applied?: PublisherAnswer; published?: PublishedChange }>,
+      updated: [] as Array<{ moduleName: string; oldVersion: string; newVersion: string; applied?: PublisherAnswer; published?: PublishedChange; listUnconfirmed?: string }>,
       failed: [] as Array<{ moduleName: string; error: string; unconfirmed?: true; changedElsewhere?: true; elsewhere?: ElsewhereChange }>,
       checkErrors: [] as Array<{ moduleName: string; error: string }>,
       skipped: [] as Array<{ moduleName: string; reason: string }>
@@ -2515,8 +2623,10 @@ export class AppStoreManager {
           oldVersion,
           newVersion: updateResult.newVersion,
           ...(updateResult.applied ? { applied: updateResult.applied } : {}),
-          ...(updateResult.published ? { published: updateResult.published } : {})
+          ...(updateResult.published ? { published: updateResult.published } : {}),
+          ...(updateResult.listUnconfirmed ? { listUnconfirmed: updateResult.listUnconfirmed } : {})
         });
+        if (updateResult.listUnconfirmed) result.success = false;
       } else if (!updateResult.success) {
         result.failed.push({
           moduleName: moduleUpdate.moduleName,

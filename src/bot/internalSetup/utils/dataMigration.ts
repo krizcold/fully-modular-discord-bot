@@ -8,6 +8,9 @@ import * as path from 'path';
 import { createHash, randomUUID } from 'crypto';
 import { DATA_ROOT, dataPath } from '../../../utils/dataRoot';
 import { atomicWriteFileSync } from './atomicWrite';
+import {
+  FolderSyncError, syncFolder as syncOneFolder, syncFolderChain, syncFoldersUnder, syncWords, writeErrorText, writeFileSynced, type ChainAnswer,
+} from './folderChain';
 import { canonicalGuildKey, isCanonicalGuildKey } from './dataKeys';
 import { decodeStorable, fold, globalKeyRefusal, keyRefusal, KeyTree, pathKeyOf } from './storableData';
 import {
@@ -145,7 +148,29 @@ export interface MigrationAnswer {
 }
 
 class Refusal extends Error {}
-class Interrupted extends Error {}
+/** unconfirmed: T15, when the marker or the .env names the job but its folder sync failed (NB19 D5). */
+class Interrupted extends Error {
+  constructor(message: string, readonly unconfirmed?: string) {
+    super(message);
+  }
+}
+
+/** T15: the marker or the .env is written, but its folder chain failed, so the switch is not confirmed. */
+function switchUnconfirmed(what: string, error: FolderSyncError): string {
+  const tail = error.kind === 'open' ? 'Run the migration again to confirm the switch.' : 'Run the migration again after the restart to confirm the switch.';
+  return `${writeErrorText(what, error)} ${tail}`;
+}
+
+/** T20: a folder sync of the migration failed. */
+function foldersUnconfirmed(answer: Extract<ChainAnswer, { failed: true }>): Error {
+  const { why, next } = syncWords(answer.kind, answer.dir, answer.errno);
+  return new Error(`the migration's folders can't be confirmed as stored: ${why}. ${answer.kind === 'open' ? 'Run the migration again.' : next}`);
+}
+
+async function mustSync(answer: Promise<ChainAnswer>): Promise<void> {
+  const done = await answer;
+  if (done.failed) throw foldersUnconfirmed(done);
+}
 
 function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -263,6 +288,7 @@ export function deriveStatus(facts: DataFacts, opts: { running: { jobId: string 
   const journal = facts.journal;
   if (!journal) return { status: 200, body: { success: true, job: null } };
   if (opts.running && opts.running.jobId === journal.jobId) return { status: 200, body: { success: true, job: jobView(journal, 'running', journal.stage) } };
+  if (journal.unconfirmed) return { status: 200, body: { success: true, job: jobView(journal, 'interrupted', journal.stage, journal.unconfirmed) } };
   if (journal.result === 'done') {
     if (markerNamesJob(facts.marker, journal)) return { status: 200, body: { success: true, job: jobView(journal, 'done', journal.stage) } };
     return { status: 409, body: { success: false, error: doneUnnamedText(journal.jobId), jobId: journal.jobId, to: journal.to } };
@@ -565,22 +591,10 @@ export async function walkJsonSource(root: string): Promise<Snapshot> {
   return snap;
 }
 
-async function writeSynced(file: string, bytes: Buffer | string): Promise<void> {
-  await fs.promises.mkdir(path.dirname(file), { recursive: true });
-  const handle = await fs.promises.open(file, 'w');
-  try {
-    await handle.writeFile(bytes);
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-}
+const writeSynced = writeFileSynced;
 
 async function syncFolder(dir: string): Promise<void> {
-  try {
-    const handle = await fs.promises.open(dir, 'r');
-    try { await handle.sync(); } finally { await handle.close(); }
-  } catch { /* folders cannot be fsynced on Windows */ }
+  await mustSync(syncOneFolder(dir));
 }
 
 function stagedPath(staging: string, item: { guildId: string; grave?: boolean; retiredAt?: number; module: string; filename: string }): string {
@@ -671,7 +685,9 @@ export async function placeStaged(root: string, staging: string, superseded: str
     await fs.promises.mkdir(path.dirname(to), { recursive: true });
     await fs.promises.rename(from, to);
   }
-  await syncFolder(root);
+  for (const dir of new Set([...stale, ...incoming].flatMap(([from, to]) => [path.dirname(path.resolve(from)), path.dirname(path.resolve(to))]))) {
+    await mustSync(syncFolderChain(dir));
+  }
   await fs.promises.rm(staging, { recursive: true, force: true });
 }
 
@@ -1451,6 +1467,8 @@ async function moveCredentialsAside(superseded: string): Promise<string | null> 
   if (fs.existsSync(to)) throw new Refusal(`${to} exists; nothing was moved`);
   await fs.promises.mkdir(path.dirname(to), { recursive: true });
   await fs.promises.rename(file, to);
+  await mustSync(syncFolderChain(path.dirname(to)));
+  await mustSync(syncFolderChain(path.dirname(file)));
   return to;
 }
 
@@ -2073,6 +2091,7 @@ export class MigrationService {
         try {
           writeJournal({ ...earlier, result: 'failed', error: OLD_STORE_NOT_RETIRED, finishedAt: Date.now() });
         } catch (error) {
+          if (error instanceof FolderSyncError) return refuse(writeErrorText(`The earlier journal of migration ${earlier.jobId}`, error, ', so nothing was started'));
           return refuse(`The earlier journal could not be written, so nothing was started: ${message(error)}`);
         }
       }
@@ -2100,6 +2119,7 @@ export class MigrationService {
       try {
         writeMarkerStrict({ live: 'file', storeId: null, flippedAt: Date.now() });
       } catch (error) {
+        if (error instanceof FolderSyncError) return refuse(writeErrorText('The backend marker', error, ', so nothing was started'));
         return refuse(`${MARKER_FILE} could not be written, so nothing was started: ${message(error)}`);
       }
     }
@@ -2108,7 +2128,7 @@ export class MigrationService {
 
   private async classifyEarlier(earlier: MigrationJournal, marker: BackendStateMarker | null, jobId: string, url: string | undefined): Promise<Classification> {
     const unknown = (why: string): Classification => ({ kind: 'unknown', reason: `can't confirm; ${why}` });
-    if (markerNamesJob(marker, earlier)) return { kind: 'finish', from: 'env' };
+    if (markerNamesJob(marker, earlier)) return { kind: 'finish', from: earlier.unconfirmed ? 'switch' : 'env' };
     if (earlier.result === 'done') return { kind: 'unknown', reason: doneUnnamedText(earlier.jobId) };
     if (marker && marker.live === earlier.to) return unknown(`the marker /data/.backend.json names ${earlier.to} under ${marker.migration ? `migration ${marker.migration}` : 'no migration'}, not migration ${earlier.jobId}`);
     if (earlier.to === 'postgres') {
@@ -2297,7 +2317,8 @@ export class MigrationService {
         stage('switching');
         this.switchMarker(j);
       }
-      if (!managed && readEnvFileDataBackend() !== j.to) {
+      // An earlier process's .env write whose chain failed is written again, so a chain of this process confirms it.
+      if (!managed && (earlier.unconfirmed || readEnvFileDataBackend() !== j.to)) {
         stage('env');
         this.switchEnv(j.to);
       }
@@ -2305,19 +2326,21 @@ export class MigrationService {
       const wasDone = earlier.result === 'done';
       if (!wasDone || changed) {
         const finishedAt = wasDone && earlier.finishedAt !== undefined ? earlier.finishedAt : Date.now();
-        const done: MigrationJournal = { ...j, result: 'done', error: undefined, finishedAt, envSwitched: !managed };
+        const done: MigrationJournal = { ...j, result: 'done', error: undefined, unconfirmed: undefined, finishedAt, envSwitched: !managed };
         try {
           writeJournal(done);
           j = done;
         } catch (error) {
-          console.error(`[Migration] Migration ${j.jobId} is done, but its journal's done could not be written: ${message(error)}`);
+          if (error instanceof FolderSyncError) console.error(`[Migration] Migration ${j.jobId} is done, but its journal can't be confirmed as saved: ${error.message}`);
+          else console.error(`[Migration] Migration ${j.jobId} is done, but its journal's done could not be written: ${message(error)}`);
         }
       }
       console.log(`[Migration] Migration ${j.jobId} (--to ${j.to}) is finished`);
       return { status: 200, body: { success: true, jobId: j.jobId, to: j.to, state: 'done', stage: j.stage, envSwitched: !managed } };
     } catch (error) {
       const error2 = message(error);
-      try { writeJournal({ ...j, result: 'interrupted', error: error2, finishedAt: Date.now() }); } catch { /* a missing result reads as interrupted */ }
+      const unconfirmed = error instanceof Interrupted && error.unconfirmed ? error.unconfirmed : j.unconfirmed;
+      try { writeJournal({ ...j, result: 'interrupted', error: error2, finishedAt: Date.now(), ...(unconfirmed ? { unconfirmed } : {}) }); } catch { /* a missing result reads as interrupted */ }
       console.error(`[Migration] Migration ${j.jobId} could not be finished at ${j.stage}: ${error2}`);
       return { status: 200, body: { success: true, jobId: j.jobId, to: j.to, state: 'interrupted', stage: j.stage, error: error2 } };
     }
@@ -2331,6 +2354,11 @@ export class MigrationService {
     try {
       writeMarkerStrict(want);
     } catch (error) {
+      // The read-back sees only the page cache: a marker whose folder sync failed is never taken as switched.
+      if (error instanceof FolderSyncError) {
+        const text = switchUnconfirmed(`The marker of migration ${j.jobId}`, error);
+        throw new Interrupted(text, text);
+      }
       const back = readDataFacts();
       const m = back.ok ? back.marker : null;
       if (m && m.live === want.live && (m.storeId ?? null) === want.storeId && m.migration === want.migration) {
@@ -2345,6 +2373,10 @@ export class MigrationService {
     try {
       writeEnvDataBackend(to);
     } catch (error) {
+      if (error instanceof FolderSyncError) {
+        console.error(writeErrorText('[Migration] DATA_BACKEND in /data/.env', error));
+        throw new Interrupted(ENV_UNFINISHED, switchUnconfirmed('DATA_BACKEND in /data/.env', error));
+      }
       console.error(`[Migration] DATA_BACKEND in /data/.env could not be written: ${message(error)}`);
       throw new Interrupted(ENV_UNFINISHED);
     }
@@ -2356,7 +2388,10 @@ export class MigrationService {
     try {
       writeJournal(j);
     } catch (error) {
-      return { status: 200, body: { success: true, jobId, to, state: 'failed', stage: 'checking', error: `The journal could not be written: ${message(error)}` } };
+      const text = error instanceof FolderSyncError
+        ? writeErrorText(`The journal of migration ${jobId}`, error, ', so nothing was started')
+        : `The journal could not be written: ${message(error)}`;
+      return { status: 200, body: { success: true, jobId, to, state: 'failed', stage: 'checking', error: text } };
     }
     console.log(`[Migration] Migration ${jobId} (--to ${to}) started`);
     const promise = this.run(j, url, lastJobId).finally(() => {
@@ -2404,10 +2439,11 @@ export class MigrationService {
     if (!interrupted && stage === 'committing') stage = 'rereading';
     if (!interrupted && stage === 'retire-source') stage = 'placing';
     const result = interrupted ? 'interrupted' : 'failed';
+    const unconfirmed = error instanceof Interrupted && error.unconfirmed ? error.unconfirmed : ctx.j.unconfirmed;
     try {
-      writeJournal({ ...ctx.j, stage, result, error: why, finishedAt: Date.now() });
+      writeJournal({ ...ctx.j, stage, result, error: why, finishedAt: Date.now(), ...(unconfirmed ? { unconfirmed } : {}) });
     } catch (writeError) {
-      console.error(`[Migration] The journal of migration ${ctx.j.jobId} could not be written: ${message(writeError)}`);
+      console.error(writeErrorText(`[Migration] The journal of migration ${ctx.j.jobId}`, writeError));
     }
     console.error(`[Migration] Migration ${ctx.j.jobId} ${interrupted ? 'was interrupted' : 'failed'} at ${stage}: ${why}`);
   }
@@ -2633,6 +2669,7 @@ export class MigrationService {
       await pgReader(main)(part => stageSnapshot(part, staging));
       await eachShared(main, part => stageShared(staging, part));
       if (copiedChannel.kind === 'id') await writeSynced(path.join(staging, OWNER_CHANNEL_NAME), JSON.stringify({ channelId: copiedChannel.id }));
+      await mustSync(syncFoldersUnder(staging));
     }
 
     // S6: the read-back of the destination.
@@ -2710,6 +2747,10 @@ export class MigrationService {
           await writeSynced(target, s.bytes);
         }
       }
+      if (tally.shadowUnits.length > 0 && fs.existsSync(path.join(ctx.superseded, 'shadow'))) {
+        await mustSync(syncFoldersUnder(path.join(ctx.superseded, 'shadow')));
+        await mustSync(syncFolderChain(ctx.superseded));
+      }
       const stagedDoc = path.join(ctx.staging!, ...credentialsKey().split('/'));
       const keys = planKeys((await lstatOrNull(stagedDoc)) ? (await readFileStrict(stagedDoc)).toString('utf8') : null);
       const keysChange = Object.keys(keys.changes).length > 0;
@@ -2767,9 +2808,10 @@ export class MigrationService {
     await this.fault('S12');
     resetDataBackendCache();
     try {
-      writeJournal({ ...ctx.j, result: 'done', error: undefined, finishedAt: Date.now(), envSwitched: !managed });
+      writeJournal({ ...ctx.j, result: 'done', error: undefined, unconfirmed: undefined, finishedAt: Date.now(), envSwitched: !managed });
     } catch (error) {
-      console.error(`[Migration] Migration ${jobId} is done, but its journal's done could not be written: ${message(error)}`);
+      if (error instanceof FolderSyncError) console.error(`[Migration] Migration ${jobId} is done, but its journal can't be confirmed as saved: ${error.message}`);
+      else console.error(`[Migration] Migration ${jobId} is done, but its journal's done could not be written: ${message(error)}`);
     }
     console.log(`[Migration] Migration ${jobId} (--to ${to}) is done: ${counts.documents} documents, ${counts.appendFiles} streams, ${counts.graveyardEntries} graveyard entries`
       + (counts.providerKeys > 0

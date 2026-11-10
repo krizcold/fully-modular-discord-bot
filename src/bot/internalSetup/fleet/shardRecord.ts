@@ -3,9 +3,10 @@
 // for this machine, which the next boot take reads.
 
 import * as fs from 'fs';
-import * as path from 'path';
 import { dataPath } from '../../../utils/dataRoot';
 import { FLEET_DIR } from './constants';
+import { atomicWriteFileSync } from '../utils/atomicWrite';
+import { FolderSyncError, logFolderSyncError } from '../utils/folderChain';
 
 export interface ShardRecord {
   shardCount: number;
@@ -19,19 +20,14 @@ export function shardRecordPath(): string {
   return dataPath('global', FLEET_DIR, 'shards.json');
 }
 
-/** Temp file, fsync, rename; throws when the write fails. */
+/** Temp file, fsync, rename, folder chain; throws when the write fails, and logs when only the folder chain failed. */
 export function writeShardRecord(record: ShardRecord): void {
-  const file = shardRecordPath();
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.tmp`;
-  const fd = fs.openSync(tmp, 'w');
   try {
-    fs.writeSync(fd, JSON.stringify(record, null, 2));
-    fs.fsyncSync(fd);
-  } finally {
-    fs.closeSync(fd);
+    atomicWriteFileSync(shardRecordPath(), JSON.stringify(record, null, 2));
+  } catch (error) {
+    if (!(error instanceof FolderSyncError)) throw error;
+    logFolderSyncError('[Shards] The shard record', error);
   }
-  fs.renameSync(tmp, file);
 }
 
 /** The record, or null when there is none or it cannot be read. */

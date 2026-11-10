@@ -42,7 +42,11 @@ describe('writing the shard record', () => {
   it('syncs the temp file to disk before it replaces the record', () => {
     writeShardRecord({ shardCount: 2, shardIds: [0], processId: 'p-a', at: 'now' });
     const fd = h.events.find(e => e.startsWith('open:'))!.slice('open:'.length);
-    expect(h.events).toEqual([`open:${fd}`, `fsync:${fd}`, `close:${fd}`, 'rename']);
+    expect(h.events.slice(0, 4)).toEqual([`open:${fd}`, `fsync:${fd}`, `close:${fd}`, 'rename']);
+    // NB19: on POSIX fleet, global and DATA_ROOT are synced after the rename, each opened, fsynced and closed.
+    const after = h.events.slice(4);
+    expect(after.length).toBe(process.platform === 'win32' ? 0 : 9);
+    for (let i = 0; i < after.length; i += 3) expect(after.slice(i, i + 3).map(e => e.split(':')[0])).toEqual(['open', 'fsync', 'close']);
   });
 });
 

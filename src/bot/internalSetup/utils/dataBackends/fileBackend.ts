@@ -14,6 +14,7 @@ import { DATA_ROOT } from '../../../../utils/dataRoot';
 import { DataBackendUnavailableError } from './workingSet';
 import type { RestoreStop } from './backend';
 import { fold, keyRefusal, KeyTree } from '../storableData';
+import { flagAnswer, forgetDurableFolders, folderSyncFailed, logSyncLine, noteFolderSyncFailure, syncFolder, syncFolderChain, syncFolderSync, syncWords, type ChainAnswer, type SyncKind } from '../folderChain';
 
 const BASE_DATA_DIR = DATA_ROOT;
 
@@ -101,14 +102,21 @@ export interface LandingRecord {
   wholeLanded?: number;
 }
 
-interface ReplacedTry {
+/** What a failed op left in the file, and the folder sync answer that failed it, when its chain failed. */
+interface FailureSource {
+  what: 'lines' | 'whole';
+  kind?: SyncKind;
+  dir?: string;
+}
+
+interface ReplacedTry extends FailureSource {
   from: number;
   through: number;
   errno: string;
   lines: number;
 }
 
-export interface FailedRange {
+export interface FailedRange extends FailureSource {
   from: number;
   through: number;
   errno: string | null;
@@ -163,11 +171,11 @@ export function fileLandingRecords(): number {
 // write held through a disk fault lands once the disk takes it.
 const retryAttempts = new Map<string, number>();
 const retryTimers = new Map<string, NodeJS.Timeout>();
-/** Paths with appended lines whose sync the disk did not confirm, until a delete or whole write of the path lands. */
+/** Paths holding lines or whole files whose sync the disk did not confirm, until a delete or whole write of the path lands. */
 const unconfirmedPaths = new Set<string>();
 
 /**
- * Files holding appended lines the disk did not confirm (NB13 decision 8), and appends queued empty: a short write
+ * Files holding lines or whole files the disk did not confirm (NB13 decision 8, NB19), and appends queued empty: a short write
  * left a line in the file without its newline, which the next try's guard closes, so it is not unsaved.
  */
 export function unconfirmedFiles(): number {
@@ -190,15 +198,17 @@ const lastFlushErrno = new Map<string, string>();
 /** Per path, the identity of a file whose name this process made durable in this hold of the writer lock. */
 const durableFiles = new Map<string, { dev: bigint; ino: bigint; birth: bigint }>();
 
-/** Forgets every durable name: another holder of the writer lock may have replaced any file since. */
+/** Forgets every durable name and folder: another holder of the writer lock may have replaced any file since. */
 export function forgetDurableFiles(): void {
   durableFiles.clear();
+  forgetDurableFolders();
 }
 
-/** Forgets the durable names under /data/{guildId}: its folder moved and the move may not be on disk. */
+/** Forgets the durable names and folders under /data/{guildId}: its folder moved and the move may not be on disk. */
 export function forgetGuildDurableFiles(guildId: string): void {
   const under = underGuild(guildId);
   for (const p of [...durableFiles.keys()]) if (under(p)) durableFiles.delete(p);
+  forgetDurableFolders(path.join(BASE_DATA_DIR, guildId));
 }
 
 const failedRangeOf = (ticket: FileTicket): FailedRange | undefined =>
@@ -216,24 +226,31 @@ export function fileTicketState(ticket: FileTicket): 'landed' | 'unconfirmed' | 
   return 'open';
 }
 
-/** Why a ticket is 'unconfirmed': the errno and whether a cut try left it; null when no failed range holds it. */
-export function fileTicketFailure(ticket: FileTicket): { errno: string | null; cut: boolean } | null {
-  const range = failedRangeOf(ticket);
-  return range ? { errno: range.errno, cut: range.cut } : null;
+export interface FileTicketFailure extends FailureSource {
+  errno: string | null;
+  cut: boolean;
 }
 
+/** Why a ticket is 'unconfirmed': the errno, whether a cut try left it, and the failed folder sync; null when no failed range holds it. */
+export function fileTicketFailure(ticket: FileTicket): FileTicketFailure | null {
+  const range = failedRangeOf(ticket);
+  return range ? { errno: range.errno, cut: range.cut, ...sourceOf(range) } : null;
+}
+
+const sourceOf = (from: FailureSource): FailureSource => ({ what: from.what, ...(from.kind ? { kind: from.kind, dir: from.dir } : {}) });
+
 /** Adds the parts of from..through no failed range of the record covers yet; answers whether it added any. */
-function addFailedRange(record: LandingRecord, from: number, through: number, errno: string | null, cut: boolean): boolean {
+function addFailedRange(record: LandingRecord, from: number, through: number, errno: string | null, cut: boolean, source: FailureSource): boolean {
   const ranges = (record.failed ??= []);
   let added = false;
   let start = from;
   for (const range of [...ranges].sort((a, b) => a.from - b.from)) {
     if (range.through < start) continue;
     if (range.from > through) break;
-    if (range.from > start) { ranges.push({ from: start, through: range.from - 1, errno, cut }); added = true; }
+    if (range.from > start) { ranges.push({ from: start, through: range.from - 1, errno, cut, ...sourceOf(source) }); added = true; }
     start = Math.max(start, range.through + 1);
   }
-  if (start <= through) { ranges.push({ from: start, through, errno, cut }); added = true; }
+  if (start <= through) { ranges.push({ from: start, through, errno, cut, ...sourceOf(source) }); added = true; }
   return added;
 }
 
@@ -245,42 +262,21 @@ const closeCodeOf = (error: unknown): string => {
 const SKIPPED_DIR_OPEN = new Set(['EISDIR', 'EPERM', 'EACCES']);
 const SKIPPED_DIR_SYNC = new Set(['EINVAL', 'ENOTSUP', 'EOPNOTSUPP']);
 
-/**
- * fsyncs each directory from the file's own up to DATA_ROOT (POSIX; Windows skips directories, as atomicReplace
- * does), so the file's name and every directory made for it are durable. Only an unsupported operation is skipped;
- * the first other error is answered. Each handle is closed in its own finally, and a close error changes no answer.
- */
-async function syncDirectoryChain(absPath: string): Promise<{ failed: false } | { failed: true; error: unknown }> {
-  if (IS_WINDOWS) return { failed: false };
-  const root = path.resolve(BASE_DATA_DIR);
-  for (let dir = path.dirname(path.resolve(absPath)); ; dir = path.dirname(dir)) {
-    let failure: { failed: true; error: unknown } | null = null;
-    let dh: fs.promises.FileHandle | null = null;
-    try {
-      dh = await fs.promises.open(dir, 'r');
-    } catch (error) {
-      if (!SKIPPED_DIR_OPEN.has(errnoOf(error))) return { failed: true, error };
-    }
-    if (dh) {
-      try {
-        await dh.sync();
-      } catch (error) {
-        if (!SKIPPED_DIR_SYNC.has(errnoOf(error))) failure = { failed: true, error };
-      } finally {
-        try { await dh.close(); } catch (error) { console.error(`[Data] ${dir}: the directory could not be closed after its sync (${closeCodeOf(error)}); this changes nothing about the lines already reported for the files in it`); }
-      }
-    }
-    if (failure) return failure;
-    const rel = path.relative(root, dir);
-    if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel) || dir === path.dirname(dir)) return { failed: false };
-  }
-}
+const chainSource = (chain: Extract<ChainAnswer, { failed: true }>, what: 'lines' | 'whole'): FailureSource => ({ what, kind: chain.kind, dir: chain.dir });
 
 /** Lines of text, counted by their newlines (a last line with none counts too). */
 const lineCount = (text: string): number => text.split('\n').filter((line, i, all) => line !== '' || i < all.length - 1).length;
 
-function logUnconfirmed(absPath: string, lines: number, errno: string): void {
-  console.error(`[Data] ${absPath}: the disk did not confirm the sync of ${lines} appended line(s) (${errno}); they are in the file and are not written again; can't confirm they are stored`);
+/** The error line of a failed op, built from its range: T2 for a whole write, T17 for lines whose chain failed. */
+function logUnconfirmed(absPath: string, failure: FailureSource & { lines: number; errno: string }): void {
+  if (failure.kind) {
+    const { why, next } = syncWords(failure.kind, failure.dir!, failure.errno);
+    logSyncLine(absPath, failure.kind, failure.what === 'whole'
+      ? `[Data] ${absPath}: the file is written whole, but ${why}; it is not written again; can't confirm it is stored. ${next}`
+      : `[Data] ${absPath}: ${failure.lines} appended line(s) are in the file and synced, but ${why}; they are not written again; can't confirm they are stored. ${next}`);
+    return;
+  }
+  console.error(`[Data] ${absPath}: the disk did not confirm the sync of ${failure.lines} appended line(s) (${failure.errno}); they are in the file and are not written again; can't confirm they are stored`);
 }
 
 /** Turns the record's replaced tries into failed ranges; answers the last one's errno, or null when it held none. */
@@ -290,8 +286,8 @@ function failReplacedTries(record: LandingRecord, absPath: string): string | nul
   replacedTries.delete(record);
   if (tries.length === 0) return null;
   for (const t of tries) {
-    addFailedRange(record, t.from, t.through, t.errno, false);
-    logUnconfirmed(absPath, t.lines, t.errno);
+    addFailedRange(record, t.from, t.through, t.errno, false, t);
+    logUnconfirmed(absPath, t);
   }
   unconfirmedPaths.add(absPath);
   return tries[tries.length - 1].errno;
@@ -390,13 +386,7 @@ export async function atomicReplace(target: string, content: string | Buffer, op
   } finally {
     openTemps.delete(tmp);
   }
-  // POSIX best-effort parent-dir fsync so the rename itself is durable.
-  if (!IS_WINDOWS && options.parentSync !== false) {
-    try {
-      const dh = await fs.promises.open(path.dirname(target), 'r');
-      try { await dh.sync(); } finally { await dh.close(); }
-    } catch { /* directory fsync is best-effort */ }
-  }
+  if (options.parentSync !== false) await syncFolder(path.dirname(target));
 }
 
 function delay(ms: number): Promise<void> {
@@ -414,21 +404,18 @@ async function flushPath(absPath: string): Promise<boolean> {
   }
   flushing.add(absPath);
   let record = landingRecords.get(absPath);
-  // Every try of a stream has a record, so a cancel can read what it left in the file.
-  if (!record && (entry.op === 'append' || absPath.endsWith('.jsonl'))) record = startRecord(absPath);
+  // Every write and every try of a stream has a record, so a ticket or a cancel can read what it left in the file.
+  if (!record && (entry.op !== 'delete' || absPath.endsWith('.jsonl'))) record = startRecord(absPath);
   if (record) tryRecords.set(absPath, record);
   try {
     const seqAtStart = entry.seq;
     if (entry.op === 'append') return await flushAppend(absPath, entry, record!);
-    const wholeStream = entry.op === 'write' && absPath.endsWith('.jsonl');
-    let chain: Awaited<ReturnType<typeof syncDirectoryChain>> = { failed: false };
+    let chain: ChainAnswer = { failed: false };
     try {
       if (entry.op === 'write') {
-        await atomicReplace(absPath, entry.content, wholeStream ? { parentSync: false } : {});
-        if (wholeStream) {
-          durableFiles.delete(absPath);
-          chain = await syncDirectoryChain(absPath);
-        }
+        await atomicReplace(absPath, entry.content, { parentSync: false });
+        durableFiles.delete(absPath);
+        chain = await syncFolderChain(path.dirname(absPath));
       } else {
         try {
           await fs.promises.unlink(absPath);
@@ -453,19 +440,20 @@ async function flushPath(absPath: string): Promise<boolean> {
     const current = pendingOps.get(absPath);
     const replaced = current !== undefined && current.seq !== seqAtStart;
     if (chain.failed) {
-      // The whole write of a stream is in the file, but its name's sync failed: never written again, can't confirm.
-      const errno = errnoOf(chain.error);
+      // The whole write is in the file, but its folder chain failed: never written again, can't confirm.
+      const errno = chain.errno;
       lastFlushErrno.set(absPath, errno);
       const lines = entry.op === 'write' ? lineCount(entry.content) : 0;
+      const source = chainSource(chain, 'whole');
       if (!replaced) {
         if (record) {
-          addFailedRange(record, record.landed + 1, seqAtStart, errno, false);
+          addFailedRange(record, record.landed + 1, seqAtStart, errno, false, source);
           dropReplacedTries(record, seqAtStart);
         }
         unconfirmedPaths.add(absPath);
-        logUnconfirmed(absPath, lines, errno);
+        logUnconfirmed(absPath, { ...source, lines, errno });
       } else if (record) {
-        (record.replaced ??= []).push({ from: record.landed + 1, through: seqAtStart, errno, lines });
+        (record.replaced ??= []).push({ from: record.landed + 1, through: seqAtStart, errno, lines, ...source });
         replacedTries.set(record, absPath);
       }
     } else {
@@ -473,7 +461,7 @@ async function flushPath(absPath: string): Promise<boolean> {
       lastLandedAt = performance.now();
       lastFlushErrno.delete(absPath);
       noteLanded(absPath, record, seqAtStart, true);
-      if (entry.op === 'delete' || wholeStream) unconfirmedPaths.delete(absPath);
+      unconfirmedPaths.delete(absPath);
     }
     // Drop the entry only if no newer op arrived while we were flushing.
     if (current && current.seq === seqAtStart) {
@@ -505,6 +493,7 @@ async function flushAppend(absPath: string, entry: PendingOp & { op: 'append' },
   let failure: unknown = null;
   let syncFailed = false;
   let syncFailure: unknown = null;
+  let chainFailure: Extract<ChainAnswer, { failed: true }> | null = null;
   let accepted = -1;
   let guardBytes = 0;
   try {
@@ -540,11 +529,12 @@ async function flushAppend(absPath: string, entry: PendingOp & { op: 'append' },
     if (!failed) {
       try {
         await fh.sync();
-        if (!skipChain) {
-          const chain = await syncDirectoryChain(absPath);
+        if (!skipChain || folderSyncFailed()) {
+          const chain = await syncFolderChain(path.dirname(absPath));
           if (chain.failed) {
             syncFailed = true;
             syncFailure = chain.error;
+            chainFailure = chain;
           } else durableFiles.set(absPath, identity);
         }
       } catch (error) {
@@ -580,14 +570,23 @@ async function flushAppend(absPath: string, entry: PendingOp & { op: 'append' },
   retryAttempts.delete(absPath);
   failingSince.delete(absPath);
   failingCode.delete(absPath);
+  if (!syncFailed) {
+    const flagged = flagAnswer();
+    if (flagged.failed) {
+      syncFailed = true;
+      syncFailure = flagged.error;
+      chainFailure = flagged;
+    }
+  }
   if (syncFailed) {
-    const errno = errnoOf(syncFailure);
+    const errno = chainFailure ? chainFailure.errno : errnoOf(syncFailure);
+    const source: FailureSource = chainFailure ? chainSource(chainFailure, 'lines') : { what: 'lines' };
     durableFiles.delete(absPath);
     lastFlushErrno.set(absPath, errno);
-    addFailedRange(record, landedAtStart + 1, flushedSeq, errno, false);
+    addFailedRange(record, landedAtStart + 1, flushedSeq, errno, false, source);
     dropReplacedTries(record, flushedSeq);
     unconfirmedPaths.add(absPath);
-    logUnconfirmed(absPath, lineCount(flushed), errno);
+    logUnconfirmed(absPath, { ...source, lines: lineCount(flushed), errno });
   } else {
     lastFlushErrno.delete(absPath);
     noteLanded(absPath, record, flushedSeq);
@@ -665,7 +664,7 @@ export async function flushAll(): Promise<void> {
 export type CancelOutcome =
   | { path: string; outcome: 'landed'; row?: true }
   | { path: string; outcome: 'cancelled'; errno: string | null; row?: true }
-  | { path: string; outcome: 'unconfirmed'; errno: string | null; cut: boolean; row?: true };
+  | { path: string; outcome: 'unconfirmed'; errno: string | null; cut: boolean; row?: true; what?: 'lines' | 'whole'; kind?: SyncKind; dir?: string };
 
 /** The row queue's part of cancelQueued (sharedStore.ts sets it): the paths it holds and their cancel. */
 export interface RowCancel {
@@ -693,7 +692,7 @@ function cancelAnswer(p: string, records: LandingRecord[], seq: number, dropped:
   const held = [...inFile(first).filter(range => range.from <= seq), ...others.flatMap(inFile)];
   if (held.length > 0) {
     const range = held.reduce((a, b) => (b.through > a.through ? b : a));
-    return { path: p, outcome: 'unconfirmed', errno: range.errno, cut: range.cut };
+    return { path: p, outcome: 'unconfirmed', errno: range.errno, cut: range.cut, ...sourceOf(range) };
   }
   if (!dropped && first.landed >= seq) return { path: p, outcome: 'landed' };
   return { path: p, outcome: 'cancelled', errno };
@@ -745,7 +744,7 @@ export async function cancelQueued(paths: string[], sleep: (ms: number) => Promi
     for (const record of read) {
       // NB13 C9: a replaced whole write is in the file, and a try that wrote bytes and never landed left them there.
       failReplacedTries(record, p);
-      if ((record.wrote ?? 0) > record.landed) addFailedRange(record, record.landed + 1, record.wrote ?? 0, flushErrno, true);
+      if ((record.wrote ?? 0) > record.landed) addFailedRange(record, record.landed + 1, record.wrote ?? 0, flushErrno, true, { what: 'lines' });
     }
     const wholeLanded = Math.max(0, ...[started, ...before, ...after].map(record => record.wholeLanded ?? 0));
     const answer = cancelAnswer(p, read, entry ? Math.max(seq, entry.seq) : seq, !!entry, entry ? flushErrno : null, wholeLanded);
@@ -828,7 +827,7 @@ export function guildFailingWrite(guildId: string): { file: string; code: string
   return null;
 }
 
-export type DataDirsSync = { failed: false } | { failed: true; dir: string; code: string };
+export type DataDirsSync = { failed: false } | { failed: true; dir: string; code: string; kind: 'sync' | 'open' };
 
 /**
  * fsyncs /data and /data/_graveyard on POSIX, so a rename between them survives a power cut. Only an unsupported
@@ -840,22 +839,31 @@ export async function fsyncDataDirs(): Promise<DataDirsSync> {
   let first: DataDirsSync = { failed: false };
   for (const dir of [BASE_DATA_DIR, path.join(BASE_DATA_DIR, GRAVEYARD_DIR)]) {
     let code: string | null = null;
+    let kind: 'sync' | 'open' = 'open';
     let dh: fs.promises.FileHandle | null = null;
     try {
       dh = await fs.promises.open(dir, 'r');
     } catch (error) {
       if (!SKIPPED_DIR_OPEN.has(errnoOf(error))) code = errnoOf(error);
+      if (code === 'EIO') {
+        kind = 'sync';
+        noteFolderSyncFailure(dir, code);
+      }
     }
     if (dh) {
       try {
         await dh.sync();
       } catch (error) {
-        if (!SKIPPED_DIR_SYNC.has(errnoOf(error))) code = errnoOf(error);
+        if (!SKIPPED_DIR_SYNC.has(errnoOf(error))) {
+          code = errnoOf(error);
+          kind = 'sync';
+          noteFolderSyncFailure(dir, code);
+        }
       } finally {
         try { await dh.close(); } catch (error) { console.error(`[Data] ${dir}: the directory could not be closed after its sync (${closeCodeOf(error)}); this does not change whether the sync succeeded`); }
       }
     }
-    if (code !== null && !first.failed) first = { failed: true, dir, code };
+    if (code !== null && !first.failed) first = { failed: true, dir, code, kind };
   }
   return first;
 }
@@ -974,15 +982,22 @@ export function fileTicket(absPath: string): FileTicket {
  */
 export async function confirmFile(ticket: FileTicket, deadlineMs: number): Promise<'ok' | 'pending' | 'held' | 'unavailable'> {
   const deadline = performance.now() + deadlineMs;
+  // A whole write renamed into place before its chain failed is in the file: 'unavailable' with its kinded range.
+  const covered = (): boolean => ticket.record.replaced?.some(t => t.from <= ticket.seq && ticket.seq <= t.through) ?? false;
+  const unavailable = (): 'unavailable' => {
+    if (covered()) failReplacedTries(ticket.record, ticket.path);
+    return 'unavailable';
+  };
+  const unsettled = (answer: 'pending' | 'held'): 'pending' | 'held' | 'unavailable' => (covered() ? unavailable() : answer);
   let stuckAttempts = 0;
   for (;;) {
     const state = fileTicketState(ticket);
-    if (state === 'unconfirmed') return 'unavailable';
+    if (state === 'unconfirmed') return unavailable();
     if (state === 'landed') return 'ok';
     // Its record retired without reaching it, or nothing queued: it was dropped.
-    if (landingRecords.get(ticket.path) !== ticket.record || !pendingOps.has(ticket.path)) return 'unavailable';
+    if (landingRecords.get(ticket.path) !== ticket.record || !pendingOps.has(ticket.path)) return unavailable();
     const left = deadline - performance.now();
-    if (left <= 0) return 'pending';
+    if (left <= 0) return unsettled('pending');
     if (flushing.has(ticket.path)) {
       await new Promise<void>(resolve => { setTimeout(resolve, Math.min(20, left)); });
       continue;
@@ -995,7 +1010,7 @@ export async function confirmFile(ticket: FileTicket, deadlineMs: number): Promi
     });
     const landed = await Promise.race([flushPath(ticket.path), timeout]);
     clearTimeout(timer);
-    if (landed === 'timeout') return 'pending';
+    if (landed === 'timeout') return unsettled('pending');
     if (landed) continue;
     const after = pendingOps.get(ticket.path);
     if (!after) continue;
@@ -1003,7 +1018,7 @@ export async function confirmFile(ticket: FileTicket, deadlineMs: number): Promi
       stuckAttempts = 0; // a newer op arrived: progress
       continue;
     }
-    if (++stuckAttempts >= 3) return 'held';
+    if (++stuckAttempts >= 3) return unsettled('held');
     const wait = Math.min(25 * stuckAttempts, deadline - performance.now());
     if (wait > 0) await new Promise<void>(resolve => { setTimeout(resolve, wait); });
   }
@@ -1280,12 +1295,7 @@ export async function writeGraveyardNote(entryDir: string, note: GraveyardNote):
     await fs.promises.unlink(tmp).catch(() => undefined);
     throw error;
   }
-  if (!IS_WINDOWS) {
-    try {
-      const dh = await fs.promises.open(entryDir, 'r');
-      try { await dh.sync(); } finally { await dh.close(); }
-    } catch { /* directory fsync is best-effort */ }
-  }
+  await syncFolder(entryDir);
 }
 
 /** writeGraveyardNote with sync calls only, for the boot: one rename try. */
@@ -1305,23 +1315,12 @@ export function writeGraveyardNoteSync(entryDir: string, note: GraveyardNote): v
     try { fs.unlinkSync(tmp); } catch { /* the temp file is swept as an orphan */ }
     throw error;
   }
-  if (!IS_WINDOWS) {
-    try {
-      const fd2 = fs.openSync(entryDir, 'r');
-      try { fs.fsyncSync(fd2); } finally { fs.closeSync(fd2); }
-    } catch { /* directory fsync is best-effort */ }
-  }
+  syncFolderSync(entryDir);
 }
 
 /** fsyncDataDirs with sync calls only, best effort, for the boot. */
 export function fsyncDataDirsSync(): void {
-  if (IS_WINDOWS) return;
-  for (const dir of [BASE_DATA_DIR, path.join(BASE_DATA_DIR, GRAVEYARD_DIR)]) {
-    try {
-      const fd = fs.openSync(dir, 'r');
-      try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-    } catch { /* best effort */ }
-  }
+  for (const dir of [BASE_DATA_DIR, path.join(BASE_DATA_DIR, GRAVEYARD_DIR)]) syncFolderSync(dir);
 }
 
 /**
@@ -1400,7 +1399,8 @@ export type FileRestoreOutcome =
   | { ok: false; why: 'writer-lost' }
   | { ok: false; why: 'failing'; file: string; code: string }
   | { ok: false; why: 'unflushed' }
-  | { ok: false; why: 'stamp' | 'copy' | 'copy-sync' | 'move' | 'put'; x: number; code: string }
+  | { ok: false; why: 'stamp' | 'copy' | 'move' | 'put'; x: number; code: string }
+  | { ok: false; why: 'copy-sync'; x: number; code: string; kind: SyncKind; dir: string }
   | { ok: false; why: 'copy-deadline'; x: number; copied: number }
   | { ok: false; why: 'undone'; x: number; r: number; code: string; syncCode?: string }
   | { ok: false; why: 'undone-taken'; x: number; r: number; code: string; syncCode?: string }
@@ -1423,6 +1423,12 @@ export interface FileRestoreHooks {
 
 /** The copy's floor: K4 and K5 need the last 5 s of the restore's time. */
 const COPY_FLOOR_MS = 5000;
+
+class CopySyncError extends Error {
+  constructor(readonly dir: string, readonly errno: string, readonly kind: SyncKind) {
+    super(`folder sync of the copy failed: ${dir} (${errno})`);
+  }
+}
 
 class CopyRefusal extends Error {
   constructor(readonly outcome: FileRestoreOutcome) {
@@ -1576,16 +1582,14 @@ async function restoreGuildDir(guildId: string, retiredAt: number | undefined, h
     copyAt = restorePath;
   } catch (error) {
     if (error instanceof CopyRefusal) return fs.existsSync(copyPath) || fs.existsSync(restorePath) ? failCopy(error.outcome) : error.outcome;
+    if (error instanceof CopySyncError) return failCopy(copySyncAnswer(guildId, x, error));
     const code = errnoOf(error);
     if (code !== 'ENOENT') console.error(`[DataManager] Cannot restore guild ${guildId}: graveyard entry ${guildId}-${x} could not be copied:`, error);
     if (!fs.existsSync(copyPath) && !fs.existsSync(restorePath)) return code === 'ENOENT' ? { ok: false, why: 'no-entry' } : { ok: false, why: 'copy', x, code };
     return failCopy(code === 'ENOENT' ? { ok: false, why: 'no-entry' } : { ok: false, why: 'copy', x, code });
   }
   const copySync = await fsyncDataDirs();
-  if (copySync.failed) {
-    console.error(`[DataManager] Cannot restore guild ${guildId}: the disk did not confirm the sync of ${copySync.dir} (${copySync.code}) after the copy of entry ${guildId}-${x}`);
-    return failCopy({ ok: false, why: 'copy-sync', x, code: copySync.code });
-  }
+  if (copySync.failed) return failCopy(copySyncAnswer(guildId, x, { dir: copySync.dir, errno: copySync.code, kind: copySync.kind }));
 
   // The check before the renames, one synchronous run: the gates, the copy's deadline, the lock file and X.
   const stop = hooks.stop(COPY_FLOOR_MS);
@@ -1602,7 +1606,14 @@ async function restoreGuildDir(guildId: string, retiredAt: number | undefined, h
   }
 }
 
-/** fsyncs every copied file (opened 'r+': Windows needs write access) and, on POSIX, every folder, best effort. */
+/** T18 logged, and the copy-sync outcome of a folder sync of the copy or of the check after it. */
+function copySyncAnswer(guildId: string, x: number, failure: { dir: string; errno: string; kind: SyncKind }): FileRestoreOutcome {
+  const { why } = syncWords(failure.kind, failure.dir, failure.errno);
+  console.error(`[DataManager] Cannot restore guild ${guildId}: the copy of entry ${guildId}-${x} is written, but ${why}`);
+  return { ok: false, why: 'copy-sync', x, code: failure.errno, kind: failure.kind, dir: failure.dir };
+}
+
+/** fsyncs every copied file (opened 'r+': Windows needs write access) and, on POSIX, every folder; a failed folder sync throws. */
 async function syncCopy(dir: string, check: () => void): Promise<void> {
   for (const entry of await fs.promises.readdir(dir, { withFileTypes: true })) {
     const full = path.join(dir, entry.name);
@@ -1620,10 +1631,8 @@ async function syncCopy(dir: string, check: () => void): Promise<void> {
   }
   if (IS_WINDOWS) return;
   check();
-  try {
-    const dh = await fs.promises.open(dir, 'r');
-    try { await dh.sync(); } finally { await dh.close(); }
-  } catch { /* directory fsync is best-effort */ }
+  const synced = await syncFolder(dir);
+  if (synced.failed) throw new CopySyncError(synced.dir, synced.errno, synced.kind);
 }
 
 /** K5 of a plain restore: the gates and the lock file read before each try; a refusal or a failure drops the copy. */
@@ -1640,9 +1649,9 @@ async function putPlainCopy(guildId: string, x: number, n: number, reason: strin
     return fail({ ok: false, why: 'put', x, code: put.code });
   }
   hooks.progress.renamed = true;
+  forgetGuildDurableFiles(guildId);
   const synced = await fsyncDataDirs();
   if (synced.failed) {
-    forgetGuildDurableFiles(guildId);
     console.error(`[DataManager] Guild ${guildId} restored from graveyard entry ${guildId}-${x}, but the disk did not confirm the sync of ${synced.dir} (${synced.code}), so a power cut can put the folder back in the graveyard`);
   } else {
     console.warn(`[DataManager] Guild ${guildId} restored from graveyard entry ${guildId}-${x}`);
@@ -1669,6 +1678,7 @@ async function replaceInSection(guildId: string, x: number, n: number, reason: s
     return { ok: false, why: 'move', x, code: moved.code };
   }
   hooks.progress.moved = { r: n, x };
+  forgetGuildDurableFiles(guildId);
   let unconfirmed: string | null = null;
   const k4Sync = await fsyncDataDirs();
   if (k4Sync.failed) unconfirmed = k4Sync.code;
@@ -1687,6 +1697,7 @@ async function replaceInSection(guildId: string, x: number, n: number, reason: s
   }
   if (putCode !== null) return undoReplace(guildId, x, n, putCode, restorePath, hooks);
   hooks.progress.renamed = true;
+  forgetGuildDurableFiles(guildId);
 
   // K6: R's note, unless another process took the data files.
   let noteWritten = false;
@@ -1703,7 +1714,6 @@ async function replaceInSection(guildId: string, x: number, n: number, reason: s
   const k6Sync = await fsyncDataDirs();
   if (k6Sync.failed && unconfirmed === null) unconfirmed = k6Sync.code;
   if (unconfirmed !== null) {
-    forgetGuildDurableFiles(guildId);
     console.error(`[DataManager] Guild ${guildId}'s data was replaced with a copy of graveyard entry ${guildId}-${x}, but the disk did not confirm a folder sync (${unconfirmed}), so a power cut can undo the replace`);
   } else {
     console.warn(`[DataManager] Guild ${guildId}'s data was replaced with a copy of graveyard entry ${guildId}-${x}; its data from before is entry ${guildId}-${n}`);
@@ -1739,6 +1749,7 @@ async function undoReplace(guildId: string, x: number, n: number, code: string, 
       continue;
     }
     dropGuildView(guildId);
+    forgetGuildDurableFiles(guildId);
     const synced = await fsyncDataDirs();
     const syncCode = synced.failed ? { syncCode: synced.code } : {};
     if (takenAfter) {

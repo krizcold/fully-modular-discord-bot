@@ -36,6 +36,7 @@ import { BotManager, inStoreWrite } from '../botManager';
 import { ComponentToggleDebouncer } from '../utils/componentToggleDebouncer';
 import { getInstallQueue } from '../utils/installQueue';
 import { readConfigFile, writeConfigFile } from '../../bot/internalSetup/utils/appStoreConfigFile';
+import { FolderSyncError, writeErrorText } from '../../bot/internalSetup/utils/folderChain';
 import { childQueuedError, readServedGlobal, withTargetLock } from '../utils/servedRead';
 import { SharedOpAnswered, sharedOpFailure, sharedOpRunner } from './hopFailure';
 import { shaOfRaw } from '../../bot/internalSetup/utils/ipcDataHandler';
@@ -2316,13 +2317,20 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       const { config, sha } = readComponentConfig();
       const changed = (config[key] !== false) !== enabled;
 
+      // A FolderSyncError leaves the new setting in the file, so the running bot is told as on success.
+      let unconfirmed: FolderSyncError | null = null;
       if (changed) {
         if (enabled) {
           delete config[key]; // Default is enabled, so just remove the override
         } else {
           config[key] = false;
         }
-        await saveComponentConfig(config, sha);
+        try {
+          await saveComponentConfig(config, sha);
+        } catch (error) {
+          if (!(error instanceof FolderSyncError)) throw error;
+          unconfirmed = error;
+        }
       }
 
       // Fire debounced runtime toggle (async, doesn't block response)
@@ -2336,6 +2344,12 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         });
       }
 
+      if (unconfirmed) {
+        const text = writeErrorText('The component setting', unconfirmed);
+        console.error(`[AppStore] ${text}`);
+        res.status(500).json({ success: false, key, enabled, changed, error: text });
+        return;
+      }
       res.json({ success: true, key, enabled, changed, ...(changed ? {} : { message: enabled ? 'already enabled' : 'already disabled' }) });
     } catch (error) {
       if (storeWriteAnswered(res, error)) return;
@@ -2381,7 +2395,13 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       if (typeof req.body.autoUpdate === 'boolean') {
         config.autoUpdate = req.body.autoUpdate;
       }
-      await saveAppStoreConfig(config, sha);
+      let unconfirmed: FolderSyncError | null = null;
+      try {
+        await saveAppStoreConfig(config, sha);
+      } catch (error) {
+        if (!(error instanceof FolderSyncError)) throw error;
+        unconfirmed = error;
+      }
 
       // Turning autoCleanup ON kicks off the orphan sweep as tracked background
       // work: rate-limited global-command sweeps can run for minutes, so the
@@ -2394,6 +2414,20 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         cleanupStarted = true;
       }
       const cleanupStopping = req.body.autoCleanup === false && botManager.getCommandCleanupStatus().running;
+
+      if (unconfirmed) {
+        const text = writeErrorText('The App Store settings', unconfirmed);
+        console.error(`[AppStore] ${text}`);
+        res.status(500).json({
+          success: false,
+          autoCleanup: config.autoCleanup === true,
+          autoUpdate: config.autoUpdate === true,
+          ...(cleanupStarted ? { cleanupStarted: true } : {}),
+          ...(cleanupStopping ? { cleanupStopping: true } : {}),
+          error: text,
+        });
+        return;
+      }
 
       res.json({
         success: true,

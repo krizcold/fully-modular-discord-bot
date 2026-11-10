@@ -7,6 +7,8 @@ import { cancelQueued, droppedByDeposition, fileTicketFailure, fileTicketState, 
 import { carriedWrites, landed, type LedgerTicket } from '../bot/internalSetup/utils/dataBackends/writeLedger';
 import { EXIT_DEPOSED, isSharedPath, sharedWritesSettled as rowWritesSettled } from '../bot/internalSetup/utils/dataManager';
 import { holderWords, onDeposed, readWriterHolder, releaseWriterLock, takeWriterLock, unconfirmedWords, writerLockPath } from '../bot/internalSetup/utils/writerLock';
+import { syncWords, type SyncKind } from '../bot/internalSetup/utils/folderChain';
+import type { CancelOutcome, FileTicket } from '../bot/internalSetup/utils/dataBackends/fileBackend';
 import type { LockHolder } from '../bot/internalSetup/utils/processLock';
 import { applySharedOp, callsProvider, invalidateSharedCaches, partialEnding, partialEndingIn, PROVIDER_SENTENCE } from '../bot/internalSetup/utils/sharedOps';
 import { applyOperatorDataWrite, type GuildDataWriteRequest } from '../bot/internalSetup/utils/ipcDataHandler';
@@ -314,7 +316,7 @@ export interface MaintenanceSaveResult {
   unsavedFiles?: number;
   /** Guilds holding a save the database did not answer, which may have landed (NB13 decision 6). */
   unansweredGuilds?: number;
-  /** Files holding appended lines the disk did not confirm. */
+  /** Files holding lines or whole files the disk did not confirm. */
   unconfirmedFiles?: number;
   /** Guilds waiting to be re-saved on the bot's main database (NB5 decision 12); only above 0. */
   resaveGuilds?: number;
@@ -411,6 +413,36 @@ function forkBot(credentials: BotCredentials, extra: Record<string, string>): Ch
     silent: true, // Capture stdout/stderr
     execArgv: isProd ? [] : ['-r', 'ts-node/register'] // Use ts-node in development
   });
+}
+
+/**
+ * T22 (NB19 D9): the 'disk' reply when a named result or an unsure ticket carries a folder sync kind, one clause per
+ * file; null when none carries one, so the reply keeps its text.
+ */
+function diskClauses(named: CancelOutcome[], unsure: FileTicket[]): string | null {
+  const byFile = new Map<string, { what?: 'lines' | 'whole'; kind?: SyncKind; dir?: string; errno: string | null }>();
+  for (const r of named) {
+    const name = path.basename(r.path);
+    if (!byFile.has(name) || (r.outcome === 'unconfirmed' && r.kind)) byFile.set(name, r.outcome === 'unconfirmed' ? r : { errno: r.outcome === 'cancelled' ? r.errno : null });
+  }
+  for (const t of unsure) {
+    const name = path.basename(t.path);
+    const failure = fileTicketFailure(t);
+    if (!byFile.has(name) || failure?.kind) byFile.set(name, failure ?? { errno: null });
+  }
+  const files = [...byFile];
+  if (!files.some(([, f]) => f.kind)) return null;
+  const clauses = files.map(([name, f]) => {
+    if (!f.kind) return `the disk did not confirm the write of ${name} (${f.errno ?? 'no error code'})`;
+    const { why } = syncWords(f.kind, f.dir!, f.errno ?? 'no error code');
+    return f.what === 'lines' ? `the lines of ${name} are in the file and synced, but ${why}` : `${name} is written, but ${why}`;
+  });
+  const next = files.some(([, f]) => f.kind === 'sync' || f.kind === 'earlier')
+    ? 'Check the disk, then restart the machine, then reload to check before you try again.'
+    : files.some(([, f]) => !f.kind)
+      ? 'Check the disk, then reload to check before you try again.'
+      : 'Reload to check before you try again.';
+  return `Can't confirm whether your change was saved: ${clauses.join('; ')}. ${next}`;
 }
 
 export class BotManager {
@@ -2200,6 +2232,8 @@ export class BotManager {
     const unsure = (writes?.tickets ?? []).flatMap(t => (t.kind === 'file' && (fileTicketState(t) === 'unconfirmed' || fileTicketState(t) === 'written') ? [t] : []));
     if (unconfirmedResults.length > 0 || unsure.length > 0) {
       const named = results.filter(r => !r.row && (r.outcome === 'cancelled' || r.outcome === 'unconfirmed'));
+      const kinded = diskClauses(named, unsure);
+      if (kinded) return { ok: false, status: 503, code: 'disk', error: `${kinded}${sentence}` };
       const names = [...new Set([...named.map(r => path.basename(r.path)), ...unsure.map(t => path.basename(t.path))])];
       const errnos = [...new Set([
         ...named.map(r => (r as { errno: string | null }).errno),

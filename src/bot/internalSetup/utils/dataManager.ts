@@ -2031,7 +2031,11 @@ export const RESTORE_TEXTS = {
     ? `entry ${x} could not be copied (ENOSPC); nothing was restored; free disk space, then try again`
     : `entry ${x} could not be copied (${code}); nothing was restored; try again in a moment`),
   copyDeadline: (x: number, copied: number) => `entry ${x} could not be copied before the restore's deadline (${copied} file(s) copied); nothing was restored`,
-  copySync: (x: number, code: string) => `the disk did not confirm the copy of entry ${x} (${code}); nothing was restored; check the disk, then try again`,
+  copySync: (x: number, code: string, kind: 'sync' | 'open' | 'earlier', dir: string) => (kind === 'sync'
+    ? `the disk did not confirm the copy of entry ${x} (${code}); nothing was restored; check the disk, then restart the machine and try again`
+    : kind === 'earlier'
+      ? `the copy of entry ${x} is not trusted, since the disk did not confirm a folder sync earlier in this process (${code}); nothing was restored; check the disk, then restart the machine and try again`
+      : `${dir} could not be opened for the sync of the copy of entry ${x} (${code}); nothing was restored; try again`),
   move: (code: string) => `the server's current data could not be moved to the graveyard (${code}); nothing was restored; try again in a moment`,
   put: (x: number, code: string) => `the copy of entry ${x} could not be put in place (${code}); nothing was restored; try again in a moment`,
   undo: (x: number, code: string) => `the copy of entry ${x} could not be put in place (${code}); nothing was restored; the server's data is back in place; try again in a moment`,
@@ -2425,7 +2429,7 @@ function fileRestoreReply(guildId: string, outcome: FileRestoreOutcome | undefin
     case 'stamp': return { ok: false, code: 'io-error', error: RESTORE_TEXTS.stamp(outcome.x, outcome.code) };
     case 'copy': return { ok: false, code: 'io-error', error: RESTORE_TEXTS.copy(outcome.x, outcome.code) };
     case 'copy-deadline': return { ok: false, code: 'backend-unavailable', error: RESTORE_TEXTS.copyDeadline(outcome.x, outcome.copied) };
-    case 'copy-sync': return { ok: false, code: 'io-error', error: RESTORE_TEXTS.copySync(outcome.x, outcome.code) };
+    case 'copy-sync': return { ok: false, code: 'io-error', error: RESTORE_TEXTS.copySync(outcome.x, outcome.code, outcome.kind, outcome.dir) };
     case 'move': return { ok: false, code: 'io-error', error: RESTORE_TEXTS.move(outcome.code) };
     case 'put': return { ok: false, code: 'io-error', error: RESTORE_TEXTS.put(outcome.x, outcome.code) };
     case 'undone': {

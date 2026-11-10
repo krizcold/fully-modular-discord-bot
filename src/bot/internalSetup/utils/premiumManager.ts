@@ -48,6 +48,7 @@ import {
   sharedWritesClosedLost,
 } from './dataManager';
 import { confirmFile, enqueueAppend, fileTicket, fileTicketFailure, fileTicketState, type FileTicket } from './dataBackends/fileBackend';
+import { syncWords } from './folderChain';
 import {
   currentLedger,
   isPaymentLedger,
@@ -123,6 +124,13 @@ function exitFate(ticket: FileTicket | RowTicket | undefined): 'landed' | 'uncon
   }
   const state = fileTicketState(ticket);
   return state === 'unconfirmed' && fileTicketFailure(ticket)?.cut ? 'written' : state;
+}
+
+/** The sync clause of a line whose failed range carries a folder sync kind (NB19 T23); null for a failed file fsync. */
+function chainWhy(ticket: FileTicket | RowTicket | undefined): string | null {
+  if (!ticket || ticket.kind !== 'file') return null;
+  const failure = fileTicketFailure(ticket);
+  return failure?.kind ? syncWords(failure.kind, failure.dir!, failure.errno ?? 'no error code').why : null;
 }
 
 // ============================================================================
@@ -1977,8 +1985,11 @@ export class PremiumManager {
   /** An install line whose bytes may be in the file: the disk did not confirm them, or a write of them was cut. */
   private installLineUnsure(install: InstallLine, fate: 'unconfirmed' | 'written', kind: StopKind): string {
     const head = `[PremiumManager] The audit line subscription.install.paid (guild ${install.entry.guildId ?? 'none'}, subscription ${install.providerSubId ?? install.entry.subscriptionId})`;
+    const why = chainWhy(install.ticket);
     const what = fate === 'unconfirmed'
-      ? 'is in the file, but the disk did not confirm its sync; can\'t confirm whether it is stored'
+      ? why
+        ? `is in the file and synced, but ${why}; can't confirm whether it is stored`
+        : 'is in the file, but the disk did not confirm its sync; can\'t confirm whether it is stored'
       : `was being written ${beforeWords(kind)}; can't confirm whether it is stored`;
     const webhook = install.webhook
       ? '; the webhook was answered 503, and if the line is not stored, the provider\'s next delivery of it writes it, or, when the subscription\'s own save was lost too, installs the subscription again under a new id with its own line'
@@ -2035,7 +2046,9 @@ export class PremiumManager {
       if ((e.ticket && landed(e.ticket)) || covered(e)) continue;
       const fate = exitFate(e.ticket);
       const head = `[PremiumManager] A ${eventWords(e.event)} was received while ${e.file} could not be read`;
-      if (fate === 'unconfirmed') console.error(`${head}; the disk did not confirm the sync of its journal line, so can't confirm whether it is stored: ${JSON.stringify(e.event)}`);
+      const why = chainWhy(e.ticket);
+      if (fate === 'unconfirmed' && why) console.error(`${head}; its journal line is in the file and synced, but ${why}, so can't confirm whether it is stored: ${JSON.stringify(e.event)}`);
+      else if (fate === 'unconfirmed') console.error(`${head}; the disk did not confirm the sync of its journal line, so can't confirm whether it is stored: ${JSON.stringify(e.event)}`);
       else if (fate === 'written') console.error(`${head}; its journal line was being written ${beforeWords(kind)}, so can't confirm whether it is stored: ${JSON.stringify(e.event)}`);
       else console.error(`${head} and is ${lostWords(kind)}: ${JSON.stringify(e.event)}`);
     }
@@ -2057,7 +2070,9 @@ export class PremiumManager {
       }
       const fate = exitFate(pending.ticket);
       const head = `[PremiumManager] The audit line ${pending.entry.action} (guild ${pending.entry.guildId ?? 'none'}, ${pending.entry.timestamp})`;
-      if (fate === 'unconfirmed') console.error(`${head} is in the file, but the disk did not confirm its sync; can't confirm whether it is stored: ${pending.line.trimEnd()}`);
+      const why = chainWhy(pending.ticket);
+      if (fate === 'unconfirmed' && why) console.error(`${head} is in the file and synced, but ${why}; can't confirm whether it is stored: ${pending.line.trimEnd()}`);
+      else if (fate === 'unconfirmed') console.error(`${head} is in the file, but the disk did not confirm its sync; can't confirm whether it is stored: ${pending.line.trimEnd()}`);
       else if (fate === 'written') console.error(`${head} was being written ${beforeWords(kind)}; can't confirm whether it is stored: ${pending.line.trimEnd()}`);
       else console.error(`${head} did not reach the disk ${beforeWords(kind)} and is lost: ${pending.line.trimEnd()}`);
     }

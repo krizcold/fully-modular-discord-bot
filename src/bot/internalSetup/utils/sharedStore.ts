@@ -1545,7 +1545,7 @@ function writeStoreKey(key: string, file: string, stored: Buffer | null, sha: st
           if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error;
         }
       } else {
-        atomicWriteFileSync(file, stored);
+        atomicWriteFileSync(file, stored, undefined, { chain: false });
       }
     } catch (error) {
       if (moved !== null) movedWriteFailed(key, file, moved, error);

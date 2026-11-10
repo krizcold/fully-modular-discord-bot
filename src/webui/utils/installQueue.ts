@@ -2,6 +2,7 @@ import { EventEmitter } from 'events';
 import { getAppStoreManager, type PublishedChange } from '../../bot/internalSetup/utils/appStoreManager';
 import { componentConfigPath, readConfigFile, writeConfigFile } from '../../bot/internalSetup/utils/appStoreConfigFile';
 import { resolveDataBackend } from '../../utils/envLoader';
+import { FolderSyncError, logFolderSyncError } from '../../bot/internalSetup/utils/folderChain';
 import { dropStagedFolder, inStoreWrite, notAppliedText, type BotManager, type ModuleApplyAnswer } from '../botManager';
 
 export type JobKind = 'install' | 'uninstall';
@@ -54,6 +55,10 @@ async function cleanupComponentConfig(moduleName: string): Promise<void> {
     }
     if (cleaned) await writeConfigFile(componentConfigPath(), config, read.sha);
   } catch (error) {
+    if (error instanceof FolderSyncError) {
+      logFolderSyncError(`[AppStore] The component toggles cleanup of ${moduleName}`, error);
+      return;
+    }
     console.error(`[AppStore] Kept the component toggles of ${moduleName}: the cleanup write failed:`, error);
   }
 }
@@ -208,7 +213,16 @@ export class InstallQueue extends EventEmitter {
       await inStoreWrite(() => manager.saveCredentialsAwaited(job.moduleName, credentials));
     }
 
-    const installed = await manager.installModule(job.moduleName, job.repoId);
+    // A FolderSyncError leaves the module installed, so it is loaded as on success and the job then fails with T9.
+    let unconfirmed: FolderSyncError | null = null;
+    let installed: Awaited<ReturnType<typeof manager.installModule>>;
+    try {
+      installed = await manager.installModule(job.moduleName, job.repoId);
+    } catch (error) {
+      if (!(error instanceof FolderSyncError)) throw error;
+      unconfirmed = error;
+      installed = true;
+    }
     if (typeof installed === 'object') {
       this.complete(job, await this.applied(installed));
       return;
@@ -226,9 +240,10 @@ export class InstallQueue extends EventEmitter {
       }
     }
 
-    job.status = 'completed';
     job.loaded = loaded;
     if (loadError) job.loadError = loadError;
+    if (unconfirmed) throw unconfirmed;
+    job.status = 'completed';
     job.finishedAt = Date.now();
     this.emit('completed', this.redact(job));
   }
@@ -244,7 +259,15 @@ export class InstallQueue extends EventEmitter {
       return;
     }
 
-    const uninstalled = await manager.uninstallModule(job.moduleName);
+    let unconfirmed: FolderSyncError | null = null;
+    let uninstalled: Awaited<ReturnType<typeof manager.uninstallModule>>;
+    try {
+      uninstalled = await manager.uninstallModule(job.moduleName);
+    } catch (error) {
+      if (!(error instanceof FolderSyncError)) throw error;
+      unconfirmed = error;
+      uninstalled = true;
+    }
     if (typeof uninstalled === 'object') {
       const answer = await this.applied(uninstalled);
       await inStoreWrite(() => cleanupComponentConfig(job.moduleName));
@@ -264,8 +287,9 @@ export class InstallQueue extends EventEmitter {
 
     await cleanupComponentConfig(job.moduleName);
 
-    job.status = 'completed';
     job.unloaded = unloaded;
+    if (unconfirmed) throw unconfirmed;
+    job.status = 'completed';
     job.finishedAt = Date.now();
     this.emit('completed', this.redact(job));
   }

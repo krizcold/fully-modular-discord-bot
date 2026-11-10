@@ -43,7 +43,7 @@ interface Entry {
   stamp: number;
   /** A file entry's tickets not landed yet, each with its own stamp (NB13 decision 8). */
   open?: Array<{ stamp: number; ticket: FileTicket }>;
-  /** The highest stamp of a file ticket found 'unconfirmed': the entry then stays for the process's life. */
+  /** The highest stamp of a file ticket found 'unconfirmed': kept under the path in failedPaths once open is empty. */
   failedStamp?: number;
   /** A row ticket's document, under which a refusal of its op is kept once the op settles. */
   doc?: string;
@@ -53,6 +53,8 @@ interface Scope {
   entries: Map<object, Entry>;
   lost: LostMark[];
   refused: Map<string, Refusal>;
+  /** Per file path, the highest stamp of a ticket of it found 'unconfirmed', once its entry held no open ticket. */
+  failedPaths: Map<string, number>;
   prunedThrough: number;
 }
 
@@ -89,7 +91,7 @@ export function stampOf(mark: unknown): number | null {
 function scopeFor(scopeId: string): Scope {
   let scope = scopes.get(scopeId);
   if (!scope) {
-    scope = { entries: new Map(), lost: [], refused: new Map(), prunedThrough: 0 };
+    scope = { entries: new Map(), lost: [], refused: new Map(), failedPaths: new Map(), prunedThrough: 0 };
     scopes.set(scopeId, scope);
   }
   return scope;
@@ -112,7 +114,13 @@ function dropLanded(scope: Scope): void {
         if (state === 'unconfirmed') entry.failedStamp = Math.max(entry.failedStamp ?? 0, kept.stamp);
         return state !== 'landed' && state !== 'unconfirmed';
       });
-      if (entry.open.length === 0 && !entry.failedStamp) scope.entries.delete(key);
+      if (entry.open.length > 0) continue;
+      scope.entries.delete(key);
+      if (entry.failedStamp) {
+        // Folded per path, so failed saves under a set folder sync flag keep one value per file, not one per flush.
+        const path = (entry.ticket as FileTicket).path;
+        scope.failedPaths.set(path, Math.max(scope.failedPaths.get(path) ?? 0, entry.failedStamp));
+      }
     } else if (landed(entry.ticket)) scope.entries.delete(key);
   }
 }
@@ -209,6 +217,18 @@ export function pendingFor(scopeId: string, since: number): { tickets: Ticket[];
     const tickets = entry.open.filter(kept => kept.stamp > since).map(kept => kept.ticket);
     const failed = (entry.failedStamp ?? 0) > since;
     if (tickets.length > 0 || failed) files.push({ path: (entry.ticket as FileTicket).path, tickets, failed });
+  }
+  for (const [path, stamp] of scope.failedPaths) {
+    if (stamp <= since) continue;
+    const group = files.find(g => g.path === path);
+    if (group) group.failed = true;
+    else files.push({ path, tickets: [], failed: true });
+  }
+  for (const [path, stamp] of scope.failedPaths) {
+    if (stamp <= since) continue;
+    const group = files.find(g => g.path === path);
+    if (group) group.failed = true;
+    else files.push({ path, tickets: [], failed: true });
   }
   return {
     // A file entry noted after since answers through its highest kept ticket; files names each ticket after since.
