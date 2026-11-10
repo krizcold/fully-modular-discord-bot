@@ -14,7 +14,9 @@ import {
   channelCause, discordWords, hashNonce, noticeEmbed, pinMessage, placeWords, postInPlace, readNoticesIn, unpinMessages,
   type Notice, type OwnerPlace, type RequestFailureInfo,
 } from '../../utils/ownerMessages';
-import { noteChannelPosted, noteChannelRefusal, ownerMessagesFile, readOwnerChannelSetting } from '../utils/ownerChannel';
+import {
+  noteChannelPosted, noteChannelRefusal, ownerMessagesFile, readOwnerChannelSetting, readOwnerMessageKey, recordOwnerMessageKey,
+} from '../utils/ownerChannel';
 import { unknownStoreWords, webuiChoiceDeps } from '../utils/webuiDataReader';
 import { DEFAULT_MAINTENANCE_MESSAGE } from '../../bot/internalSetup/utils/maintenanceGate';
 import { MAINTENANCE_MESSAGE_MAX, readMaintenanceFile, writeMaintenanceFile } from '../../utils/maintenanceFile';
@@ -63,6 +65,7 @@ export function _setManagedTiming(over: { notifyMs?: number; switchMs?: number; 
 
 const RECORD_KEYS_MAX = 1000;
 const RECORD_DAYS = 90;
+const KEY_READ_MS = 5_000;
 const FILE_BOT = 'This bot keeps its data in files, so it has no main database';
 
 type KeyRecord = { keys: Record<string, string> };
@@ -160,11 +163,26 @@ async function notifyOwner(text: string, key: string, deadline: number): Promise
   if (!read.ok) {
     return { status: 502, body: { success: false, error: `The record of posted messages (/data/owner-messages.json) cannot be read (${read.cause}); nothing was posted` } };
   }
-  const known = read.record.keys[key];
+  const notes: string[] = [];
+  let known: string | undefined = read.record.keys[key];
+  let inMain = false;
+  if (known === undefined && resolveDataBackend() === 'postgres') {
+    const bound = Math.max(1, Math.min(KEY_READ_MS, deadline - Date.now()));
+    const remote = await beforeDeadline(
+      readOwnerMessageKey(key, bound).then(at => ({ at }), (error: unknown) => ({ error: error instanceof Error ? error.message : String(error) })),
+      deadline,
+    );
+    if (remote === 'lapsed') return lapsedAnswer(KEY_LAPSED);
+    if ('error' in remote) {
+      notes.push(`The repeat check in the bot's main database could not be read (${remote.error}), so only this machine's record of posted messages was checked, and this key is recorded only there.`);
+    } else {
+      known = remote.at ?? undefined;
+      inMain = true;
+    }
+  }
   if (known !== undefined) {
     return { status: 200, body: { success: true, posted: false, note: `A message with this key was posted on ${known}; this repeat was not posted.` } };
   }
-  const notes: string[] = [];
   const setting = await beforeDeadline(readOwnerChannelSetting(), deadline);
   if (setting === 'lapsed' || Date.now() >= deadline) return lapsedAnswer(KEY_LAPSED);
   if (setting.kind === 'unreadable') notes.push(`Posted in the owner's DMs: the chosen channel setting could not be read (${setting.cause}).`);
@@ -200,10 +218,20 @@ async function notifyOwner(text: string, key: string, deadline: number): Promise
   } else if (place.kind === 'channel') {
     noteChannelPosted(place.id);
   }
+  const postedAt = new Date().toISOString();
   try {
     writeKeyRecord(key);
   } catch (error) {
     notes.push(`The repeat check could not be saved (${error instanceof Error ? error.message : String(error)}), so a repeat of this key would post again.`);
+  }
+  if (inMain) {
+    const answered = await beforeDeadline(recordOwnerMessageKey(key, postedAt), Math.max(deadline, Date.now() + KEY_READ_MS));
+    const saved = answered === 'lapsed' ? { kind: 'unknown' as const, cause: 'the database did not answer in time' } : answered;
+    if (saved.kind === 'not-saved') {
+      notes.push(`The repeat check could not be saved in the bot's main database (${saved.cause}), so a repeat of this key would post again after the main database moves to another machine.`);
+    } else if (saved.kind === 'unknown') {
+      notes.push(`can't confirm whether the repeat check was saved in the bot's main database (${saved.cause}), so a repeat of this key may post again after the main database moves to another machine.`);
+    }
   }
   return { status: 200, body: { success: true, posted: true, place: inDm ? 'dm' : 'channel', ...(notes.length > 0 ? { note: notes.join(' ') } : {}) } };
 }

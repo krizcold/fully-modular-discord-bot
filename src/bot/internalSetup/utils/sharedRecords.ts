@@ -51,6 +51,8 @@ export interface ModuleEntry {
   main: string | null;
   /** null forces a compile (decision 59's `builtCurrent`). */
   built: BuiltMark | null;
+  /** T19: the sha and image build on which the module's own files did not compile; the boot compiles it again when either changes. */
+  noCompile?: (BuiltMark & { error: string }) | null;
   failedSha: string | null;
   /** Date.now() before which the pass leaves the module alone, after a compile that failed naming no file. */
   retryAt: number | null;

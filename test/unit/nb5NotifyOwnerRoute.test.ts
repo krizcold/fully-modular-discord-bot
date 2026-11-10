@@ -58,6 +58,8 @@ beforeEach(() => {
       return row.value;
     },
     readMs: 150,
+    readKey: async () => null,
+    recordKey: async () => ({ kind: 'ok' }),
   });
   setBackendKind('file');
   fs.rmSync(ownerMessagesFile(), { force: true });
@@ -366,6 +368,8 @@ describe('decision 14 with decision 23: the place', () => {
           return 'entry' in resolved && resolved.entry === ENTRY ? JSON.stringify(C) : null;
         },
         readMs: 150,
+        readKey: async () => null,
+        recordKey: async () => ({ kind: 'ok' }),
       });
       const res = await notify({ text: 'one', key: 'k13' });
       expect(res.body).toEqual({ success: true, posted: true, place: 'channel' });

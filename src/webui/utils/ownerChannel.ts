@@ -9,6 +9,8 @@ import { atomicWriteFileSync } from '../../bot/internalSetup/utils/atomicWrite';
 import { shortLivedClient } from '../../bot/internalSetup/utils/pgClient';
 import { ownerChannelFromFile, ownerChannelOf, type OwnerChannelValue } from '../../bot/internalSetup/utils/dataBackends/mainDatabase';
 import { channelCause, postInPlace } from '../../utils/ownerMessages';
+import { rowBackend } from '../../bot/internalSetup/utils/sharedStore';
+import type { SharedStatement } from '../../bot/internalSetup/utils/dataBackends/postgresBackend';
 import type { RunningMigration } from '../../bot/internalSetup/utils/dataMigration';
 import {
   CHOOSING_REFUSAL, chooseNow, getWebuiDataReader, resolveWebuiDatabase, unreachableReason, webuiChildCase,
@@ -24,9 +26,68 @@ export function ownerChannelFile(): string {
   return dataPath('owner-channel.json');
 }
 
-/** Decision 14's key record of the notify-owner route. */
+/** Decision 14's key record of the notify-owner route on this machine. */
 export function ownerMessagesFile(): string {
   return dataPath('owner-messages.json');
+}
+
+/** On a Postgres bot each posted key is also a smdb_data.meta row of the main database, so it moves with a switch. */
+export const OWNER_KEY_PREFIX = 'owner-message:';
+export const OWNER_KEY_READ_SQL = 'SELECT value FROM smdb_data.meta WHERE key = $1';
+const OWNER_KEYS_DAYS = 90;
+const OWNER_KEYS_MAX = 1000;
+
+/** The record of a posted key, with the deletes of keys older than 90 days and of all but the newest 1000, in one transaction. */
+export function ownerKeyStatements(key: string, at: string): SharedStatement[] {
+  const ours = `key LIKE '${OWNER_KEY_PREFIX}%'`;
+  return [
+    {
+      text: 'INSERT INTO smdb_data.meta (key, value, updated_at) VALUES ($1, $2, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()',
+      values: [`${OWNER_KEY_PREFIX}${key}`, JSON.stringify(at)],
+    },
+    { text: `DELETE FROM smdb_data.meta WHERE ${ours} AND updated_at < now() - interval '${OWNER_KEYS_DAYS} days'`, values: [] },
+    {
+      text: `DELETE FROM smdb_data.meta WHERE key IN (SELECT key FROM smdb_data.meta WHERE ${ours} ORDER BY updated_at DESC, key DESC OFFSET ${OWNER_KEYS_MAX})`,
+      values: [],
+    },
+  ];
+}
+
+export type KeyWrite = { kind: 'ok' } | { kind: 'not-saved'; cause: string } | { kind: 'unknown'; cause: string };
+
+/** The time a key was posted by the main database's record, null for none; throws when it cannot be read. */
+async function readKeyRow(key: string, boundMs: number): Promise<string | null> {
+  const backend = rowBackend();
+  if (!backend?.sharedSelect) throw new Error("this process has no connection to the bot's database");
+  try {
+    const { rows } = await backend.sharedSelect(OWNER_KEY_READ_SQL, [`${OWNER_KEY_PREFIX}${key}`], boundMs);
+    if (rows.length === 0) return null;
+    const raw = String(rows[0].value);
+    try {
+      const parsed = JSON.parse(raw);
+      return typeof parsed === 'string' ? parsed : raw;
+    } catch {
+      return raw;
+    }
+  } catch (error) {
+    const code = (error as { code?: unknown })?.code;
+    if (code === '42P01' || code === '3F000') return null;
+    throw new Error(causeOf(error));
+  }
+}
+
+async function writeKeyRow(key: string, at: string): Promise<KeyWrite> {
+  const backend = rowBackend();
+  if (!backend) return { kind: 'not-saved', cause: "this process has no connection to the bot's database" };
+  try {
+    const out = await backend.sharedTx({ check: null, statements: () => ownerKeyStatements(key, at) });
+    if (out.kind === 'committed') return { kind: 'ok' };
+    if (out.kind === 'unknown') return { kind: 'unknown', cause: out.detail ?? 'the answer to COMMIT was lost' };
+    if (out.kind === 'refused' || out.kind === 'failed') return { kind: 'not-saved', cause: out.detail };
+    return { kind: 'not-saved', cause: 'the database did not take the change' };
+  } catch (error) {
+    return { kind: 'not-saved', cause: causeOf(error) };
+  }
 }
 
 interface OwnerChannelDeps {
@@ -36,13 +97,26 @@ interface OwnerChannelDeps {
   readMs: number;
   /** How long after the write session's connect answer its mark lasts when the write got no answer (10 s). */
   markAfterConnectMs: number;
+  /** The main database's record of a posted key: its time or null; throws with the cause when it cannot be read. */
+  readKey(key: string, boundMs: number): Promise<string | null>;
+  recordKey(key: string, at: string): Promise<KeyWrite>;
 }
 
 const realDeps: OwnerChannelDeps = {
   readRow: boundMs => getWebuiDataReader().ownerChannelRow(boundMs),
   readMs: 5_000,
   markAfterConnectMs: 10_000,
+  readKey: readKeyRow,
+  recordKey: writeKeyRow,
 };
+
+export function readOwnerMessageKey(key: string, boundMs: number): Promise<string | null> {
+  return deps.readKey(key, boundMs);
+}
+
+export function recordOwnerMessageKey(key: string, at: string): Promise<KeyWrite> {
+  return deps.recordKey(key, at);
+}
 let deps: OwnerChannelDeps = realDeps;
 
 export function _setOwnerChannelDeps(over: Partial<OwnerChannelDeps> | null): void {

@@ -930,7 +930,7 @@ function setBuilt(module: string, sha: string): void {
     const record = readRecord();
     const entry = record.modules[module];
     if (!entry || entry.sha !== sha) return;
-    record.modules[module] = { ...entry, built: { sha, buildId: buildIdNow() } };
+    record.modules[module] = { ...entry, built: { sha, buildId: buildIdNow() }, noCompile: null };
     writeStoreRecord(record);
   });
 }
@@ -1110,6 +1110,48 @@ function dropStaleStaged(): void {
   }
 }
 
+/** How long every folder in cache/backups is kept, by the time in its name. */
+export const BACKUP_KEEP_MS = 30 * 86_400_000;
+const BACKUP_NAME = /^(.+)-(\d{13})(-orphan|-failed|-interrupted)?(?:-\d+)?$/;
+const PRUNE_EVERY_MS = 60 * 60_000;
+let prunedAt = -Infinity;
+
+/**
+ * Deletes, under the store lock, each folder of cache/backups older than BACKUP_KEEP_MS, except a module's newest
+ * backup of a version (no suffix), every orphan (its content may exist nowhere else) and every folder of a module
+ * whose apply is open or running, since restoreModule reads them. Names the apply does not give are left alone.
+ */
+export function pruneBackups(now = Date.now()): void {
+  const root = dirs().backups;
+  withStoreLock(() => {
+    if (!exists(root)) return;
+    const read = readStoreRecord();
+    if (!read.ok) return;
+    const found: Array<{ name: string; module: string; at: number; kind: string }> = [];
+    for (const e of fs.readdirSync(root, { withFileTypes: true })) {
+      const match = BACKUP_NAME.exec(e.name);
+      if (!e.isDirectory() || !match) continue;
+      found.push({ name: e.name, module: match[1], at: Number(match[2]), kind: match[3] ?? '' });
+    }
+    const newest = new Map<string, number>();
+    for (const f of found) {
+      if (f.kind === '' && f.at > (newest.get(f.module) ?? -Infinity)) newest.set(f.module, f.at);
+    }
+    for (const f of found) {
+      if (now - f.at <= BACKUP_KEEP_MS || f.kind === '-orphan') continue;
+      if (f.kind === '' && newest.get(f.module) === f.at) continue;
+      if (applyRuns.has(f.module) || read.record.modules[f.module]?.applying) continue;
+      const dir = path.join(root, f.name);
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
+        console.log(`[Shared] Deleted the module backup ${dir}: it was older than 30 days and not the newest backup of ${f.module}`);
+      } catch {
+        // The next prune tries again.
+      }
+    }
+  });
+}
+
 /** The pass's module step: the listing, step 0 for each pending status, each module, then step 7. */
 export async function modulePassStep(pass: { tag0: string | null; modules?: string[] }): Promise<boolean | { cause: string }> {
   const backend = rowBackend();
@@ -1122,6 +1164,14 @@ export async function modulePassStep(pass: { tag0: string | null; modules?: stri
     return { cause: messageOf(error) };
   }
   dropStaleStaged();
+  if (Date.now() - prunedAt >= PRUNE_EVERY_MS) {
+    prunedAt = Date.now();
+    try {
+      pruneBackups();
+    } catch (error) {
+      console.error(`[Shared] Could not prune the module backups (${messageOf(error)}); the pass tries again in an hour`);
+    }
+  }
   const read = readStoreRecord();
   if (!read.ok) return true;
   for (const [module, entry] of Object.entries(read.record.modules)) {
@@ -1191,6 +1241,15 @@ export function builtCurrent(entry: ModuleEntry): boolean {
   return !!entry.built && entry.built.sha === entry.sha && entry.built.buildId === buildIdNow() && !exists(safeModeMarker());
 }
 
+/** T19 recorded for this sha in this image's build, with no safe-mode build in place: a compile would fail the same way. */
+function noCompileCurrent(entry: ModuleEntry): boolean {
+  return !!entry.noCompile && entry.noCompile.sha === entry.sha && entry.noCompile.buildId === buildIdNow() && !exists(safeModeMarker());
+}
+
+function logDoesNotCompile(module: string, version: string | null, error: string): void {
+  console.error(`[Shared] ${module} ${version ?? entryOf(module)?.sha ?? ''} does not compile with this bot's version (${error}); this machine does not load it until it is updated or the bot's version changes`);
+}
+
 /** A compile the boot runs: 600 s for tsc (81), and a compile still running at 600 s answers 69's error. */
 async function bootCompile(): Promise<CompileResult> {
   const begun = Date.now();
@@ -1236,10 +1295,12 @@ function doesNotCompile(module: string, own: CompileResult['diagnostics']): void
     const entry = record.modules[module];
     if (!entry) return;
     clearCompiled(module);
-    record.modules[module] = { ...entry, built: null, status: nextStatus(record, 'failed', entry.sha, error) };
+    record.modules[module] = {
+      ...entry, built: null, noCompile: exists(safeModeMarker()) ? null : { sha: entry.sha, buildId: buildIdNow(), error }, status: nextStatus(record, 'failed', entry.sha, error),
+    };
     writeStoreRecord(record);
   });
-  console.error(`[Shared] ${module} ${version ?? entryOf(module)?.sha ?? ''} does not compile with this bot's version (${error}); this machine does not load it until it is updated or the bot's version changes`);
+  logDoesNotCompile(module, version, error);
 }
 
 interface BootRestore {
@@ -1280,8 +1341,19 @@ export async function bootCompileModules(): Promise<void> {
   const d = dirs();
   const applied = new Map(takeBootApplied());
   const inPlace = Object.keys(read.record.modules).filter(module => exists(path.join(d.source, module)));
-  const stale = inPlace.filter(module => !applied.has(module) && !read.record.modules[module].applying && !builtCurrent(read.record.modules[module]));
-  if (applied.size === 0 && stale.length === 0) return;
+  const judged = inPlace.filter(module => !applied.has(module) && !read.record.modules[module].applying && !builtCurrent(read.record.modules[module]));
+  const stale = judged.filter(module => !noCompileCurrent(read.record.modules[module]));
+  if (applied.size === 0 && stale.length === 0) {
+    for (const module of judged) {
+      try {
+        withStoreLock(() => clearCompiled(module));
+        logDoesNotCompile(module, manifestVersion(module), read.record.modules[module].noCompile!.error);
+      } catch (thrown) {
+        bootStepFailed(module, thrown);
+      }
+    }
+    return;
+  }
   const copyFailed = new Map<string, string>();
   for (const module of inPlace) {
     try {
@@ -1309,7 +1381,7 @@ export async function bootCompileModules(): Promise<void> {
   const second = restores.some(r => r.restored.version !== 'absent') ? await bootCompile() : null;
   const last = second ?? compile;
   const lastNoFile = !last.success && last.diagnostics.length === 0;
-  for (const module of stale) {
+  for (const module of judged) {
     const own = last.diagnostics.filter(diag => ownFile(diag.file, module));
     const copyError = copyFailed.get(module);
     try {
@@ -1324,7 +1396,7 @@ export async function bootCompileModules(): Promise<void> {
     }
   }
   await restoredAtBoot(restores, null, second);
-  for (const module of new Set([...stale, ...restores.map(r => r.module)])) await statusAfterWrite(module);
+  for (const module of new Set([...judged, ...restores.map(r => r.module)])) await statusAfterWrite(module);
 }
 
 /** 102's rule for a throw in a boot step of one module: T33, its dist folder deleted, the module left out of this boot. */
@@ -1522,6 +1594,7 @@ export async function bootLoadCheck(client: Client, loaded: LoadedModule[]): Pro
 export function _resetModuleApply(): void {
   applyRuns.clear();
   listedOnce.clear();
+  prunedAt = -Infinity;
   applyClient = null;
   bootSwaps = false;
   bootApplied.clear();
