@@ -125,6 +125,7 @@ const orphan = async (guild = 'g1', paused = false, tierId = 'gold') => {
   await d.settle();
   return result.providerSubId!;
 };
+const planOf = async (guild: string, id: string) => (await r.pm().findOrphansForGuild(guild)).find(o => o.ref.providerSubId === id)?.plan;
 const schedule = async () => {
   const migration = await r.pm().scheduleMigration({
     providerId: 'dummy', sourceTierId: 'gold', sourceOfferingId: 'o1', sourceVariantId: MONTHLY,
@@ -164,7 +165,7 @@ const SITES: Site[] = [
   { site: 'premiumManager.ts:1908 reactivatePaidSubscription, a void provider', setup: () => buyVoid(), drive: () => r.pm().reactivatePaidSubscription('g1'), items: [{ audit: 'subscription.reactivate.paid', link: 'standalone' }] },
   { site: 'premiumManager.ts:1936, 1945 cancelPaidSubscriptionImmediately', setup: () => d.buy(), drive: () => r.pm().cancelPaidSubscriptionImmediately('g1'), items: [{ audit: 'subscription.cancel.paid', link: 'carry' }, { notice: 'paid.sub.cancelled-by-user', link: 'carry' }] },
   { site: 'premiumManager.ts:1976 cancelAndRemovePausedSubscription', setup: async () => { await d.buy('g1', 'gold'); await d.buy('g1', 'silver'); return r.row().subscriptions.g1.paused[0].id; }, drive: id => r.pm().cancelAndRemovePausedSubscription('g1', id), items: [{ audit: 'subscription.cancel.paid', link: 'carry' }] },
-  { site: 'premiumManager.ts:2059 adoptOrphan', setup: () => orphan(), drive: id => r.pm().adoptOrphan('g1', 'dummy', id), items: [{ audit: 'subscription.adopt.orphan', link: 'carry' }] },
+  { site: 'premiumManager.ts:2059 adoptOrphan', setup: () => orphan(), drive: async id => r.pm().adoptOrphan('g1', 'dummy', id, await planOf('g1', id)), items: [{ audit: 'subscription.adopt.orphan', link: 'carry' }] },
   { site: 'premiumManager.ts:2077 cancelOrphan', setup: () => orphan(), drive: id => r.pm().cancelOrphan('dummy', id), items: [{ audit: 'subscription.cancel.orphan', link: 'standalone' }] },
   { site: 'premiumManager.ts:2310, 2318 checkExpiry', setup: async () => { await r.pm().grantManual('g1', 'gold', 1); await d.settle(); d.later(2); }, drive: expiryCheck, items: [{ audit: 'subscription.revoke.manual', link: 'carry' }, { notice: 'manual.grant.ended', link: 'carry' }] },
   { site: 'premiumManager.ts:2337 ending-soon', setup: async () => { await r.pm().grantManual('g1', 'gold', 1); await d.settle(); d.later(0.5); }, drive: expiryCheck, items: [{ notice: 'manual.grant.ending-soon', link: 'standalone' }] },
@@ -228,14 +229,14 @@ describe('the rows of the Dummy and the orphans', () => {
   it('242: adoptOrphan whose install is skipped (unknown tier): T21; no line', async () => {
     const id = await orphan('g1', false, 'nope');
     const lines = auditActions().length;
-    await expect(r.pm().adoptOrphan('g1', 'dummy', id)).rejects.toThrow(`Subscription '${id}' was not adopted: tier 'nope' does not exist.`);
+    await expect(r.pm().adoptOrphan('g1', 'dummy', id, await planOf('g1', id))).rejects.toThrow(`Subscription '${id}' was not adopted: tier 'nope' does not exist.`);
     await d.settle();
     expect(auditActions()).toHaveLength(lines);
   });
 
   it("243, 288: adoptOrphan's install landed: the adoption line in installSubscription's save; true", async () => {
     const id = await orphan();
-    expect(await r.pm().adoptOrphan('g1', 'dummy', id)).toBe(true);
+    expect(await r.pm().adoptOrphan('g1', 'dummy', id, await planOf('g1', id))).toBe(true);
     await d.settle();
     const tx = txOfLine('subscription.adopt.orphan');
     expect(tx).toEqual(txOfLine('subscription.install.paid'));
@@ -244,8 +245,9 @@ describe('the rows of the Dummy and the orphans', () => {
 
   it("289: adoptOrphan's install save refused: its lines and the adoption line written marked; false", async () => {
     const id = await orphan();
+    const plan = await planOf('g1', id);
     inject.premium.push({ cause: 'unstorable', thrown: false });
-    expect(await r.pm().adoptOrphan('g1', 'dummy', id)).toBe(false);
+    expect(await r.pm().adoptOrphan('g1', 'dummy', id, plan)).toBe(false);
     await d.settle();
     const marked = r.lines(AUDIT_KEY).filter(l => l.action === 'subscription.adopt.orphan' || l.action === 'subscription.install.paid');
     expect(marked.map(l => [l.action, l.metadata.notSaved.cause])).toEqual([['subscription.adopt.orphan', 'unstorable'], ['subscription.install.paid', 'unstorable']]);
@@ -340,14 +342,14 @@ describe('the rows of the Dummy and the orphans', () => {
   it('315: adoptOrphan installs a paused sub behind a higher active one: the provider pause with the active endDate; a record already paused: T25 warned', async () => {
     await d.buy('g1', 'gold');
     const active = await orphan('g1', false, 'silver');
-    expect(await r.pm().adoptOrphan('g1', 'dummy', active)).toBe(true);
+    expect(await r.pm().adoptOrphan('g1', 'dummy', active, await planOf('g1', active))).toBe(true);
     await d.settle();
     expect(d.record(active)).toMatchObject({ status: 'paused', paused: true, resumesAt: premiumSub().endDate });
     await r.pm().cancelPaidSubscriptionImmediately('g1');
     await d.settle();
     await d.buy('g2', 'gold');
     const paused = await orphan('g2', true, 'silver');
-    expect(await r.pm().adoptOrphan('g2', 'dummy', paused)).toBe(true);
+    expect(await r.pm().adoptOrphan('g2', 'dummy', paused, await planOf('g2', paused))).toBe(true);
     await d.settle();
     expect(r.logged(`[PremiumManager] provider pauseSubscription failed for 'dummy': Dummy subscription '${paused}' is already paused, so it was not paused.`)).toHaveLength(1);
     expect(r.row().subscriptions.g2.paused[0].providerSubId).toBe(paused);

@@ -38,6 +38,14 @@ function safeIso(epochSeconds: number | null | undefined): string | null {
   return new Date(epochSeconds * 1000).toISOString();
 }
 
+/** metadata[pausedDaysLeft] is `<days>@<unix seconds of the pause>`; any other text records nothing. */
+function pausedDaysLeftOf(raw: string | undefined): { pausedDaysLeft?: number; pausedAt?: string } {
+  const match = typeof raw === 'string' ? /^(\d+)@(\d+)$/.exec(raw) : null;
+  const at = match ? new Date(Number(match[2]) * 1000) : null;
+  if (!match || !at || !Number.isFinite(at.getTime())) return {};
+  return { pausedDaysLeft: Number(match[1]), pausedAt: at.toISOString() };
+}
+
 const CAPABILITIES: ProviderCapabilities = {
   canInitiatePurchase: true,
   supportsCancel: true,
@@ -448,13 +456,17 @@ export class StripeProvider implements PaymentProvider {
    * This is community-confirmed but not formally documented; verify on test
    * mode before relying on it in production.
    */
-  async pauseSubscription(providerSubId: string, resumesAt: string | null): Promise<void> {
+  async pauseSubscription(providerSubId: string, resumesAt: string | null, daysLeft?: number | null): Promise<void> {
     if (this.isOneTimeSubId(providerSubId)) return;
 
     const params: Record<string, string> = {
       'pause_collection[behavior]': 'void',
       proration_behavior: 'none',
     };
+    if (daysLeft !== undefined) {
+      // An empty value removes the key at Stripe.
+      params['metadata[pausedDaysLeft]'] = daysLeft === null ? '' : `${Math.max(0, Math.floor(daysLeft))}@${Math.floor(Date.now() / 1000)}`;
+    }
 
     // If we have an expected resume time, use it to set trial_end so the
     // next bill is deferred to that point. Otherwise we just halt billing
@@ -482,6 +494,7 @@ export class StripeProvider implements PaymentProvider {
     const params: Record<string, string> = {
       pause_collection: '',
       proration_behavior: 'none',
+      'metadata[pausedDaysLeft]': '',
     };
     if (newEndDate) {
       const epoch = Math.floor(Date.parse(newEndDate) / 1000);
@@ -492,6 +505,9 @@ export class StripeProvider implements PaymentProvider {
     const result = await this.api<StripeSubscription>('POST', `/v1/subscriptions/${encodeURIComponent(providerSubId)}`, params);
     if (result?.pause_collection !== null && result?.pause_collection !== undefined) {
       throw new Error(`Stripe POST for '${providerSubId}' did not clear pause_collection. Got ${JSON.stringify(result?.pause_collection)}.`);
+    }
+    if (result?.status === 'paused') {
+      throw new Error(`Stripe subscription '${providerSubId}' is still paused by Stripe itself; resume or cancel it in the Stripe dashboard.`);
     }
   }
 
@@ -673,6 +689,7 @@ export class StripeProvider implements PaymentProvider {
         variantId: sub.metadata?.variantId || price?.id,
         couponCode: sub.metadata?.couponCode || undefined,
         userId: sub.metadata?.userId || undefined,
+        ...pausedDaysLeftOf(sub.metadata?.pausedDaysLeft),
       },
       display: { amountLabel, periodLabel, statusLabel },
     };
@@ -734,6 +751,7 @@ export class StripeProvider implements PaymentProvider {
 
     return {
       status,
+      ...(sub.status === 'paused' ? { resumable: false as const } : {}),
       startDate: startIso,
       endDate: endIso,
       autoRenew: !sub.cancel_at_period_end,

@@ -80,7 +80,7 @@ const guildRows: Row[] = [
   ['cancel a paid subscription', 'DELETE', `/${G}/paid`, undefined, 'premium.cancelPaidSubscription', [G]],
   ['reactivate a paid subscription', 'POST', `/${G}/paid/reactivate`, {}, 'premium.reactivatePaidSubscription', [G]],
   ['expire a paid subscription now', 'POST', `/${G}/paid/expire-now`, {}, 'premium.cancelPaidSubscriptionImmediately', [G]],
-  ['adopt an orphan', 'POST', `/${G}/orphans/dummy/os1/adopt`, {}, 'premium.adoptOrphan', [G, 'dummy', 'os1']],
+  ['adopt an orphan', 'POST', `/${G}/orphans/dummy/os1/adopt`, { plan: { kind: 'install' } }, 'premium.adoptOrphan', [G, 'dummy', 'os1', { kind: 'install' }]],
   ['cancel an orphan', 'DELETE', `/${G}/orphans/dummy/os1`, undefined, 'premium.cancelOrphan', ['dummy', 'os1']],
   ['remove a paused subscription', 'DELETE', `/${G}/paused/s1`, undefined, 'premium.cancelAndRemovePausedSubscription', [G, 's1']],
   ['unlink a provider account', 'DELETE', `/${G}/provider-links/patreon`, undefined, 'premium.unlinkProviderAccount', [G, 'patreon']],

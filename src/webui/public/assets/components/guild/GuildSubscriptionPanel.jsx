@@ -83,13 +83,14 @@ function GuildSubscriptionPanel({ guild, subData, onRefresh }) {
         const canAdoptAuto = safeAuto
           && !!ref.metadata.tierId
           && !!ref.metadata.offeringId
-          && !!tiers[ref.metadata.tierId];
+          && !!tiers[ref.metadata.tierId]
+          && orphan.plan?.kind === 'install';
         if (!canAdoptAuto) {
           remaining.push(orphan);
           continue;
         }
         try {
-          const adopted = await guildApi.adoptOrphan(guild.id, orphan.providerId, ref.providerSubId);
+          const adopted = await guildApi.adoptOrphan(guild.id, orphan.providerId, ref.providerSubId, orphan.plan);
           if (adopted.success) adoptedCount++;
           else remaining.push(orphan);
         } catch { remaining.push(orphan); }
@@ -429,14 +430,22 @@ function GuildSubscriptionPanel({ guild, subData, onRefresh }) {
     finally { setProcessing(false); }
   }
 
+  /** The bot's line for a paused orphan's plan (what adopting it does, or why it cannot be adopted); null otherwise. */
+  function orphanPlanLine(orphan) {
+    const plan = orphan.plan;
+    return plan && plan.kind !== 'install' && typeof plan.line === 'string' ? plan.line : null;
+  }
+
   async function handleAdoptOrphan(orphan) {
+    const planLine = orphanPlanLine(orphan);
     if (!confirm(
       `Re-link this ${orphan.providerId} subscription (${orphan.ref.providerSubId}) into your guild's tier? ` +
-      `It will be installed under '${orphan.ref.metadata.tierId || '?'}' as if you'd just subscribed.`
+      `It will be installed under '${orphan.ref.metadata.tierId || '?'}' as if you'd just subscribed.` +
+      (planLine ? ` ${planLine}` : '')
     )) return;
     setProcessing(true); setError(null);
     try {
-      const res = await guildApi.adoptOrphan(guild.id, orphan.providerId, orphan.ref.providerSubId);
+      const res = await guildApi.adoptOrphan(guild.id, orphan.providerId, orphan.ref.providerSubId, orphan.plan);
       if (res.success) {
         await onRefresh();
         await loadOrphans();
@@ -835,7 +844,9 @@ function GuildSubscriptionPanel({ guild, subData, onRefresh }) {
               const tierName = ref.metadata.tierId
                 ? (tiers[ref.metadata.tierId]?.displayName || ref.metadata.tierId)
                 : '(unknown tier)';
-              const canAdopt = !!(ref.metadata.tierId && ref.metadata.offeringId);
+              const hasMetadata = !!(ref.metadata.tierId && ref.metadata.offeringId);
+              const canAdopt = hasMetadata && orphan.plan?.kind !== 'refuse';
+              const planLine = orphanPlanLine(orphan);
               return (
                 <div key={`${orphan.providerId}:${ref.providerSubId}:${idx}`} style={{
                   ...cardStyle,
@@ -873,7 +884,12 @@ function GuildSubscriptionPanel({ guild, subData, onRefresh }) {
                       {processing ? 'Cancelling…' : 'Cancel at provider'}
                     </button>
                   </div>
-                  {!canAdopt && (
+                  {planLine && (
+                    <div style={{ color: '#ccc', fontSize: '0.75rem', marginTop: '6px', lineHeight: 1.4 }}>
+                      {planLine}
+                    </div>
+                  )}
+                  {!hasMetadata && (
                     <div style={{ color: '#888', fontSize: '0.72rem', marginTop: '6px', lineHeight: 1.4 }}>
                       Missing tier metadata - can only be cancelled.
                     </div>

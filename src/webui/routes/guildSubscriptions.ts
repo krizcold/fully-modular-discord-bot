@@ -299,7 +299,7 @@ export function createGuildSubscriptionRoutes(botManager: BotManager): Router {
         return res.status(400).json({ success: false, error: 'Invalid guild ID' });
       }
       const mgr = getPremiumManager();
-      await shared(res, 'premium.adoptOrphan', [guildId, providerId, providerSubId]);
+      await shared(res, 'premium.adoptOrphan', [guildId, providerId, providerSubId, req.body?.plan]);
       res.json({ success: true, subscriptions: mgr.getSubscriptions(guildId) });
     } catch (error) {
       if (error instanceof SharedOpAnswered) return;

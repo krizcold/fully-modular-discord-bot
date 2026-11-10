@@ -211,11 +211,11 @@ const guildApi = {
     return await response.json();
   },
 
-  /** Re-link an orphan into the local cache. */
-  async adoptOrphan(guildId, providerId, providerSubId) {
+  /** Re-link an orphan into the local cache; `plan` is the plan its card showed, which the bot checks. */
+  async adoptOrphan(guildId, providerId, providerSubId, plan) {
     const response = await guildFetch(
       `${GUILD_API_BASE}/subscriptions/${guildId}/orphans/${encodeURIComponent(providerId)}/${encodeURIComponent(providerSubId)}/adopt`,
-      { method: 'POST' },
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ plan }) },
     );
     return await response.json();
   },

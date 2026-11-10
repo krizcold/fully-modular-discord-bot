@@ -175,6 +175,8 @@ export interface ProviderSubscriptionState {
   endDate: string | null;
   autoRenew: boolean;
   meta?: Record<string, any>;
+  /** false: the provider paused it itself and the bot cannot lift that pause (NB25 decision 5). */
+  resumable?: false;
 }
 
 /**
@@ -300,6 +302,9 @@ export interface ProviderSubscriptionRef {
     variantId?: string;
     couponCode?: string;
     userId?: string;
+    /** The days left the bot recorded at its pause, and when it paused (NB25 decision 1). */
+    pausedDaysLeft?: number;
+    pausedAt?: string;
   };
   /** Short labels for UI display. */
   display: { amountLabel: string; periodLabel: string; statusLabel: string };
@@ -476,8 +481,11 @@ export interface PaymentProvider {
    * For Stripe, the provider should set `trial_end = current_period_end + N`
    * alongside `pause_collection: { behavior: 'void' }` so the next bill is
    * deferred correctly.
+   *
+   * `daysLeft`: the paid days the subscription had left at this pause, which a provider may record so an adoption can
+   * resume it with them; null clears a recorded value, and undefined leaves it as it is.
    */
-  pauseSubscription?(providerSubId: string, resumesAt: string | null): Promise<void | ProviderSubscriptionState>;
+  pauseSubscription?(providerSubId: string, resumesAt: string | null, daysLeft?: number | null): Promise<void | ProviderSubscriptionState>;
   /**
    * Optional: resume a paused subscription with a fresh endDate. `newEndDate`
    * may be null for lifetime. Required when `capabilities.supportsPause`.

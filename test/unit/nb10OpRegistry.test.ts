@@ -63,7 +63,7 @@ const PREMIUM_ARGS: Record<string, unknown[]> = {
   reactivatePaidSubscription: [GP],
   cancelPaidSubscriptionImmediately: [GP],
   cancelAndRemovePausedSubscription: [G, 'paused1'],
-  adoptOrphan: [GO, 'fake', 'orph1'],
+  adoptOrphan: [GO, 'fake', 'orph1', { kind: 'install' }],
   cancelOrphan: ['fake', 'orph1'],
   linkAccount: ['fake', 'acct2', GN],
   unlinkAccount: ['patreon', 'acct'],

@@ -40,6 +40,7 @@ import {
   appendDataTracked,
   DataBackendUnavailableError,
   deleteDataTracked,
+  isStopping,
   onSharedApplied,
   onWriterTake,
   readRawStrict,
@@ -60,7 +61,8 @@ import {
   type LedgerCause,
   type WriteLedger,
 } from './dataBackends/writeLedger';
-import { deposedHolder, onDeposed, writerLockDepth } from './writerLock';
+import { checkWriterLock, deposedHolder, onDeposed, writerLockDepth } from './writerLock';
+import { truthText } from './dataBackends/replyGate';
 import type { NotificationPayload, NotificationType, NotifyOutcome } from './subscriptionNotifier';
 import type { HardLimitOverride } from '../../types/settingsTypes';
 import {
@@ -812,6 +814,48 @@ function pauseWarning(paused: Subscription, err: any): string {
     : `[PremiumManager] provider pauseSubscription failed for '${paused.providerId}': ${err?.message || err}`;
 }
 
+/** What adopting an orphan with tier metadata does (NB25 decision 2); `line` is the card's text for it. */
+export type AdoptPlan =
+  | { kind: 'install'; line: string }
+  | { kind: 'refuse'; reason: string; line: string }
+  | { kind: 'resume'; days: number | null; from: 'recorded' | 'period'; at?: string; autoRenew: boolean; call: boolean; line: string }
+  | { kind: 'queue'; days: number | null; from: 'recorded' | 'period'; at?: string; activeTierId: string; activeTier: string; line: string };
+
+export type PausedDaysLeft = { days: number | null; from: 'recorded'; at: string } | { days: number | null; from: 'period' };
+
+const MAX_RECORDED_DAYS = 36500;
+
+/** NB25 decision 1: the days the bot recorded at its pause, else the whole days to the provider's period end. */
+export function pausedDaysLeft(ref: ProviderSubscriptionRef, now: number): PausedDaysLeft {
+  const recorded = ref.metadata.pausedDaysLeft;
+  if (typeof recorded === 'number' && Number.isInteger(recorded) && recorded >= 0 && recorded <= MAX_RECORDED_DAYS && typeof ref.metadata.pausedAt === 'string') {
+    return { days: recorded, from: 'recorded', at: ref.metadata.pausedAt };
+  }
+  if (ref.state.endDate === null) return { days: null, from: 'period' };
+  const end = Date.parse(ref.state.endDate);
+  return { days: Number.isFinite(end) ? Math.max(0, Math.ceil((end - now) / DAY_MS)) : 0, from: 'period' };
+}
+
+const CANNOT_TAKE_CHANGES = 'premium cannot take changes right now';
+
+/** NB25 decision 2: the plan a page showed against the server's; `line` follows from the compared fields. */
+export function samePlan(shown: unknown, plan: AdoptPlan): boolean {
+  if (!shown || typeof shown !== 'object' || Array.isArray(shown)) return false;
+  const a = shown as Record<string, unknown>;
+  const b = plan as unknown as Record<string, unknown>;
+  return ['kind', 'days', 'from', 'at', 'autoRenew', 'activeTierId'].every(key => a[key] === b[key]);
+}
+
+const dayWords = (days: number): string => `${days} day${days === 1 ? '' : 's'}`;
+
+function utcDate(iso: string): string {
+  const at = new Date(iso);
+  return Number.isFinite(at.getTime()) ? at.toISOString().slice(0, 10) : iso;
+}
+
+/** NB25 decision 6: the provider whose records follow premium's subscriptions (decision 95's, as intoActiveSlot reads it). */
+const followsPremium = (providerId: string): boolean => providerId === 'dummy';
+
 function eventWords(event: ProviderEvent): string {
   return `${event.type} event from ${event.providerId} (subscription ${event.providerSubId}, guild ${event.guildId})`;
 }
@@ -872,6 +916,10 @@ export class PremiumManager {
   private replayDropped = false;
   private replayStarted = false;
   private replayHanded = 0;
+  /** provider:providerSubId of the adoptions and orphan cancels running in this process. */
+  private adopting = new Map<string, 'adoption' | 'cancel'>();
+  /** How many adoptions and orphan cancels of each provider:providerSubId have ended in this process. */
+  private adoptEnded = new Map<string, number>();
   private raisedMarks: Record<string, number> | null = null;
   /** The first premium-tiers.json ticket issued at or after the replay raised its marks. */
   private marksTicket: FileTicket | RowTicket | null = null;
@@ -2954,7 +3002,7 @@ export class PremiumManager {
     if (!opts.boughtPaused && paused.source === 'paid' && paused.providerId && paused.providerSubId) {
       const provider = getPaymentRegistry().get(paused.providerId);
       if (provider?.pauseSubscription && provider.capabilities.supportsPause) {
-        try { await provider.pauseSubscription(paused.providerSubId, active!.endDate); }
+        try { await provider.pauseSubscription(paused.providerSubId, active!.endDate, paused.remainingDaysAtPause ?? null); }
         catch (err: any) {
           console.warn(pauseWarning(paused, err));
         }
@@ -3044,7 +3092,7 @@ export class PremiumManager {
     if (paused.source === 'paid' && paused.providerId && paused.providerSubId) {
       const provider = getPaymentRegistry().get(paused.providerId);
       if (provider?.pauseSubscription && provider.capabilities.supportsPause) {
-        try { await provider.pauseSubscription(paused.providerSubId, null); }
+        try { await provider.pauseSubscription(paused.providerSubId, null, remaining); }
         catch (err: any) {
           console.warn(pauseWarning(paused, err));
         }
@@ -3681,18 +3729,23 @@ export class PremiumManager {
     return ids;
   }
 
-  async findOrphansForGuild(guildId: string): Promise<Array<{ providerId: string; ref: ProviderSubscriptionRef }>> {
+  async findOrphansForGuild(guildId: string): Promise<Array<{ providerId: string; ref: ProviderSubscriptionRef; plan?: AdoptPlan }>> {
     this.ensureLoaded();
-    const known = this.knownProviderSubIds(guildId);
-    const out: Array<{ providerId: string; ref: ProviderSubscriptionRef }> = [];
+    const out: Array<{ providerId: string; ref: ProviderSubscriptionRef; plan?: AdoptPlan }> = [];
     for (const provider of getPaymentRegistry().listAll()) {
       if (!provider.listSubscriptionsForGuild) continue;
       if (!provider.isConfigured()) continue;
       try {
         const refs = await provider.listSubscriptionsForGuild(guildId);
+        this.ensureLoaded();
+        const known = this.knownProviderSubIds(guildId);
+        const blocked = !this.configLoaded || !!this.unreadable ? this.blockedReason() : null;
         for (const ref of refs) {
           if (!known.has(`${provider.id}:${ref.providerSubId}`)) {
-            out.push({ providerId: provider.id, ref });
+            const plan = !ref.metadata.tierId || !ref.metadata.offeringId ? null
+              : blocked !== null ? { kind: 'refuse' as const, reason: blocked, line: `It cannot be adopted: ${blocked}.` }
+              : this.adoptPlan(guildId, provider.id, ref);
+            out.push(plan ? { providerId: provider.id, ref, plan } : { providerId: provider.id, ref });
           }
         }
       } catch (err: any) {
@@ -3702,13 +3755,121 @@ export class PremiumManager {
     return out;
   }
 
-  async adoptOrphan(guildId: string, providerId: string, providerSubId: string): Promise<boolean> {
+  /** Why no orphan can be adopted while premium's cache is not loaded or its file cannot be read in this process. */
+  private blockedReason(): string {
+    const u = this.unreadable;
+    if (!u) return CANNOT_TAKE_CHANGES;
+    return u.file === JOURNAL_FILE
+      ? `premium-tiers.events.jsonl cannot be read in this process (${u.cause}); make that file readable, then reload the page`
+      : `premium-tiers.json cannot be read in this process (${u.cause}); fix or restore it, then reload the page`;
+  }
+
+  /**
+   * NB25 decision 2's slot rule for a paid sub of this tier, as installSubscription places one: 'active' with no live
+   * active sub or a higher priority, 'tie' at equal priority, 'queue' below.
+   */
+  private slotFor(guildId: string, tierId: string): { kind: 'active' } | { kind: 'tie' | 'queue'; activeTierId: string; activeTier: string } {
+    const active = this.config.subscriptions[guildId]?.active;
+    const alive = active
+      && active.status === 'active'
+      && (active.endDate === null || Date.parse(active.endDate) > Date.now());
+    if (!active || !alive) return { kind: 'active' };
+    const incoming = this.config.tiers[tierId]?.priority ?? 0;
+    const current = this.config.tiers[active.tierId]?.priority ?? 0;
+    if (incoming > current) return { kind: 'active' };
+    const named = { activeTierId: active.tierId, activeTier: this.config.tiers[active.tierId]?.displayName || active.tierId };
+    return incoming === current ? { kind: 'tie', ...named } : { kind: 'queue', ...named };
+  }
+
+  /** NB25 decision 2: what adopting this orphan (with tierId and offeringId metadata) does, with the card's line. */
+  private adoptPlan(guildId: string, providerId: string, ref: ProviderSubscriptionRef): AdoptPlan {
+    const name = this.providerDisplayName(providerId) ?? providerId;
+    if (ref.state.status !== 'paused') return { kind: 'install', line: `It is active at ${name}, and adopting adds it as it is.` };
+    const refuse = (reason: string): AdoptPlan => ({ kind: 'refuse', reason, line: `It cannot be adopted: ${reason}.` });
+    const tierId = ref.metadata.tierId ?? '';
+    const offeringId = ref.metadata.offeringId ?? '';
+    const tier = this.config.tiers[tierId];
+    if (!tier) return refuse(`tier '${tierId}' does not exist`);
+    if (!tier.offerings.some(o => o.id === offeringId)) return refuse(`tier '${tierId}' has no offering '${offeringId}'`);
+    if (ref.state.resumable === false) {
+      return refuse(`${name} paused it itself and the bot cannot lift that pause; resume or cancel it in the ${name} dashboard`);
+    }
+    const provider = getPaymentRegistry().get(providerId);
+    if (!provider?.resumeSubscription || !provider.capabilities.supportsPause) {
+      return refuse(`${name} cannot resume a paused subscription, so its billing would stay paused; cancel it at ${name} instead`);
+    }
+    const left = pausedDaysLeft(ref, Date.now());
+    if (left.days === 0) return refuse(`it is paused with no paid days left; cancel it at ${name} instead`);
+    const slot = this.slotFor(guildId, tierId);
+    if (slot.kind === 'tie') {
+      return refuse(`the server already has a '${slot.activeTier}' subscription of the same priority; cancel one of them or let it end first`);
+    }
+    const at = left.from === 'recorded' ? left.at : undefined;
+    const source = at !== undefined
+      ? ` The days are the ones the bot recorded when it paused it on ${utcDate(at)}.`
+      : ` The days come from ${name}'s current billing period, because the bot did not record them when it was paused.`;
+    const recorded = at !== undefined ? { at } : {};
+    if (slot.kind === 'queue') {
+      const resumes = left.days === null ? '' : `, then resumes with ${dayWords(left.days)} left`;
+      return {
+        kind: 'queue', days: left.days, from: left.from, ...recorded, activeTierId: slot.activeTierId, activeTier: slot.activeTier,
+        line: `Adopting queues this paused subscription behind ${slot.activeTier}; it stays paused at ${name} until its turn in the queue${resumes}.${source}`,
+      };
+    }
+    const autoRenew = ref.state.autoRenew;
+    const ending = left.days === null ? '' : autoRenew ? `; its next charge is in ${dayWords(left.days)}` : `; it ends in ${dayWords(left.days)} with no further charge`;
+    return {
+      kind: 'resume', days: left.days, from: left.from, ...recorded, autoRenew, call: !followsPremium(providerId),
+      line: `Adopting resumes this paused subscription at ${name}${ending}.${source}`,
+    };
+  }
+
+  /** NB25 decision 4's stop check: one synchronous test, the same in every process. */
+  private adoptionStop(): StopKind | null {
+    if (checkWriterLock().kind === 'deposed' || this.stopped === 'deposed') return 'deposed';
+    if (this.stopped === 'stopping' || isStopping()) return 'stopping';
+    return null;
+  }
+
+  /**
+   * NB25 decision 4's reload rule after an await of an adoption: the stop check, premium's row brought up to date (its
+   * applied hook drops the cache), the stop check again. Answers what refused, or null.
+   */
+  private async adoptionReload(): Promise<{ stop: StopKind } | { refresh: string } | null> {
+    const before = this.adoptionStop();
+    if (before) return { stop: before };
+    const pass = { end: Promise.resolve() };
+    const refreshed = await refreshShared([PREMIUM_KEY], end => { pass.end = end; });
+    if (!refreshed.ok) await pass.end;
+    const after = this.adoptionStop();
+    if (after) return { stop: after };
+    if (refreshed.ok) return null;
+    return {
+      refresh: refreshed.local
+        ? `this machine could not write its copy of the current premium settings (${refreshed.cause})`
+        : `the current premium settings could not be brought up to date from the database (${refreshed.cause})`,
+    };
+  }
+
+  async adoptOrphan(guildId: string, providerId: string, providerSubId: string, shown?: unknown): Promise<boolean> {
     if (this.refusedAtEntry()) return false;
+    const key = `${providerId}:${providerSubId}`;
+    const seen = this.adoptEnded.get(key) ?? 0;
     const provider = getPaymentRegistry().get(providerId);
     if (!provider?.listSubscriptionsForGuild) {
       throw new Error(`Provider '${providerId}' does not support orphan listing.`);
     }
     const refs = await provider.listSubscriptionsForGuild(guildId);
+    const reload = await this.adoptionReload();
+    if (reload && 'stop' in reload) {
+      if (this.stopped) {
+        this.refusedAtEntry();
+        return false;
+      }
+      throw new Error(truthText(stopCause(reload.stop), false));
+    }
+    if (reload) throw new Error(`Subscription '${providerSubId}' was not adopted: ${reload.refresh}.`);
+    if (this.refusedAtEntry()) return false;
     const ref = refs.find(r => r.providerSubId === providerSubId);
     if (!ref) {
       throw new Error(`Subscription '${providerSubId}' not found at '${providerId}' for guild ${guildId}.`);
@@ -3723,9 +3884,107 @@ export class PremiumManager {
       );
     }
 
-    // Decision 72: no event; the adoption line rides the save of the install it starts.
-    const tierId = ref.metadata.tierId;
-    const offeringId = ref.metadata.offeringId;
+    const running = this.adopting.get(key);
+    if (running === 'adoption') {
+      throw new Error(`Subscription '${providerSubId}' was not adopted: another adoption of it is already running; reload the page when it has finished.`);
+    }
+    if (running === 'cancel') {
+      throw new Error(`Subscription '${providerSubId}' was not adopted: a cancel of it at the provider is running; reload the page when it has finished.`);
+    }
+    if ((this.adoptEnded.get(key) ?? 0) !== seen) {
+      throw new Error(`Subscription '${providerSubId}' was not adopted: another adoption or cancel of it ended after this one started; reload the page.`);
+    }
+    this.adopting.set(key, 'adoption');
+    try {
+      const plan = this.adoptPlan(guildId, providerId, ref);
+      if (plan.kind === 'refuse') throw new Error(`Subscription '${providerSubId}' was not adopted: ${plan.reason}.`);
+      if (!samePlan(shown, plan)) {
+        throw new Error(
+          `Subscription '${providerSubId}' was not adopted: what adopting it does is not what this page showed; ` +
+          `the bot now says: "${plan.line}"; reload the page before adopting it.`,
+        );
+      }
+      if (plan.kind === 'resume' && plan.call) return await this.adoptByResume(guildId, providerId, ref, plan);
+      const state = plan.kind === 'queue'
+        ? { ...ref.state, endDate: plan.days === null ? null : new Date(Date.now() + plan.days * DAY_MS).toISOString() }
+        : ref.state;
+      return await this.installAdopted(guildId, providerId, ref, state, false);
+    } finally {
+      this.adopting.delete(key);
+      this.adoptEnded.set(key, (this.adoptEnded.get(key) ?? 0) + 1);
+    }
+  }
+
+  /**
+   * NB25 decision 4: resumes the orphan at its provider, then, after the reload rule, installs it active, answers T8
+   * when another adoption holds it active, or pauses it again (T7). Nothing is awaited between the plan and the call.
+   */
+  private async adoptByResume(
+    guildId: string,
+    providerId: string,
+    ref: ProviderSubscriptionRef,
+    plan: Extract<AdoptPlan, { kind: 'resume' }>,
+  ): Promise<boolean> {
+    const provider = getPaymentRegistry().get(providerId)!;
+    const providerSubId = ref.providerSubId;
+    const name = this.providerDisplayName(providerId) ?? providerId;
+    const days = plan.days;
+    const endDate = days === null ? null : new Date(Date.now() + days * DAY_MS).toISOString();
+    const left = days === null ? 'with no end date' : `with ${dayWords(days)} left`;
+    console.warn(`[PremiumManager] Adoption is resuming ${name} subscription ${providerSubId} for guild ${guildId} ${left}.`);
+    try {
+      await provider.resumeSubscription!(providerSubId, endDate);
+    } catch (error: any) {
+      throw new Error(`Subscription '${providerSubId}' was not adopted: the resume call to ${name} failed (${error?.message || error}).`);
+    }
+    console.warn(`[PremiumManager] Adoption resumed ${name} subscription ${providerSubId} for guild ${guildId} ${left}; the bot may not have saved it yet.`);
+
+    const reload = await this.adoptionReload();
+    this.ensureLoaded();
+    const readable = this.configLoaded && !this.unreadable;
+    const subs = readable ? this.config.subscriptions[guildId] : undefined;
+    const held = subs ? this.findSubscriptionByProviderSubId(subs, providerSubId) : null;
+    if (held?.location === 'active') throw new Error(`Subscription '${providerSubId}' was not adopted: it is already in this bot's subscriptions.`);
+    const tierId = ref.metadata.tierId ?? '';
+    const offeringId = ref.metadata.offeringId ?? '';
+    const tier = this.config.tiers[tierId];
+    const slot = this.slotFor(guildId, tierId);
+    const reason = reload && 'stop' in reload ? stopWords(reload.stop)
+      : reload ? reload.refresh
+      : this.stopped ? stopWords(this.stopped)
+      : !readable || this.replay ? CANNOT_TAKE_CHANGES
+      : held ? 'the bot already holds it, queued behind a higher-priority subscription'
+      : !tier ? `tier '${tierId}' does not exist`
+      : !tier.offerings.some(o => o.id === offeringId) ? `tier '${tierId}' has no offering '${offeringId}'`
+      : slot.kind !== 'active' ? `the server now holds a '${slot.activeTier}' subscription of equal or higher priority`
+      : null;
+    if (reason !== null) {
+      let after = ` It was paused again at ${name}.`;
+      try {
+        if (!provider.pauseSubscription) throw new Error(`${name} has no pause call`);
+        await provider.pauseSubscription(providerSubId, null, days);
+      } catch (error: any) {
+        const text = error?.message || String(error);
+        after = plan.autoRenew
+          ? ` Pausing it again failed (${text}); unless it is paused at ${name}, it charges ${days === null ? 'on its next billing date' : `in ${dayWords(days)}`}.`
+          : ` Pausing it again failed (${text}); unless it is paused at ${name}, it stays resumed${days === null ? ' with no end date' : ` and ends in ${dayWords(days)} with no further charge`}.`;
+      }
+      throw new Error(`Subscription '${providerSubId}' was not adopted: it was resumed at ${name}, but not installed: ${reason}.${after}`);
+    }
+    return this.installAdopted(guildId, providerId, ref, { ...ref.state, status: 'active', startDate: new Date().toISOString(), endDate }, true);
+  }
+
+  /** Today's install of an adopted orphan with the state given; the adoption line rides its save (decision 72). */
+  private async installAdopted(
+    guildId: string,
+    providerId: string,
+    ref: ProviderSubscriptionRef,
+    state: ProviderSubscriptionState,
+    resumed: boolean,
+  ): Promise<boolean> {
+    const providerSubId = ref.providerSubId;
+    const tierId = ref.metadata.tierId ?? '';
+    const offeringId = ref.metadata.offeringId ?? '';
     const carry = newCarry();
     this.writeAudit({
       timestamp: new Date().toISOString(),
@@ -3733,7 +3992,7 @@ export class PremiumManager {
       action: 'subscription.adopt.orphan',
       guildId,
       providerId,
-      metadata: { providerSubId, tierId, offeringId },
+      metadata: { providerSubId, tierId, offeringId, ...(resumed ? { resumed: true } : {}) },
     }, { carry });
     const outcome = await this.installAsyncSubscription({
       type: 'subscription.created',
@@ -3744,7 +4003,7 @@ export class PremiumManager {
       offeringId,
       variantId: ref.metadata.variantId,
       couponCode: ref.metadata.couponCode,
-      state: ref.state,
+      state,
     }, { carry });
     if ('op' in outcome) return true;
     if ('refused' in outcome) return false;
@@ -3762,7 +4021,21 @@ export class PremiumManager {
     if (!provider.cancelSubscription || !provider.capabilities.supportsCancel) {
       throw new Error(`Provider '${providerId}' does not support cancellation.`);
     }
-    await provider.cancelSubscription(providerSubId, true);
+    const key = `${providerId}:${providerSubId}`;
+    const running = this.adopting.get(key);
+    if (running === 'adoption') {
+      throw new Error(`Subscription '${providerSubId}' was not cancelled: an adoption of it is running; reload the page when it has finished.`);
+    }
+    if (running === 'cancel') {
+      throw new Error(`Subscription '${providerSubId}' was not cancelled: another cancel of it is already running; reload the page when it has finished.`);
+    }
+    this.adopting.set(key, 'cancel');
+    try {
+      await provider.cancelSubscription(providerSubId, true);
+    } finally {
+      this.adopting.delete(key);
+      this.adoptEnded.set(key, (this.adoptEnded.get(key) ?? 0) + 1);
+    }
     this.writeAudit({
       timestamp: new Date().toISOString(),
       actor: 'admin',

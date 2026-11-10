@@ -572,7 +572,8 @@ describe("the tick's reconcile (94, 96, 102)", () => {
     await d.dummy.initiatePurchase({ guildId: 'g1', tierId: 'gold', offeringId: 'o1', variantId: MONTHLY, startPausedUntil: null });
     await d.settle();
     const writes = d.writes(DUMMY_KEY);
-    expect(await r.pm().adoptOrphan('g1', 'dummy', 'dummy_1')).toBe(true);
+    const plan = (await r.pm().findOrphansForGuild('g1')).find(o => o.ref.providerSubId === 'dummy_1')?.plan;
+    expect(await r.pm().adoptOrphan('g1', 'dummy', 'dummy_1', plan)).toBe(true);
     await d.settle();
     expect(premiumSub()).toMatchObject({ providerSubId: 'dummy_1', status: 'active' });
     expect(premiumSub().pausedAt).toBeUndefined();

@@ -547,7 +547,7 @@ describe('test 35 round 7 (a): install lines of every origin that did not land a
     const pm = getPremiumManager();
     getPaymentRegistry().emitEvent(created('ent1', 'g1') as any);
     getPaymentRegistry().emitEvent({ ...created('bst1', 'g2'), providerId: 'boost' } as any);
-    expect(await applySharedOp({ op: 'premium.adoptOrphan', args: { args: ['g3', 'fake', 'orph1'] } })).toMatchObject({ ok: false });
+    expect(await applySharedOp({ op: 'premium.adoptOrphan', args: { args: ['g3', 'fake', 'orph1', { kind: 'install' }] } })).toMatchObject({ ok: false });
     answers503(await deliver(created('ps4', 'g4')));
     await vi.waitFor(() => {
       const subs = jsonOf(PREMIUM).subscriptions;
