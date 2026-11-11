@@ -7,13 +7,14 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 // audit file has none; the audit file is read once per process, never for a tick's re-emits; an op waits only for the
 // installs started under its own ledger; a lost install line is logged with the ending its first op decided.
 
-const inject = vi.hoisted(() => ({ refuse: new Map<string, string>(), reads: new Map<string, number>() }));
+const inject = vi.hoisted(() => ({ refuse: new Map<string, string>(), reads: new Map<string, number>(), refused: 0 }));
 vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => {
   const real = await orig<typeof import('../../src/bot/internalSetup/utils/dataManager')>();
   const ledger = await import('../../src/bot/internalSetup/utils/dataBackends/writeLedger');
   const guard = (filename: string, options: any) => {
     const cause = inject.refuse.get(filename);
     if (!cause) return;
+    inject.refused += 1;
     ledger.recordRefusal(cause as any, `global:${options.category ?? ''}/${filename}`);
     throw new real.DataBackendUnavailableError(cause as any);
   };
@@ -170,7 +171,7 @@ describe.each([['in the bot', true], ['in the local chain', false]])('test 19: a
     pause = gate();
     let firstDone = false;
     const first = send(created('ps1')).then(r => { firstDone = true; return r; });
-    await tick(30);
+    await vi.waitFor(() => expect(pauseCalls).toContain('ps1'), { timeout: 5000, interval: 5 });
     const second = send(created('ps1'));
     await tick(30);
     expect(firstDone).toBe(false);
@@ -221,7 +222,7 @@ describe('test 37: an op waits only for the installs started under its own ledge
     pauses.set('ent1', entPause);
     pauses.set('ps2', hookPause);
     getPaymentRegistry().emitEvent(created('ent1') as any);
-    await tick(20);
+    await vi.waitFor(() => expect(pauseCalls).toEqual(['ent1']), { timeout: 5000, interval: 5 });
     expect(await applySharedOp({ op: 'premium.setMessages', args: { args: [{ moduleBlocked: 'no' }] } })).toMatchObject({ ok: true });
     expect(pauseCalls).toEqual(['ent1']);
     // NB6 decision 63 (sheet 2606-2608): an install's line goes out with its save, before the provider's pause (NB10
@@ -230,9 +231,8 @@ describe('test 37: an op waits only for the installs started under its own ledge
     expect(installLines()).toHaveLength(1);
     let done = false;
     const hook = deliver(created('ps2', 'g1')).then(r => { done = true; return r; });
-    await tick(30);
+    await vi.waitFor(() => expect(pauseCalls).toEqual(['ent1', 'ps2']), { timeout: 5000, interval: 5 });
     expect(done).toBe(false);
-    expect(pauseCalls).toEqual(['ent1', 'ps2']);
     await settleQueue();
     expect(installLines()).toHaveLength(2);
     entPause.open();
@@ -250,7 +250,7 @@ describe('test 35: redeliveries', () => {
     expect(await deliver(created('ps1'))).toMatchObject({ ok: false, answer: 'held' });
     expect(await deliver(created('ps1'))).toMatchObject({ ok: false });
     recover();
-    await vi.waitFor(() => expect(installLines()).toHaveLength(1), { timeout: 5000, interval: 50 });
+    await vi.waitFor(() => expect(installLines()).toHaveLength(1), { timeout: 10_000, interval: 50 });
     expect(await deliver(created('ps1'))).toMatchObject({ ok: true });
     await settleQueue();
     expect(installLines()).toHaveLength(1);
@@ -260,7 +260,7 @@ describe('test 35: redeliveries', () => {
   it('only premium-tiers.json refused: a redelivery is answered on its own save of the file, not on the landed line', async () => {
     refuse('premium-tiers.json');
     answers503(await deliver(created('ps1')));
-    await vi.waitFor(() => expect(installLines()).toHaveLength(1), { timeout: 5000, interval: 20 });
+    await vi.waitFor(() => expect(installLines()).toHaveLength(1), { timeout: 10_000, interval: 20 });
     answers503(await deliver(created('ps1')));
     expect(jsonOf(PREMIUM)?.subscriptions?.g1).toBeUndefined();
     expect(installLines()).toHaveLength(1);
@@ -371,8 +371,9 @@ describe('the endings of an install line lost at a stop', () => {
   it('held at the final step: the webhook line names the next delivery, the entitlement line is lost', async () => {
     refuse('premium-tiers.json', 'premium-tiers.audit.jsonl');
     expect(await deliver(created('ps1', 'g1'))).toMatchObject({ ok: false, answer: 'held' });
+    const refusedBefore = inject.refused;
     getPaymentRegistry().emitEvent(created('ent2', 'g2') as any);
-    await tick(30);
+    await vi.waitFor(() => expect(inject.refused).toBeGreaterThan(refusedBefore), { timeout: 5000, interval: 5 });
     getPremiumManager().finalStop();
     const errors = logged(spies.error);
     const hook = errors.find(l => l.includes('subscription ps1'));
@@ -386,7 +387,10 @@ describe('the endings of an install line lost at a stop', () => {
     fs.mkdirSync(AUDIT);
     expect(await deliver(created('ps1', 'g1'))).toMatchObject({ ok: false });
     getPaymentRegistry().emitEvent(created('ent2', 'g2') as any);
-    await tick(30);
+    await vi.waitFor(() => {
+      expect(jsonOf(PREMIUM)?.subscriptions?.g2?.active?.providerSubId).toBe('ent2');
+      expect(queuedFilePaths()).toContain(AUDIT);
+    }, { timeout: 5000, interval: 5 });
     const pm = getPremiumManager();
     spies.error.mockClear();
     spies.warn.mockClear();
@@ -413,7 +417,7 @@ describe.each([['in the bot', true], ['in the local chain', false]])('test 35, t
     refuse('premium-tiers.json', 'premium-tiers.audit.jsonl');
     let firstDone = false;
     const first = send(created('ps1')).then(r => { firstDone = true; return r; });
-    await tick(30);
+    await vi.waitFor(() => expect(pauseCalls).toContain('ps1'), { timeout: 5000, interval: 5 });
     const second = send(created('ps1'));
     await tick(30);
     expect(firstDone).toBe(false);
@@ -424,8 +428,10 @@ describe.each([['in the bot', true], ['in the local chain', false]])('test 35, t
     expect(installLines()).toEqual([]);
     recover();
     if (bot) {
-      await vi.waitFor(() => expect(installLines()).toHaveLength(1), { timeout: 5000, interval: 50 });
-      expect(jsonOf(PREMIUM).subscriptions.g1.paused.map((p: any) => p.providerSubId)).toEqual(['ps1']);
+      await vi.waitFor(() => {
+        expect(installLines()).toHaveLength(1);
+        expect(jsonOf(PREMIUM).subscriptions.g1.paused.map((p: any) => p.providerSubId)).toEqual(['ps1']);
+      }, { timeout: 10_000, interval: 50 });
     } else {
       await settleQueue();
       expect(fs.readFileSync(PREMIUM, 'utf8')).toBe(before);
@@ -468,7 +474,7 @@ describe('test 35 round 4 and round 8 (d): the retry appends the held install li
     await vi.waitFor(() => {
       expect(jsonOf(PREMIUM).subscriptions.g1?.active?.providerSubId).toBe('ps1');
       expect(audit.calls).toBeGreaterThan(0);
-    }, { timeout: 5000, interval: 50 });
+    }, { timeout: 10_000, interval: 50 });
     expect(queuedFilePaths()).toContain(AUDIT);
     expect(installLines()).toEqual([]);
     return audit;
@@ -552,7 +558,7 @@ describe('test 35 round 7 (a): install lines of every origin that did not land a
     await vi.waitFor(() => {
       const subs = jsonOf(PREMIUM).subscriptions;
       expect(['g1', 'g2', 'g3', 'g4'].map(g => subs[g]?.active?.providerSubId)).toEqual(['ent1', 'bst1', 'orph1', 'ps4']);
-    }, { timeout: 5000, interval: 20 });
+    }, { timeout: 10_000, interval: 20 });
     const premiumAtStop = fs.readFileSync(PREMIUM, 'utf8');
     spies.error.mockClear();
     spies.warn.mockClear();

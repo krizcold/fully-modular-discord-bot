@@ -71,6 +71,9 @@ describe('a write ticket against a real Postgres', () => {
       expect(await stored(guildId, 'a.json')).toBeNull();
 
       hop.restore();
+      const ready = Date.now() + 5_000;
+      while (backend.connectionState().state !== 'ready' && Date.now() < ready) await new Promise(resolve => { setTimeout(resolve, 10); });
+      expect(backend.connectionState().state).toBe('ready');
       expect(await ws.confirm(ticket, 15_000)).toBe('ok');
       expect(await stored(guildId, 'a.json')).toBe('{"a":1}');
     } finally {
@@ -109,6 +112,9 @@ describe('a write ticket against a real Postgres', () => {
       expect(await stored(guildId, 'b.json')).toBe(JSON.stringify({ b: 1 }, null, 2));
 
       hop.restore();
+      const ready = Date.now() + 5_000;
+      while (backend.connectionState().state !== 'ready' && Date.now() < ready) await new Promise(resolve => { setTimeout(resolve, 10); });
+      expect(backend.connectionState().state).toBe('ready');
       const saved = saveDataTracked('c.json', options, { c: 1 });
       if (saved.outcome !== 'saved') throw new Error(`the write was not accepted: ${saved.outcome}`);
       expect(await confirmWrite(saved.ticket, 15_000)).toBe('ok');
