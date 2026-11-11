@@ -333,15 +333,22 @@ does not name by its content.
    mutant at a time and gives the config's
    limit for each test and hook, and a child scenario step's default bound, four times their time (a limit a test,
    hook or step sets itself is not scaled), and Stryker a larger budget for the whole run.
-   - A gating mutant that timed out in pass A, whose run there failed only on the machine's texts (below), or whose
+   - A gating mutant that timed out in pass A (past Stryker's budget, or past the gate's own bound on a run of named
+     files, below in "Which fast tests a mutant runs"), whose run there failed only on the machine's texts (below), or whose
      kill there came from a test file that also failed alone with no mutant (below, "Which fast tests a mutant
      runs"), reruns
      with pass A's fast tests. It counts as killed when the rerun fails a test, whatever the failure says, or times out when run alone: a test or its beforeEach or afterEach hook past four times its limit, or past its own limit when it sets one (a beforeAll or
-     afterAll hook's timeout is inconclusive, below), or the whole run past Stryker's budget for
-     it, which is four times what those tests take with no mutant, plus a minute. That budget fires first whenever
-     those tests take under 15 seconds, so a mutant that only slows several tests, each within its own limit, by that
-     much in all counts as killed; each confirmed timeout is listed with its replacement, to check. One that survives
-     the rerun goes on to pass B.
+     afterAll hook's timeout is inconclusive, below), or the whole run past its budget, which is four times what its
+     own test files take with no mutant, plus a minute. A rerun takes the files its run in pass A took (below), and
+     its budget is built from what those files cost in a2's own run with no mutant, which runs alone at a2's time
+     scale as each rerun does; the runner ends a rerun past it. The owner ruled on 2026-11-11 that a mutant that only
+     slows its tests, without breaking one, counts as killed sooner than under a budget built from every related file,
+     so a rerun is judged against its own files and not against the whole pass. A rerun of every related file, or one
+     whose files have no cost there, has Stryker's budget, the same formula on a2's whole run with no mutant, since
+     there is nothing smaller to build one from (below, "Which fast tests a mutant runs"). The budget fires first
+     whenever those tests take under 15 seconds, so a mutant that only slows several tests, each within its own limit,
+     by that much in all counts as killed; each confirmed timeout is listed with its replacement, to check. An a2
+     result stands whatever ended the mutant's run in pass A. One that survives the rerun goes on to pass B.
    - In pass B, where containers and children can be slow or fail on their own, a hang never counts: a mutant that
      only hangs a test there is inconclusive, and so is one that hangs a test run before the one that would kill it
      (in the order above). A test that waits must bound its wait and fail, as a child scenario step
@@ -384,23 +391,24 @@ does not name by its content.
    the tree, with the same code made and none of it active (the tree's files only, git-ignored ones never, and pass
    B's dist built from that code), which ends after its run with no mutant (`dryRunOnly`). If they fail, the
    machine or a container went bad during the reruns, so what the reruns counted is inconclusive and the gate ends NO
-   RESULT. When a rerun of pass A confirmed a timeout, the run must also fit in the budget Stryker gave each rerun (four
+   RESULT. When a rerun of pass A confirmed a timeout, the run must also fit in Stryker's budget for a rerun (four
    times the reruns' own run with no mutant, plus a minute, plus Stryker's overhead), by a monotonic clock, which no
-   clock step moves, or the machine was as slow as the mutant seemed and the gate ends NO RESULT the same way. The
+   clock step moves, or the machine was as slow as the mutant seemed and the gate ends NO RESULT the same way. It takes
+   every related file, so that is the budget built from its own files, whichever budget held each rerun. The
    budget is Stryker's own: its reporter leaves Stryker's time for the reruns' run with no mutant (dry-timing.json),
    and runner.mjs times that run by a monotonic clock (dry-ms.txt). Where the two disagree by more than a second plus
    a tenth of the run, the clock of Stryker's process stepped, so the budget is not what the reruns took (a step
    forward of days overflows Node's timer, which then holds each rerun to 1 ms), and the gate ends NO RESULT the same
    way (mutation/control.mjs). A step within that margin moves the budget by at most four times it. Its bound is
    above the largest budget a rerun can have (four times the longest run with no mutant Stryker allows the reruns,
-   plus their time limit), times the number of files it runs, plus five minutes: 126 minutes after a2, which runs
+   plus their time limit), times the number of files it runs, plus five minutes: 246 minutes after a2, which runs
    every related fast file in one run, and 120 per file plus five after b2, which runs every file that failed in
    pass B, each of which a b2 rerun took alone (passes.mjs controlBoundMinutes), so the budget, not the bound, judges
    its time.
    What it cannot see: a machine that was
    four times slower for one rerun only and well again by the end (a pass A rerun that timed out, or a pass B rerun
    whose child step ran past its bound), or, for a test, hook or step that sets its own limit, which is not scaled,
-   one only as much slower as that limit allows (no test that reaches src sets one today); nor what an earlier rerun,
+   one only as much slower as that limit allows (unit/nb10AfterDrainBound.test.ts sets some); nor what an earlier rerun,
    or the pass's own run with no mutant, left inside that pass's one sandbox (a file written under its test or src
    through a path a mutant made relative, a module a scenario put into its dist), which can fail a later rerun: its
    sandbox is fresh, so it holds none of it (no test or scenario writes there today).
@@ -521,13 +529,14 @@ a test starts does not take the dir as its own, and touched.mjs takes it out of 
 names the dir to the runs with no mutant of pass A, A with no checker and B (in B, to both tiers' runs) and to no
 other run, whatever the shell set. No mutant run, rerun or run with no mutant that checks a pass loads the recorder.
 
-a2 and the run with no mutant after it record nothing. a2 reruns only mutants on which some file already failed or
+a2 and the run with no mutant after it record no reach. a2 reruns only mutants on which some file already failed or
 timed out in pass A, and a fresh run with no mutant that happened to miss the mutant would drop that file, so each a2
 run takes the files its mutant's run in pass A took, which hold the one that failed: touched.mjs writes them from
 `<id>-reach.json` in `a/` or `a-unchecked/` to `taken.json` in `a2/` by the mutant's key, targets.mjs writes each a2
 id's key to `run-keys.json`, and runner.mjs takes every related file when a link is missing or cannot be read. a2's
 own run with no mutant, and the one after the reruns, take every related file, so neither runs the smaller set an a2
-run took; the gate runs those sets on their own after the reruns (below).
+run took; the gate runs those sets on their own after the reruns (below). a2's run with no mutant leaves what each
+file cost there, which each rerun's budget is built from (below).
 
 A test file's reach is the union of the ids in every record of its dir. The file is unsure, and runs for every mutant,
 when:
@@ -605,15 +614,73 @@ the run after the reruns takes every related file, so it never runs that set wit
 run, the gate runs each distinct set an a2 kill or timeout ran on, when that set was smaller than every related file,
 once with no mutant (`alone-a2/`), each in a vitest run of its own with a2's time limits, in the same kind of Stryker
 run and with the same bounds at scale 4 (verdict.mjs bySet). An a2 kill or timeout is voided when its set failed
-there, ran past its bound or left no result, or when the set cannot be read from its `<id>-reach.json`; an a2 timeout
-is also voided when its set took longer there than the budget Stryker gave each a2 run (verdict.mjs voidFailedSets).
-The mutant is then inconclusive, and the report lists each such set and why under the runs with no mutant. When that
-Stryker run cannot run at all, the gate stops NO RESULT.
+there, ran past its bound or left no result, or when the set cannot be read from its `<id>-reach.json`. An a2 timeout
+is also voided when its set took longer there than the budget that rerun had: for one the runner ended, the set's own
+budget (four times what its files cost in a2's run with no mutant, plus a minute; a budget that cannot be made voids
+it), and for one Stryker ended, the budget Stryker gave each a2 run (verdict.mjs voidFailedSets). A set that takes as
+long with no mutant as its rerun was allowed shows a slow machine, not a slow mutant. The mutant is then
+inconclusive, and the report lists each such set and why under the runs with no mutant. When that Stryker run cannot
+run at all, the gate stops NO RESULT.
 
-Stryker builds each mutant run's budget from the run with no mutant, which ran every related file and loaded the setup
-file in each. A run that takes fewer files fits in it with more room, and one that hangs still runs past it and counts
-as a timeout. a2's run with no mutant and the one after the reruns take every related file, so each a2 run, which
-takes the files its run in pass A took, fits in its budget the same way.
+Stryker builds each mutant run's budget from the pass's run with no mutant, which ran every related file and loaded
+the setup file in each: in pass A twice that run plus ten seconds, in a2 four times it plus a minute, however few
+files a mutant's run takes. A run of a few files fits in it with room to spare: a run with no mutant of some 660
+files can take half an hour, so a mutant that blocks the event loop (which vitest's own limits cannot end) in a run
+of two dozen files that takes a minute would hold its slot for an hour, and a mutant that only slows those files
+would finish inside that budget and survive. So a run of named files is judged against the time its own files take
+with no mutant, which is the owner's ruling of 2026-11-11 (above, "The passes"):
+
+- a mutant's run in pass A, or in pass A with no checker, is ended past three times what its files cost in that
+  pass's run with no mutant, plus two minutes for vitest to start and end (passes.mjs RUN_BOUND). Pass A runs
+  several mutants side by side on a machine that may be busy, and three times leaves room for that. A run past it is
+  a timeout, never a kill: a gating one reruns alone in a2, exactly as one Stryker timed out does, and a context one is
+  listed as a timeout.
+- an a2 rerun is ended past four times what its files cost in a2's own run with no mutant, plus a minute: the formula
+  Stryker uses for the whole pass, on the rerun's own files (passes.mjs A2_BOUND). a2's run with no mutant takes every
+  related file, one at a time and at a2's time scale, as each rerun runs, so its costs are what the files take under
+  the same conditions; it leaves them in `dry-costs.json` in `a2/` (reach.mjs writeCosts). A rerun the runner ended
+  is a timeout of a2, and counts as a confirmed timeout, as a rerun past Stryker's budget does.
+
+Each run with no mutant is on one worker, so its files run one after another, and a file's cost is its own span and
+the gaps on both sides of it: from the end of the file before it (for the first, from the report's start) to the
+start of the file after it (for the last, to the time runner.mjs makes the costs, after vitest exited), as vitest's
+report of that run gives the times (reach.mjs costsOf). vitest gives a file's start and end as those of its tests, so
+the fork, the imports, collection and a beforeAll fall in the gap before it, and an afterAll in the gap after it. A
+gap holds the end of one file and the start of the next, and the report cannot split it, so each of the two is given
+the whole gap; the costs add up to more than the run took, which only makes a bound larger. A file none of whose tests
+ran (each skipped, or none collected) has no times of its own; it ran inside one of the gaps, so it costs the widest of
+them. runner.mjs leaves pass A's costs in `dry-reach.json` beside the reach. It leaves none when the report has no
+start, times that cannot be read, times that overlap, or no file whose tests ran, or when its last file ends after the
+costs are made.
+
+The report's times come from the wall clock, which a clock step moves. runner.mjs also times the run by the monotonic
+clock from before vitest starts (as it times `dry-ms.txt`), and leaves no costs when the wall-clock time from the
+report's start to the end is longer than that time plus a second and a hundredth of it: the wall clock stepped forward
+during the run. The margin holds the wall clock's coarse ticks (about 16 ms on Windows) and NTP's slewing of it (at
+most 500 ppm) with room to spare, and a step within it only raises a cost, by at most twice the margin. A step back
+shrinks a cost by at most the span or gap it falls in; a longer one makes the times overlap, which leaves no costs.
+
+A run is not bounded this way, and Stryker's limit alone applies, when it takes every related file (no reach or no link
+to pass A's files, or a take that holds every file of the run with no mutant), no file, or a file with no cost, when
+there are no costs, and when the bound would pass Node's limit on a timer (2^31-1 ms, about 24.8 days), past which a
+timer fires at once. Stryker's limit stays on a bounded run too, and ends it first in the rare case it is the smaller.
+
+runner.mjs ends a run past its bound with every process it started (helpers/endTree.mjs), leaves `<id>-bound.json`
+in the pass's dir (the bound in ms and the number of files the run took) and exits 1. Stryker counts that exit as a
+kill; the gate reads the mark beside a result of pass A, pass A with no checker or a2 (`a/`, `a-unchecked/` and `a2/`
+only) and records a Killed result with the mark as a timeout, as it records one Stryker reports as Timeout
+(verdict.mjs endedByBound). The report gives a pass A one as ended by the gate's bound, with its seconds, and an a2 one
+as a run past its own budget alone, with that budget's seconds. An a2 timeout the runner called takes every check an
+a2 timeout takes: its set runs with no mutant and must fit that set's own budget (above), and the run with no mutant
+after the reruns must pass and fit Stryker's budget ("The passes", item 4). A mark beside any other result (Survived,
+for one) changes nothing. A vitest that has exited on its own by the time the bound fires keeps its own exit and
+leaves no mark. One that exits in the instant between the runner's check that it still runs and the kill keeps its
+own exit when that exit is 0, and on POSIX when it is not 0 as well, since the runner tells its own exit from the kill
+by the signal; on Windows, where an ended process shows only an exit code, a non-zero exit in that instant is marked,
+and the run counts as a timeout. The runs with no mutant are bounded only as above (a set's own bound). Pass B and b2
+keep Stryker's budget: pass B takes every related integration file and the whole child tier, so there is no smaller
+set to build a budget from, and a b2 rerun takes the one file that failed in pass B, which is all its own run with no
+mutant takes, so Stryker's budget there is already built from the run's own file.
 
 ## Which tests a pass B mutant runs
 
@@ -682,8 +749,10 @@ built from it, stays 120 minutes per file plus five.
   child; a nested mutant a pass is not for runs nothing; `dry-*` is the run with no mutant, `dry-ms.txt` its monotonic time and `dry-timing.json` Stryker's).
   `a/`, `a-unchecked/` and `b/` also hold `dry-coverage/` (one dir of records per test file process: fast in `a/`
   and `a-unchecked/`, integration and child in `b/`) and `dry-reach.json`, the reach built from them; each mutant
-  run there and in `a2/` leaves `<id>-reach.json`, the files it took. `a2/` also holds `taken.json`, the files each target's run in pass A took, by its key, and each dir with
-  run-ids.json holds `run-keys.json`, each of those ids' key.
+  run there and in `a2/` leaves `<id>-reach.json`, the files it took. `a2/` also holds `taken.json`, the files each
+  target's run in pass A took, by its key, and `dry-costs.json`, what each file cost in a2's run with no mutant; each
+  dir with run-ids.json holds `run-keys.json`, each of those ids' key. A run the runner ended at its bound in `a/`,
+  `a-unchecked/` or `a2/` leaves `<id>-bound.json`.
   `a-unchecked/`, `a2/`, `b/` and `b2-*/` also hold targets.json and run-ids.json, the mutants the pass is for. A run
   of named test files leaves the list it gave vitest in `<id>-<tier>.include.json` beside its report. `alone-a/`
   holds each file that killed in pass A run alone with no mutant, and `alone-a2/` each set an a2 kill or timeout ran
@@ -692,14 +761,17 @@ built from it, stays 120 minutes per file plus five.
 
 The verdict is FAIL when a gating mutant ends Survived, NoCoverage, inconclusive (a pass that made no mutant at its place included), RuntimeError, or Ignored (a
 `// Stryker disable` comment needs the same justification in the notes as a survivor). A confirmed timeout counts as
-killed and is listed. CompileError counts as killed by the type checker, unless its only error is an unused
+killed and is listed: a rerun alone in which a test or its beforeEach or afterEach hook ran past its scaled limit, or
+the whole run past its budget, which is built from what its own files take with no mutant whenever those costs are
+known, so a mutant that only slows its own tests that much counts as killed (the owner's ruling of 2026-11-11, above). CompileError counts as killed by the type checker, unless its only error is an unused
 `@ts-expect-error` (a gating one then meets pass A's tests with no checker, above). The verdict is NO RESULT when no src file
 changed, when no gating mutant was made, when every gating mutant was a type error (no test ran against the change),
 when the type checker would judge a file outside the tree, when what it reads is not what the root lockfile ships
 (test/'s TypeScript, or npm's record of the root install) or that lockfile names no TypeScript or cannot be read,
-when a pass could not run (its run with no mutant past Stryker's bound on it included: 30 minutes for A, A with no
-checker and a2, 120 for B, which runs every related integration file and the whole child tier, and fifteen for b2,
-which runs one file, each on one vitest worker (passes.mjs dryRunTimeoutMinutes); Stryker's log above
+when a pass could not run (its run with no mutant past Stryker's bound on it included: 60 minutes for A, A with no
+checker and a2, where that run takes every related fast file and can take half an hour on a busy machine, 120 for
+B, which runs every related integration file and the whole child tier, and fifteen for b2, which runs one file,
+each on one vitest worker (passes.mjs dryRunTimeoutMinutes); Stryker's log above
 the report then says the initial test run timed out), when a run of pass B or b2 timed out while the clock
 of Stryker's process stepped during that pass's run with no mutant (or its times could not be read), when Stryker
 mutated a file no target names, when the run of each file that killed in pass A alone, or of each set an a2 result

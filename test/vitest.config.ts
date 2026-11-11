@@ -49,7 +49,7 @@ export default defineConfig({
   server: { fs: { allow: [repo] } },
   test: {
     root: here,
-    // A pass A run with no mutant records what each test file reached
+    // A pass A or pass B run with no mutant records what each test file reached
     // (mutation/README.md); first, so its recorder is in place before any instrumented file loads.
     setupFiles: [...(process.env.SMDB_MUTATION_COVERAGE ? ['./helpers/mutationCoverage.ts'] : []), './helpers/setup.ts'],
     // Not 'test', as a developer's shell may set it, so every run shows that

@@ -5,14 +5,15 @@
  * @typedef {import('./ranges.mjs').Location} Location
  * @typedef {'a' | 'a2' | 'b' | 'b2'} PassName
  * @typedef {{ id: string | null, dir?: string, status: string, statusReason?: string, killedBy?: string, timeout?: string,
- *   inconclusive?: string, recheck?: string, voided?: string, unreached?: boolean, pending?: 'alone-a' | 'alone-a2' }}
+ *   inconclusive?: string, recheck?: string, voided?: string, unreached?: boolean, pending?: 'alone-a' | 'alone-a2', bounded?: boolean }}
  *   PassResult dir: the report dir the
  *   id's runs are in (Stryker numbers each run's mutants anew); recheck: the test that failed only on the machine's
  *   texts, so the mutant reruns alone; voided: why a rerun's kill or timeout no longer counts; unreached: no test
  *   file reached the mutant in the pass's run with no mutant (pass A or its run with no checker, or pass B), so its run
  *   there ran none; a
  *   CompileError with an inconclusive is one only of an unused `@ts-expect-error` (TS2578), which no test met; pending:
- *   the check with no mutant (touched.mjs aloneCheck or setCheck) that covers the result and has not finished
+ *   the check with no mutant (touched.mjs aloneCheck or setCheck) that covers the result and has not finished; bounded:
+ *   the runner, not Stryker, ended the run at the bound built from its files' costs (endedByBound)
  * @typedef {{ file: string, location: Location, mutator: string, original: string, replacement: string, gating: boolean,
  *   passes: Partial<Record<PassName, PassResult>> }} MutantRecord
  * @typedef {{ name: string, status?: string, message?: string,
@@ -106,6 +107,31 @@ export function onlyUnusedDirective(reason) {
 }
 
 /**
+ * A run of named files that the runner ended at its bound (runner.mjs,
+ * `<id>-bound.json`; `mark`: what that file holds, `{}` when it is there but
+ * cannot be read, null when it is not there): Stryker counts the run's
+ * non-zero exit as a kill, and it is recorded as a timeout, as a result
+ * Stryker itself reports as Timeout is. In pass A that bound is the gate's
+ * own; in a2 (`alone`) it is the run's own budget. null when the result stands
+ * as Stryker reported it: no mark, or any status but Killed.
+ * @param {string} status Stryker's
+ * @param {unknown} mark
+ * @param {boolean} [alone] an a2 rerun
+ * @returns {{ status: 'Timeout', statusReason: string, bounded: true } | null}
+ */
+export function endedByBound(status, mark, alone = false) {
+  if (status !== 'Killed' || mark === null || mark === undefined) return null;
+  const ms = typeof mark === 'object' ? /** @type {{ ms?: unknown }} */ (mark).ms : undefined;
+  const known = typeof ms === 'number' && Number.isFinite(ms);
+  if (alone) {
+    const budget = known ? `${Math.round(ms / 1000)} s` : 'a time that could not be read';
+    return { status: 'Timeout', statusReason: `ran past its own budget alone (${budget}: four times what its files take in a2's run with no mutant, plus a minute)`, bounded: true };
+  }
+  const after = known ? `after ${Math.round(ms / 1000)} s` : 'after a time that could not be read';
+  return { status: 'Timeout', statusReason: `the gate's bound on the run ended it ${after}`, bounded: true };
+}
+
+/**
  * One pass's outcome for a mutant.
  * @param {PassResult} result
  */
@@ -143,7 +169,8 @@ const failedInB = b => (b?.killedBy ? `killed in pass B by ${b.killedBy}` : `fai
  * A mutant's outcome, counting for a gating one only what its rerun alone
  * confirmed. In pass A a timeout counts when the rerun, with four times the
  * config's time limits, times out alone (a test or its beforeEach or afterEach
- * hook, or the whole run past Stryker's budget) or fails a test, and so does a
+ * hook, or the whole run past its budget: its own when it takes named files and
+ * their costs are known, else Stryker's) or fails a test, and so does a
  * run that failed only on the machine's texts. In pass B, where containers and children can be
  * slow on their own, a hang never counts, and a kill (or a run that failed only
  * on the machine's texts) counts only when the test file that failed fails for
@@ -311,21 +338,28 @@ export function bySet(mutants, taken) {
 /**
  * Voids each a2 kill or timeout of bySet's groups whose set of files failed
  * together with no mutant, left no result there, or could not be read, and
- * each a2 timeout whose set took longer with no mutant than `budget`, the ms
- * Stryker gave each a2 run (NaN when unknown). `runs` is what dry-alone.json
- * holds: per set, its files, exit and time. Returns a report line per set
- * whose results were voided.
+ * each a2 timeout whose set took longer with no mutant than the budget that
+ * rerun had: for one the runner ended at its own budget (bounded), the set's
+ * own, `ownBudget(files)` (NaN when unknown); for one Stryker ended, `budget`,
+ * the ms Stryker gave each a2 run (NaN when unknown). `runs` is what
+ * dry-alone.json holds: per set, its files, exit and time. Returns a report
+ * line per set and reason whose results were voided, and the number of sets
+ * any result was voided in.
  * @param {{ files: string[] | null, on: MutantRecord[] }[]} sets
  * @param {unknown} runs
  * @param {string} dir the dir of the runs with no mutant
  * @param {number} budget
- * @returns {string[]}
+ * @param {(files: string[]) => number} [ownBudget]
+ * @returns {{ lines: string[], voided: number }}
  */
-export function voidFailedSets(sets, runs, dir, budget) {
+export function voidFailedSets(sets, runs, dir, budget, ownBudget = () => NaN) {
   /** @type {string[]} */
   const lines = [];
+  let count = 0;
   /** @type {{ files?: unknown, code?: unknown, ms?: unknown }[]} */
   const list = Array.isArray(runs) ? runs.filter(r => r !== null && typeof r === 'object') : [];
+  /** @param {number} ms */
+  const seconds = ms => `${Math.round(ms / 1000)} s`;
   for (const { files, on } of sets) {
     const run = files ? list.find(r => JSON.stringify(r.files) === JSON.stringify(files)) : undefined;
     const named = files ? files.join(', ') : '';
@@ -334,20 +368,25 @@ export function voidFailedSets(sets, runs, dir, budget) {
       ? 'the files its a2 run took could not be read'
       : run?.code === undefined || typeof run.code !== 'number' ? `${named}, run together with no mutant (${dir}/), left no result`
         : run.code !== 0 ? `${named} failed together with no mutant (${dir}/)` : '';
-    const slow = ms <= budget ? ''
-      : `${named} took ${Number.isFinite(ms) ? `${Math.round(ms / 1000)} s` : 'a time that could not be read'} together with no mutant (${dir}/), not within the ${Number.isFinite(budget) ? `${Math.round(budget / 1000)} s` : 'unknown budget'} Stryker gave each a2 run`;
-    let voided = 0;
+    const took = `${named} took ${Number.isFinite(ms) ? seconds(ms) : 'a time that could not be read'} together with no mutant (${dir}/)`;
+    const slowStryker = ms <= budget ? '' : `${took}, not within the ${Number.isFinite(budget) ? seconds(budget) : 'unknown budget'} Stryker gave each a2 run`;
+    const own = files ? ownBudget(files) : NaN;
+    const slowOwn = ms <= own ? ''
+      : `${took}, not within ${Number.isFinite(own) ? `the ${seconds(own)}` : 'an unknown'} budget of that set alone (four times what its files take in a2's run with no mutant, plus a minute)`;
+    /** @type {Map<string, number>} */
+    const voided = new Map();
     for (const m of on) {
       const a2 = /** @type {PassResult} */ (m.passes.a2);
       const timeout = outcomeOf(a2) === 'Timeout';
-      const why = failed || (timeout ? slow : '');
+      const why = failed || (timeout ? (a2.bounded ? slowOwn : slowStryker) : '');
       if (!why) continue;
-      voided += 1;
+      voided.set(why, (voided.get(why) ?? 0) + 1);
       m.passes.a2 = { ...a2, voided: `${timeout ? 'timed out' : `killed by ${a2.killedBy}`} in a2, but ${why}, so it proves nothing` };
     }
-    if (voided > 0) lines.push(`${failed || slow}, so ${voided} a2 result(s) that ran on it do not count`);
+    if (voided.size > 0) count += 1;
+    for (const [why, count] of voided) lines.push(`${why}, so ${count} a2 result(s) that ran on it do not count`);
   }
-  return lines;
+  return { lines, voided: count };
 }
 
 /**

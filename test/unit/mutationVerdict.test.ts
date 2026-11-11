@@ -4,7 +4,7 @@ import os from 'os';
 import path from 'path';
 import { describe, expect, it, onTestFinished } from 'vitest';
 import {
-  byKiller, bySet, classifyKill, confirmed, INFRASTRUCTURE, judge, killedInA, onlyUnusedDirective, outcome, toConfirm, toPassB, toUncheck, uncreditFailedAlone,
+  byKiller, bySet, classifyKill, confirmed, endedByBound, INFRASTRUCTURE, judge, killedInA, onlyUnusedDirective, outcome, toConfirm, toPassB, toUncheck, uncreditFailedAlone,
   voidFailedSets,
   type MutantRecord, type PassResult,
 } from '../mutation/verdict.mjs';
@@ -116,6 +116,58 @@ describe('the passes a mutant goes through', () => {
     expect(confirmed(flake)).toEqual({
       outcome: 'Inconclusive', why: 'killed in pass B by integration/x.test.ts > x, but not when that file ran alone, and the tests after it in pass B never ran on it',
     });
+  });
+
+  it('records a pass A run the runner ended at its bound as a timeout, which a gating mutant confirms alone', () => {
+    const ended = endedByBound('Killed', { ms: 183_400, files: 2 });
+    expect(ended).toEqual({ status: 'Timeout', statusReason: "the gate's bound on the run ended it after 183 s", bounded: true });
+    // A mark that is there but cannot be read still says the runner ended the run.
+    expect(endedByBound('Killed', {})).toEqual({ status: 'Timeout', statusReason: "the gate's bound on the run ended it after a time that could not be read", bounded: true });
+    const gating = mutant(1, true, { a: pass('Killed', { ...ended! }) });
+    const context = mutant(2, false, { a: pass('Killed', { ...ended! }) });
+    expect(toConfirm([gating, context], 'a')).toEqual([gating]);
+    expect(confirmed(gating)).toEqual({ outcome: 'Inconclusive', why: 'timed out, never rerun alone' });
+    expect(outcome(context)).toBe('Timeout');
+    expect(killedInA([gating, context]).size).toBe(0);
+    expect(toPassB([gating])).toEqual([]);
+    // With no mark, or any status but Killed, the result stands as Stryker reported it.
+    expect(endedByBound('Killed', null)).toBeNull();
+    for (const status of ['Survived', 'Timeout', 'NoCoverage', 'CompileError', 'RuntimeError']) expect(endedByBound(status, { ms: 1000, files: 1 }), status).toBeNull();
+  });
+
+  it('counts an a2 rerun the runner ended at its own budget as a confirmed timeout, whatever ended its run in pass A', () => {
+    const own = endedByBound('Killed', { ms: 183_400, files: 2 }, true);
+    expect(own).toEqual({ status: 'Timeout', statusReason: "ran past its own budget alone (183 s: four times what its files take in a2's run with no mutant, plus a minute)", bounded: true });
+    expect(endedByBound('Killed', {}, true)?.statusReason).toBe("ran past its own budget alone (a time that could not be read: four times what its files take in a2's run with no mutant, plus a minute)");
+    const ended = endedByBound('Killed', { ms: 300_000, files: 24 })!;
+    const byBound = mutant(1, true, { a: pass('Killed', { ...ended, dir: 'a' }), a2: pass('Killed', { ...own! }) });
+    const byStryker = mutant(2, true, { a: pass('Timeout', { dir: 'a' }), a2: pass('Killed', { ...own! }) });
+    for (const m of [byBound, byStryker]) {
+      expect(confirmed(m), String(m.location.start.line)).toEqual({ outcome: 'Timeout' });
+      expect(toPassB([m])).toEqual([]);
+    }
+    // An a2 result of a run the bound ended in pass A stands like any other.
+    expect(outcome(mutant(3, true, { a: pass('Killed', { ...ended, dir: 'a' }), a2: pass('Killed', { killedBy: 'unit/x.test.ts > x' }) }))).toBe('Killed');
+    expect(outcome(mutant(4, true, { a: pass('Killed', { ...ended, dir: 'a' }), a2: pass('Killed', { timeout: 'unit/x.test.ts > x' }) }))).toBe('Timeout');
+    expect(outcome(mutant(5, true, { a: pass('Killed', { ...ended, dir: 'a' }), a2: pass('Timeout') }))).toBe('Timeout');
+    expect(outcome(mutant(6, true, { a: pass('Killed', { ...ended, dir: 'a' }), a2: pass('Survived') }))).toBe('Survived');
+    // The report says the run passed its own budget alone.
+    expect(run([byBound]).lines.join('\n')).toContain("(ran past its own budget alone (183 s: four times what its files take in a2's run with no mutant, plus a minute))");
+    expect(run([byBound]).lines).toContain("Timeouts (each timed out when run alone with four times the config's limit, or past the limit a test or hook sets itself: a test or its beforeEach or afterEach hook, or the whole run past its budget; counted as killed, so check each replacement):");
+  });
+
+  it('reads the mark in pass A, pass A with no checker and a2 only, and only in the result Stryker reports', () => {
+    const gate = fs.readFileSync(path.join(__dirname, '..', 'mutation', 'touched.mjs'), 'utf8');
+    const read = "const bound = dir === 'a' || dir === 'a-unchecked' || dir === 'a2' ? endedByBound(r.status, boundMarkOf(dir, r.id), dir === 'a2') : null;";
+    expect(gate.split(read).length).toBe(2);
+    expect(gate.split('boundMarkOf(').length).toBe(3);
+    expect(gate.split('-bound.json').length).toBe(3);
+    expect(gate.indexOf(read)).toBeGreaterThan(gate.indexOf('function resultOf('));
+    expect(gate.indexOf(read)).toBeLessThan(gate.indexOf("return r.status === 'Killed' ? { ...result, ...classifyKill("));
+    // a2 results are read as a rerun alone, and nothing between a2 and its checks takes a result back for its pass A.
+    expect(gate).toContain("m.passes[name] = r ? resultOf(dir, r, name === 'a2' || name === 'b2') : { id: null, dir, status: 'Missing' };");
+    const a2 = gate.indexOf("    await passOn('a2', 'a2', 'a', confirmA, PASSES.a2);\n");
+    expect(gate.slice(a2).startsWith("    await passOn('a2', 'a2', 'a', confirmA, PASSES.a2);\n    if (confirmA.some(credited)) await control('a2'")).toBe(true);
   });
 
   it('counts a pass B kill only when a test fails for it again alone, and nothing it never reran', () => {
@@ -245,7 +297,8 @@ describe('the passes a mutant goes through', () => {
     const sets = bySet([m, related, held, slow, unread, survived], one => taken.get(one) ?? null);
     expect(sets.map(({ files, on }) => [files, on.map(one => one.location.start.line)])).toEqual([[set, [1]], [['unit/y.test.ts'], [3, 4]], [null, [5]]]);
     const runs = [{ files: set, code: 1, ms: 900 }, { files: ['unit/y.test.ts'], code: 0, ms: 20_000 }];
-    const lines = voidFailedSets(sets, runs, 'alone-a2', 10_000);
+    const { lines, voided } = voidFailedSets(sets, runs, 'alone-a2', 10_000);
+    expect(voided).toBe(3);
     expect(outcome(m)).toBe('Inconclusive');
     expect(confirmed(m).why).toBe('killed by unit/x.test.ts > reads in a2, but unit/x.test.ts failed together with no mutant (alone-a2/), so it proves nothing');
     // A kill on a set that passes stands; a timeout there stands only if the set fit in a2's budget.
@@ -264,11 +317,45 @@ describe('the passes a mutant goes through', () => {
     expect(confirmed(lost).why).toBe('killed by unit/z.test.ts > z in a2, but unit/z.test.ts, run together with no mutant (alone-a2/), left no result, so it proves nothing');
   });
 
+  it("holds an a2 timeout the runner called to its own set's budget, and one Stryker called to Stryker's", () => {
+    const own = endedByBound('Killed', { ms: 64_000, files: 1 }, true)!;
+    const set = ['unit/y.test.ts'];
+    // Stryker gave each a2 run 600 s; the set's own budget is 4 x 1 s + 60 s.
+    const ownBudget = (files: string[]) => (JSON.stringify(files) === JSON.stringify(set) ? 64_000 : NaN);
+    const make = () => ({
+      ownFits: mutant(1, true, { a: pass('Timeout'), a2: pass('Killed', { ...own }) }),
+      stryker: mutant(2, true, { a: pass('Timeout'), a2: pass('Timeout') }),
+      killed: mutant(3, true, { a: pass('Timeout'), a2: pass('Killed', { killedBy: 'unit/y.test.ts > y' }) }),
+    });
+    const fits = make();
+    expect(voidFailedSets([{ files: set, on: Object.values(fits) }], [{ files: set, code: 0, ms: 64_000 }], 'alone-a2', 600_000, ownBudget)).toEqual({ lines: [], voided: 0 });
+    for (const m of Object.values(fits)) expect(outcome(m), String(m.location.start.line)).not.toBe('Inconclusive');
+    // The set took longer with no mutant than its own budget: the runner's timeout proves nothing, Stryker's stands.
+    const slow = make();
+    const { lines } = voidFailedSets([{ files: set, on: Object.values(slow) }], [{ files: set, code: 0, ms: 70_000 }], 'alone-a2', 600_000, ownBudget);
+    const why = "unit/y.test.ts took 70 s together with no mutant (alone-a2/), not within the 64 s budget of that set alone (four times what its files take in a2's run with no mutant, plus a minute)";
+    expect(confirmed(slow.ownFits)).toEqual({ outcome: 'Inconclusive', why: `timed out in a2, but ${why}, so it proves nothing` });
+    expect(outcome(slow.stryker)).toBe('Timeout');
+    expect(outcome(slow.killed)).toBe('Killed');
+    expect(lines).toEqual([`${why}, so 1 a2 result(s) that ran on it do not count`]);
+    // A set budget that cannot be made voids the runner's timeout; past Stryker's, Stryker's is voided too.
+    const unknown = make();
+    const { lines: both, voided } = voidFailedSets([{ files: set, on: Object.values(unknown) }], [{ files: set, code: 0, ms: 700_000 }], 'alone-a2', 600_000, () => NaN);
+    expect(voided).toBe(1);
+    expect(both).toEqual([
+      "unit/y.test.ts took 700 s together with no mutant (alone-a2/), not within an unknown budget of that set alone (four times what its files take in a2's run with no mutant, plus a minute), so 1 a2 result(s) that ran on it do not count",
+      'unit/y.test.ts took 700 s together with no mutant (alone-a2/), not within the 600 s Stryker gave each a2 run, so 1 a2 result(s) that ran on it do not count',
+    ]);
+    expect(outcome(unknown.killed)).toBe('Killed');
+  });
+
   it('checks the sets a2 results ran on after the run with no mutant after the reruns', () => {
     const gate = fs.readFileSync(path.join(__dirname, '..', 'mutation', 'touched.mjs'), 'utf8');
     const check = gate.indexOf('    await setCheck(confirmA);\n');
     expect(check).toBeGreaterThan(gate.indexOf("await control('a2'"));
     expect(check).toBeLessThan(gate.indexOf('const forB = toPassB(mutants);'));
+    // Each set's own budget, by the formula and the costs a2's reruns were bounded by.
+    expect(gate).toContain("  const costs = readCosts(path.join(reportDir, 'a2'));\n  const { lines, voided } = voidFailedSets(sets, runs, dir, strykerBudget('a2', PASSES.a2), files => boundFor(costs, files, A2_BOUND) ?? NaN);\n");
   });
 
   it('counts no pass A kill when the gate stopped before its file ran alone with no mutant', () => {

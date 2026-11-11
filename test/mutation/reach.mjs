@@ -4,17 +4,26 @@
 // every test file's process and the Node processes under it, which leave the
 // mutant ids that file's run reached; each mutant run then takes the files that
 // reached it, every file whose reach is unknown, and nothing else.
-// A rerun alone (a2) of a mutant takes the files its run in pass A took.
+// A rerun alone (a2) of a mutant takes the files its run in pass A took. A run
+// of pass A or a2 that takes some of them is bounded by what they cost in its
+// pass's run with no mutant (boundFor).
 import { createHash } from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import { RUN_BOUND } from './passes.mjs';
 
 /**
- * @typedef {{ files: string[], unsure: number[], reached: Record<string, number[]> }} Reach files: the test files the
- *   run with no mutant ran, relative to test/; unsure: the indexes of those whose reach is unknown, which every mutant
- *   run takes; reached: per mutant id, the indexes of the files that reached it
+ * @typedef {{ files: string[], unsure: number[], reached: Record<string, number[]>, costs?: number[] }} Reach files: the
+ *   test files the run with no mutant ran, relative to test/; unsure: the indexes of those whose reach is unknown, which
+ *   every mutant run takes; reached: per mutant id, the indexes of the files that reached it; costs: per file, the ms
+ *   it cost in that run (costsOf), absent when they could not be made
+ * @typedef {{ files: string[], costs?: number[] }} Costs files: the test files a run with no mutant ran, relative to
+ *   test/; costs: per file, the ms it cost in that run (costsOf)
+ * @typedef {{ factor: number, startMs: number }} Formula a bound of `factor` times what a run's files cost, plus `startMs`
  * @typedef {{ file?: unknown, ids?: unknown, unsure?: unknown }} CoverageRecord one test file's run: its ids, and why
  *   it is unsure when it is
+ * @typedef {{ startTime?: unknown, testResults?: { name?: unknown, startTime?: unknown, endTime?: unknown,
+ *   assertionResults?: { duration?: unknown }[] }[] }} TimedReport the parts of vitest's JSON report costsOf reads
  */
 
 // The dir, under a pass's report dir, where the run with no mutant leaves one record per test file.
@@ -25,6 +34,10 @@ export const REACH_FILE = 'dry-reach.json';
 export const TAKEN_FILE = 'taken.json';
 // In a pass's dir: per mutant id, its key (targets.mjs).
 export const RUN_KEYS_FILE = 'run-keys.json';
+// In a2's dir: what each file cost in a2's run with no mutant (writeCosts).
+export const COSTS_FILE = 'dry-costs.json';
+// Node's limit on a timer: a longer one fires at once.
+export const TIMER_LIMIT_MS = 2 ** 31 - 1;
 
 /**
  * @param {string} testDir
@@ -66,6 +79,147 @@ export function reachOf(testDir, ran, records) {
     }
   });
   return { files, unsure, reached };
+}
+
+/** @param {unknown} value */
+const isTime = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
+
+/**
+ * What each test file cost, in ms, in a run with no mutant on one worker, from
+ * its vitest JSON report and `end`, the time (Date.now) after that vitest
+ * exited: its own span and the gaps on both sides of it, from the end of the
+ * file before it (for the first, from the report's start) to the start of the
+ * file after it (for the last, to `end`). The report gives a file's start and
+ * end as those of its tests, so the fork, the imports, collection and a
+ * beforeAll fall in the gap before it and an afterAll in the gap after it; a
+ * gap cannot be split between the two files beside it, so each is given it
+ * whole. A file none of whose tests ran (each skipped, or none collected) has
+ * no times of its own: it ran inside one of those gaps, so it costs the widest
+ * of them. null when the report has no start, a file with no name or with
+ * times that cannot be read, times that overlap (not one file after another),
+ * no timed file, or `end` is not a time after the last file's end; and null
+ * when the wall-clock time the costs are built from, the report's start to
+ * `end`, is longer than `took`, that run's time by the monotonic clock from
+ * before vitest started, plus a second and a hundredth of it: the wall clock
+ * stepped forward during the run.
+ * @param {string} testDir
+ * @param {TimedReport | null | undefined} report
+ * @param {number} end
+ * @param {number} took
+ * @returns {Record<string, number> | null}
+ */
+export function costsOf(testDir, report, end, took) {
+  const start = report?.startTime;
+  const results = report?.testResults;
+  if (!isTime(start) || !isTime(end) || !isTime(took) || !Array.isArray(results)) return null;
+  if (end - /** @type {number} */ (start) > took + 1000 + took / 100) return null;
+  /** @type {{ name: string, from: number, to: number }[]} */
+  const timed = [];
+  /** @type {string[]} */
+  const untimed = [];
+  for (const file of results) {
+    if (typeof file?.name !== 'string') return null;
+    const name = testName(testDir, file.name);
+    const tests = Array.isArray(file.assertionResults) ? file.assertionResults : [];
+    if (!tests.some(test => isTime(test?.duration))) { untimed.push(name); continue; }
+    if (!isTime(file.startTime) || !isTime(file.endTime)) return null;
+    const [from, to] = [/** @type {number} */ (file.startTime), /** @type {number} */ (file.endTime)];
+    if (to < from || from < /** @type {number} */ (start)) return null;
+    timed.push({ name, from, to });
+  }
+  if (timed.length === 0) return null;
+  timed.sort((x, y) => x.from - y.from);
+  /** @type {Record<string, number>} */
+  const costs = {};
+  let before = /** @type {number} */ (start);
+  let widest = 0;
+  for (const [index, { name, from, to }] of timed.entries()) {
+    const after = index + 1 < timed.length ? timed[index + 1].from : end;
+    if (from < before || after < to) return null;
+    widest = Math.max(widest, from - before, after - to);
+    costs[name] = (Object.hasOwn(costs, name) ? costs[name] : 0) + after - before;
+    before = to;
+  }
+  for (const name of untimed) costs[name] = (Object.hasOwn(costs, name) ? costs[name] : 0) + widest;
+  return costs;
+}
+
+/**
+ * The bound, in ms, on a mutant's run that takes `take`, by `formula` (pass
+ * A: passes.mjs RUN_BOUND; a2: PASSES.a2's timeoutFactor and timeoutMS) on
+ * what those files cost in `costs`: null when it takes none of them or every
+ * one, when a file it takes has no cost, or when the bound is past Node's
+ * timer limit.
+ * @param {Costs | null} costs
+ * @param {string[] | null} take
+ * @param {Formula} [formula]
+ * @returns {number | null}
+ */
+export function boundFor(costs, take, { factor, startMs } = RUN_BOUND) {
+  const each = costs?.costs;
+  if (!costs || !each || !Array.isArray(take) || take.length === 0) return null;
+  if (costs.files.every(name => take.includes(name))) return null;
+  let sum = 0;
+  for (const name of take) {
+    const index = costs.files.indexOf(name);
+    if (index < 0 || !isTime(each[index])) return null;
+    sum += each[index];
+  }
+  const bound = factor * sum + startMs;
+  return Number.isFinite(bound) && bound <= TIMER_LIMIT_MS ? bound : null;
+}
+
+/**
+ * The time a bounded run leaves vitest to start and end: `ms`, or
+ * SMDB_MUTATION_BOUND_START_MS when a test's stand-in replaces vitest
+ * (SMDB_MUTATION_VITEST), so a test can see a bound fire in seconds; the gate
+ * has no result whenever the stand-in is set.
+ * @param {NodeJS.ProcessEnv} env
+ * @param {number} [ms]
+ */
+export function boundStartMs(env, ms = RUN_BOUND.startMs) {
+  const given = Number(env.SMDB_MUTATION_BOUND_START_MS);
+  return env.SMDB_MUTATION_VITEST && env.SMDB_MUTATION_BOUND_START_MS && isTime(given) ? given : ms;
+}
+
+/**
+ * The run with no mutant's fast report in `out`, or null when it cannot be read.
+ * @param {string} out
+ * @returns {TimedReport | null}
+ */
+function dryReport(out) {
+  try { return JSON.parse(fs.readFileSync(path.join(out, 'dry-fast.json'), 'utf8')); } catch { return null; }
+}
+
+/**
+ * Writes what each file cost in a2's run with no mutant (costsOf, from its fast
+ * report in `out`, to `end`, against `took`) to `out`, or removes what is there
+ * when the costs cannot be made.
+ * @param {string} out a2's report dir
+ * @param {string} testDir
+ * @param {number} end the time (Date.now) after that run's vitest exited
+ * @param {number} took that run's time so far, by the monotonic clock
+ */
+export function writeCosts(out, testDir, end, took) {
+  const file = path.join(out, COSTS_FILE);
+  fs.rmSync(file, { force: true });
+  const costs = costsOf(testDir, dryReport(out), end, took);
+  if (costs) fs.writeFileSync(file, JSON.stringify({ files: Object.keys(costs), costs: Object.values(costs) }));
+}
+
+/**
+ * What writeCosts left in `out`, or null when there is none or it cannot be read.
+ * @param {string} out
+ * @returns {Costs | null}
+ */
+export function readCosts(out) {
+  try {
+    const { files, costs } = JSON.parse(fs.readFileSync(path.join(out, COSTS_FILE), 'utf8')) ?? {};
+    const valid = Array.isArray(files) && files.every(name => typeof name === 'string') && Array.isArray(costs) && costs.length === files.length && costs.every(isTime);
+    return valid ? { files, costs } : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -172,31 +326,41 @@ export function readRecords(coverage, testDir, ran) {
 /**
  * Builds the reach from what the run with no mutant left in `out` (the report
  * of each of its `tiers`, in the order they ran, and its coverage records) and
- * writes it there. A tier with no report, or no list of files in it, or
- * reports that list no file in all, leave no reach, so every mutant run takes
- * every related file (in pass B, and the whole child tier).
+ * writes it there, with what each file cost when `end` and `took` are given
+ * and the fast report gives that (costsOf, to `end`, against `took`). A tier
+ * with no report, or no list of files in it, or reports that list no file in
+ * all, leave no reach, so every mutant run takes every related file (in pass
+ * B, and the whole child tier).
  * @param {string} out the pass's report dir
  * @param {string} testDir
  * @param {string[]} [tiers] pass A's fast tier, or pass B's integration and child tiers
+ * @param {number} [end] the time (Date.now) after that run's vitest exited
+ * @param {number} [took] that run's time so far, by the monotonic clock
  */
-export function writeReach(out, testDir, tiers = ['fast']) {
+export function writeReach(out, testDir, tiers = ['fast'], end, took) {
   /** @type {string[]} */
   const ran = [];
+  /** @type {TimedReport | null} */
+  let fast = null;
   for (const tier of tiers) {
-    /** @type {{ testResults?: { name?: unknown }[] }} */
+    /** @type {TimedReport} */
     let report;
     try { report = JSON.parse(fs.readFileSync(path.join(out, `dry-${tier}.json`), 'utf8')); } catch { return; }
     if (!Array.isArray(report?.testResults)) return;
+    if (tier === 'fast') fast = report;
     ran.push(.../** @type {string[]} */ (report.testResults.map(result => result?.name).filter(name => typeof name === 'string')));
   }
   if (ran.length === 0) return;
   const records = readRecords(path.join(out, COVERAGE_DIR), testDir, ran);
-  fs.writeFileSync(path.join(out, REACH_FILE), JSON.stringify(reachOf(testDir, ran, records)));
+  const reach = reachOf(testDir, ran, records);
+  const costs = end === undefined || took === undefined ? null : costsOf(testDir, fast, end, took);
+  if (costs && reach.files.every(name => Object.hasOwn(costs, name))) reach.costs = reach.files.map(name => costs[name]);
+  fs.writeFileSync(path.join(out, REACH_FILE), JSON.stringify(reach));
 }
 
 /**
  * The reach the run with no mutant left in `out`, or null when there is none
- * or it cannot be read.
+ * or it cannot be read; its costs are dropped when they cannot be read.
  * @param {string} out
  * @returns {Reach | null}
  */
@@ -206,7 +370,9 @@ export function readReach(out) {
     const indexes = (/** @type {unknown} */ list) => Array.isArray(list) && list.every(i => Number.isInteger(i) && i >= 0 && i < reach.files.length);
     const valid = Array.isArray(reach?.files) && reach.files.every((/** @type {unknown} */ f) => typeof f === 'string') && indexes(reach.unsure)
       && reach.reached !== null && typeof reach.reached === 'object' && Object.values(reach.reached).every(indexes);
-    return valid ? reach : null;
+    if (!valid) return null;
+    if (!(Array.isArray(reach.costs) && reach.costs.length === reach.files.length && reach.costs.every(isTime))) delete reach.costs;
+    return reach;
   } catch {
     return null;
   }

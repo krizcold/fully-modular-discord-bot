@@ -22,9 +22,10 @@ export const COMMON = {
 const BUILD = { buildCommand: 'node test/helpers/build.cjs', checkers: [] };
 
 export const PASSES = {
-  // Its run with no mutant runs every fast test importing a mutated file: can pass 5 min.
-  a: { checkers: ['typescript'], timeoutMS: 10_000, timeoutFactor: 2, dryRunTimeoutMinutes: 30 },
-  a2: { checkers: [], concurrency: 1, timeoutMS: 60_000, timeoutFactor: 4, dryRunTimeoutMinutes: 30 },
+  // Their run with no mutant runs every fast test importing a mutated file, one worker: one took 27.9 minutes on a
+  // busy machine, and a run past this bound ends the gate NO RESULT before any mutant runs.
+  a: { checkers: ['typescript'], timeoutMS: 10_000, timeoutFactor: 2, dryRunTimeoutMinutes: 60 },
+  a2: { checkers: [], concurrency: 1, timeoutMS: 60_000, timeoutFactor: 4, dryRunTimeoutMinutes: 60 },
   // One at a time, as its run with no mutant is made: Stryker builds each run's
   // budget from that run, and a hang in pass B stands with no rerun to clear it.
   // Its run with no mutant takes every related integration file and the whole
@@ -36,6 +37,27 @@ export const PASSES = {
   // test, then its hooks), so a rerun that fails always leaves its report.
   b2: { ...BUILD, concurrency: 1, timeoutMS: 60 * 60_000, timeoutFactor: 4, dryRunTimeoutMinutes: 15 },
 };
+
+/**
+ * The bound on a mutant's run in pass A (and in pass A with no checker) that
+ * takes named fast test files (runner.mjs): `factor` times the sum of what
+ * those files cost in the pass's run with no mutant (reach.mjs costsOf), plus
+ * `startMs` for vitest to start and end. Stryker's own limit on such a run is
+ * twice that whole run plus ten seconds, however few files it takes, so a
+ * mutant that blocks the event loop (which vitest's own limits cannot end)
+ * would hold its slot for the length of every related file. Three times leaves
+ * room for a busy machine; a run past it counts as a timeout, never a kill,
+ * and a gating one reruns alone in a2.
+ */
+export const RUN_BOUND = { factor: 3, startMs: 120_000 };
+
+/**
+ * The budget of an a2 rerun that takes named fast test files (runner.mjs): the
+ * formula Stryker uses for the whole pass, on what those files cost in a2's own
+ * run with no mutant (reach.mjs writeCosts), and the budget of the set of those
+ * files when it runs with no mutant (touched.mjs setCheck).
+ */
+export const A2_BOUND = { factor: PASSES.a2.timeoutFactor, startMs: PASSES.a2.timeoutMS };
 
 /**
  * The bound, in minutes, on the run with no mutant after a pass's reruns

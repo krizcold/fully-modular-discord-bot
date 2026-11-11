@@ -5,7 +5,11 @@ import os from 'os';
 import path from 'path';
 import { Instrumenter } from '@stryker-mutator/instrumenter';
 import { describe, expect, it, onTestFinished } from 'vitest';
-import { COVERAGE_DIR, fileKey, readRecordDir, readReach, reachOf, REACH_FILE, RUN_KEYS_FILE, selectFor, TAKEN_FILE, writeReach } from '../mutation/reach.mjs';
+import { A2_BOUND, PASSES, RUN_BOUND } from '../mutation/passes.mjs';
+import {
+  boundFor, boundStartMs, COSTS_FILE, costsOf, COVERAGE_DIR, fileKey, readCosts, readRecordDir, readReach, reachOf, REACH_FILE, RUN_KEYS_FILE, selectFor, TAKEN_FILE,
+  TIMER_LIMIT_MS, writeCosts, writeReach,
+} from '../mutation/reach.mjs';
 import { judge, type MutantRecord, type PassResult } from '../mutation/verdict.mjs';
 
 // Which fast test files a pass A mutant run takes (mutation/README.md): the
@@ -145,11 +149,12 @@ describe('the run with no mutant', () => {
     fs.writeFileSync(path.join(dir, 'vitest.config.mjs'), `export default ${JSON.stringify({ test: { globals: true, pool: 'forks', setupFiles: [setup] } })};\n`);
     const out = path.join(dir, 'out');
     fs.mkdirSync(out);
+    const begun = performance.now();
     const result = spawnSync(process.execPath, [vitest, 'run', '--root', dir, '--maxWorkers=2', '--reporter=json', `--outputFile=${path.join(out, 'dry-fast.json')}`], {
       cwd: dir, env: dryEnv({ SMDB_MUTATION_COVERAGE: path.join(out, COVERAGE_DIR) }), encoding: 'utf8', timeout: 200_000,
     });
     expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
-    writeReach(out, dir);
+    writeReach(out, dir, ['fast'], Date.now(), performance.now() - begun);
     const reach = readReach(out);
     expect(reach?.files.slice().sort()).toEqual(Object.keys(tests).sort());
     const unsure = ['shellop.test.ts', 'worker.test.ts'];
@@ -732,15 +737,156 @@ describe('the reach', () => {
     expect(selectFor(reach, 'constructor')).toEqual([]);
   });
 
+  it('gives each file what it cost: its span and the gaps on both sides of it, the last one to the end of the run', () => {
+    const file = (name: string, startTime: number, endTime: number, durations: (number | undefined)[] = [1]) =>
+      ({ name: at(name), startTime, endTime, assertionResults: durations.map(duration => ({ status: duration === undefined ? 'skipped' : 'passed', duration })) });
+    // In the order vitest lists them, not the order they ran in. a: 1000 to 1900; b: 1700 to the run's end at 3000.
+    const report = { startTime: 1000, testResults: [file('unit/b.test.ts', 1900, 2500), file('unit/a.test.ts', 1400, 1700)] };
+    // The run's time by the monotonic clock, from before vitest started.
+    const took = 5000;
+    expect(costsOf(testDir, report, 3000, took)).toEqual({ 'unit/a.test.ts': 900, 'unit/b.test.ts': 1300 });
+    // A file whose tests were all skipped has no times of its own (vitest gives it the report's start): it ran in a gap,
+    // the one after the last file included, so it costs the widest gap.
+    const skipped = { ...report, testResults: [...report.testResults, file('unit/s.test.ts', 1000, 1000, [undefined, undefined]), file('unit/l.test.ts', 1000, 1000, [])] };
+    expect(costsOf(testDir, skipped, 3000, took)).toEqual({ 'unit/a.test.ts': 900, 'unit/b.test.ts': 1300, 'unit/s.test.ts': 500, 'unit/l.test.ts': 500 });
+    expect(costsOf(testDir, skipped, 2600, took)).toEqual({ 'unit/a.test.ts': 900, 'unit/b.test.ts': 900, 'unit/s.test.ts': 400, 'unit/l.test.ts': 400 });
+    // Times that overlap are not one file after another, so no file has a cost.
+    expect(costsOf(testDir, { startTime: 1000, testResults: [file('unit/a.test.ts', 1400, 2000), file('unit/b.test.ts', 1900, 2500)] }, 3000, took)).toBeNull();
+    expect(costsOf(testDir, { startTime: 1500, testResults: [file('unit/a.test.ts', 1400, 2000)] }, 3000, took)).toBeNull();
+    expect(costsOf(testDir, { startTime: 1000, testResults: [file('unit/a.test.ts', 2000, 1900)] }, 3000, took)).toBeNull();
+    // An end of the run before the last file's end, or none.
+    for (const end of [2499, NaN, -1]) expect(costsOf(testDir, report, end, took), String(end)).toBeNull();
+    // The wall clock stepped forward during the run: the 2 s from the report's start to the end are more than the run
+    // took by the monotonic clock plus a second and a hundredth of it (991 ms is the shortest that holds them).
+    expect(costsOf(testDir, report, 3000, 991)).toEqual({ 'unit/a.test.ts': 900, 'unit/b.test.ts': 1300 });
+    for (const short of [990, 0, NaN, -1]) expect(costsOf(testDir, report, 3000, short), String(short)).toBeNull();
+    expect(costsOf(testDir, report, 3000 + 3_600_000, 5000)).toBeNull();
+    // No report, no start, a time or a name that cannot be read, or no timed file.
+    for (const bad of [null, undefined, {}, { testResults: report.testResults }, { startTime: 'soon', testResults: report.testResults }, { startTime: 1000 },
+      { startTime: 1000, testResults: [{ ...file('unit/a.test.ts', 1400, 1700), endTime: null }] }, { startTime: 1000, testResults: [{ startTime: 1400, endTime: 1700 }] },
+      { startTime: 1000, testResults: [file('unit/s.test.ts', 1000, 1000, [undefined])] }, { startTime: 1000, testResults: [] }]) {
+      expect(costsOf(testDir, bad as never, 3000, took), JSON.stringify(bad)).toBeNull();
+    }
+  });
+
+  it("gives each file a cost from vitest's own report of a run on one worker, a skipped file and slow hooks included", { timeout: 180_000 }, () => {
+    const dir = tempDir('smdb-costs-');
+    fs.writeFileSync(path.join(dir, 'quick.test.mjs'), "it('runs', () => {});\n");
+    fs.writeFileSync(path.join(dir, 'skipped.test.mjs'), "it.skip('waits', () => {});\n");
+    fs.writeFileSync(path.join(dir, 'slowHook.test.mjs'), "beforeAll(() => new Promise(resolve => setTimeout(resolve, 600)));\nit('runs', () => {});\n");
+    fs.writeFileSync(path.join(dir, 'slowAfter.test.mjs'), "afterAll(() => new Promise(resolve => setTimeout(resolve, 1500)));\nit('runs', () => {});\n");
+    const out = path.join(dir, 'report.json');
+    const begun = performance.now();
+    const run = spawnSync(process.execPath, [vitest, 'run', '--root', dir, '--globals', '--maxWorkers=1', '--reporter=json', `--outputFile=${out}`], { cwd: dir, encoding: 'utf8', timeout: 120_000 });
+    const end = Date.now();
+    const took = performance.now() - begun;
+    expect(run.status, `${run.stdout}${run.stderr}`).toBe(0);
+    const report = JSON.parse(fs.readFileSync(out, 'utf8'));
+    // The wall-clock span vitest's report gives fits in the monotonic time of the process around it.
+    const costs = costsOf(dir, report, end, took);
+    expect(Object.keys(costs ?? {}).sort()).toEqual(['quick.test.mjs', 'skipped.test.mjs', 'slowAfter.test.mjs', 'slowHook.test.mjs']);
+    // A beforeAll falls in the gap before the file's tests, an afterAll in the gap after them; both are the file's.
+    expect(costs!['slowHook.test.mjs']).toBeGreaterThanOrEqual(600);
+    expect(costs!['slowAfter.test.mjs']).toBeGreaterThanOrEqual(1500);
+    const timed = (report.testResults as { name: string; startTime: number; endTime: number }[]).filter(f => !f.name.endsWith('skipped.test.mjs')).sort((x, y) => x.startTime - y.startTime);
+    const gaps = [timed[0].startTime - report.startTime, ...timed.slice(1).map((f, i) => f.startTime - timed[i].endTime), end - timed[timed.length - 1].endTime];
+    expect(costs!['skipped.test.mjs']).toBe(Math.max(...gaps));
+  });
+
+  it('is left with each file\'s cost, and read back without costs that cannot be read', () => {
+    const out = tempDir('smdb-reachcosts-');
+    fs.writeFileSync(path.join(out, 'dry-fast.json'), JSON.stringify({ startTime: 1000, testResults: [
+      { name: at('unit/a.test.ts'), startTime: 1400, endTime: 1700, assertionResults: [{ duration: 300 }] }, { name: at('unit/b.test.ts'), startTime: 1900, endTime: 2500, assertionResults: [{ duration: 600 }] },
+    ] }));
+    writeReach(out, testDir, ['fast'], 3000, 5000);
+    expect(readReach(out)).toEqual({ files: ['unit/a.test.ts', 'unit/b.test.ts'], unsure: [0, 1], reached: {}, costs: [900, 1300] });
+    // A wall clock that stepped forward during the run leaves the reach with no costs.
+    writeReach(out, testDir, ['fast'], 3000, 500);
+    expect(readReach(out)).toEqual({ files: ['unit/a.test.ts', 'unit/b.test.ts'], unsure: [0, 1], reached: {} });
+    fs.writeFileSync(path.join(out, 'dry-fast.json'), JSON.stringify({ startTime: 1000, testResults: [
+      { name: at('unit/a.test.ts'), startTime: 1400, endTime: 2000, assertionResults: [{ duration: 600 }] }, { name: at('unit/b.test.ts'), startTime: 1900, endTime: 2500, assertionResults: [{ duration: 600 }] },
+    ] }));
+    writeReach(out, testDir, ['fast'], 3000, 5000);
+    expect(readReach(out)).toEqual({ files: ['unit/a.test.ts', 'unit/b.test.ts'], unsure: [0, 1], reached: {} });
+    for (const costs of [[700], [700, -1], [700, 'soon'], 'soon', [700, null]]) {
+      fs.writeFileSync(path.join(out, REACH_FILE), JSON.stringify({ files: ['unit/a.test.ts', 'unit/b.test.ts'], unsure: [], reached: {}, costs }));
+      expect(readReach(out), JSON.stringify(costs)).toEqual({ files: ['unit/a.test.ts', 'unit/b.test.ts'], unsure: [], reached: {} });
+    }
+  });
+
+  it('bounds a run of named files in pass A by three times what they cost plus two minutes, and no other run', () => {
+    const reach = { files: ['unit/a.test.ts', 'unit/b.test.ts', 'unit/c.test.ts'], unsure: [], reached: {}, costs: [700, 800, 1500] };
+    expect(RUN_BOUND).toEqual({ factor: 3, startMs: 120_000 });
+    expect(boundFor(reach, ['unit/a.test.ts', 'unit/c.test.ts'])).toBe(3 * 2200 + 120_000);
+    expect(boundFor(reach, ['unit/b.test.ts'], { ...RUN_BOUND, startMs: 1000 })).toBe(3 * 800 + 1000);
+    // Every related file, no file, a file with no cost, or no costs at all: Stryker's own limit applies.
+    expect(boundFor(reach, null)).toBeNull();
+    expect(boundFor(reach, [])).toBeNull();
+    expect(boundFor(reach, ['unit/a.test.ts', 'unit/d.test.ts'])).toBeNull();
+    expect(boundFor({ ...reach, costs: undefined }, ['unit/a.test.ts'])).toBeNull();
+    expect(boundFor(null, ['unit/a.test.ts'])).toBeNull();
+    // A shorter start only for a test's stand-in for vitest, whose gate has no result.
+    expect(boundStartMs({ SMDB_MUTATION_BOUND_START_MS: '1000' })).toBe(120_000);
+    expect(boundStartMs({ SMDB_MUTATION_VITEST: 'x.cjs', SMDB_MUTATION_BOUND_START_MS: '1000' })).toBe(1000);
+    for (const ms of ['', 'soon', '-5']) expect(boundStartMs({ SMDB_MUTATION_VITEST: 'x.cjs', SMDB_MUTATION_BOUND_START_MS: ms }), ms).toBe(120_000);
+    expect(boundStartMs({ SMDB_MUTATION_BOUND_START_MS: '1000' }, 60_000)).toBe(60_000);
+  });
+
+  it("bounds an a2 rerun of named files by Stryker's formula on what they cost in a2's run with no mutant, and no other", () => {
+    const costs = { files: ['unit/a.test.ts', 'unit/b.test.ts', 'unit/c.test.ts'], costs: [700, 800, 1500] };
+    expect(A2_BOUND).toEqual({ factor: PASSES.a2.timeoutFactor, startMs: PASSES.a2.timeoutMS });
+    expect(A2_BOUND).toEqual({ factor: 4, startMs: 60_000 });
+    expect(boundFor(costs, ['unit/a.test.ts', 'unit/c.test.ts'], A2_BOUND)).toBe(4 * 2200 + 60_000);
+    expect(boundFor(costs, ['unit/b.test.ts'], A2_BOUND)).toBe(4 * 800 + 60_000);
+    // Every file of that run (in any order), none, a file with no cost, or no costs: Stryker's own budget applies.
+    expect(boundFor(costs, ['unit/c.test.ts', 'unit/a.test.ts', 'unit/b.test.ts'], A2_BOUND)).toBeNull();
+    expect(boundFor(costs, null, A2_BOUND)).toBeNull();
+    expect(boundFor(costs, [], A2_BOUND)).toBeNull();
+    expect(boundFor(costs, ['unit/a.test.ts', 'unit/d.test.ts'], A2_BOUND)).toBeNull();
+    expect(boundFor({ files: costs.files }, ['unit/a.test.ts'], A2_BOUND)).toBeNull();
+    expect(boundFor(null, ['unit/a.test.ts'], A2_BOUND)).toBeNull();
+  });
+
+  it("arms no bound past Node's timer limit, which would fire at once", () => {
+    expect(TIMER_LIMIT_MS).toBe(2 ** 31 - 1);
+    const at = (cost: number) => ({ files: ['unit/a.test.ts', 'unit/b.test.ts'], costs: [cost, 1] });
+    // 4 x cost + 60 s: the largest cost that keeps the bound within the limit, and the smallest past it.
+    const largest = Math.floor((TIMER_LIMIT_MS - 60_000) / 4);
+    expect(boundFor(at(largest), ['unit/a.test.ts'], A2_BOUND)).toBe(4 * largest + 60_000);
+    expect(boundFor(at(largest + 1), ['unit/a.test.ts'], A2_BOUND)).toBeNull();
+    expect(boundFor(at(Number.MAX_VALUE), ['unit/a.test.ts'], A2_BOUND)).toBeNull();
+    expect(boundFor(at(TIMER_LIMIT_MS), ['unit/a.test.ts'])).toBeNull();
+  });
+
+  it("is left by a2's run with no mutant, in a2's dir, and read back only when whole", () => {
+    const out = tempDir('smdb-a2costs-');
+    fs.writeFileSync(path.join(out, 'dry-fast.json'), JSON.stringify({ startTime: 1000, testResults: [
+      { name: at('unit/a.test.ts'), startTime: 1400, endTime: 1700, assertionResults: [{ duration: 300 }] }, { name: at('unit/b.test.ts'), startTime: 1900, endTime: 2500, assertionResults: [{ duration: 600 }] },
+    ] }));
+    writeCosts(out, testDir, 3000, 5000);
+    expect(readCosts(out)).toEqual({ files: ['unit/a.test.ts', 'unit/b.test.ts'], costs: [900, 1300] });
+    // A clock that stepped, or a report that cannot be read, leaves none, and takes away what was there.
+    writeCosts(out, testDir, 3000, 500);
+    expect(fs.existsSync(path.join(out, COSTS_FILE))).toBe(false);
+    writeCosts(out, testDir, 3000, 5000);
+    fs.writeFileSync(path.join(out, 'dry-fast.json'), '{');
+    writeCosts(out, testDir, 3000, 5000);
+    expect(readCosts(out)).toBeNull();
+    for (const bad of ['{', 'null', '{"files":["a"],"costs":[]}', '{"files":["a"],"costs":[-1]}', '{"files":[1],"costs":[1]}', '{"files":["a"],"costs":["1"]}']) {
+      fs.writeFileSync(path.join(out, COSTS_FILE), bad);
+      expect(readCosts(out), bad).toBeNull();
+    }
+  });
+
   it('is left only from a fast report that lists a file, and read back only when whole', () => {
     const out = tempDir('smdb-reach-');
-    writeReach(out, testDir);
+    writeReach(out, testDir, ['fast'], 3000, 5000);
     expect(fs.existsSync(path.join(out, REACH_FILE))).toBe(false);
     fs.writeFileSync(path.join(out, 'dry-fast.json'), JSON.stringify({ testResults: [] }));
-    writeReach(out, testDir);
+    writeReach(out, testDir, ['fast'], 3000, 5000);
     expect(readReach(out)).toBeNull();
     fs.writeFileSync(path.join(out, 'dry-fast.json'), JSON.stringify({ testResults: [{ name: at('unit/a.test.ts') }] }));
-    writeReach(out, testDir);
+    writeReach(out, testDir, ['fast'], 3000, 5000);
     expect(readReach(out)).toEqual({ files: ['unit/a.test.ts'], unsure: [0], reached: {} });
     for (const bad of ['{', '{"files":["a"],"unsure":[1],"reached":{}}', '{"files":["a"],"unsure":[],"reached":{"1":[0.5]}}', '{"files":[1],"unsure":[],"reached":{}}']) {
       fs.writeFileSync(path.join(out, REACH_FILE), bad);

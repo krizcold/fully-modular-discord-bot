@@ -3,7 +3,9 @@
 // this tree's own tests: pass a, the fast tier's tests that import the mutated
 // files (every file the gate mutates, in every run), of which a mutant's run
 // takes those that reached it in the run with no mutant (a rerun alone, those
-// its run in pass A took); pass b, the integration
+// its run in pass A took), and one that takes some of them is ended past a
+// bound built from what they cost in its pass's run with no mutant, leaving
+// <id>-bound.json (reach.mjs boundFor); pass b, the integration
 // tests that import them, then the whole child tier, of which a mutant's run
 // takes those that reached it in the run with no mutant; or only the test files
 // SMDB_MUTATION_ONLY names (the rerun of a pass B failure with the file that
@@ -86,14 +88,19 @@ function tier(project, take, run = {}) {
   }
 }
 
+/** @param {number} pid */
+const running = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
+
 /**
  * Runs `files` as tier() does, and ends it with every process it started
- * once it passes `ms`; resolves to its exit (1 when it was ended or could not
- * start) and the time it took.
+ * once it passes `ms`; resolves to its exit (1 when the bound fired or it
+ * could not start), the time it took, whether the runner ended it (it was
+ * still running when the bound fired, and did not exit on its own) and
+ * vitest's own exit status.
  * @param {string[]} files
  * @param {string} name
  * @param {number} ms
- * @returns {Promise<{ code: number, ms: number }>}
+ * @returns {Promise<{ code: number, ms: number, ended: boolean, status: number | null }>}
  */
 async function bounded(files, name, ms) {
   const { endTree } = await import('../helpers/endTree.mjs');
@@ -101,20 +108,27 @@ async function bounded(files, name, ms) {
   const begun = performance.now();
   try {
     const child = spawn(process.execPath, args, { cwd: testDir, stdio: ['ignore', log, log], env });
-    let ended = false;
+    let fired = false;
+    let killed = false;
     const timer = setTimeout(() => {
-      ended = true;
+      fired = true;
+      killed = child.pid !== undefined && child.exitCode === null && child.signalCode === null && running(child.pid);
       if (child.pid !== undefined) endTree(child.pid);
       child.kill('SIGKILL');
     }, ms);
-    /** @type {number | null} */
-    const code = await new Promise(resolve => {
-      child.once('error', error => { fs.writeSync(log, `runner.mjs could not start vitest: ${error.message}\n`); resolve(null); });
-      child.once('exit', status => resolve(status));
+    // A test's stand-in only (unit/mutationRunner.test.ts): the stand-in exits while the runner is held, so the bound's timer runs before the exit is seen.
+    const hold = process.env.SMDB_MUTATION_VITEST ? Number(process.env.SMDB_MUTATION_HOLD_MS) : NaN;
+    if (hold > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, hold);
+    /** @type {{ status: number | null, signal: NodeJS.Signals | null }} */
+    const exit = await new Promise(resolve => {
+      child.once('error', error => { fs.writeSync(log, `runner.mjs could not start vitest: ${error.message}\n`); resolve({ status: null, signal: null }); });
+      child.once('exit', (status, signal) => resolve({ status, signal }));
     });
     clearTimeout(timer);
-    if (ended) fs.writeSync(log, `runner.mjs ended vitest after ${ms} ms, the bound on this run with no mutant\n`);
-    return { code: !ended && code === 0 ? 0 : 1, ms: Math.round(performance.now() - begun) };
+    // A vitest that exited on its own between the check and the kill keeps its own exit: 0, or no signal on POSIX.
+    const ended = killed && exit.status !== 0 && (process.platform === 'win32' || exit.signal !== null);
+    if (ended) fs.writeSync(log, `runner.mjs ended vitest after ${ms} ms, the bound on this run${mutant === 'dry' ? ' with no mutant' : ''}\n`);
+    return { code: !fired && exit.status === 0 ? 0 : 1, ms: Math.round(performance.now() - begun), ended, status: exit.status };
   } finally {
     fs.closeSync(log);
   }
@@ -224,28 +238,52 @@ if (pass === 'b') {
     }
   }
 }
+const { boundFor, boundStartMs, COSTS_FILE, COVERAGE_DIR, REACH_FILE, readCosts, readReach, selectFor, takenBefore, writeCosts, writeReach } = await import('./reach.mjs');
+const { A2_BOUND, RUN_BOUND } = await import('./passes.mjs');
+/**
+ * Runs a mutant's fast tests on `take` within `bound` (ms; null for Stryker's
+ * limit alone) and ends.
+ * @param {string[] | null} take
+ * @param {number | null} bound
+ */
+async function runTake(take, bound) {
+  // One that cannot be written only leaves the report without "no fast test reached it".
+  try { fs.writeFileSync(path.join(out, `${mutant}-reach.json`), JSON.stringify({ files: take ?? 'related' })); } catch {}
+  if (take === null) end(tier('fast', 'related'));
+  else if (take.length === 0) end(0);
+  else if (bound === null) end(tier('fast', take));
+  else {
+    const run = await bounded(take, `${mutant}-fast`, bound);
+    // The mark tells the gate the runner, not the mutant, ended the run (touched.mjs resultOf, verdict.mjs endedByBound).
+    if (run.ended) try { fs.writeFileSync(path.join(out, `${mutant}-bound.json`), JSON.stringify({ ms: bound, files: take.length })); } catch {}
+    end(run.ended || run.status !== 0 ? 1 : 0);
+  }
+}
 // A rerun alone (a2) is of mutants a file already failed or timed out on in
 // pass A, so it takes the files that run took: a fresh run with no mutant that
 // missed the mutant would drop the file that showed it. Its run with no mutant
-// takes every related file, which its budget is built from.
+// takes every related file and leaves what each cost, and a rerun of some of
+// them is bounded by what they cost there, as Stryker bounds the whole pass.
 if (confirm) {
-  const { takenBefore } = await import('./reach.mjs');
-  const take = mutant === 'dry' ? null : takenBefore(out, mutant);
-  if (mutant !== 'dry') try { fs.writeFileSync(path.join(out, `${mutant}-reach.json`), JSON.stringify({ files: take ?? 'related' })); } catch {}
-  end(tier('fast', take ?? 'related'));
+  if (mutant === 'dry') {
+    const code = tier('fast', 'related');
+    try { writeCosts(out, testDir, Date.now(), performance.now() - started); } catch { try { fs.rmSync(path.join(out, COSTS_FILE), { force: true }); } catch {} }
+    end(code);
+  }
+  const take = takenBefore(out, mutant);
+  await runTake(take, boundFor(readCosts(out), take, { ...A2_BOUND, startMs: boundStartMs(process.env, A2_BOUND.startMs) }));
 }
-// Pass A: the run with no mutant records what each test file reached, and each
-// mutant run takes only the files that reached its mutant (reach.mjs).
-const { COVERAGE_DIR, REACH_FILE, readReach, selectFor, writeReach } = await import('./reach.mjs');
+// Pass A: the run with no mutant records what each test file reached and cost,
+// and each mutant run takes only the files that reached its mutant, within a
+// bound built from what they cost (reach.mjs).
 if (mutant === 'dry') {
   const coverage = path.join(out, COVERAGE_DIR);
   fs.rmSync(coverage, { recursive: true, force: true });
   const code = tier('fast', 'related', { coverage });
   // With no reach left, every mutant run takes every related file.
-  try { writeReach(out, testDir); } catch { try { fs.rmSync(path.join(out, REACH_FILE), { force: true }); } catch {} }
+  try { writeReach(out, testDir, ['fast'], Date.now(), performance.now() - started); } catch { try { fs.rmSync(path.join(out, REACH_FILE), { force: true }); } catch {} }
   end(code);
 }
-const take = selectFor(readReach(out), mutant);
-// One that cannot be written only leaves the report without "no fast test reached it".
-try { fs.writeFileSync(path.join(out, `${mutant}-reach.json`), JSON.stringify({ files: take ?? 'related' })); } catch {}
-end(take === null ? tier('fast', 'related') : take.length === 0 ? 0 : tier('fast', take));
+const reach = readReach(out);
+const take = selectFor(reach, mutant);
+await runTake(take, boundFor(reach, take, { ...RUN_BOUND, startMs: boundStartMs(process.env, RUN_BOUND.startMs) }));

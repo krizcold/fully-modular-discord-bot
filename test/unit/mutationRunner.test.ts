@@ -4,6 +4,8 @@ import os from 'os';
 import path from 'path';
 import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { pastBudget, strykerClock } from '../mutation/control.mjs';
+import { readCosts } from '../mutation/reach.mjs';
+import { confirmed, endedByBound, type MutantRecord } from '../mutation/verdict.mjs';
 
 // The command every mutant run executes (mutation/runner.mjs), against a
 // stand-in for vitest that records how it was called and fails the tiers it is
@@ -13,8 +15,10 @@ const root = path.resolve(__dirname, '..', '..');
 
 interface Call { project: string; args: string[]; scale: string | null; mutant: string | null; include: string[] | null; coverage: string | null }
 
-// fail: the tiers, or the test files, whose runs fail; hang: the test files whose runs never end.
-function fakeVitest(fail: string[], hang: string[] = []) {
+// fail: the tiers, or the test files, whose runs fail; hang: the test files whose runs never end; slow: the test files
+// (or 'related', a run of every related file) whose runs take 3 s before they end as they would; report: the test files
+// a run with no mutant lists in its JSON report, one after another, each 10 ms with 10 ms between them.
+function fakeVitest(fail: string[], hang: string[] = [], slow: string[] = [], report: string[] = []) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-runner-'));
   onTestFinished(() => fs.rmSync(dir, { recursive: true, force: true }));
   const calls = path.join(dir, 'calls.jsonl');
@@ -27,9 +31,19 @@ function fakeVitest(fail: string[], hang: string[] = []) {
     "const include = listed ? JSON.parse(fs.readFileSync(listed, 'utf8')) : null;",
     'const coverage = process.env.SMDB_MUTATION_COVERAGE ?? null;',
     `fs.appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ project, args, scale: process.env.SMDB_TEST_TIME_SCALE ?? null, mutant: process.env.__STRYKER_ACTIVE_MUTANT__ ?? null, include, coverage }) + '\\n');`,
+    `const report = ${JSON.stringify(report)};`,
+    "const outputFile = (args.find(arg => arg.startsWith('--outputFile=')) ?? '').slice('--outputFile='.length);",
+    "if (report.length > 0 && outputFile && process.env.__STRYKER_ACTIVE_MUTANT__ === 'none') {",
+    '  const start = Date.now();',
+    "  const testResults = report.map((name, i) => ({ name: require('path').join(process.cwd(), name), startTime: start + 20 * i + 10, endTime: start + 20 * i + 20, assertionResults: [{ status: 'passed', duration: 10 }] }));",
+    '  fs.writeFileSync(outputFile, JSON.stringify({ startTime: start, testResults }));',
+    '  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20 * report.length + 20);',
+    '}',
     `const fail = ${JSON.stringify(fail)};`,
+    'const code = fail.includes(project) || (include ?? []).some(file => fail.includes(file)) ? 1 : 0;',
     `if ((include ?? []).some(file => ${JSON.stringify(hang)}.includes(file))) setInterval(() => {}, 1000);`,
-    'else process.exit(fail.includes(project) || (include ?? []).some(file => fail.includes(file)) ? 1 : 0);',
+    `else if ((include ?? ['related']).some(file => ${JSON.stringify(slow)}.includes(file))) setTimeout(() => process.exit(code), 3000);`,
+    'else process.exit(code);',
     '',
   ].join('\n'));
   const out = path.join(dir, 'out');
@@ -156,6 +170,128 @@ describe('a mutant run', () => {
     expect(runs.map(({ files, code }) => [files, code])).toEqual([[['unit/hang.test.ts'], 1], [['unit/a.test.ts'], 0]]);
     expect(runs[0].ms).toBeGreaterThanOrEqual(1400);
     expect(fs.readFileSync(path.join(fake.out, 'dry-alone-0.log'), 'utf8')).toMatch(/runner\.mjs ended vitest after 1500 ms, the bound on this run with no mutant/);
+  });
+
+  // Pass A's reach with what each file cost: mutant 7 reached the hung file, 8 the quick one, 9 the failing one, 6 the
+  // slow one, and 5 every file. A 2 s start for the stand-in makes each bound 3 x 100 ms + 2000 ms.
+  const costed = (out: string, costs: number[] | null = [100, 100, 100, 100]) => fs.writeFileSync(path.join(out, 'dry-reach.json'), JSON.stringify({
+    files: ['unit/hang.test.ts', 'unit/a.test.ts', 'unit/fail.test.ts', 'unit/slow.test.ts'], unsure: [], reached: { 7: [0], 8: [1], 9: [2], 6: [3], 5: [0, 1, 2, 3] }, ...(costs ? { costs } : {}),
+  }));
+  const start = { SMDB_MUTATION_BOUND_START_MS: '2000' };
+  const bound = (out: string, id: string) => path.join(out, `${id}-bound.json`);
+
+  it('ends a pass A mutant run of named files at the bound their costs give, exits non-zero and marks it', { timeout: 120_000 }, () => {
+    const fake = fakeVitest([], ['unit/hang.test.ts']);
+    costed(fake.out);
+    const begun = Date.now();
+    expect(runner(fake, 'a', '', [], start).status).toBe(1);
+    expect(Date.now() - begun).toBeLessThan(30_000);
+    expect(fake.read().map(call => call.include)).toEqual([['unit/hang.test.ts']]);
+    expect(JSON.parse(fs.readFileSync(bound(fake.out, '7'), 'utf8'))).toEqual({ ms: 2300, files: 1 });
+    expect(fs.readFileSync(path.join(fake.out, '7-fast.log'), 'utf8')).toMatch(/runner\.mjs ended vitest after 2300 ms, the bound on this run\n/);
+    // A slow run is ended the same way, though it would pass.
+    const slow = fakeVitest([], [], ['unit/slow.test.ts']);
+    costed(slow.out);
+    expect(runner(slow, 'a', '', [], { ...start, __STRYKER_ACTIVE_MUTANT__: '6' }).status).toBe(1);
+    expect(fs.existsSync(bound(slow.out, '6'))).toBe(true);
+  });
+
+  it('leaves a pass A mutant run that passes or fails within its bound its own exit, and no mark', () => {
+    const fake = fakeVitest(['unit/fail.test.ts']);
+    costed(fake.out);
+    expect(runner(fake, 'a', '', [], { ...start, __STRYKER_ACTIVE_MUTANT__: '8' }).status).toBe(0);
+    expect(runner(fake, 'a', '', [], { ...start, __STRYKER_ACTIVE_MUTANT__: '9' }).status).toBe(1);
+    expect(fake.read().map(call => call.include)).toEqual([['unit/a.test.ts'], ['unit/fail.test.ts']]);
+    expect(fs.readdirSync(fake.out).filter(name => name.endsWith('-bound.json'))).toEqual([]);
+  });
+
+  it('leaves a vitest that exited on its own as the bound fired its own exit, and no mark', { timeout: 120_000 }, () => {
+    // A 300 ms bound, and the runner held 6 s after the start: the stand-in has exited when the bound's timer runs,
+    // before the runner has seen the exit.
+    const fake = fakeVitest(['unit/fail.test.ts']);
+    costed(fake.out);
+    const held = { SMDB_MUTATION_BOUND_START_MS: '0', SMDB_MUTATION_HOLD_MS: '6000' };
+    expect(runner(fake, 'a', '', [], { ...held, __STRYKER_ACTIVE_MUTANT__: '9' }).status).toBe(1);
+    expect(runner(fake, 'a', '', [], { ...held, __STRYKER_ACTIVE_MUTANT__: '8' }).status).toBe(0);
+    expect(fake.read().map(call => call.include)).toEqual([['unit/fail.test.ts'], ['unit/a.test.ts']]);
+    expect(fs.readdirSync(fake.out).filter(name => name.endsWith('-bound.json'))).toEqual([]);
+    for (const id of ['9', '8']) expect(fs.readFileSync(path.join(fake.out, `${id}-fast.log`), 'utf8'), id).not.toMatch(/runner\.mjs ended vitest/);
+  });
+
+  // a2's dir: the links to the files each mutant's run in pass A took (7: the hung file, 6: the slow one, 9: the failing
+  // one, 8: the quick one, 5: every file), and its own run with no mutant, which lists the four files.
+  const FOUR = ['unit/hang.test.ts', 'unit/a.test.ts', 'unit/fail.test.ts', 'unit/slow.test.ts'];
+  const a2Dir = (out: string) => {
+    fs.writeFileSync(path.join(out, 'run-keys.json'), JSON.stringify({ 5: 'k5', 6: 'k6', 7: 'k7', 8: 'k8', 9: 'k9' }));
+    fs.writeFileSync(path.join(out, 'taken.json'), JSON.stringify({ k5: FOUR, k6: [FOUR[3]], k7: [FOUR[0]], k8: [FOUR[1]], k9: [FOUR[2]] }));
+  };
+  const dryA2 = { __STRYKER_ACTIVE_MUTANT__: 'none', SMDB_MUTATION_FILES: '["test/mutation/control.mjs"]' };
+
+  it("leaves, from a2's run with no mutant, what each of its files cost there", () => {
+    const fake = fakeVitest([], [], [], FOUR);
+    expect(runner(fake, 'a', '1', [], dryA2).status).toBe(0);
+    const costs = readCosts(fake.out);
+    expect(costs?.files).toEqual(FOUR);
+    // Each file 10 ms with 10 ms gaps on both sides, the last to after the run: none less than 20 ms.
+    for (const cost of costs?.costs ?? []) expect(cost).toBeGreaterThanOrEqual(20);
+    expect(fake.read().map(call => [call.scale, call.include, call.coverage, call.args[0]])).toEqual([['4', null, null, 'related']]);
+    // Only a run with no mutant leaves them; a run whose report gives no times leaves none.
+    const quiet = fakeVitest([]);
+    expect(runner(quiet, 'a', '1', [], dryA2).status).toBe(0);
+    expect(readCosts(quiet.out)).toBeNull();
+  });
+
+  it('ends an a2 rerun of named files at four times what they cost there plus a minute, marks it, and counts it a confirmed timeout', { timeout: 120_000 }, () => {
+    const fake = fakeVitest([], ['unit/hang.test.ts'], [], FOUR);
+    a2Dir(fake.out);
+    expect(runner(fake, 'a', '1', [], dryA2).status).toBe(0);
+    const cost = readCosts(fake.out)?.costs?.[0] ?? NaN;
+    expect(cost).toBeGreaterThanOrEqual(20);
+    // A 2 s start for the stand-in, in place of the minute.
+    const budget = 4 * cost + 2000;
+    const begun = Date.now();
+    expect(runner(fake, 'a', '1', [], start).status).toBe(1);
+    expect(Date.now() - begun).toBeLessThan(30_000);
+    expect(fake.read().map(call => [call.scale, call.include])).toEqual([['4', null], ['4', ['unit/hang.test.ts']]]);
+    const mark = JSON.parse(fs.readFileSync(bound(fake.out, '7'), 'utf8'));
+    expect(mark).toEqual({ ms: budget, files: 1 });
+    expect(fs.readFileSync(path.join(fake.out, '7-fast.log'), 'utf8')).toMatch(new RegExp(`runner\\.mjs ended vitest after ${budget} ms, the bound on this run\\n`));
+    // Stryker counts the exit as a kill; the gate reads the mark beside the a2 result as a timeout, which confirms it.
+    const a2 = { id: '7', dir: 'a2', status: 'Killed', ...endedByBound('Killed', mark, true) };
+    expect(a2.status).toBe('Timeout');
+    const m: MutantRecord = { file: 'src/a.ts', location: { start: { line: 1, column: 1 }, end: { line: 1, column: 2 } }, mutator: 'x', original: 'a', replacement: 'b', gating: true,
+      passes: { a: { id: '3', dir: 'a', status: 'Timeout' }, a2 } };
+    expect(confirmed(m)).toEqual({ outcome: 'Timeout' });
+    // One that passes or fails within its budget keeps its own exit and leaves no mark.
+    expect(runner(fake, 'a', '1', [], { ...start, __STRYKER_ACTIVE_MUTANT__: '8' }).status).toBe(0);
+    expect(fs.existsSync(bound(fake.out, '8'))).toBe(false);
+  });
+
+  it('bounds no run whose files have no cost, that takes every related file, or of pass B or b2', { timeout: 120_000 }, () => {
+    const fake = fakeVitest([], [], ['unit/slow.test.ts', 'related']);
+    const slow = { ...start, __STRYKER_ACTIVE_MUTANT__: '6' };
+    costed(fake.out, null);
+    expect(runner(fake, 'a', '', [], slow).status).toBe(0);
+    costed(fake.out);
+    expect(runner(fake, 'a', '', [], { ...start, __STRYKER_ACTIVE_MUTANT__: '5' }).status).toBe(0);
+    // a2 takes the slow file its run in pass A took: with no costs of a2's own, Stryker's budget alone bounds it.
+    a2Dir(fake.out);
+    expect(runner(fake, 'a', '1', [], slow).status).toBe(0);
+    // With a2's costs (a budget of 2 s and a few ms, under the slow file's 3 s), a rerun of every file of a2's run with no
+    // mutant, or with no link to pass A's files, is not bounded.
+    fs.writeFileSync(path.join(fake.out, 'dry-costs.json'), JSON.stringify({ files: FOUR, costs: [1, 1, 1, 1] }));
+    fs.writeFileSync(path.join(fake.out, 'taken.json'), JSON.stringify({ k6: FOUR }));
+    expect(runner(fake, 'a', '1', [], slow).status).toBe(0);
+    fs.writeFileSync(path.join(fake.out, 'taken.json'), JSON.stringify({}));
+    expect(runner(fake, 'a', '1', [], slow).status).toBe(0);
+    // Pass B, and b2, which reruns the one file that failed in pass B, whatever costs their dir holds.
+    expect(runner(fake, 'b', '', [], slow).status).toBe(0);
+    expect(runner(fake, 'b', '1', ['unit/slow.test.ts'], slow).status).toBe(0);
+    expect(fake.read().map(call => [call.project, call.scale, call.include])).toEqual([
+      ['fast', '1', ['unit/slow.test.ts']], ['fast', '1', null], ['fast', '4', ['unit/slow.test.ts']], ['fast', '4', FOUR], ['fast', '4', null],
+      ['integration', '1', null], ['child', '1', null], ['fast', '4', ['unit/slow.test.ts']],
+    ]);
+    expect(fs.readdirSync(fake.out).filter(name => name.endsWith('-bound.json'))).toEqual([]);
   });
 
   it('gives no run the coverage dir the caller\'s shell set', () => {
@@ -620,19 +756,21 @@ describe('the Stryker options', () => {
       const largest = rerun.timeoutFactor * rerun.dryRunTimeoutMinutes * 60_000 + rerun.timeoutMS;
       expect(controlBoundMinutes(rerun) * 60_000 - largest, name).toBeGreaterThanOrEqual(5 * 60_000);
     }
-    expect(controlBoundMinutes(PASSES.a2)).toBe(126);
+    expect(controlBoundMinutes(PASSES.a2)).toBe(246);
     expect(controlBoundMinutes(PASSES.b2)).toBe(125);
     // control-b2 runs every file that failed in pass B, each of which could take a whole b2 budget.
     expect(controlBoundMinutes(PASSES.b2, 3)).toBe(365);
-    expect(controlBoundMinutes(PASSES.a2, 0)).toBe(126);
+    expect(controlBoundMinutes(PASSES.a2, 0)).toBe(246);
+    // A run with no mutant of every related fast file took 27.9 minutes on a busy machine.
+    for (const name of ['a', 'a2'] as const) expect(PASSES[name].dryRunTimeoutMinutes, name).toBe(60);
   });
 
   it("bound pass B's own run with no mutant at two hours, and b2's, which the bound after the reruns is built from, at fifteen minutes", async () => {
     const { controlBoundMinutes, PASSES } = await import('../mutation/passes.mjs');
     expect(PASSES.b.dryRunTimeoutMinutes).toBe(120);
     expect(PASSES.b2.dryRunTimeoutMinutes).toBe(15);
-    expect(PASSES.a.dryRunTimeoutMinutes).toBe(30);
-    expect(PASSES.a2.dryRunTimeoutMinutes).toBe(30);
+    expect(PASSES.a.dryRunTimeoutMinutes).toBe(60);
+    expect(PASSES.a2.dryRunTimeoutMinutes).toBe(60);
     // The run with no mutant after b2 runs every file that failed in pass B, bound per file as a b2 rerun is.
     expect(controlBoundMinutes(PASSES.b2, 2)).toBe(245);
     const gate = fs.readFileSync(path.join(root, 'test', 'mutation', 'touched.mjs'), 'utf8');

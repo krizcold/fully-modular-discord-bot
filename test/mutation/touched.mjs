@@ -13,8 +13,8 @@ import { fileURLToPath } from 'url';
 import { pastBudget, strykerClock } from './control.mjs';
 import { PACKAGE_LOCKS, treeChanges, treePrint } from './tree.mjs';
 import { canonicalName, fileOf as nameOf, keyOf } from './keys.mjs';
-import { COMMON, controlBoundMinutes, PASSES, setBoundMs, setsBoundMinutes } from './passes.mjs';
-import { TAKEN_FILE } from './reach.mjs';
+import { A2_BOUND, COMMON, controlBoundMinutes, PASSES, setBoundMs, setsBoundMinutes } from './passes.mjs';
+import { boundFor, readCosts, TAKEN_FILE } from './reach.mjs';
 
 /**
  * @typedef {import('./ranges.mjs').Location} Location
@@ -68,7 +68,7 @@ const {
   structureLines, DATA_ROUTE_WHY, EXTRA_BREAK_WHY, GLOB_NAME_WHY, beyondTree, checkerDiffers, gatesIn, holdsDataRoute, holdsExtraBreak, linesOfTarget, mutatePatterns,
   notMutated, ownNames, planFromGit, rootGlobFree, rootRelatable, sandboxPatterns, strykerTakes, treeTsconfig, unmatchedPatterns, untouched,
 } = ranges;
-const { byKiller, bySet, classifyKill, judge, killedInA, onlyUnusedDirective, outcome, toConfirm, toPassB, toUncheck, uncreditFailedAlone, voidFailedSets } = verdicts;
+const { byKiller, bySet, classifyKill, endedByBound, judge, killedInA, onlyUnusedDirective, outcome, toConfirm, toPassB, toUncheck, uncreditFailedAlone, voidFailedSets } = verdicts;
 
 const USAGE = 'usage: node test/mutation/touched.mjs [--base REF] [--mutate PATTERN]... [--concurrency N] [--keep]';
 /** @type {{ base: string, mutate: string[], concurrency: number, keep: boolean }} */
@@ -277,7 +277,22 @@ function resultOf(dir, r, alone = false) {
     return { ...result, inconclusive: 'a type error only because a @ts-expect-error went unused (TS2578), so no test ran on it' };
   }
   if (r.status === 'Survived' && ranNone(dir, r.id)) return { ...result, unreached: true };
+  const bound = dir === 'a' || dir === 'a-unchecked' || dir === 'a2' ? endedByBound(r.status, boundMarkOf(dir, r.id), dir === 'a2') : null;
+  if (bound) return { ...result, ...bound };
   return r.status === 'Killed' ? { ...result, ...classifyKill(reportsOf(dir, r.id), alone) } : result;
+}
+
+/**
+ * What runner.mjs left in `<id>-bound.json` when it ended a run of pass A or
+ * a2 at its bound: null when there is no such file, `{}` when it cannot be read.
+ * @param {string} dir
+ * @param {string} id
+ * @returns {unknown}
+ */
+function boundMarkOf(dir, id) {
+  const file = path.join(reportDir, dir, `${id}-bound.json`);
+  if (!fs.existsSync(file)) return null;
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')) ?? {}; } catch { return {}; }
 }
 
 /**
@@ -508,8 +523,9 @@ function takenInA2(m) {
  * state a dropped file leaves behind, and a2 would count it. Each set runs once
  * in a vitest run of its own, as a2 ran it (runSets, a2's time limits). A
  * result whose set failed there, left no result, ran past its bound, or (for a
- * timeout) took longer than the budget Stryker gave each a2 run, is voided
- * (verdict.mjs voidFailedSets), and its mutant is inconclusive.
+ * timeout) took longer than the budget that rerun had (the set's own, from
+ * a2's costs, for one the runner ended; Stryker's for one Stryker ended), is
+ * voided (verdict.mjs voidFailedSets), and its mutant is inconclusive.
  * @param {MutantRecord[]} on
  */
 async function setCheck(on) {
@@ -522,12 +538,23 @@ async function setCheck(on) {
   console.log(`L5: each of the ${sets.length} set(s) of fast test files an a2 kill or timeout ran on, once with no mutant, so a result counts only from a set that passes without it`);
   const runs = runnable.length === 0 ? [] : await runSets(dir, runnable.flatMap(set => set.on), runnable.map(set => ({ files: set.files, ms: setBoundMs(set.files.length, 4) })), true,
     'the run of each set of files an a2 result ran on, with no mutant,');
-  const { clock, net, overhead } = strykerClock(path.join(reportDir, 'a2'));
-  const budget = clock ? NaN : PASSES.a2.timeoutFactor * net + PASSES.a2.timeoutMS + overhead;
-  const lines = voidFailedSets(sets, runs, dir, budget);
+  const costs = readCosts(path.join(reportDir, 'a2'));
+  const { lines, voided } = voidFailedSets(sets, runs, dir, strykerBudget('a2', PASSES.a2), files => boundFor(costs, files, A2_BOUND) ?? NaN);
   for (const m of sets.flatMap(set => set.on)) delete /** @type {PassResult} */ (m.passes.a2).pending;
-  controls.push(`after pass a2, each set of files an a2 result ran on, with no mutant: ${sets.length - lines.length} of ${sets.length} held (${posix(path.relative(root, out))}/dry-alone-*.log)`);
+  controls.push(`after pass a2, each set of files an a2 result ran on, with no mutant: ${sets.length - voided} of ${sets.length} held (${posix(path.relative(root, out))}/dry-alone-*.log)`);
   for (const line of lines) controls.push(`  ${line}`);
+}
+
+/**
+ * The budget, in ms, Stryker gave each mutant run of the pass in `dir`, as it
+ * built it from that pass's run with no mutant; NaN when its time could not be
+ * read or its clock stepped (control.mjs strykerClock).
+ * @param {string} dir
+ * @param {{ timeoutFactor: number, timeoutMS: number }} pass
+ */
+function strykerBudget(dir, { timeoutFactor, timeoutMS }) {
+  const { clock, net, overhead } = strykerClock(path.join(reportDir, dir));
+  return clock ? NaN : timeoutFactor * net + timeoutMS + overhead;
 }
 
 /**
