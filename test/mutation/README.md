@@ -16,6 +16,7 @@ active mutant travels in `__STRYKER_ACTIVE_MUTANT__` and reaches child processes
 | stryker.json | (data) empty on purpose: every pass names it as its config file, so Stryker never reads one it finds in the bot root |
 | keys.mjs | (library) how a file and a mutant are named across passes; unit/mutationRanges.test.ts |
 | targets.mjs | (Stryker reporter) which mutant ids a later pass runs tests for, and Stryker's own time for each run with no mutant; unit/mutationRunner.test.ts and the bite |
+| survivors.mjs | (read-only tool) pass A's survivors so far, from a run's report dir and sandbox while the run goes on or after it died; unit/mutationSurvivors.test.ts |
 | tree.mjs | (library) the fingerprint of the tree a run reads and of the packages it loads, taken before the plan and before the verdict; unit/mutationRanges.test.ts and the bite |
 | ../helpers/time.mjs | the factor on the config's test and hook limits and a child step's default bound (4 in a rerun alone and in the run with no mutant after the reruns; a limit a test, hook or step sets itself is not scaled) |
 | ../helpers/env.ts, setup.ts | what a test and its children keep of the environment, and the run's fast-check seed |
@@ -593,6 +594,54 @@ passes.mjs setsBoundMinutes; a single vitest run past its own bound only takes b
 the run with no mutant after the reruns failed (or ran past the reruns' budget, or its times could not be read),
 when the tree changed during the run, or when a test's stand-in replaced vitest (SMDB_MUTATION_VITEST, for the
 gate's own tests only); the report then says why, with the passes that did finish.
+
+## Survivors before a pass ends
+
+Until pass A ends, only Stryker's memory ties a mutant id in `a/` to its file, place, mutator and replacement, so a
+run that is still going, or one that died, names no survivor. survivors.mjs makes that list again and reads each id's
+files in `a/`:
+
+    node test/mutation/survivors.mjs --report <run>/a --sandbox <checkout>/.stryker-tmp/sandbox-XXXX [--sandbox-name sandbox-XXXX] --out <dir> [--tree <checkout>] [--base REF] [--mutate PATTERN]...
+
+- The sandbox must be the one the run in `--report` made. Each vitest report names it in its test files' paths
+  (`.stryker-tmp/sandbox-XXXX/test/...`), and the tool refuses (exit 2, nothing written) when the run with no mutant
+  or any report it reads names another one, or when it lists ids and no report names one: another run's sandbox of
+  the same tree can prove every file while its ids sit off the report dir's, which would give each mutant its
+  neighbour's state. The name expected is the last part of `--sandbox`; for a copy under another name,
+  `--sandbox-name` gives the original one.
+
+- The plan is the gate's own: `--mutate` patterns as given, or else planFromGit from the merge-base of `--base`
+  (default HEAD) and HEAD in `--tree` (default this checkout), then only the files a target can gate in, as touched.mjs
+  makes it. The tree's files must be the ones the run mutated. The only git commands it runs are the planner's reads, each with
+  GIT_OPTIONAL_LOCKS=0 beside the process's env, so a read never refreshes the index or takes `.git/index.lock` in a
+  tree where a gate run or the owner is working.
+- Stryker 10.0.0 instruments all the files in one call, and its ids run on from file to file, so an id depends on the
+  files before it. The tool instruments each file alone with Stryker's own instrumenter and default mutator options,
+  passes it through disableTypeChecks as Stryker does before writing it into the sandbox, and shifts its ids by the
+  difference between the first id each text names. A file is proven only when that text equals the sandbox's copy
+  exactly; otherwise it is unproven, named with the reason, and none of its mutants is listed, since an id the text
+  does not prove may belong to another mutant.
+- An id's state: passed when its `<id>-reach.json` names no file ("no fast test reached it") and the run left no
+  `<id>-fast.json` (a report beside such a reach is a test run the reach did not foresee, so the id is unknown), or when
+  `<id>-fast.json` is a finished vitest report in which every test passed (success true, no failed test or suite,
+  every file entry passed, every test passed, was skipped or is a todo and at least one passed, and exactly the files its reach names, or for
+  `"related"` those of the run with no mutant: the files in `dry-reach.json`, or else those `dry-fast.json` ran); failed when a report holds a failure; unknown for any other file it
+  left (a run in flight, timed out or killed, half written, or a worker that died while a test was still running,
+  which vitest writes as success true with that test pending); no run when it left no file (the type checker ended
+  it, or the pass has not reached it).
+- `--out` gets survivors.json (the gating survivors' keys, keys.mjs, as `b/targets.json` holds them),
+  survivors-context.json (the context ones), mutants.json (every mapped id with its key, place, mutator, replacement,
+  original text, gating, state and `unreached`) and summary.txt, which it also prints. It refuses an `--out` inside
+  the tree, inside its own checkout, or inside the sandbox or the report dir or their checkouts, and writes nowhere
+  else: a new file in a tree ends a gate run there NO RESULT. Exit 0 when every mutated file was proven and every id
+  in the report dir matched a mapped mutant; 1 when a file was not proven, or when some id matched none, since then
+  the plan left out a file the run mutated and survivors may be missing (the results found are still written); 2 for a usage error or when nothing could be read.
+- What the files cannot show: Stryker judges a run by vitest's exit code, not its report. vitest 5.0.3 exits 1 on an
+  unhandled error or rejection while its JSON report reads success true with every test passed, and with only the
+  JSON reporter it prints nothing of the error to the log, so such a run is listed passed while the gate counts it
+  inconclusive. A timeout Stryker called after the report was complete cannot be seen either: it is listed passed
+  while the gate counts a timeout. Both errors list as a survivor a mutant the gate will not count as one; the
+  unknown ones are in mutants.json, to look at once the pass ends.
 
 ## Child scenarios
 
