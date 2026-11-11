@@ -15,6 +15,8 @@ const DIST = path.join(botRoot, 'dist') + path.sep;
 const SCENARIOS = path.join(botRoot, 'test', 'child', 'scenarios');
 // Preloaded in every scenario step: a fork that would lose DATA_DIR throws.
 export const FORK_GUARD = path.join(botRoot, 'test', 'helpers', 'forkGuard.cjs');
+// Preloaded through NODE_OPTIONS in a step of a gate's run with no mutant (mutation/README.md, "Child scenarios").
+export const REACH_RECORDER = path.join(botRoot, 'test', 'helpers', 'reachRecorder.cjs');
 
 // A throwaway data dir for one test, removed when the test ends.
 export function freshDataDir(): string {
@@ -38,7 +40,9 @@ export function childEnv(dataDir: string): NodeJS.ProcessEnv {
 // child's cwd is its data dir, so a `dotenv/config` import in the bot finds no
 // .env; its env is childEnv's. It fails on a missing RESULT line, a nonzero
 // exit, a timeout (and ends the step's processes, helpers/endTree.mjs), or a bot module
-// loaded from anywhere but this repo's dist. onStdout gets the step's whole stdout so far after each chunk.
+// loaded from anywhere but this repo's dist; of this repo's test helpers, only the
+// fork guard, which it must load, and the reach recorder may load too. onStdout gets
+// the step's whole stdout so far after each chunk.
 export function runScenario<T>(script: string, args: string[], dataDir: string, timeoutMs = STEP_MS, onStdout?: (stdout: string) => void): Promise<ScenarioRun<T>> {
   const env = childEnv(dataDir);
   const child = spawn(process.execPath, ['--require', FORK_GUARD, path.join(SCENARIOS, script), ...args], { cwd: dataDir, env, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -67,7 +71,8 @@ export function runScenario<T>(script: string, args: string[], dataDir: string, 
         reject(new Error(`scenario ${script} ran without ${FORK_GUARD} preloaded`));
         return;
       }
-      const run = { ...parsed, loaded: parsed.loaded.filter(file => !guard.has(file)) };
+      const recorder = new Set([REACH_RECORDER, fs.realpathSync(REACH_RECORDER)]);
+      const run = { ...parsed, loaded: parsed.loaded.filter(file => !guard.has(file) && !recorder.has(file)) };
       const foreign = run.loaded.filter(file => !file.startsWith(DIST));
       if (run.loaded.length === 0 || foreign.length > 0) {
         reject(new Error(`scenario ${script} must load the bot from ${DIST}, but loaded ${run.loaded.length === 0 ? 'nothing' : foreign.join(', ')}`));

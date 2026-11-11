@@ -8,8 +8,9 @@
  *   inconclusive?: string, recheck?: string, voided?: string, unreached?: boolean, pending?: 'alone-a' | 'alone-a2' }}
  *   PassResult dir: the report dir the
  *   id's runs are in (Stryker numbers each run's mutants anew); recheck: the test that failed only on the machine's
- *   texts, so the mutant reruns alone; voided: why a rerun's kill or timeout no longer counts; unreached: no fast test
- *   reached the mutant in the pass's run with no mutant, so its run in a pass of pass A's tests ran none; a
+ *   texts, so the mutant reruns alone; voided: why a rerun's kill or timeout no longer counts; unreached: no test
+ *   file reached the mutant in the pass's run with no mutant (pass A or its run with no checker, or pass B), so its run
+ *   there ran none; a
  *   CompileError with an inconclusive is one only of an unused `@ts-expect-error` (TS2578), which no test met; pending:
  *   the check with no mutant (touched.mjs aloneCheck or setCheck) that covers the result and has not finished
  * @typedef {{ file: string, location: Location, mutator: string, original: string, replacement: string, gating: boolean,
@@ -125,6 +126,15 @@ export const UNREACHED = 'no fast test reached it';
  * @param {MutantRecord} m
  */
 export const unreached = m => Boolean((m.passes.a2 ?? m.passes.a)?.unreached);
+
+export const UNREACHED_B = 'no test of pass B reached it';
+
+/**
+ * Whether no integration or child test reached the mutant in pass B's run with
+ * no mutant, so pass B ran no test on it.
+ * @param {MutantRecord} m
+ */
+export const unreachedInB = m => Boolean(m.passes.b?.unreached);
 
 /** @param {PassResult | undefined} b what pass B found, which sent the mutant to a rerun alone */
 const failedInB = b => (b?.killedBy ? `killed in pass B by ${b.killedBy}` : `failed in pass B only on the machine's texts (${b?.recheck})`);
@@ -393,10 +403,13 @@ export function judge(run) {
     const last = latest(m);
     const why = confirmedIn(m).why ?? last.inconclusive ?? last.statusReason
       ?? (outcomeIn(m) === 'Timeout' ? (last.timeout ? `timed out alone: ${last.timeout}` : "ran past Stryker's budget alone") : '');
-    return unreachedSurvivor(m) ? [UNREACHED, why].filter(Boolean).join('; ') : why;
+    const labels = [...(unreachedSurvivor(m) ? [UNREACHED] : []), ...(unreachedInBSurvivor(m) ? [UNREACHED_B] : [])];
+    return labels.length > 0 ? [...labels, why].filter(Boolean).join('; ') : why;
   };
   /** @param {MutantRecord} m */
   const unreachedSurvivor = m => unreached(m) && ['Survived', 'NoCoverage'].includes(outcomeIn(m));
+  /** @param {MutantRecord} m */
+  const unreachedInBSurvivor = m => unreachedInB(m) && ['Survived', 'NoCoverage'].includes(outcomeIn(m));
   /** @param {MutantRecord} m */
   const show = m => `  ${where(m)} ${m.mutator}: \`${m.original}\` -> \`${m.replacement}\`${note(m) ? ` (${note(m)})` : ''}`;
   /** @param {MutantRecord[]} list */
@@ -425,6 +438,7 @@ export function judge(run) {
     `Gating mutants (they touch a changed line that holds code, not one blank or a comment only): ${gating.length}: ${tally(gating)}`,
     `  killed in pass A: ${gating.filter(m => !m.passes.b && outcomeIn(m) === 'Killed').length}; run in pass B: ${gating.filter(m => m.passes.b).length}, killed there: ${gating.filter(m => m.passes.b && outcomeIn(m) === 'Killed').length}`,
     ...(gating.some(unreachedSurvivor) ? [`  survivors no fast test reached (none ran their code in the run with no mutant, so pass A ran no test on them): ${gating.filter(unreachedSurvivor).length}`] : []),
+    ...(gating.some(unreachedInBSurvivor) ? [`  survivors no test of pass B reached (none ran their code in pass B's run with no mutant, so pass B ran no test on them): ${gating.filter(unreachedInBSurvivor).length}`] : []),
     ...section('Survivors (each needs a test that kills it, or a justification in the notes):', [...gatingAt('Survived'), ...gatingAt('NoCoverage')]),
     ...section('Silenced by a Stryker disable comment (each needs a justification in the notes):', gatingAt('Ignored')),
     ...section("Inconclusive (no test failed for the mutant itself; rerun, or add a test that fails on it: a failure the mutant itself causes only at load, in a beforeAll or afterAll, or as an unhandled error repeats on every rerun, so that test must fail inside its own body, where no static import or failing hook stops it first; mutation/README.md says where):", [...gatingAt('Inconclusive'), ...gatingAt('RuntimeError')]),

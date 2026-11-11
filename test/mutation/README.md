@@ -16,8 +16,8 @@ active mutant travels in `__STRYKER_ACTIVE_MUTANT__` and reaches child processes
 | stryker.json | (data) empty on purpose: every pass names it as its config file, so Stryker never reads one it finds in the bot root |
 | keys.mjs | (library) how a file and a mutant are named across passes; unit/mutationRanges.test.ts |
 | targets.mjs | (Stryker reporter) which mutant ids a later pass runs tests for, and Stryker's own time for each run with no mutant; unit/mutationRunner.test.ts and the bite |
-| reach.mjs | (library) which fast test files a pass A mutant run takes: the records of the run with no mutant read into each file's ids and whether it is unsure; unit/mutationCoverage.test.ts |
-| ../helpers/mutationCoverage.ts, reachRecorder.cjs | the first setup file of pass A's run with no mutant, and the recorder it loads in each test file's process and, through NODE_OPTIONS, in each Node process under it: each mutant id at its first count, and each process started; unit/mutationCoverage.test.ts |
+| reach.mjs | (library) which test files a mutant run takes, fast ones in pass A and integration and child ones in pass B: the records of the pass's run with no mutant read into each file's ids and whether it is unsure; unit/mutationCoverage.test.ts |
+| ../helpers/mutationCoverage.ts, reachRecorder.cjs | the first setup file of the runs with no mutant that record reach (pass A's, for the fast tier, and pass B's, for the integration and child tiers), and the recorder it loads in each test file's process and, through NODE_OPTIONS, in each Node process under it: each mutant id at its first count, and each process started; unit/mutationCoverage.test.ts |
 | survivors.mjs | (read-only tool) pass A's survivors so far, from a run's report dir and sandbox while the run goes on or after it died; unit/mutationSurvivors.test.ts |
 | tree.mjs | (library) the fingerprint of the tree a run reads and of the packages it loads, taken before the plan and before the verdict; unit/mutationRanges.test.ts and the bite |
 | ../helpers/time.mjs | the factor on the config's test and hook limits and a child step's default bound (4 in a rerun alone and in the run with no mutant after the reruns; a limit a test, hook or step sets itself is not scaled) |
@@ -307,18 +307,22 @@ does not name by its content.
    mutant's run in pass A and in its run with no checker takes the files that reached the mutant in that pass's run
    with no mutant and every file whose reach is unknown, and its a2 rerun the files that run took (below, "Which fast
    tests a mutant runs"); the runs with no mutant of pass A, A with no checker and a2 take every related fast file.
-   Pass B's run of each survivor takes every related integration file and then the whole child tier; each b2 run
-   takes only the one file that failed in pass B, and the run with no mutant after them every such file. The mutated
+   Pass B's run with no mutant takes every related integration file and then the whole child tier, and a survivor's
+   run there takes those of them that reached it in that run and every one whose reach is unknown (below, "Which
+   tests a pass B mutant runs"); each b2 run takes only the one file that failed in pass B, and the run with no
+   mutant after them every such file, together, one vitest run per tier. The mutated
    files go on vitest's command line relative to test/ (`vitest related`); a change of many hundreds of files can
    pass Windows' limit on a command line, and then the run's log says vitest could not start. A run of named test
-   files (a mutant's run in pass A or a2 that takes some of them, b2, the run with no mutant after b2, and each file
+   files (a mutant's run in pass A, a2 or B that takes some of them, b2, the run with no mutant after b2, and each file
    that killed in pass A run alone, below) gives vitest none on its command line: runner.mjs writes the list to `<id>-<tier>.include.json` in the pass's dir and names that file in
    SMDB_MUTATION_INCLUDE, and vitest.config.ts then sets that tier's include to exactly those paths, so no file whose
    path only holds a name runs, and no list is too long. The config takes the variable out of the env as it reads
    it, so a vitest a test starts runs as it would anywhere.
 2. **Pass B, the rest, on pass A's gating survivors only.** The sandbox's dist is built from the instrumented src
-   (build.cjs), then each survivor runs `vitest related <mutated files>` on the integration tier and then the whole child tier, whose
-   scenarios start real processes on that dist. A child sees the mutant through the env. Stryker makes every mutant a
+   (build.cjs), then its run with no mutant runs `vitest related <mutated files>` on the integration tier and then
+   the whole child tier, whose scenarios start real processes on that dist, and records what each file reached; each
+   survivor's run takes the files of the two tiers that reached it, the unsure ones, or every one of them (below,
+   "Which tests a pass B mutant runs"). A child sees the mutant through the env. Stryker makes every mutant a
    span holds, so a survivor that spans lines brings in the mutants nested inside it; in pass B and every rerun those
    run no test (targets.mjs gives the runner the ids the pass is for) and their results are dropped.
 3. **Reruns alone.** Every run takes its tiers in turn (fast, then integration, then child), each in vitest's own
@@ -464,10 +468,10 @@ original)` (a statement or a switch case gets an `if` of the same shape), and `s
 given in `globalThis.__stryker__.mutantCoverage`: under `static`, or under `perTest[currentTestId]` when a test id is
 set, which Stryker's command runner never does. Each instrumented file takes that object from the namespace the first
 time it counts, and makes it when it is missing. With no mutant active, every place a run executes counts the ids of
-its mutants. Pass A and its run with no checker each start with their run with no mutant, which names a dir in
-SMDB_MUTATION_COVERAGE (`dry-coverage/` in the pass's report dir), and vitest.config.ts then loads
-helpers/mutationCoverage.ts first in every test file; vitest runs each fast test file in a process of its own (pool
-forks, isolate on). mutationCoverage.ts loads helpers/reachRecorder.cjs, which puts a count object of its own in the
+its mutants. Pass A, its run with no checker and pass B each start with their run with no mutant, which names a dir
+in SMDB_MUTATION_COVERAGE (`dry-coverage/` in the pass's report dir), and vitest.config.ts then loads
+helpers/mutationCoverage.ts first in every test file; vitest runs each test file in a process of its own (pool
+forks, isolate on), in every tier. mutationCoverage.ts loads helpers/reachRecorder.cjs, which puts a count object of its own in the
 namespace before any instrumented file loads. Its `static` table and each `perTest` table is a Proxy that, the first
 time an id is set in it, appends the id to the process's record with one synchronous write (a test id read for the
 first time gets such a table at once, since Stryker counts into the object it assigns, not into the one stored). So an
@@ -484,6 +488,9 @@ file's path, or a child, with the token of the start that made it), whether that
 test file, and whether its recorder came late (below); then one line per id at its first count; one line per process
 or worker the process starts, written before the start, with the start's token and kind; and, when a write failed, a
 line saying so on the next write that works, with a `<record>.failed` file beside the record when one can be made.
+A process whose record cannot be opened makes the same `.failed` file when it can, and takes SMDB_MUTATION_REACH_TOKEN
+out of its own env, so a child it starts writes no record under the token of this process's start: that start then
+has no record that carries its token, and the file is unsure (below) even when the `.failed` file could not be made.
 
 The recorder hooks every way a process starts, in the test file's process and in every child that loaded it:
 ChildProcess.prototype.spawn, where every async form (fork, spawn, exec, execFile, a promisified one) starts its
@@ -511,8 +518,8 @@ into the same dir under that token, and so does a Node process that a listed pro
 runner.mjs then reads the dirs (reach.mjs readRecords) and joins them with the files vitest's report says ran, in
 `dry-reach.json`. The setup file takes SMDB_MUTATION_COVERAGE out of its process's env when it loads, so a vitest that
 a test starts does not take the dir as its own, and touched.mjs takes it out of its own env when it starts: runner.mjs
-names the dir to pass A's run with no mutant and to no other run, whatever the shell set. No mutant run loads the
-recorder.
+names the dir to the runs with no mutant of pass A, A with no checker and B (in B, to both tiers' runs) and to no
+other run, whatever the shell set. No mutant run, rerun or run with no mutant that checks a pass loads the recorder.
 
 a2 and the run with no mutant after it record nothing. a2 reruns only mutants on which some file already failed or
 timed out in pass A, and a fresh run with no mutant that happened to miss the mutant would drop that file, so each a2
@@ -538,7 +545,7 @@ when:
   whose arguments the recorder cannot reproduce exactly);
 - a start of kind node has no record in the dir that carries its token: that child may have run the tree's code
   without the recorder (a Node that never read NODE_OPTIONS, a program named node that is not Node, a start that
-  failed, a child ended before its recorder wrote);
+  failed, a child ended before its recorder wrote, a child whose record could not be opened);
 - a process under it is also a test file's own process (a test that runs vitest with this setup file) and starts a
   process: the child's env names only the newer dir, so the older one cannot follow it.
 
@@ -608,6 +615,51 @@ file in each. A run that takes fewer files fits in it with more room, and one th
 as a timeout. a2's run with no mutant and the one after the reruns take every related file, so each a2 run, which
 takes the files its run in pass A took, fits in its budget the same way.
 
+## Which tests a pass B mutant runs
+
+Pass B's run with no mutant records reach as pass A's does, in both of its tiers: runner.mjs names `dry-coverage/` in
+`b/` to its integration run and to its child run, and builds `dry-reach.json` there from both tiers' reports (the
+integration files first, then the child ones, each tier in the order its report lists them) and the records, by the
+rules above. A child test file runs each scenario step through helpers/child.ts as a Node child of the test file's
+process, so the recorder gives the step its preload through NODE_OPTIONS, and the step and every Node process under it
+(the bot a BotManager forks, a lock holder) report into the test file's dir under the token of the start that made
+them. The file's reach is the union of what its own process and those processes recorded, and a start of kind node
+that left no record makes the file unsure, as above. A step prints the modules it loaded, and child.ts takes this
+root's recorder among them as it takes the fork guard (below, "Child scenarios"). An integration test's processes
+report by the same rules; a container is started through Docker's API, not as a process, and runs only the files a
+test copies into it, which the records do not see (no test copies a file of src into one today: the oracle's
+container gets test/oracle/oracle.mjs, nb5Tls's its certificates).
+
+The reach is built only when both tiers' runs passed and each left a report with its list of files: a tier that
+left none, or a failed run (which ends the pass anyway), leaves no reach. An integration tier no file is related to
+lists none, and then the child files are the whole reach. Each survivor's run in pass B then takes:
+
+- every related integration file and then the whole child tier, as the run with no mutant did, when there is no
+  reach, when it cannot be read or names a file of the fast tier, or when every file reached the mutant or is unsure;
+- otherwise, of each tier, the files that reached the mutant and the unsure ones, by name (SMDB_MUTATION_INCLUDE):
+  the integration ones in a vitest run of their own, then the child ones in another, a tier with none of them
+  taking no run, and the run ends at the first that fails, as a whole pass B run does;
+- no file when none reached it and none is unsure. The run then exits 0, Stryker counts the mutant as a survivor, and
+  the report says "no test of pass B reached it" beside it and counts such survivors.
+
+Each run leaves `<id>-reach.json` in `b/`, naming the files it took (`"related"` for every related integration file
+and the whole child tier). A dropped file cannot kill the mutant for the reason given above: a mutant's run is the run
+with no mutant until the mutant's place first runs, and a file whose processes never ran that place with no mutant
+never run it with the mutant either. What that does not cover is what it does not cover in pass A: a place a file
+reaches only on some runs (a race, a retry on a timer, randomness, the machine), and a process that outlives its test
+file. Such a process, one a step leaves running, keeps writing into the dir, but what it reaches after runner.mjs
+read the records is not in the reach. Either way the file is dropped and the mutant shows as a survivor, never as a
+kill. A kill counts as it did with every file: b2 reruns the mutant alone with the one file that failed, so a file
+that failed in the smaller set for state a dropped file would have left or cleared has to fail again alone, and the
+run with no mutant after b2 takes every file that failed in pass B, together, one vitest run per tier. b2 and the run
+with no mutant after it name their files and record nothing, and no other run of pass B gets a coverage dir.
+
+Pass B's run with no mutant runs every related integration file and the whole child tier on one worker, which for a
+change to widely imported files takes more than an hour; Stryker's bound on it is 120 minutes (passes.mjs
+dryRunTimeoutMinutes), since a run past it ends the gate NO RESULT before any survivor runs. b2's bound stays fifteen
+minutes, since each b2 pass's run with no mutant takes one file, and the bound on the run with no mutant after b2,
+built from it, stays 120 minutes per file plus five.
+
 ## The report
 
 `test/mutation/reports/<time>-<process id>/` (ignored by git; delete it whenever you like):
@@ -615,7 +667,8 @@ takes the files its run in pass A took, fits in its budget the same way.
 - `summary.txt` is the L5 report for the review packet: the scope, what was not mutated and why, patterns or lines no
   mutant touched, the changed lines that can move others, the places code was taken out, the gating mutants by
   outcome, every survivor, silenced and inconclusive mutant with its place and replacement (with why a kill or timeout
-  did not count, and "no fast test reached it" for a survivor whose pass A run took no test file), the confirmed
+  did not count, "no fast test reached it" for a survivor whose pass A run took no test file, and "no test of pass B
+  reached it" for one whose pass B run took none), the confirmed
   timeouts, the context mutants, the runs with no mutant that checked a pass (each file that killed in pass A run
   alone, naming each that failed there and why, the runs after the reruns, and each set an a2 result ran on, naming
   each whose results were voided and why), why the gate
@@ -623,13 +676,13 @@ takes the files its run in pass A took, fits in its budget the same way.
 - `mutants.json` has the run's fast-check seed and every mutant: its place, original text and replacement, whether it
   gates, and per pass its status, the report dir its id is in (Stryker numbers each run's mutants anew), the test
   that killed it (for a mutant pass A met again with no checker, its pass A is that run, in `a-unchecked/`) and, as
-  `unreached`, whether its run in pass A took no test file because none reached it.
+  `unreached`, whether its run in that pass (A, A with no checker, or B) took no test file because none reached it.
 - `a/`, `a-unchecked/` (pass A again with no checker), `a2/`, `b/` and `b2-1/`, `b2-2/` (one per test file that failed in pass B: a kill, or a failure only on the machine's texts) hold, for each mutant run, one vitest
   JSON report and log per tier it ran (`<id>-<tier>.json` and `.log`; a run in `b/` can reach both integration and
   child; a nested mutant a pass is not for runs nothing; `dry-*` is the run with no mutant, `dry-ms.txt` its monotonic time and `dry-timing.json` Stryker's).
-  `a/` and `a-unchecked/` also hold `dry-coverage/` (one dir of records per fast test file process) and
-  `dry-reach.json`, the reach built from them; each mutant run there and in `a2/` leaves `<id>-reach.json`, the files
-  it took. `a2/` also holds `taken.json`, the files each target's run in pass A took, by its key, and each dir with
+  `a/`, `a-unchecked/` and `b/` also hold `dry-coverage/` (one dir of records per test file process: fast in `a/`
+  and `a-unchecked/`, integration and child in `b/`) and `dry-reach.json`, the reach built from them; each mutant
+  run there and in `a2/` leaves `<id>-reach.json`, the files it took. `a2/` also holds `taken.json`, the files each target's run in pass A took, by its key, and each dir with
   run-ids.json holds `run-keys.json`, each of those ids' key.
   `a-unchecked/`, `a2/`, `b/` and `b2-*/` also hold targets.json and run-ids.json, the mutants the pass is for. A run
   of named test files leaves the list it gave vitest in `<id>-<tier>.include.json` beside its report. `alone-a/`
@@ -645,7 +698,8 @@ changed, when no gating mutant was made, when every gating mutant was a type err
 when the type checker would judge a file outside the tree, when what it reads is not what the root lockfile ships
 (test/'s TypeScript, or npm's record of the root install) or that lockfile names no TypeScript or cannot be read,
 when a pass could not run (its run with no mutant past Stryker's bound on it included: 30 minutes for A, A with no
-checker and a2, fifteen for B and b2, each on one vitest worker (passes.mjs dryRunTimeoutMinutes); Stryker's log above
+checker and a2, 120 for B, which runs every related integration file and the whole child tier, and fifteen for b2,
+which runs one file, each on one vitest worker (passes.mjs dryRunTimeoutMinutes); Stryker's log above
 the report then says the initial test run timed out), when a run of pass B or b2 timed out while the clock
 of Stryker's process stepped during that pass's run with no mutant (or its times could not be read), when Stryker
 mutated a file no target names, when the run of each file that killed in pass A alone, or of each set an a2 result
@@ -729,7 +783,9 @@ child away from anything real:
   walked, since its pid can be another process's by then, so what it started and left holding its output is not
   ended either); a step prints one `RESULT`
   line with its result and the modules it loaded; the helper fails unless the fork guard is among them and every other
-  one sits under this root's dist.
+  one sits under this root's dist, but for this root's reach recorder, which a step of pass B's run with no mutant
+  preloads through NODE_OPTIONS (above, "Which tests a pass B mutant runs") and which calls no code of the tree. Any
+  other test helper, and any module of another checkout, still fails the step.
 
 The child tier's globalSetup runs build.cjs `--if-stale`: it rebuilds dist unless the stamp matches both what dist was
 built from (every file under src, links followed, but none under an entry named .git or node_modules, a dir it

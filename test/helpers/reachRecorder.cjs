@@ -1,5 +1,7 @@
-// Records which mutants a fast test file's run reaches, for pass A's run with no
-// mutant (mutation/README.md, "Which fast tests a mutant runs"). It is loaded
+// Records which mutants a test file's run reaches, for the run with no mutant
+// of pass A, in the fast tier, and that of pass B, in the integration and child
+// tiers (mutation/README.md, "Which fast tests a mutant runs" and "Which tests
+// a pass B mutant runs"). It is loaded
 // first in the test file's process (helpers/mutationCoverage.ts) and, through
 // NODE_OPTIONS, in every Node process that descends from it. Stryker's
 // instrumented code counts each mutant in globalThis.__stryker__.mutantCoverage;
@@ -135,6 +137,9 @@ function openSink(dir, header) {
     mkdirSync(dir, { recursive: true });
     fd = openSync(file, 'ax');
   } catch {
+    // A child that inherits the token would answer for this process's start, so none may; the marker says why.
+    try { delete process.env.SMDB_MUTATION_REACH_TOKEN; } catch {}
+    try { writeFileSync(`${file}.failed`, ''); } catch {}
     return;
   }
   const sink = { dir, file, fd, failed: false };

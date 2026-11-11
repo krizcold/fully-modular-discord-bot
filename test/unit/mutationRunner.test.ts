@@ -111,6 +111,23 @@ describe('a mutant run', () => {
     for (const call of calls) expect(call.args).toContain('--bail=1');
   });
 
+  it('runs the files given with no mutant together, one vitest run per tier, recording no reach', () => {
+    const only = ['integration/store.test.ts', 'integration/vault.test.ts', 'child/nodeIdentity.test.ts', 'child/takeover.test.ts'];
+    const dry = { __STRYKER_ACTIVE_MUTANT__: 'none', SMDB_MUTATION_FILES: '["test/mutation/control.mjs"]' };
+    const passing = fakeVitest([]);
+    expect(runner(passing, 'b', '1', only, dry).status).toBe(0);
+    const calls = passing.read();
+    expect(calls.map(call => [call.project, call.scale, call.include, call.coverage])).toEqual([
+      ['integration', '4', [only[0], only[1]], null],
+      ['child', '4', [only[2], only[3]], null],
+    ]);
+    expect(calls.map(call => call.args.find(arg => arg.startsWith('--outputFile=')))).toEqual(['dry-integration', 'dry-child'].map(name => `--outputFile=${path.join(passing.out, name)}.json`));
+
+    const failing = fakeVitest(['integration/vault.test.ts']);
+    expect(runner(failing, 'b', '1', only, dry).status).toBe(1);
+    expect(failing.read().map(call => call.include)).toEqual([[only[0], only[1]]]);
+  });
+
   it('runs, to check what a pass counted, each set given in a vitest run of its own, and passes whatever they do', () => {
     const sets = [['unit/a.test.ts'], ['unit/b.test.ts', 'unit/c.test.ts'], ['unit/c.test.ts']];
     const fake = fakeVitest(['unit/b.test.ts']);
@@ -608,6 +625,19 @@ describe('the Stryker options', () => {
     // control-b2 runs every file that failed in pass B, each of which could take a whole b2 budget.
     expect(controlBoundMinutes(PASSES.b2, 3)).toBe(365);
     expect(controlBoundMinutes(PASSES.a2, 0)).toBe(126);
+  });
+
+  it("bound pass B's own run with no mutant at two hours, and b2's, which the bound after the reruns is built from, at fifteen minutes", async () => {
+    const { controlBoundMinutes, PASSES } = await import('../mutation/passes.mjs');
+    expect(PASSES.b.dryRunTimeoutMinutes).toBe(120);
+    expect(PASSES.b2.dryRunTimeoutMinutes).toBe(15);
+    expect(PASSES.a.dryRunTimeoutMinutes).toBe(30);
+    expect(PASSES.a2.dryRunTimeoutMinutes).toBe(30);
+    // The run with no mutant after b2 runs every file that failed in pass B, bound per file as a b2 rerun is.
+    expect(controlBoundMinutes(PASSES.b2, 2)).toBe(245);
+    const gate = fs.readFileSync(path.join(root, 'test', 'mutation', 'touched.mjs'), 'utf8');
+    expect(gate).toContain("const rerun = tier === 'a' ? PASSES.a2 : PASSES.b2;");
+    expect(gate).not.toMatch(/controlBoundMinutes\(PASSES\.b\b/);
   });
 
   it('take nothing from a Stryker config file in the bot root, and never mutate in place', async () => {

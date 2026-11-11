@@ -134,7 +134,7 @@ const sandbox = sandboxPatterns([...planned.keys()]);
 // too; it also overrides an id set in the shell, which Stryker passes on to the
 // command it runs.
 process.env.__STRYKER_ACTIVE_MUTANT__ = 'none';
-// Only pass A's run with no mutant records reach (runner.mjs gives it the dir); one set in the shell would reach every run.
+// Only the runs with no mutant of pass A and pass B record reach (runner.mjs gives them the dir); one set in the shell would reach every run.
 delete process.env.SMDB_MUTATION_COVERAGE;
 // A pattern is a file, or a file and lines; one with columns names no file, so it is refused.
 /** @param {string} pattern */
@@ -281,8 +281,9 @@ function resultOf(dir, r, alone = false) {
 }
 
 /**
- * Whether a mutant's run in a pass of pass A's tests took no test file, as no
- * file reached it in the pass's run with no mutant (runner.mjs, reach.mjs).
+ * Whether a mutant's run in pass A, its run with no checker, or pass B took no
+ * test file, as no file reached it in the pass's run with no mutant
+ * (runner.mjs, reach.mjs).
  * @param {string} dir
  * @param {string} id
  */
@@ -330,7 +331,8 @@ const common = {
  * tier's tests related to every file the gate mutates (each mutant's run takes
  * those that reached it in the pass's run with no mutant, and in a2 those its
  * run in pass A took), b for the integration
- * tier's related tests and then the whole child tier; `only`, when given,
+ * tier's related tests and then the whole child tier (each mutant's run takes
+ * those that reached it in pass B's run with no mutant); `only`, when given,
  * names the test files to run instead. A run `alone` (the reruns, a2 and b2,
  * and the runs with no mutant after them) gets four times the config's time
  * limits. `keys`, when given, are the mutants the pass is for: Stryker makes

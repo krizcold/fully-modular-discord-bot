@@ -1,8 +1,9 @@
-// Which fast test files a mutant run of pass A takes (runner.mjs): the run with
-// no mutant loads helpers/reachRecorder.cjs in every test file's process and the
-// Node processes under it, which leave the mutant ids that file's run reached;
-// each mutant run then takes the files that reached it, every file whose reach
-// is unknown, and nothing else.
+// Which test files a mutant run of pass A or pass B takes (runner.mjs): the
+// run with no mutant of pass A records the fast tier's reach, and that of pass
+// B the integration and child tiers'. Each loads helpers/reachRecorder.cjs in
+// every test file's process and the Node processes under it, which leave the
+// mutant ids that file's run reached; each mutant run then takes the files that
+// reached it, every file whose reach is unknown, and nothing else.
 // A rerun alone (a2) of a mutant takes the files its run in pass A took.
 import { createHash } from 'crypto';
 import fs from 'fs';
@@ -169,18 +170,25 @@ export function readRecords(coverage, testDir, ran) {
 }
 
 /**
- * Builds the reach from what the run with no mutant left in `out` (its fast
- * report and its coverage records) and writes it there. No report, or one
- * that lists no file, leaves no reach, so every mutant run takes every
- * related file.
+ * Builds the reach from what the run with no mutant left in `out` (the report
+ * of each of its `tiers`, in the order they ran, and its coverage records) and
+ * writes it there. A tier with no report, or no list of files in it, or
+ * reports that list no file in all, leave no reach, so every mutant run takes
+ * every related file (in pass B, and the whole child tier).
  * @param {string} out the pass's report dir
  * @param {string} testDir
+ * @param {string[]} [tiers] pass A's fast tier, or pass B's integration and child tiers
  */
-export function writeReach(out, testDir) {
-  /** @type {{ testResults?: { name?: unknown }[] }} */
-  let report;
-  try { report = JSON.parse(fs.readFileSync(path.join(out, 'dry-fast.json'), 'utf8')); } catch { return; }
-  const ran = /** @type {string[]} */ ((report?.testResults ?? []).map(result => result?.name).filter(name => typeof name === 'string'));
+export function writeReach(out, testDir, tiers = ['fast']) {
+  /** @type {string[]} */
+  const ran = [];
+  for (const tier of tiers) {
+    /** @type {{ testResults?: { name?: unknown }[] }} */
+    let report;
+    try { report = JSON.parse(fs.readFileSync(path.join(out, `dry-${tier}.json`), 'utf8')); } catch { return; }
+    if (!Array.isArray(report?.testResults)) return;
+    ran.push(.../** @type {string[]} */ (report.testResults.map(result => result?.name).filter(name => typeof name === 'string')));
+  }
   if (ran.length === 0) return;
   const records = readRecords(path.join(out, COVERAGE_DIR), testDir, ran);
   fs.writeFileSync(path.join(out, REACH_FILE), JSON.stringify(reachOf(testDir, ran, records)));

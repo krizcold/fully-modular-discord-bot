@@ -19,7 +19,7 @@ export const COMMON = {
   logLevel: /** @type {import('@stryker-mutator/api/core').LogLevel} */ ('warn'),
 };
 
-const BUILD = { buildCommand: 'node test/helpers/build.cjs', checkers: [], dryRunTimeoutMinutes: 15 };
+const BUILD = { buildCommand: 'node test/helpers/build.cjs', checkers: [] };
 
 export const PASSES = {
   // Its run with no mutant runs every fast test importing a mutated file: can pass 5 min.
@@ -27,11 +27,14 @@ export const PASSES = {
   a2: { checkers: [], concurrency: 1, timeoutMS: 60_000, timeoutFactor: 4, dryRunTimeoutMinutes: 30 },
   // One at a time, as its run with no mutant is made: Stryker builds each run's
   // budget from that run, and a hang in pass B stands with no rerun to clear it.
-  b: { ...BUILD, concurrency: 1, timeoutMS: 60_000, timeoutFactor: 2 },
+  // Its run with no mutant takes every related integration file and the whole
+  // child tier on one worker, more than an hour for a change to widely imported
+  // files, and one past this bound ends the gate NO RESULT before any survivor runs.
+  b: { ...BUILD, concurrency: 1, timeoutMS: 60_000, timeoutFactor: 2, dryRunTimeoutMinutes: 120 },
   // A pass B failure rerun with one file: an hour is above anything vitest's own
   // limits let that file take after its first failure (the rest of a child
   // test, then its hooks), so a rerun that fails always leaves its report.
-  b2: { ...BUILD, concurrency: 1, timeoutMS: 60 * 60_000, timeoutFactor: 4 },
+  b2: { ...BUILD, concurrency: 1, timeoutMS: 60 * 60_000, timeoutFactor: 4, dryRunTimeoutMinutes: 15 },
 };
 
 /**

@@ -4,7 +4,8 @@
 // files (every file the gate mutates, in every run), of which a mutant's run
 // takes those that reached it in the run with no mutant (a rerun alone, those
 // its run in pass A took); pass b, the integration
-// tests that import them, then the whole child tier; or only the test files
+// tests that import them, then the whole child tier, of which a mutant's run
+// takes those that reached it in the run with no mutant; or only the test files
 // SMDB_MUTATION_ONLY names (the rerun of a pass B failure with the file that
 // failed), each in its tier; or, with no mutant, each set of files
 // SMDB_MUTATION_SETS names, in a vitest run of its own (touched.mjs aloneCheck
@@ -39,8 +40,8 @@ const mutant = active === 'none' ? 'dry' : active;
 /**
  * Runs one tier on `take`: the test files given (relative to test/), the
  * tests related to the mutated files, or every test of the tier. `coverage` is
- * the dir pass A's run with no mutant records reach in; no other run is given
- * one, whatever the caller's shell set.
+ * the dir the runs with no mutant of pass A and pass B record reach in; no
+ * other run is given one, whatever the caller's shell set.
  * @param {string} project
  * @param {string[] | 'related' | 'all'} take
  * @param {{ coverage?: string, name?: string }} [run] name: the report's and the log's, in `out`
@@ -191,7 +192,38 @@ if (only.length > 0) {
   }
   end(0);
 }
-if (pass === 'b') end(tier('integration', 'related') || tier('child', 'all'));
+// Pass B: its run with no mutant records what each integration and child test
+// file reached, its own process and the Node processes under it, and each
+// mutant run takes, tier by tier, the files that reached its mutant and the
+// unsure ones (reach.mjs). A b2 rerun, and the run with no mutant after b2,
+// name their files above.
+if (pass === 'b') {
+  const { COVERAGE_DIR, REACH_FILE, readReach, selectFor, writeReach } = await import('./reach.mjs');
+  const whole = () => tier('integration', 'related') || tier('child', 'all');
+  if (confirm) end(whole());
+  else if (mutant === 'dry') {
+    const coverage = path.join(out, COVERAGE_DIR);
+    fs.rmSync(coverage, { recursive: true, force: true });
+    try { fs.rmSync(path.join(out, REACH_FILE), { force: true }); } catch {}
+    const code = tier('integration', 'related', { coverage }) || tier('child', 'all', { coverage });
+    // With no reach left, every mutant run takes every related integration file and the whole child tier.
+    if (code === 0) try { writeReach(out, testDir, ['integration', 'child']); } catch { try { fs.rmSync(path.join(out, REACH_FILE), { force: true }); } catch {} }
+    end(code);
+  } else {
+    const reach = readReach(out);
+    const take = reach && reach.files.every(file => projectOf(file) !== 'fast') ? selectFor(reach, mutant) : null;
+    // One that cannot be written only leaves the report without "no test of pass B reached it".
+    try { fs.writeFileSync(path.join(out, `${mutant}-reach.json`), JSON.stringify({ files: take ?? 'related' })); } catch {}
+    if (take === null) end(whole());
+    else {
+      for (const project of ['integration', 'child']) {
+        const these = take.filter(file => projectOf(file) === project);
+        if (these.length > 0 && tier(project, these)) end(1);
+      }
+      end(0);
+    }
+  }
+}
 // A rerun alone (a2) is of mutants a file already failed or timed out on in
 // pass A, so it takes the files that run took: a fresh run with no mutant that
 // missed the mutant would drop the file that showed it. Its run with no mutant

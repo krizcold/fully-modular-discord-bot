@@ -503,6 +503,62 @@ describe('the run with no mutant', () => {
     expect(readRecordDir(path.join(coverage, recordDir)).unsure).toBeTruthy();
   });
 
+  // A test file's process starts a Node child whose record cannot be opened (and, with `marker`, nor the file beside
+  // it); that child starts a Node grandchild whose record opens.
+  function unopened(marker: boolean) {
+    const dir = tempDir('smdb-unopened-');
+    const coverage = path.join(dir, 'coverage');
+    const fail = path.join(dir, 'fail.cjs');
+    fs.writeFileSync(fail, [
+      "const fs = require('fs');",
+      'const open = fs.openSync;',
+      `const ends = ${JSON.stringify(marker ? ['.jsonl', '.failed'] : ['.jsonl'])};`,
+      'const write = fs.writeFileSync;',
+      "if (process.argv[2] === 'middle') {",
+      "  fs.openSync = (file, ...rest) => { if (ends.some(end => String(file).endsWith(end))) throw new Error('EMFILE'); return open(file, ...rest); };",
+      "  fs.writeFileSync = (file, ...rest) => { if (ends.some(end => String(file).endsWith(end))) throw new Error('EMFILE'); return write(file, ...rest); };",
+      '}',
+      '',
+    ].join('\n'));
+    const middle = path.join(dir, 'middle.cjs');
+    fs.writeFileSync(middle, [
+      "if (process.argv[2] === 'middle') {",
+      "  const run = require('child_process').spawnSync(process.execPath, [__filename, 'leaf'], { stdio: 'inherit' });",
+      '  process.exit(run.status);',
+      '}',
+      '',
+    ].join('\n'));
+    const script = path.join(dir, 'outer.cjs');
+    fs.writeFileSync(script, [
+      `require(${JSON.stringify(RECORDER)}).openTestFile(${JSON.stringify(coverage)}, __filename);`,
+      `const env = { ...process.env, NODE_OPTIONS: ${JSON.stringify(`--require "${fail.split(path.sep).join('/')}"`)} };`,
+      `const run = require('child_process').spawnSync(process.execPath, [${JSON.stringify(middle)}, 'middle'], { stdio: 'inherit', env });`,
+      'process.exit(run.status);',
+      '',
+    ].join('\n'));
+    const result = spawnSync(process.execPath, [script], { env: plainEnv(), encoding: 'utf8', timeout: 30_000 });
+    expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
+    const [recordDir] = fs.readdirSync(coverage);
+    return path.join(coverage, recordDir);
+  }
+
+  it('leaves a marker when a child cannot open its record', { timeout: 60_000 }, () => {
+    const record = unopened(false);
+    const markers = fs.readdirSync(record).filter(name => !name.endsWith('.jsonl'));
+    expect(markers).toHaveLength(1);
+    expect(markers[0]).toMatch(/\.jsonl\.failed$/);
+    expect(readRecordDir(record).unsure).toBe(`its record dir holds ${markers[0]}, which is no record (a write failed)`);
+  });
+
+  it('lets no process under a child that cannot open its record answer for its start', { timeout: 60_000 }, () => {
+    const record = unopened(true);
+    const names = fs.readdirSync(record);
+    expect(names.every(name => name.endsWith('.jsonl'))).toBe(true);
+    const roles = names.map(name => (JSON.parse(fs.readFileSync(path.join(record, name), 'utf8').split('\n')[0]) as { role: string }).role);
+    expect(roles).toEqual(['file']);
+    expect(readRecordDir(record).unsure).toBe('it started a Node process that left no record');
+  });
+
   it('names a record dir by the same key the reach reads', () => {
     expect(fileKey('D:/a/test/unit/x.test.ts')).toMatch(/^[0-9a-f]{32}$/);
     expect(recorder.fileKey('D:/a/test/unit/x.test.ts')).toBe(fileKey('D:/a/test/unit/x.test.ts'));
@@ -691,6 +747,29 @@ describe('the reach', () => {
       expect(readReach(out), bad).toBeNull();
     }
   });
+
+  it("is left, for pass B, from both tiers' reports in the order they ran, and only when each tier left one", () => {
+    const tiers = ['integration', 'child'];
+    const report = (out: string, tier: string, names: string[]) => fs.writeFileSync(path.join(out, `dry-${tier}.json`), JSON.stringify({ testResults: names.map(name => ({ name: at(name) })) }));
+    const out = tempDir('smdb-reachb-');
+    report(out, 'child', ['child/c.test.ts']);
+    writeReach(out, testDir, tiers);
+    expect(fs.existsSync(path.join(out, REACH_FILE))).toBe(false);
+    fs.writeFileSync(path.join(out, 'dry-integration.json'), JSON.stringify({}));
+    writeReach(out, testDir, tiers);
+    expect(fs.existsSync(path.join(out, REACH_FILE))).toBe(false);
+    // An integration tier no test file is related to lists none: the child tier's files are the reach.
+    report(out, 'integration', []);
+    writeReach(out, testDir, tiers);
+    expect(readReach(out)).toEqual({ files: ['child/c.test.ts'], unsure: [0], reached: {} });
+    report(out, 'integration', ['integration/b.test.ts', 'integration/a.test.ts']);
+    writeReach(out, testDir, tiers);
+    expect(readReach(out)?.files).toEqual(['integration/b.test.ts', 'integration/a.test.ts', 'child/c.test.ts']);
+    fs.rmSync(path.join(out, 'dry-child.json'));
+    fs.rmSync(path.join(out, REACH_FILE));
+    writeReach(out, testDir, tiers);
+    expect(fs.existsSync(path.join(out, REACH_FILE))).toBe(false);
+  });
 });
 
 describe('a pass A mutant run', () => {
@@ -808,12 +887,175 @@ describe('a pass A mutant run', () => {
     expect(JSON.parse(fs.readFileSync(path.join(stand.out, '4-reach.json'), 'utf8'))).toEqual({ files: [] });
   });
 
-  it('leaves pass B as it was: every related integration test, then the child tier', () => {
+});
+
+describe('a pass B mutant run', () => {
+  interface Call { project: string; args: string[]; coverage: string | null; include: string[] | null; mutant: string | null; scale: string | null }
+  // Per tier, the files its run lists in order, each with the ids its own process records and the ids a Node process
+  // it starts records (null: the file leaves no record dir).
+  type Plan = Record<'integration' | 'child', { file: string; ids: string[] | null; childIds?: string[] }[]>;
+  const PLAN: Plan = {
+    integration: [{ file: 'integration/z.test.ts', ids: ['7'] }, { file: 'integration/a.test.ts', ids: ['3', '7'] }],
+    child: [{ file: 'child/c1.test.ts', ids: [], childIds: ['3', '5'] }, { file: 'child/c2.test.ts', ids: null }],
+  };
+  const FILES = ['integration/z.test.ts', 'integration/a.test.ts', 'child/c1.test.ts', 'child/c2.test.ts'];
+
+  // A stand-in for vitest that records its calls, fails the tiers or files in `fail`, and, given a coverage dir,
+  // leaves the tier's report and the records `plan` names, as reachRecorder.cjs writes them.
+  function fake(plan: Plan = PLAN, fail: string[] = []) {
+    const dir = tempDir('smdb-selectb-');
+    const calls = path.join(dir, 'calls.jsonl');
+    const script = path.join(dir, 'vitest.cjs');
+    fs.writeFileSync(script, [
+      "const fs = require('fs');",
+      "const path = require('path');",
+      "const { createHash } = require('crypto');",
+      'const args = process.argv.slice(2);',
+      "const project = args[args.indexOf('--project') + 1];",
+      'const coverage = process.env.SMDB_MUTATION_COVERAGE || null;',
+      "const include = process.env.SMDB_MUTATION_INCLUDE ? JSON.parse(fs.readFileSync(process.env.SMDB_MUTATION_INCLUDE, 'utf8')) : null;",
+      `fs.appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ project, args, coverage, include, mutant: process.env.__STRYKER_ACTIVE_MUTANT__ ?? null, scale: process.env.SMDB_TEST_TIME_SCALE ?? null }) + '\\n');`,
+      `const plan = ${JSON.stringify(plan)}[project] || [];`,
+      'if (coverage) {',
+      '  const testDir = process.cwd();',
+      "  const report = args.find(arg => arg.startsWith('--outputFile=')).slice('--outputFile='.length);",
+      '  fs.writeFileSync(report, JSON.stringify({ testResults: plan.map(entry => ({ name: path.join(testDir, entry.file) })) }));',
+      '  plan.forEach((entry, n) => {',
+      '    if (!entry.ids) return;',
+      '    const file = path.join(testDir, entry.file);',
+      "    const dir = path.join(coverage, `${createHash('sha256').update(path.resolve(file)).digest('hex').slice(0, 32)}-${n + 1}`);",
+      '    fs.mkdirSync(dir, { recursive: true });',
+      "    const own = [{ role: 'file', file, ranOther: false, late: false, pid: n + 1 }, ...entry.ids.map(id => ({ id })), ...(entry.childIds ? [{ start: 't1', kind: 'node' }] : [])];",
+      "    fs.writeFileSync(path.join(dir, `${n + 1}-a.jsonl`), own.map(line => JSON.stringify(line) + '\\n').join(''));",
+      "    if (entry.childIds) fs.writeFileSync(path.join(dir, '99-b.jsonl'), [{ role: 'child', token: 't1', ranOther: false, late: false, pid: 99 }, ...entry.childIds.map(id => ({ id }))].map(line => JSON.stringify(line) + '\\n').join(''));",
+      '  });',
+      '}',
+      `const fail = ${JSON.stringify(fail)};`,
+      'process.exit(fail.includes(project) || (include ?? []).some(file => fail.includes(file)) ? 1 : 0);',
+      '',
+    ].join('\n'));
+    const out = path.join(dir, 'out');
+    fs.mkdirSync(out);
+    const read = (): Call[] => (fs.existsSync(calls) ? fs.readFileSync(calls, 'utf8').trim().split('\n').map(line => JSON.parse(line) as Call) : []);
+    return { script, out, read };
+  }
+
+  const runner = (stand: { script: string; out: string }, mutant: string, { confirm = '', only = [] as string[], pass = 'b', sets = '' } = {}) => spawnSync(process.execPath, [path.join(root, 'test', 'mutation', 'runner.mjs')], {
+    encoding: 'utf8',
+    env: {
+      ...process.env, SMDB_MUTATION_VITEST: stand.script, SMDB_MUTATION_PASS: pass, SMDB_MUTATION_FILES: '["test/mutation/control.mjs"]', SMDB_MUTATION_OUT: stand.out,
+      SMDB_MUTATION_CONFIRM: confirm, SMDB_MUTATION_ONLY: JSON.stringify(only), SMDB_MUTATION_RUN: '', SMDB_MUTATION_SETS: sets, __STRYKER_ACTIVE_MUTANT__: mutant,
+      SMDB_MUTATION_COVERAGE: path.join(stand.out, 'shell'),
+    },
+  });
+  const took = (out: string, id: string) => JSON.parse(fs.readFileSync(path.join(out, `${id}-reach.json`), 'utf8')) as { files: string[] | 'related' };
+
+  it("records, in its run with no mutant, both tiers' reach in one dir, and builds the reach from both reports and every record", () => {
     const stand = fake();
-    fs.writeFileSync(path.join(stand.out, REACH_FILE), JSON.stringify({ files: ['unit/a.test.ts', 'unit/b.test.ts'], unsure: [], reached: {} }));
-    expect(runner(stand, 'b', '4').status).toBe(0);
-    expect(stand.read().map(call => call.args.slice(0, 1))).toEqual([['related'], ['run']]);
+    expect(runner(stand, 'none').status).toBe(0);
+    const coverage = path.join(stand.out, COVERAGE_DIR);
+    expect(stand.read().map(call => [call.project, call.args[0], call.coverage, call.include])).toEqual([['integration', 'related', coverage, null], ['child', 'run', coverage, null]]);
+    // c1's own process reached nothing; the Node process it started reached 3 and 5. c2 left no record.
+    expect(readReach(stand.out)).toEqual({ files: FILES, unsure: [3], reached: { 3: [1, 2], 5: [2], 7: [0, 1] } });
+    expect(fs.existsSync(path.join(stand.out, 'dry-ms.txt'))).toBe(true);
+  });
+
+  it('leaves no reach when its run with no mutant fails, or a tier left no report', () => {
+    const failed = fake(PLAN, ['integration']);
+    expect(runner(failed, 'none').status).toBe(1);
+    expect(failed.read().map(call => call.project)).toEqual(['integration']);
+    expect(fs.existsSync(path.join(failed.out, REACH_FILE))).toBe(false);
+    const childFailed = fake(PLAN, ['child']);
+    expect(runner(childFailed, 'none').status).toBe(1);
+    expect(fs.existsSync(path.join(childFailed.out, REACH_FILE))).toBe(false);
+    // A reach left from before the run is gone with it.
+    const stale = fake(PLAN, ['integration']);
+    fs.writeFileSync(path.join(stale.out, REACH_FILE), JSON.stringify({ files: ['child/c1.test.ts'], unsure: [], reached: {} }));
+    expect(runner(stale, 'none').status).toBe(1);
+    expect(fs.existsSync(path.join(stale.out, REACH_FILE))).toBe(false);
+  });
+
+  it("takes, tier by tier in the run with no mutant's order, exactly the files that reached its mutant or are unsure", () => {
+    const stand = fake();
+    expect(runner(stand, 'none').status).toBe(0);
+    const runs = (id: string) => {
+      const before = stand.read().length;
+      expect(runner(stand, id).status, id).toBe(0);
+      return stand.read().slice(before).map(call => [call.project, call.args[0], call.include, call.coverage, call.mutant, call.scale]);
+    };
+    expect(runs('7')).toEqual([['integration', 'run', ['integration/z.test.ts', 'integration/a.test.ts'], null, '7', '1'], ['child', 'run', ['child/c2.test.ts'], null, '7', '1']]);
+    expect(took(stand.out, '7')).toEqual({ files: ['integration/z.test.ts', 'integration/a.test.ts', 'child/c2.test.ts'] });
+    expect(runs('3')).toEqual([['integration', 'run', ['integration/a.test.ts'], null, '3', '1'], ['child', 'run', ['child/c1.test.ts', 'child/c2.test.ts'], null, '3', '1']]);
+    expect(took(stand.out, '3')).toEqual({ files: ['integration/a.test.ts', 'child/c1.test.ts', 'child/c2.test.ts'] });
+    // Reached only in children: no integration run.
+    expect(runs('5')).toEqual([['child', 'run', ['child/c1.test.ts', 'child/c2.test.ts'], null, '5', '1']]);
+    // Reached by none: the unsure file alone.
+    expect(runs('9')).toEqual([['child', 'run', ['child/c2.test.ts'], null, '9', '1']]);
+    for (const call of stand.read().slice(2)) expect(call.args).toEqual(expect.arrayContaining(['--bail=1', '--no-cache', '--maxWorkers=1']));
+
+    // A failure in the integration tier stops the run before the child tier.
+    const failing = fake(PLAN, ['integration/a.test.ts']);
+    expect(runner(failing, 'none').status).toBe(0);
+    expect(runner(failing, '3').status).toBe(1);
+    expect(failing.read().slice(2).map(call => call.project)).toEqual(['integration']);
+  });
+
+  it('takes every related integration file and the whole child tier when there is no reach, or it cannot be read, is not of these tiers, or every file reached the mutant', () => {
+    const reaches: [string, string | null][] = [
+      ['none', null],
+      ['unreadable', '{'],
+      ['a fast file', JSON.stringify({ files: ['unit/a.test.ts', 'child/c1.test.ts'], unsure: [], reached: {} })],
+      ['every file', JSON.stringify({ files: ['integration/a.test.ts', 'child/c1.test.ts'], unsure: [1], reached: { 4: [0] } })],
+    ];
+    for (const [what, reach] of reaches) {
+      const stand = fake();
+      if (reach !== null) fs.writeFileSync(path.join(stand.out, REACH_FILE), reach);
+      expect(runner(stand, '4').status, what).toBe(0);
+      expect(stand.read().map(call => [call.project, call.args[0], call.include, call.coverage]), what).toEqual([['integration', 'related', null, null], ['child', 'run', null, null]]);
+      expect(took(stand.out, '4'), what).toEqual({ files: 'related' });
+    }
+  });
+
+  it('takes no file, and passes, when no file reached its mutant and none is unsure', () => {
+    const stand = fake();
+    fs.writeFileSync(path.join(stand.out, REACH_FILE), JSON.stringify({ files: ['integration/a.test.ts', 'child/c1.test.ts'], unsure: [], reached: { 3: [0] } }));
+    const run = runner(stand, '4');
+    expect(run.status).toBe(0);
+    expect(stand.read()).toEqual([]);
+    expect(took(stand.out, '4')).toEqual({ files: [] });
+  });
+
+  it('leaves b2 and the run with no mutant after it as they were: the files they name, no record, no reach', () => {
+    const stand = fake();
+    fs.writeFileSync(path.join(stand.out, REACH_FILE), JSON.stringify({ files: ['integration/a.test.ts', 'child/c1.test.ts'], unsure: [], reached: {} }));
+    const reach = fs.readFileSync(path.join(stand.out, REACH_FILE), 'utf8');
+    expect(runner(stand, '4', { confirm: '1', only: ['child/c9.test.ts'] }).status).toBe(0);
+    expect(runner(stand, 'none', { confirm: '1', only: ['child/c9.test.ts'] }).status).toBe(0);
+    expect(stand.read().map(call => [call.project, call.args[0], call.include, call.coverage, call.scale])).toEqual([['child', 'run', ['child/c9.test.ts'], null, '4'], ['child', 'run', ['child/c9.test.ts'], null, '4']]);
     expect(fs.existsSync(path.join(stand.out, '4-reach.json'))).toBe(false);
+    expect(fs.readFileSync(path.join(stand.out, REACH_FILE), 'utf8')).toBe(reach);
+    expect(fs.existsSync(path.join(stand.out, COVERAGE_DIR))).toBe(false);
+  });
+
+  it("gives the coverage dir to the runs with no mutant of pass A and pass B, both of B's tiers, and to no mutant run, rerun or check", () => {
+    const stand = fake();
+    const coverage = path.join(stand.out, COVERAGE_DIR);
+    const given = (id: string, options: Parameters<typeof runner>[2]) => {
+      const before = stand.read().length;
+      runner(stand, id, options);
+      return stand.read().slice(before).map(call => call.coverage);
+    };
+    expect(given('none', {})).toEqual([coverage, coverage]);
+    expect(given('none', { pass: 'a' })).toEqual([coverage]);
+    expect(given('3', {})).toEqual([null, null]);
+    expect(given('3', { pass: 'a' })).toEqual([null]);
+    expect(given('none', { confirm: '1', pass: 'a' })).toEqual([null]);
+    expect(given('3', { confirm: '1', pass: 'a' })).toEqual([null]);
+    expect(given('none', { confirm: '1' })).toEqual([null, null]);
+    expect(given('3', { confirm: '1' })).toEqual([null, null]);
+    expect(given('none', { confirm: '1', only: ['child/c9.test.ts'] })).toEqual([null]);
+    expect(given('3', { confirm: '1', only: ['integration/i.test.ts', 'child/c9.test.ts'] })).toEqual([null, null]);
+    expect(given('none', { pass: 'a', sets: JSON.stringify([{ files: ['unit/a.test.ts'], ms: 60_000 }]) })).toEqual([null]);
   });
 });
 
@@ -835,5 +1077,29 @@ describe('the report', () => {
     expect(text).toMatch(/^ {2}survivors no fast test reached \(.*\): 1$/m);
     expect(judge({ stamp: 't', scope: 's', emptyScope: false, skipped: [], noMutant: [], unmatched: [], report: 'r', mutants: [mutant(2, { a: pass('Killed', { killedBy: 'x' }) })] }).lines.join('\n'))
       .not.toMatch(/no fast test reached/);
+  });
+
+  it('says of a survivor no test of pass B reached that none did, and counts them apart', () => {
+    const run = judge({
+      stamp: 't', scope: 's', emptyScope: false, skipped: [], noMutant: [], unmatched: [], report: 'r', mutants: [
+        mutant(1, { a: pass('Survived'), b: pass('Survived', { unreached: true }) }),
+        mutant(2, { a: pass('Survived', { unreached: true }), b: pass('Survived', { unreached: true }) }),
+        mutant(3, { a: pass('Survived'), b: pass('Survived') }),
+        mutant(4, { a: pass('Survived', { unreached: true }), b: pass('Survived') }),
+        // Killed in pass B and again alone: no survivor, whatever pass B's reach.
+        mutant(5, { a: pass('Survived'), b: pass('Killed', { killedBy: 'child/x.test.ts > x', unreached: true }), b2: pass('Killed', { killedBy: 'child/x.test.ts > x' }) }),
+      ],
+    });
+    const text = run.lines.join('\n');
+    expect(run.verdict).toBe('FAIL');
+    expect(text).toMatch(/^ {2}src\/a\.ts:1:3 EqualityOperator: `a > 0` -> `a >= 0` \(no test of pass B reached it\)$/m);
+    expect(text).toMatch(/^ {2}src\/a\.ts:2:3 EqualityOperator: `a > 0` -> `a >= 0` \(no fast test reached it; no test of pass B reached it\)$/m);
+    expect(text).toMatch(/^ {2}src\/a\.ts:3:3 EqualityOperator: `a > 0` -> `a >= 0`$/m);
+    expect(text).toMatch(/^ {2}src\/a\.ts:4:3 EqualityOperator: `a > 0` -> `a >= 0` \(no fast test reached it\)$/m);
+    expect(text).toMatch(/^ {2}survivors no fast test reached \(.*\): 2$/m);
+    expect(text).toMatch(/^ {2}survivors no test of pass B reached \(none ran their code in pass B's run with no mutant, so pass B ran no test on them\): 2$/m);
+    expect(text).not.toMatch(/src\/a\.ts:5:3/);
+    const none = judge({ stamp: 't', scope: 's', emptyScope: false, skipped: [], noMutant: [], unmatched: [], report: 'r', mutants: [mutant(3, { a: pass('Survived'), b: pass('Survived') })] });
+    expect(none.lines.join('\n')).not.toMatch(/no test of pass B reached/);
   });
 });
