@@ -23,7 +23,10 @@ const h = vi.hoisted(() => ({
 
 vi.mock('child_process', async orig => ({
   ...(await orig<any>()),
-  exec: (_cmd: string, _opts: unknown, cb: (error: Error | null, out?: { stdout: string; stderr: string }) => void) => { h.compiles.push(cb); },
+  exec: (cmd: string, _opts: unknown, cb: (error: Error | null, out?: { stdout: string; stderr: string }) => void) => {
+    if (cmd === 'sync') cb(null, { stdout: '', stderr: '' });
+    else h.compiles.push(cb);
+  },
 }));
 vi.mock('../../src/bot/internalSetup/utils/pathHelpers', async orig => ({
   ...(await orig<any>()),

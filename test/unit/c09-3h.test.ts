@@ -34,8 +34,9 @@ vi.mock('fs', async (orig) => {
 });
 vi.mock('child_process', async (orig) => ({
   ...(await orig<any>()),
-  exec: (_cmd: string, _opts: any, cb: (err: any, out?: any) => void) => {
-    if (h.compile) h.compile(cb);
+  exec: (cmd: string, _opts: any, cb: (err: any, out?: any) => void) => {
+    if (cmd === 'sync') cb(null, { stdout: '', stderr: '' });
+    else if (h.compile) h.compile(cb);
     else cb(Object.assign(new Error('tsc failed'), { stderr: 'tsc failed' }));
   },
 }));
