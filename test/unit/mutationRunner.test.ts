@@ -284,14 +284,24 @@ describe('a mutant run', () => {
     expect(runner(fake, 'a', '1', [], slow).status).toBe(0);
     fs.writeFileSync(path.join(fake.out, 'taken.json'), JSON.stringify({}));
     expect(runner(fake, 'a', '1', [], slow).status).toBe(0);
-    // Pass B, and b2, which reruns the one file that failed in pass B, whatever costs their dir holds.
-    expect(runner(fake, 'b', '', [], slow).status).toBe(0);
-    expect(runner(fake, 'b', '1', ['unit/slow.test.ts'], slow).status).toBe(0);
     expect(fake.read().map(call => [call.project, call.scale, call.include])).toEqual([
       ['fast', '1', ['unit/slow.test.ts']], ['fast', '1', null], ['fast', '4', ['unit/slow.test.ts']], ['fast', '4', FOUR], ['fast', '4', null],
-      ['integration', '1', null], ['child', '1', null], ['fast', '4', ['unit/slow.test.ts']],
     ]);
     expect(fs.readdirSync(fake.out).filter(name => name.endsWith('-bound.json'))).toEqual([]);
+    // Pass B's run of the files that reached its mutant (6: the slow child file), and b2's rerun of that file, with costs
+    // in their dir that would bound a pass A run of one file at 2300 ms.
+    const passB = fakeVitest([], [], ['child/slow.test.ts']);
+    fs.writeFileSync(path.join(passB.out, 'dry-reach.json'), JSON.stringify({
+      files: ['integration/hang.test.ts', 'integration/a.test.ts', 'child/slow.test.ts'], unsure: [], reached: { 6: [2], 7: [0] }, costs: [100, 100, 100],
+    }));
+    fs.writeFileSync(path.join(passB.out, 'dry-costs.json'), JSON.stringify({ files: ['child/slow.test.ts'], costs: [100] }));
+    for (const confirm of ['', '1']) {
+      const begun = Date.now();
+      expect(runner(passB, 'b', confirm, confirm ? ['child/slow.test.ts'] : [], slow).status, confirm).toBe(0);
+      expect(Date.now() - begun, confirm).toBeGreaterThanOrEqual(2900);
+    }
+    expect(passB.read().map(call => [call.project, call.scale, call.include])).toEqual([['child', '1', ['child/slow.test.ts']], ['child', '4', ['child/slow.test.ts']]]);
+    expect(fs.readdirSync(passB.out).filter(name => name.endsWith('-bound.json'))).toEqual([]);
   });
 
   it('gives no run the coverage dir the caller\'s shell set', () => {

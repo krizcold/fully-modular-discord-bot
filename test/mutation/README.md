@@ -678,9 +678,10 @@ leaves no mark. One that exits in the instant between the runner's check that it
 own exit when that exit is 0, and on POSIX when it is not 0 as well, since the runner tells its own exit from the kill
 by the signal; on Windows, where an ended process shows only an exit code, a non-zero exit in that instant is marked,
 and the run counts as a timeout. The runs with no mutant are bounded only as above (a set's own bound). Pass B and b2
-keep Stryker's budget: pass B takes every related integration file and the whole child tier, so there is no smaller
-set to build a budget from, and a b2 rerun takes the one file that failed in pass B, which is all its own run with no
-mutant takes, so Stryker's budget there is already built from the run's own file.
+keep Stryker's budget. Pass B's run with no mutant records no cost per file, so there is nothing to build a bound from,
+and a timeout in pass B is never counted as a kill: a hang there costs time and cannot cost a wrong kill. A b2 rerun
+takes the one file that failed in pass B, which is all its own run with no mutant takes, so Stryker's budget there is
+already built from the run's own file.
 
 ## Which tests a pass B mutant runs
 
