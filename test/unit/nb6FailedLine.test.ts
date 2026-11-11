@@ -36,6 +36,7 @@ import { setBackendKind } from '../helpers/backendKind';
 import { setView } from '../helpers/nb6Mirror';
 import { exitChild, freshWriterLock, resetForks } from '../helpers/nb10Rig';
 import { webuiSessions } from '../helpers/nb6WebuiSession';
+import { readSourceText } from '../helpers/sourceText';
 
 const A = 'postgres://bot@db:5432/bot';
 const SHA_1 = 'a'.repeat(64);
@@ -122,7 +123,7 @@ const moduleRow = (module: string, sha: string, version: string | null): [string
     file_count = EXCLUDED.file_count, bytes = EXCLUDED.bytes, updated_at = now(), updated_by = EXCLUDED.updated_by`, [module, sha, version, 1, 10, 'ALPHA/p-ALPHA']];
 
 function panel(): Record<string, any> {
-  const code = transformSync(fs.readFileSync(new URL('../../src/webui/public/components/AppStorePanel.jsx', import.meta.url), 'utf-8'), {
+  const code = transformSync(readSourceText(__dirname, '../../src/webui/public/components/AppStorePanel.jsx'), {
     presets: [[presetReact, { runtime: 'classic' }]], babelrc: false, configFile: false,
   })!.code!;
   const ctx: Record<string, any> = { React: { useState: () => [], useEffect: () => {}, useRef: () => ({}) }, console };

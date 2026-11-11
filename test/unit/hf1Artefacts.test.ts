@@ -1,11 +1,12 @@
 import fs from 'fs';
 import { describe, expect, it } from 'vitest';
+import { readSourceText } from '../helpers/sourceText';
 
 // HF1 (notes/HF1.md): the shipped pages and gateway configs, read as data. Without the admin login a request reaches
 // only /guild, /auth, or the member page's own files under /assets/ (GET and HEAD at Authelia).
 
 const repo = new URL('../../', import.meta.url);
-const read = (rel: string) => fs.readFileSync(new URL(rel, repo), 'utf-8');
+const read = (rel: string) => readSourceText(__dirname, `../../${rel}`);
 const exists = (rel: string) => fs.existsSync(new URL(rel, repo));
 const PUBLIC = 'src/webui/public/';
 

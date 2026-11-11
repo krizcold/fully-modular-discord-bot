@@ -1,14 +1,14 @@
-import fs from 'fs';
 import vm from 'vm';
 import { transformSync } from '@babel/core';
 import presetReact from '@babel/preset-react';
 import { describe, expect, it } from 'vitest';
+import { readSourceText } from '../helpers/sourceText';
 
 // NB6 test 49's install job rows (decision 61; part 26): the App Store tab shows the answer a job carries in `message`
 // (T7, T8, T9, T18, T30, T37) in place of its own install text; a job without one keeps today's texts.
 
 function panel(): Record<string, any> {
-  const code = transformSync(fs.readFileSync(new URL('../../src/webui/public/components/AppStorePanel.jsx', import.meta.url), 'utf-8'), {
+  const code = transformSync(readSourceText(__dirname, '../../src/webui/public/components/AppStorePanel.jsx'), {
     presets: [[presetReact, { runtime: 'classic' }]], babelrc: false, configFile: false,
   })!.code!;
   const ctx: Record<string, any> = { React: { useState: () => [], useEffect: () => {}, useRef: () => ({}) }, console };

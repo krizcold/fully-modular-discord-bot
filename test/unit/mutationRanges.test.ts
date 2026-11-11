@@ -1288,7 +1288,7 @@ describe('the widening, against what Stryker makes', () => {
 
   // The shapes above, and two real files: one with plain statements, one a
   // route file of block-bodied handlers.
-  const real = (file: string) => fs.readFileSync(path.join(__dirname, '..', '..', file), 'utf8');
+  const real = (file: string) => readSourceText(__dirname, `../../${file}`);
   const corpus: [string, string][] = [
     ...Object.entries(SHAPES),
     ['src/bot/internalSetup/fleet/nodeIdentity.ts', real('src/bot/internalSetup/fleet/nodeIdentity.ts')],

@@ -1,9 +1,9 @@
-import fs from 'fs';
 import http from 'http';
 import https from 'https';
 import { EventEmitter } from 'events';
 import ts from 'typescript';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { readSourceText } from '../helpers/sourceText';
 
 const h = vi.hoisted(() => ({
   installed: [] as any[],
@@ -30,8 +30,7 @@ vi.mock('../../src/updater/index', async (orig) => {
   };
 });
 
-const repo = new URL('../../', import.meta.url);
-const read = (rel: string) => fs.readFileSync(new URL(rel, repo), 'utf-8');
+const read = (rel: string) => readSourceText(__dirname, `../../${rel}`);
 
 function fakeResponse(mod: any, statusCode: number, body: string) {
   return vi.spyOn(mod, 'request').mockImplementation(((_opts: any, cb: any) => {

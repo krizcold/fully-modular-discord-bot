@@ -6,6 +6,7 @@ import { describe, expect, it, onTestFinished, vi } from 'vitest';
 import { childEnv } from '../helpers/child';
 import { DEAD_ENDS, kept, scrubEnv } from '../helpers/env';
 import { CODE } from '../mutation/ranges.mjs';
+import { readSourceText } from '../helpers/sourceText';
 
 // The env scrub (helpers/env.ts): tests and the children they start keep only
 // the platform's, the test tools' and the suite's own variables, so whatever a
@@ -19,7 +20,7 @@ const srcFiles = () => execFileSync('git', ['-c', 'core.quotePath=false', 'ls-fi
   .split('\0').filter(file => CODE.test(file) && fs.existsSync(path.join(botRoot, file))).map(file => path.join(botRoot, file));
 
 describe('the env scrub', () => {
-  const texts = srcFiles().map(file => fs.readFileSync(file, 'utf8'));
+  const texts = srcFiles().map(file => readSourceText(botRoot, file));
   const found = (pattern: RegExp) => [...new Set(texts.flatMap(text => [...text.matchAll(pattern)].map(m => m[1] ?? m[2])))].sort();
 
   // A key the scrub keeps (a platform one) that src reads fails this: such a read is a decision, made here.

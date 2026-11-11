@@ -46,6 +46,7 @@ import { setView } from '../helpers/nb6Mirror';
 import { exitChild, freshWriterLock, resetForks } from '../helpers/nb10Rig';
 import { webuiSessions } from '../helpers/nb6WebuiSession';
 import { lost } from '../helpers/sharedRows';
+import { readSourceText } from '../helpers/sourceText';
 
 const ENV = dataPath('.env');
 const STORE = dataPath('global', 'appstore');
@@ -140,7 +141,7 @@ async function committed(...statements: Array<[string, unknown[]]>): Promise<voi
 }
 
 function panel(): Record<string, any> {
-  const code = transformSync(fs.readFileSync(new URL('../../src/webui/public/components/AppStorePanel.jsx', import.meta.url), 'utf-8'), {
+  const code = transformSync(readSourceText(__dirname, '../../src/webui/public/components/AppStorePanel.jsx'), {
     presets: [[presetReact, { runtime: 'classic' }]], babelrc: false, configFile: false,
   })!.code!;
   const ctx: Record<string, any> = { React: { useState: () => [], useEffect: () => {}, useRef: () => ({}) }, console };

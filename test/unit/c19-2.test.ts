@@ -53,6 +53,7 @@ vi.mock('@internal/utils/moduleRegistry', () => ({
 import { ModuleLoader } from '@internal/utils/moduleLoader';
 import { reloadModule, reloadModules } from '@internal/utils/moduleReloader';
 import { scanDevModules } from '@webui/routes/devmodules';
+import { readSourceText } from '../helpers/sourceText';
 
 vi.spyOn(ModuleLoader.prototype, 'loadModule').mockImplementation(async (manifest: any, modulePath: string) => {
   state.loads.push(manifest.name);
@@ -188,7 +189,7 @@ describe('an install the bot refuses to hot-load says why', () => {
   });
 
   it('the toast shows the refusal, and suggests a restart only for an intent refusal', () => {
-    const code = transformSync(fs.readFileSync(new URL('../../src/webui/public/components/AppStorePanel.jsx', import.meta.url), 'utf-8'), {
+    const code = transformSync(readSourceText(__dirname, '../../src/webui/public/components/AppStorePanel.jsx'), {
       presets: [[presetReact, { runtime: 'classic' }]], babelrc: false, configFile: false,
     })!.code!;
     const ctx: Record<string, any> = { React: { useState: () => [], useEffect: () => {}, useRef: () => ({}) }, console };

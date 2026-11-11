@@ -26,6 +26,7 @@ vi.mock('child_process', async orig => {
 vi.mock('../../src/bot/internalSetup/utils/pathHelpers', async orig => ({ ...(await orig<any>()), getBuildRoot: () => 'Z:/nb6-no-build-root' }));
 
 import fs from 'fs';
+import { createRequire } from 'module';
 import os from 'os';
 import path from 'path';
 import { spawnSync } from 'child_process';
@@ -82,7 +83,8 @@ describe('the diagnostics of a real tsc run', () => {
       fs.writeFileSync(path.join(root, 'bot', 'modules', 'broken', 'index.ts'), "export const n: number = 1;\nexport const s: number = 'not a number';\n");
       fs.writeFileSync(path.join(root, 'bot', 'modules', 'fine', 'index.ts'), 'export const ok = 1;\n');
       fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { strict: true, noEmit: true, types: [] }, include: ['bot/**/*.ts'] }));
-      const tsc = path.resolve(__dirname, '..', '..', 'node_modules', 'typescript', 'bin', 'tsc');
+      // A gate sandbox has no root node_modules; the suite's own typescript resolves there through test/node_modules.
+      const tsc = createRequire(__filename).resolve('typescript/bin/tsc');
       const run = spawnSync(process.execPath, [tsc, '-p', 'tsconfig.json', '--pretty', 'false'], { cwd: root, encoding: 'utf8' });
       expect(run.status).not.toBe(0);
       expect(parseDiagnostics(`${run.stdout}\n${run.stderr}`, root)).toEqual([

@@ -13,8 +13,7 @@ import { applyOperatorDataWrite } from '../../src/bot/internalSetup/utils/ipcDat
 import { restoreGuildFromGraveyard, setGuildDataBackend } from '../../src/bot/internalSetup/utils/dataManager';
 import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
 import { getWorkingSet } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
-import fs from 'fs';
-import path from 'path';
+import { readSourceText } from '../helpers/sourceText';
 import { stopSteps } from '../helpers/stopRig';
 import { MemClaimStore } from '../helpers/fakeClaimStore';
 import { setBackendKind } from '../helpers/backendKind';
@@ -284,7 +283,7 @@ describe('the stop steps (NB4-R3-T1)', () => {
     return { dm, order, exit };
   }
   const stopStepSource = () => {
-    const source = fs.readFileSync(path.resolve(__dirname, '../../src/bot/internalSetup/clientInitializer.ts'), 'utf-8');
+    const source = readSourceText(__dirname, '../../src/bot/internalSetup/clientInitializer.ts');
     return source.slice(source.indexOf('addStopStep(async () => {'), source.indexOf('addReleaseStep(() => stopMainWatch());'));
   };
 

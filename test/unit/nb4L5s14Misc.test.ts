@@ -25,9 +25,8 @@ vi.mock('../../src/bot/internalSetup/utils/panel/persistentPanelStorage', async 
 import { applyOperatorDataWrite } from '../../src/bot/internalSetup/utils/ipcDataHandler';
 import { recoverPersistentPanels } from '../../src/bot/internalSetup/utils/panel/persistentPanelRecovery';
 import { setStoppedServingHook } from '../../src/bot/internalSetup/utils/servingGate';
-import fs from 'fs';
-import path from 'path';
 import { stopSteps } from '../helpers/stopRig';
+import { readSourceText } from '../helpers/sourceText';
 
 afterEach(() => {
   h.setState = null;
@@ -71,7 +70,7 @@ describe('the stop steps', () => {
     return { dm, order, exit };
   }
   const stopStepSource = () => {
-    const source = fs.readFileSync(path.resolve(__dirname, '../../src/bot/internalSetup/clientInitializer.ts'), 'utf-8');
+    const source = readSourceText(__dirname, '../../src/bot/internalSetup/clientInitializer.ts');
     return source.slice(source.indexOf('addStopStep(async () => {'), source.indexOf('addReleaseStep(() => stopMainWatch());'));
   };
 
