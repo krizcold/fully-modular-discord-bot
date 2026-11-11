@@ -50,7 +50,7 @@ export default defineConfig({
   test: {
     root: here,
     // A pass A run with no mutant records what each test file reached
-    // (mutation/README.md); first, so its beforeAll's cleanup runs after every afterAll.
+    // (mutation/README.md); first, so its recorder is in place before any instrumented file loads.
     setupFiles: [...(process.env.SMDB_MUTATION_COVERAGE ? ['./helpers/mutationCoverage.ts'] : []), './helpers/setup.ts'],
     // Not 'test', as a developer's shell may set it, so every run shows that
     // setup.ts puts it right (unit/envScrub.test.ts).

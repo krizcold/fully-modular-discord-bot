@@ -16,6 +16,8 @@ active mutant travels in `__STRYKER_ACTIVE_MUTANT__` and reaches child processes
 | stryker.json | (data) empty on purpose: every pass names it as its config file, so Stryker never reads one it finds in the bot root |
 | keys.mjs | (library) how a file and a mutant are named across passes; unit/mutationRanges.test.ts |
 | targets.mjs | (Stryker reporter) which mutant ids a later pass runs tests for, and Stryker's own time for each run with no mutant; unit/mutationRunner.test.ts and the bite |
+| reach.mjs | (library) which fast test files a pass A mutant run takes: the records of the run with no mutant read into each file's ids and whether it is unsure; unit/mutationCoverage.test.ts |
+| ../helpers/mutationCoverage.ts, reachRecorder.cjs | the first setup file of pass A's run with no mutant, and the recorder it loads in each test file's process and, through NODE_OPTIONS, in each Node process under it: each mutant id at its first count, and each process started; unit/mutationCoverage.test.ts |
 | survivors.mjs | (read-only tool) pass A's survivors so far, from a run's report dir and sandbox while the run goes on or after it died; unit/mutationSurvivors.test.ts |
 | tree.mjs | (library) the fingerprint of the tree a run reads and of the packages it loads, taken before the plan and before the verdict; unit/mutationRanges.test.ts and the bite |
 | ../helpers/time.mjs | the factor on the config's test and hook limits and a child step's default bound (4 in a rerun alone and in the run with no mutant after the reruns; a limit a test, hook or step sets itself is not scaled) |
@@ -460,17 +462,57 @@ and then (below, "Which fast tests a mutant runs").
 Stryker's instrumented code puts each mutant behind a switch, `stryMutAct_9fa48(id) ? mutated : (stryCov_9fa48(id),
 original)` (a statement or a switch case gets an `if` of the same shape), and `stryCov_9fa48` counts each id it is
 given in `globalThis.__stryker__.mutantCoverage`: under `static`, or under `perTest[currentTestId]` when a test id is
-set, which Stryker's command runner never does. With no mutant active, every place a run executes counts the ids of
+set, which Stryker's command runner never does. Each instrumented file takes that object from the namespace the first
+time it counts, and makes it when it is missing. With no mutant active, every place a run executes counts the ids of
 its mutants. Pass A and its run with no checker each start with their run with no mutant, which names a dir in
-SMDB_MUTATION_COVERAGE, and vitest.config.ts then loads helpers/mutationCoverage.ts first in every test file. vitest
-runs each fast test file in a process of its own (pool forks, isolate on), so every id that process counted, at load,
-in a hook or in a test, is the file's. The setup file's beforeAll, the file's first, returns a cleanup, which vitest's
-default hook order ('stack') runs after the file's last afterAll and after every other beforeAll's cleanup; that
-cleanup writes those ids to `dry-coverage/` in the pass's report dir, in a record named by the file and its process
-id that no other write replaces. runner.mjs then joins the records with the files vitest's report says ran, in
+SMDB_MUTATION_COVERAGE (`dry-coverage/` in the pass's report dir), and vitest.config.ts then loads
+helpers/mutationCoverage.ts first in every test file; vitest runs each fast test file in a process of its own (pool
+forks, isolate on). mutationCoverage.ts loads helpers/reachRecorder.cjs, which puts a count object of its own in the
+namespace before any instrumented file loads. Its `static` table and each `perTest` table is a Proxy that, the first
+time an id is set in it, appends the id to the process's record with one synchronous write (a test id read for the
+first time gets such a table at once, since Stryker counts into the object it assigns, not into the one stored). So an
+id is on disk from the moment its place first runs, at load, in a hook, in a test or after the last hook, and stays
+there when a signal ends the process: vitest ends each fork so, and tests and scenarios end their children with
+SIGKILL, and no exit handler runs then. The recorder never sets the active mutant, calls no code of the tree, and
+never throws into the code that counts.
+
+The recorder makes one dir per test file process under `dry-coverage/`, named by a hash of the file's path (written
+out, a sandbox's path can pass Windows' 260 characters) and the process id. Every process that reports into it
+appends to a record of its own, `<pid>-<random>.jsonl`, so a process id the system reuses never appends to another
+process's record. A record holds one JSON object per line: first who wrote it (the test file's own process, with the
+file's path, or a child, with the token of the start that made it), whether that process had already run another
+test file, and whether its recorder came late (below); then one line per id at its first count; one line per process
+or worker the process starts, written before the start, with the start's token and kind; and, when a write failed, a
+line saying so on the next write that works, with a `<record>.failed` file beside the record when one can be made.
+
+The recorder hooks every way a process starts, in the test file's process and in every child that loaded it:
+ChildProcess.prototype.spawn, where every async form (fork, spawn, exec, execFile, a promisified one) starts its
+process with Node's own options and the env already turned into `envPairs`; spawnSync, execSync and execFileSync,
+which build their env inside; and worker_threads' Worker. Each start has a kind:
+
+- node: the program's base name is node (node.exe on Windows) or it is process.execPath; or the program is a shell
+  (the platform's, as child_process starts it, or options.shell set to true) whose whole command is one simple
+  command, with none of ``& | ; < > ( ) ` $ % ^`` and no line break (cmd.exe expands `%NAME%` and reads `^` as an
+  escape before it parses the line), whose first word's base name is node;
+- listed: the program, or the first word of such a command, is fsutil, git or sync, which run none of the tree's code
+  and pass their environment on to what they start;
+- worker: a worker_threads Worker;
+- other: anything else, a start whose options.shell names a shell (that shell may read the command by other rules),
+  and every sync call whose arguments the recorder does not read (execSync given options that are neither an object
+  nor null, an execFileSync whose args are a function, a spawnSync given null options, options or an env with an
+  accessor property, which may give another value on each read), which reach Node as the caller gave them, since
+  Node still starts a process for some of them.
+
+For every kind but a worker, the child's env gets three variables, in a copy (the caller's options and env stay as
+they were): NODE_OPTIONS gains `--require "<the recorder's path>"` after the NODE_OPTIONS the child would have had,
+SMDB_MUTATION_REACH names the test file's record dir, and SMDB_MUTATION_REACH_TOKEN names the start. Node runs
+NODE_OPTIONS' preloads before the command line's, so a Node child loads the recorder before anything else and reports
+into the same dir under that token, and so does a Node process that a listed program or a child starts.
+runner.mjs then reads the dirs (reach.mjs readRecords) and joins them with the files vitest's report says ran, in
 `dry-reach.json`. The setup file takes SMDB_MUTATION_COVERAGE out of its process's env when it loads, so a vitest that
-a test starts writes no record there, and touched.mjs takes it out of its own env when it starts: runner.mjs names
-the dir to pass A's run with no mutant and to no other run, whatever the shell set.
+a test starts does not take the dir as its own, and touched.mjs takes it out of its own env when it starts: runner.mjs
+names the dir to pass A's run with no mutant and to no other run, whatever the shell set. No mutant run loads the
+recorder.
 
 a2 and the run with no mutant after it record nothing. a2 reruns only mutants on which some file already failed or
 timed out in pass A, and a fresh run with no mutant that happened to miss the mutant would drop that file, so each a2
@@ -480,13 +522,32 @@ id's key to `run-keys.json`, and runner.mjs takes every related file when a link
 own run with no mutant, and the one after the reruns, take every related file, so neither runs the smaller set an a2
 run took; the gate runs those sets on their own after the reruns (below).
 
-A test file is unsure, and runs for every mutant, when it left no record (its process died, or the record could not
-be written or read), when its process ran another test file first, or when it started a process or a worker_threads
-Worker (through child_process's async forms, which all start at ChildProcess.prototype.spawn, or spawnSync, execSync
-or execFileSync), since a child may run the instrumented code where no count reaches the file, or when its hooks ran
-in another order than 'stack' when the record was written (a file can change it with `vi.setConfig({ sequence: {
-hooks } })`), since in 'list' or 'parallel' the record can come before other cleanups. A test that mocks
-child_process starts nothing through the mock. Each mutant's run then takes:
+A test file's reach is the union of the ids in every record of its dir. The file is unsure, and runs for every mutant,
+when:
+
+- its dir or its own process's record is missing (the process died before it made them, or they could not be made),
+  or more than one record in the dir claims to be the file's own process: nothing then says what the file reached;
+- a line of a record cannot be read, or a write failed: an id may be missing;
+- its process ran another test file first, whose counts are mixed with its own;
+- a recorder came late: the namespace already held a count object when it started, so the counts before it are out of
+  its sight (an instrumented file loaded first, as when the gate mutates the recorder itself or a file preloaded
+  before it);
+- it or a process under it started a worker, whose counts stay in the worker's own global;
+- it or a process under it started a program of kind other, which may run the tree's code where no recorder is (a
+  shell command with an operator, which may start Node under any env; a Node started under another name; a sync start
+  whose arguments the recorder cannot reproduce exactly);
+- a start of kind node has no record in the dir that carries its token: that child may have run the tree's code
+  without the recorder (a Node that never read NODE_OPTIONS, a program named node that is not Node, a start that
+  failed, a child ended before its recorder wrote);
+- a process under it is also a test file's own process (a test that runs vitest with this setup file) and starts a
+  process: the child's env names only the newer dir, so the older one cannot follow it.
+
+When one file ran twice, it is sure only when both dirs are. A file whose every test is skipped runs no hook, but its
+record is on disk from its load on, so it is sure, with the ids its import counted. A test that mocks child_process
+starts nothing through the mock. What the records do not see: a process started by other means than child_process or
+worker_threads (a native addon, Node's internal bindings); code a listed program runs by itself; and counts made after
+a test replaces `globalThis.__stryker__` or its count object (no test of the suite touches them). Each mutant's run
+then takes:
 
 - every related file, as `vitest related` as the run with no mutant did, when there is no reach (that run left no
   report, or a reach that cannot be read) or when every file reached the mutant or is unsure;
@@ -499,14 +560,13 @@ A dropped file cannot kill the mutant: a mutant's run is the run with no mutant 
 so a file that never ran that place with no mutant never runs it with the mutant either. That holds for a test that
 does the same on every run. One whose path turns on timing (a race, a retry on a timer), randomness (Math.random, the
 clock) or the machine can reach a place in a mutant's run that it missed in the run with no mutant; such a mutant then
-shows as a survivor. Code that runs after the record is written is not counted: the part after the suite of an
-aroundAll at the top of the file, the teardown of a file-scoped fixture, and anything after the file's hooks, since
-vitest ends each fork with a signal and no exit handler runs. A mutant reached only there can still make that file
-fail: async work started
-earlier and not awaited (a timer, or a write queue's flush) throws, vitest reports an unhandled error and exits 1,
-Stryker counts a kill and the gate reports it inconclusive. The run with no mutant does not count it, so the file is
-dropped and the mutant shows as a survivor "no fast test reached it"; a writer who sees that label should look for
-async work that outlives the file's tests. `<id>-reach.json` in the pass's dir names the files a mutant's run took
+shows as a survivor. Code after the file's hooks (the part after the suite of an aroundAll at the top of the file, the
+teardown of a file-scoped fixture) is counted when it runs before vitest ends the fork. Async work started earlier and
+not awaited (a timer, or a write queue's flush) is timing too: when the run with no mutant ended before it ran, the
+file is dropped for a mutant only that work reaches, which then shows as a survivor "no fast test reached it", though
+in a run where the work did run the mutant could have made it throw (vitest reports an unhandled error and exits 1,
+Stryker counts a kill and the gate reports it inconclusive). A writer who sees that label should look for async work
+that outlives the file's tests. `<id>-reach.json` in the pass's dir names the files a mutant's run took
 (`"related"` for every related file).
 
 No run with no mutant of pass A runs the smaller set a mutant's run takes, so a file can fail there for reasons of
@@ -567,7 +627,7 @@ takes the files its run in pass A took, fits in its budget the same way.
 - `a/`, `a-unchecked/` (pass A again with no checker), `a2/`, `b/` and `b2-1/`, `b2-2/` (one per test file that failed in pass B: a kill, or a failure only on the machine's texts) hold, for each mutant run, one vitest
   JSON report and log per tier it ran (`<id>-<tier>.json` and `.log`; a run in `b/` can reach both integration and
   child; a nested mutant a pass is not for runs nothing; `dry-*` is the run with no mutant, `dry-ms.txt` its monotonic time and `dry-timing.json` Stryker's).
-  `a/` and `a-unchecked/` also hold `dry-coverage/` (one record per fast test file and process) and
+  `a/` and `a-unchecked/` also hold `dry-coverage/` (one dir of records per fast test file process) and
   `dry-reach.json`, the reach built from them; each mutant run there and in `a2/` leaves `<id>-reach.json`, the files
   it took. `a2/` also holds `taken.json`, the files each target's run in pass A took, by its key, and each dir with
   run-ids.json holds `run-keys.json`, each of those ids' key.
