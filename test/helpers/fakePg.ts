@@ -14,6 +14,8 @@ export interface FakeStore {
   noMeta?: boolean;
   /** The owner_channel row's value (NB5 decision 23); absent for no row. */
   ownerChannel?: string;
+  /** NB23's owner-message:<key> rows of meta: key, value and updated_at (a Date). */
+  ownerKeys?: Row[];
   /** Row 1 of the reshard table, written by provisioning's seed. */
   reshardSeeded?: boolean;
   /** NB6's shared tables (absent: no rows); bodies, lines and file bytes are bytes. */
@@ -239,6 +241,24 @@ export class FakeClient {
     if (channelRead) {
       const s = this.store(channelRead[1]);
       return { rows: s.ownerChannel === undefined ? [] : [{ value: s.ownerChannel }] };
+    }
+    const keysRead = /^SELECT key, value, updated_at FROM "?([a-z0-9_]+)"?\.meta WHERE key LIKE 'owner-message:%'/.exec(sql);
+    if (keysRead) {
+      const s = this.store(keysRead[1]);
+      if (s.noMeta) throw pgError('42P01', `relation "${keysRead[1]}.meta" does not exist`);
+      return { rows: (s.ownerKeys ?? []).map(r => ({ ...r, updated_at: new Date(r.updated_at) })) };
+    }
+    if (/^INSERT INTO smdb_data\.meta AS m \(key, value, updated_at\) SELECT .*unnest/.test(sql)) {
+      const s = this.store();
+      const [keys, values, times] = params;
+      s.ownerKeys ??= [];
+      for (let i = 0; i < keys.length; i++) {
+        const at = new Date(times[i]);
+        const held = s.ownerKeys.find(r => r.key === keys[i]);
+        if (!held) s.ownerKeys.push({ key: keys[i], value: values[i], updated_at: at });
+        else if (new Date(held.updated_at).getTime() > at.getTime()) Object.assign(held, { value: values[i], updated_at: at });
+      }
+      return { rows: [] };
     }
     if (/^DELETE FROM smdb_data\.meta WHERE key = 'owner_channel'/.test(sql)) {
       delete this.store().ownerChannel;

@@ -10,6 +10,7 @@ import { FolderSyncError, writeErrorText } from '../../bot/internalSetup/utils/f
 import { shortLivedClient } from '../../bot/internalSetup/utils/pgClient';
 import { ownerChannelFromFile, ownerChannelOf, type OwnerChannelValue } from '../../bot/internalSetup/utils/dataBackends/mainDatabase';
 import { channelCause, postInPlace } from '../../utils/ownerMessages';
+import { OWNER_KEY_PREFIX, OWNER_KEYS_DAYS, OWNER_KEYS_MAX } from '../../bot/internalSetup/utils/ownerMessageRecord';
 import { rowBackend } from '../../bot/internalSetup/utils/sharedStore';
 import type { SharedStatement } from '../../bot/internalSetup/utils/dataBackends/postgresBackend';
 import type { RunningMigration } from '../../bot/internalSetup/utils/dataMigration';
@@ -27,16 +28,8 @@ export function ownerChannelFile(): string {
   return dataPath('owner-channel.json');
 }
 
-/** Decision 14's key record of the notify-owner route on this machine. */
-export function ownerMessagesFile(): string {
-  return dataPath('owner-messages.json');
-}
-
-/** On a Postgres bot each posted key is also a smdb_data.meta row of the main database, so it moves with a switch. */
-export const OWNER_KEY_PREFIX = 'owner-message:';
+export { OWNER_KEY_PREFIX, ownerMessagesFile } from '../../bot/internalSetup/utils/ownerMessageRecord';
 export const OWNER_KEY_READ_SQL = 'SELECT value FROM smdb_data.meta WHERE key = $1';
-const OWNER_KEYS_DAYS = 90;
-const OWNER_KEYS_MAX = 1000;
 
 /** The record of a posted key, with the deletes of keys older than 90 days and of all but the newest 1000, in one transaction. */
 export function ownerKeyStatements(key: string, at: string): SharedStatement[] {

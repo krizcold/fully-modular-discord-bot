@@ -29,6 +29,9 @@ import { flushAll, queuedFilePaths } from './dataBackends/fileBackend';
 import { commitMayHaveLanded, isLoginRefused, provisionStoreInTransaction } from './dataBackends/postgresBackend';
 import { ownerChannelFromFile, ownerChannelOf, type OwnerChannelValue } from './dataBackends/mainDatabase';
 import { isGuildDataPath } from './dataManager';
+import {
+  isoTimes, keptKeys, keyTimesOfRows, mergeEarlier, OWNER_KEY_PREFIX, ownerMessagesFile, readKeyFile, sameKeys, type KeyTimes,
+} from './ownerMessageRecord';
 import { shortLivedClient } from './pgClient';
 import { checkAddressList, normalizeAddress, parseAddressList, pgConfig, showAddress } from '../../../utils/databaseAddress';
 import { getNodeId } from '../fleet/nodeIdentity';
@@ -79,6 +82,33 @@ async function ownerChannelRow(session: PgSession): Promise<OwnerChannelValue> {
     throw error;
   }
 }
+
+const OWNER_KEYS_SQL = `SELECT key, value, updated_at FROM smdb_data.meta WHERE key LIKE '${OWNER_KEY_PREFIX}%'`;
+const OWNER_KEYS_UPSERT = 'INSERT INTO smdb_data.meta AS m (key, value, updated_at) SELECT k, v, t FROM unnest($1::text[], $2::text[], $3::timestamptz[]) AS u(k, v, t) '
+  + 'ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at WHERE m.updated_at > EXCLUDED.updated_at';
+const OWNER_KEYS_DIFFER = 'The record of posted owner messages in the copy differs from the source';
+
+/** NB23's owner-message rows of a session's smdb_data with their posted times; a missing meta table holds none. */
+async function ownerKeyRows(session: PgSession): Promise<KeyTimes> {
+  try {
+    return keyTimesOfRows((await session.query(OWNER_KEYS_SQL)).rows);
+  } catch (error) {
+    const code = (error as { code?: string })?.code;
+    if (code === '42P01' || code === '3F000') return {};
+    throw error;
+  }
+}
+
+/** Writes the keys as rows whose updated_at is the posted time (a row already earlier stays), then reads them back. */
+async function carryOwnerKeys(session: PgSession, keys: KeyTimes): Promise<void> {
+  const names = Object.keys(keys);
+  if (names.length > 0) {
+    await session.query(OWNER_KEYS_UPSERT, [names.map(k => `${OWNER_KEY_PREFIX}${k}`), names.map(k => JSON.stringify(keys[k])), names.map(k => keys[k])]);
+  }
+  if (!sameKeys(await ownerKeyRows(session), keys)) throw new Error(OWNER_KEYS_DIFFER);
+}
+
+const keysWord = (n: number) => `${n} owner message ${n === 1 ? 'key' : 'keys'}`;
 
 const sameChannel = (a: OwnerChannelValue, b: OwnerChannelValue) =>
   a.kind === b.kind && (a.kind !== 'id' || a.id === (b as { id: string }).id);
@@ -641,7 +671,7 @@ const SHARED_STAGED = new Set(['config.json', 'global', 'appstore-modules']);
  * the staged ones take their places, so the placed set is the staged set; the files of one machine stay. Every target
  * is checked before the first move: a target that exists refuses with nothing moved.
  */
-export async function placeStaged(root: string, staging: string, superseded: string, onBegin?: () => void, shared?: SharedTargets): Promise<void> {
+export async function placeStaged(root: string, staging: string, superseded: string, onBegin?: () => void | Promise<void>, shared?: SharedTargets): Promise<void> {
   const stale: Array<[string, string]> = [];
   for (const name of await fs.promises.readdir(root)) {
     const full = path.join(root, name);
@@ -675,7 +705,7 @@ export async function placeStaged(root: string, staging: string, superseded: str
   for (const [, to] of incoming) {
     if (fs.existsSync(to) && !staleSources.has(path.resolve(to))) throw new Refusal(`${to} exists; nothing was moved`);
   }
-  onBegin?.();
+  await onBegin?.();
   for (const [from, to] of stale) {
     await fs.promises.mkdir(path.dirname(to), { recursive: true });
     await fs.promises.rename(from, to);
@@ -2602,11 +2632,16 @@ export class MigrationService {
     const places = this.sharedPlaces();
     let providerKeys: number;
     let keyPlanNotes: string[] = [];
+    let sourceKeys: KeyTimes = {};
+    let keysUnread: string | null = null;
     if (from === 'file') {
       providerKeys = keysFromEnv().keys;
       tally = await tallySource(jsonReader(DATA_ROOT));
       await tallyShared(tally, places);
       channel = ownerChannelFromFile(path.join(DATA_ROOT, OWNER_CHANNEL_NAME));
+      const read = readKeyFile(ownerMessagesFile());
+      if (read.ok) sourceKeys = read.keys;
+      else keysUnread = read.cause;
     } else {
       await main.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
       ctx.mainTx = true;
@@ -2617,6 +2652,7 @@ export class MigrationService {
       tally = await tallySource(pgReader(main));
       await tallyShared(tally, main);
       channel = await ownerChannelRow(main);
+      sourceKeys = await ownerKeyRows(main);
       const docRows = (await main.query('SELECT body FROM smdb_data.shared_docs WHERE key = $1', [credentialsKey()])).rows;
       const plan = planKeys(docRows.length === 0 ? null : Buffer.from(docRows[0].body).toString('utf8'));
       providerKeys = plan.held;
@@ -2628,7 +2664,11 @@ export class MigrationService {
       ? [`The owner messages channel setting could not be read (${channel.cause}), so it was not copied; owner messages go to the owner's DMs until it is set again in the web panel`]
       : [];
     notes.push(...keyPlanNotes);
+    if (keysUnread !== null) {
+      notes.push(`The record of posted owner messages (/data/owner-messages.json) could not be read (${keysUnread}), so no key was copied from it; a message the Bot Manager repeats may be posted again once the main database moves to another machine`);
+    }
     const copiedChannel: OwnerChannelValue = channel.kind === 'id' ? channel : { kind: 'none' };
+    let copiedKeys = keptKeys(isoTimes(sourceKeys), Date.now());
 
     // S5: the copy, fed guild by guild.
     stage('copying', { counts, ...(to === 'postgres' ? { destination: address } : {}), leftOut: tally.leftOut, closedTails: tally.closedTails, ...(notes.length > 0 ? { notes } : {}) });
@@ -2657,6 +2697,7 @@ export class MigrationService {
       await provisionStoreInTransaction(main);
       if (copiedChannel.kind === 'id') await main.query(OWNER_CHANNEL_UPSERT, [JSON.stringify(copiedChannel.id)]);
       else await main.query(OWNER_CHANNEL_DELETE);
+      await carryOwnerKeys(main, copiedKeys);
       const creds = loadCredentials();
       const shardCount = Number.parseInt(creds.FLEET_SHARD_COUNT ?? '', 10);
       await jsonReader(DATA_ROOT)(part => writePgItems(main, part));
@@ -2732,6 +2773,14 @@ export class MigrationService {
       record({ storeId: newId });
       await this.fault('before-commit');
       await refuseOtherSessions(main, jobId, ctx.sessions);
+      const keysAgain = readKeyFile(ownerMessagesFile());
+      if (keysUnread === null && keysAgain.ok) {
+        const late = mergeEarlier(copiedKeys, keptKeys(isoTimes(keysAgain.keys), Date.now()));
+        if (!sameKeys(late, copiedKeys)) {
+          copiedKeys = late;
+          await carryOwnerKeys(main, copiedKeys);
+        }
+      }
       stage('committing');
       await this.commit(ctx, 'commit-send');
     } else {
@@ -2758,7 +2807,14 @@ export class MigrationService {
         const refused = envSwitchRefusal(to, keysChange ? envKeysText(keys.text, keys.changes, keys.unread) : undefined);
         if (refused) throw new Refusal(refused);
       }
-      await placeStaged(DATA_ROOT, ctx.staging!, ctx.superseded, () => { ctx.placingBegun = true; }, places);
+      await placeStaged(DATA_ROOT, ctx.staging!, ctx.superseded, async () => {
+        const keysNote = await this.mergeOwnerKeys(copiedKeys, ctx.superseded);
+        if (keysNote !== null) {
+          notes.push(keysNote);
+          record({ notes });
+        }
+        ctx.placingBegun = true;
+      }, places);
       await this.fault('before-keys-env');
       if (keysChange) {
         const envPath = dataPath('.env');
@@ -2817,6 +2873,9 @@ export class MigrationService {
       + (counts.providerKeys > 0
         ? `; ${counts.providerKeys} payment provider ${counts.providerKeys === 1 ? 'key' : 'keys'} ${to === 'postgres' ? 'copied into the database' : `from the database applied to ${dataPath('.env')}`}`
         : '')
+      + (Object.keys(copiedKeys).length > 0
+        ? `; ${keysWord(Object.keys(copiedKeys).length)} ${to === 'postgres' ? 'copied into the database' : 'from the database merged into /data/owner-messages.json'}`
+        : '')
       + (tally.leftOut.length > 0 ? `; left out: ${tally.leftOut.join(', ')}` : '')
       + (notes.length > 0 ? `; ${notes.join('; ')}` : ''));
   }
@@ -2839,6 +2898,34 @@ export class MigrationService {
       if (Date.now() >= until) throw new Refusal(SHARED_WAIT_TEXT);
       await new Promise(resolve => setTimeout(resolve, 50));
     }
+  }
+
+  /**
+   * A move to JSON merges the database's owner-message keys into this machine's record, in one synchronous step so no
+   * write of the notify-owner route falls between its read and its write. An unreadable record goes to superseded first.
+   */
+  private async mergeOwnerKeys(keys: KeyTimes, superseded: string): Promise<string | null> {
+    const file = ownerMessagesFile();
+    const first = readKeyFile(file);
+    let note: string | null = null;
+    if (!first.ok) {
+      const aside = path.join(superseded, path.basename(file));
+      if (fs.existsSync(aside)) throw new Refusal(`${aside} exists; nothing was moved`);
+      await fs.promises.mkdir(superseded, { recursive: true });
+      await fs.promises.rename(file, aside);
+      await mustSync(syncFolderChain(superseded));
+      await mustSync(syncFolderChain(path.dirname(file)));
+      note = `The record of posted owner messages (/data/owner-messages.json) could not be read (${first.cause}); it was moved to ${aside} and kept there, and the keys from the database were written in its place; keys recorded only in that file are no longer checked, so a repeat of one of them is posted again`;
+    } else if (Object.keys(keys).length === 0) {
+      return null;
+    }
+    const local = readKeyFile(file);
+    if (!local.ok) throw new Error(`The record of posted owner messages (/data/owner-messages.json) could not be read (${local.cause})`);
+    const merged = keptKeys(mergeEarlier(local.keys, keys), Date.now());
+    atomicWriteFileSync(file, JSON.stringify({ keys: merged }, null, 2));
+    const back = readKeyFile(file);
+    if (!back.ok || !sameKeys(back.keys, merged)) throw new Error(OWNER_KEYS_DIFFER);
+    return note;
   }
 
   /** S3 waits, at most 20 s, until no owner channel setting write is in flight (NB5 decision 16). */

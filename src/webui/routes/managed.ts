@@ -2,7 +2,6 @@
 // the browser's routes are authenticated at the deployment boundary instead.
 
 import crypto from 'crypto';
-import fs from 'fs';
 import { Router, Request, Response, NextFunction } from 'express';
 import { addressesTiming, type BotManager } from '../botManager';
 import { resolveDataBackend } from '../../utils/envLoader';
@@ -23,6 +22,7 @@ import { unknownStoreWords, webuiChoiceDeps } from '../utils/webuiDataReader';
 import { DEFAULT_MAINTENANCE_MESSAGE } from '../../bot/internalSetup/utils/maintenanceGate';
 import { MAINTENANCE_MESSAGE_MAX, readMaintenanceFile, writeMaintenanceFile } from '../../utils/maintenanceFile';
 import { MigrationService } from '../../bot/internalSetup/utils/dataMigration';
+import { keptKeys, readKeyFile, type KeyTimes } from '../../bot/internalSetup/utils/ownerMessageRecord';
 
 function tokensMatch(given: string, expected: string): boolean {
   const a = Buffer.from(given);
@@ -66,32 +66,12 @@ export function _setManagedTiming(over: { notifyMs?: number; switchMs?: number; 
   addressesTiming.ackMs = over?.addressesAckMs ?? 5_000;
 }
 
-const RECORD_KEYS_MAX = 1000;
-const RECORD_DAYS = 90;
 const KEY_READ_MS = 5_000;
 const FILE_BOT = 'This bot keeps its data in files, so it has no main database';
 
-type KeyRecord = { keys: Record<string, string> };
-
-function readKeyRecord(): { ok: true; record: KeyRecord } | { ok: false; cause: string } {
-  let text: string;
-  try {
-    text = fs.readFileSync(ownerMessagesFile(), 'utf8');
-  } catch (error) {
-    const code = (error as { code?: unknown })?.code;
-    if (code === 'ENOENT') return { ok: true, record: { keys: {} } };
-    return { ok: false, cause: typeof code === 'string' ? code : error instanceof Error ? error.message : String(error) };
-  }
-  try {
-    const parsed = JSON.parse(text) as { keys?: unknown };
-    const keys = parsed?.keys;
-    if (!keys || typeof keys !== 'object' || Array.isArray(keys) || Object.values(keys).some(v => typeof v !== 'string')) {
-      return { ok: false, cause: 'it holds no record of keys' };
-    }
-    return { ok: true, record: { keys: { ...(keys as Record<string, string>) } } };
-  } catch (error) {
-    return { ok: false, cause: error instanceof Error ? error.message : String(error) };
-  }
+function readKeyRecord(): { ok: true; record: { keys: KeyTimes } } | { ok: false; cause: string } {
+  const read = readKeyFile(ownerMessagesFile());
+  return read.ok ? { ok: true, record: { keys: read.keys } } : read;
 }
 
 /**
@@ -102,12 +82,8 @@ function writeKeyRecord(key: string): void {
   const now = Date.now();
   const current = readKeyRecord();
   if (!current.ok) throw new Error(current.cause);
-  const keys = { ...current.record.keys, [key]: new Date(now).toISOString() };
-  const kept = Object.entries(keys)
-    .filter(([, at]) => now - Date.parse(at) <= RECORD_DAYS * 86_400_000)
-    .sort((a, b) => Date.parse(b[1]) - Date.parse(a[1]))
-    .slice(0, RECORD_KEYS_MAX);
-  atomicWriteFileSync(ownerMessagesFile(), JSON.stringify({ keys: Object.fromEntries(kept) }, null, 2));
+  const kept = keptKeys({ ...current.record.keys, [key]: new Date(now).toISOString() }, now);
+  atomicWriteFileSync(ownerMessagesFile(), JSON.stringify({ keys: kept }, null, 2));
 }
 
 interface Answer {
