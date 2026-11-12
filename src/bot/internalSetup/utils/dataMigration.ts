@@ -420,11 +420,16 @@ function compareHashes(expected: Map<string, string>, actual: Map<string, string
   }
 }
 
+function sameSorted(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  const x = [...a].sort();
+  const y = [...b].sort();
+  return x.every((v, i) => v === y[i]);
+}
+
 function compareGraves(expected: SnapGrave[], actual: SnapGrave[], what: string): void {
-  const key = (g: SnapGrave) => `${g.guildId}-${g.retiredAt}|${g.reason}|${g.usedAt ?? ''}`;
-  const a = expected.map(key).sort().join('\n');
-  const b = actual.map(key).sort().join('\n');
-  if (a !== b) throw new Error(`${what} holds other graveyard entries or reasons than the source`);
+  const key = (g: SnapGrave) => JSON.stringify([g.guildId, g.retiredAt, g.reason, g.usedAt ?? null]);
+  if (!sameSorted(expected.map(key), actual.map(key))) throw new Error(`${what} holds other graveyard entries or reasons than the source`);
 }
 
 function decodeStrict(bytes: Buffer, where: string): string {
@@ -2720,7 +2725,7 @@ export class MigrationService {
       const back = await readBackPg(main);
       compareHashes(tally.copied, back.hashes, 'The copy in the database');
       compareGraves(tally.graves, back.graves, 'The copy in the database');
-      if ([...back.owners].sort().join(',') !== [...tally.guilds].sort().join(',')) throw new Error('The copy in the database has other ownership rows than the guilds copied');
+      if (!sameSorted(back.owners, tally.guilds)) throw new Error('The copy in the database has other ownership rows than the guilds copied');
       if (!sameChannel(await ownerChannelRow(main), copiedChannel)) throw new Error('The owner messages channel in the copy differs from the source');
       compareShared(tally.shared, await readBackShared(main));
     } else {
