@@ -1011,13 +1011,19 @@ removed source file.
   mutant id left in the env, which the gate ignores.
 - integration/mutationResumeGate.test.ts (in the integration tier, as its gate runs take a quarter of an hour and
   every fast test file whose processes reach mutated src runs in pass A of each such mutant) runs the gate on a
-  stand-in for vitest on a throwaway untracked file, in a run that reaches every stage: pass A kills and times out,
-  each a2 rerun kills, each set of files those reruns took fails with no mutant in `alone-a2/`, and pass B's kills
-  repeat in `b2-1/`. A whole run gives the reference. Then three runs are each killed, one inside pass A, one inside
-  `alone-a2/` after a set failed and before the next set ran, and one inside `b2-1/`, and resumed to the end: each
-  gives every mutant the outcome the whole run gives and the same verdict, runs nothing of a stage the stopped run
-  finished, runs no item the stopped stage had saved (it counts the stand-in's runs), takes over the killed run's
-  lock.json and runs on the saved seed. It also shows each refusal: a file's content or time changed, a file added, a
+  stand-in for vitest on a throwaway untracked file, in a run that reaches every stage. The stand-in's runs with no
+  mutant leave reach as record dirs, one per test file, and reports that time each file, so each mutant run takes the
+  files that reached it: pass A kills, and runs that go past the runner's bound built from their file's cost end as
+  timeouts with the bound mark; each a2 rerun kills, each set of files those reruns took fails with no mutant in
+  `alone-a2/`; in pass B, which runs by reach on integration files, the mutant no file reached survives as unreached
+  and the others die, and their kills repeat in `b2-1/`. A whole run gives the reference. Then four runs are each
+  killed, one inside pass A, one inside `alone-a2/` after a set failed and before the next set ran, one inside `b/`
+  after the unreached mutant's result, and one inside `b2-1/`, and resumed to the end: each gives every mutant the
+  outcome the whole run gives and the same verdict, runs nothing of a stage the stopped run finished, runs no item
+  the stopped stage had saved (it counts the stand-in's runs), takes over the killed run's lock.json and runs on the
+  saved seed. The pass A continuation `a-r1/` bounds its slow runs by the costs of its own run with no mutant; the
+  pass B one keeps the unreached result with its label and runs each other survivor on the one file the reach in
+  `b-r1/` names, where the ids name other mutants than in `b/`. It also shows each refusal: a file's content or time changed, a file added, a
   package lock changed, no or an unreadable run.json, another Node binary (version or path), another stand-in for
   vitest, another scope, and `--base` or `--mutate` with `--resume`; then a resume of a run stopped before it saved a
   plan runs pass A whole and goes on to the end, a resume of that finished run reads every stage back and runs

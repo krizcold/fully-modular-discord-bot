@@ -6,7 +6,8 @@ import { afterAll, beforeAll, describe, expect, it, onTestFinished } from 'vites
 import { planOf, resultLines, setLines, type PlannedMutant } from '../mutation/resume.mjs';
 import { endTree } from '../helpers/endTree.mjs';
 import { PACKAGE_LOCKS, treePrint } from '../mutation/tree.mjs';
-import { confirmed, judge, type MutantRecord } from '../mutation/verdict.mjs';
+import { readReach, selectFor } from '../mutation/reach.mjs';
+import { confirmed, judge, UNREACHED_B, type MutantRecord } from '../mutation/verdict.mjs';
 
 // Gate runs (mutation/touched.mjs) on a stand-in for vitest that stop and are resumed (mutation/README.md, "Stopping
 // and resuming"). The target is a throwaway untracked file in src, so it is in the tree and nothing imports it.
@@ -53,12 +54,16 @@ function removeTree(dir: string) {
  * SMDB_STANDIN_CALLS names; in pass A it fails every mutant but an EqualityOperator one, which survives to pass B,
  * where every run passes. A run with no mutant of a set of files fails only in the stage SMDB_STANDIN_FAIL_ALONE
  * names (its own dir or a resume's -r<n> form of it), and takes SMDB_STANDIN_SET_MS there. In pass A a mutant of the
- * mutator SMDB_STANDIN_HANG_A names times out; with SMDB_STANDIN_KILL_B=1 every mutant fails in pass B; with
- * SMDB_STANDIN_CONFIRM set, a rerun alone (a2, b2) fails exactly when it is 1. With SMDB_STANDIN_REACH=1 pass A's run
- * with no mutant lists two test files and leaves reach in which unit/x.test.ts reaches the even mutant ids and
+ * mutator SMDB_STANDIN_SLOW_A names runs 20 s, past the runner's bound on it; with SMDB_STANDIN_KILL_B=1 every mutant
+ * fails in pass B; with SMDB_STANDIN_CONFIRM set, a rerun alone (a2, b2) fails exactly when it is 1. With
+ * SMDB_STANDIN_REACH=1 each run with no mutant that records reach lists its tier's files and leaves a record dir per
+ * file, as helpers/reachRecorder.cjs writes them: in pass A unit/x.test.ts reaches the even mutant ids and
  * unit/y.test.ts the odd ones, so a mutant's run in pass A and in a2 takes one of them, and the a2 results' sets are
- * checked in alone-a2 one per file. Mutant runs take 500 ms in pass A and 1500 ms in pass B, so a run can be stopped
- * in either.
+ * checked in alone-a2 one per file; in pass B integration/p.test.ts reaches every id but the one
+ * SMDB_STANDIN_UNREACHED_B names in b/ itself (not in a resume's b-r<n>), which no file reaches, and
+ * integration/q.test.ts and child/r.test.ts reach none, so a mutant's run there takes p alone or no file. Every report gives each file a start and an end, so the run with no mutant of pass A
+ * and of a2 leaves what each file cost. Mutant runs take 500 ms in pass A and 1500 ms in pass B, so a run can be
+ * stopped in either.
  */
 function setUp(cleanUp: (fn: () => void) => void) {
   const target = `src/smdb-resume-${process.pid}.ts`;
@@ -76,6 +81,8 @@ function setUp(cleanUp: (fn: () => void) => void) {
   fs.writeFileSync(standIn, [
     "const fs = require('fs');",
     "const path = require('path');",
+    "const { createHash } = require('crypto');",
+    'const started = Date.now();',
     "const outputFile = (process.argv.find(arg => arg.startsWith('--outputFile=')) ?? '').slice('--outputFile='.length);",
     'const out = process.env.SMDB_MUTATION_OUT;',
     'const id = process.env.__STRYKER_ACTIVE_MUTANT__;',
@@ -88,22 +95,31 @@ function setUp(cleanUp: (fn: () => void) => void) {
     "const inA = process.env.SMDB_MUTATION_PASS === 'a';",
     "const set = !mutant && include !== null && stage === process.env.SMDB_STANDIN_FAIL_ALONE;",
     "const rerun = Boolean(mutant) && process.env.SMDB_MUTATION_CONFIRM === '1' && process.env.SMDB_STANDIN_CONFIRM !== undefined;",
-    "const hang = Boolean(mutant) && inA && !rerun && Boolean(entry) && entry.mutator === process.env.SMDB_STANDIN_HANG_A;",
-    "const fail = set || hang || (Boolean(mutant) && (rerun ? process.env.SMDB_STANDIN_CONFIRM === '1'",
+    "const slow = Boolean(mutant) && inA && !rerun && Boolean(entry) && entry.mutator === process.env.SMDB_STANDIN_SLOW_A;",
+    "const fail = set || (Boolean(mutant) && (rerun ? process.env.SMDB_STANDIN_CONFIRM === '1'",
     "  : inA ? (!entry || entry.mutator !== 'EqualityOperator') : process.env.SMDB_STANDIN_KILL_B === '1'));",
-    'if (mutant) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, inA ? 500 : 1500);',
+    'if (mutant) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, slow ? 20000 : inA ? 500 : 1500);',
     "if (set && process.env.SMDB_STANDIN_SET_MS) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(process.env.SMDB_STANDIN_SET_MS));",
-    "const test = { status: fail ? 'failed' : 'passed', fullName: 'reads', failureMessages: fail ? [hang ? 'Error: Test timed out in 5000ms' : 'AssertionError: expected the mutant to fail'] : [] };",
+    "const test = { status: fail ? 'failed' : 'passed', fullName: 'reads', duration: 1, failureMessages: fail ? ['AssertionError: expected the mutant to fail'] : [] };",
+    "const project = process.argv.includes('--project') ? process.argv[process.argv.indexOf('--project') + 1] : 'fast';",
+    "const tiers = { fast: ['unit/x.test.ts', 'unit/y.test.ts'], integration: ['integration/p.test.ts', 'integration/q.test.ts'], child: ['child/r.test.ts'] };",
     'const coverage = process.env.SMDB_MUTATION_COVERAGE;',
     "const reach = !mutant && Boolean(coverage) && process.env.SMDB_STANDIN_REACH === '1';",
     'if (reach) {',
-    '  fs.mkdirSync(coverage, { recursive: true });',
-    '  const ids = Array.from({ length: 1000 }, (_, i) => String(i));',
-    "  fs.writeFileSync(path.join(coverage, 'x.json'), JSON.stringify({ file: 'unit/x.test.ts', ids: ids.filter(i => Number(i) % 2 === 0) }));",
-    "  fs.writeFileSync(path.join(coverage, 'y.json'), JSON.stringify({ file: 'unit/y.test.ts', ids: ids.filter(i => Number(i) % 2 === 1) }));",
+    "  const unreached = path.basename(out) === 'b' ? process.env.SMDB_STANDIN_UNREACHED_B : undefined;",
+    '  (tiers[project] ?? []).forEach((name, n) => {',
+    '    const file = path.join(process.cwd(), name);',
+    "    const dir = path.join(coverage, `${createHash('sha256').update(path.resolve(file)).digest('hex').slice(0, 32)}-${process.pid}`);",
+    '    fs.mkdirSync(dir, { recursive: true });',
+    "    const ids = Array.from({ length: 20 }, (_, i) => String(i)).filter(i => project === 'fast' ? Number(i) % 2 === n : project === 'integration' && n === 0 && i !== unreached);",
+    "    const lines = [{ role: 'file', file, ranOther: false, late: false, pid: process.pid }, ...ids.map(i => ({ id: i }))];",
+    "    fs.writeFileSync(path.join(dir, `${process.pid}-a.jsonl`), lines.map(line => JSON.stringify(line) + '\\n').join(''));",
+    '  });',
     '}',
-    "const files = include ?? (reach ? ['unit/x.test.ts', 'unit/y.test.ts'] : ['unit/x.test.ts']);",
-    'if (outputFile) fs.writeFileSync(outputFile, JSON.stringify({ testResults: files.map(name => ({ name, status: test.status, assertionResults: [test] })) }));',
+    "const files = include ?? (reach ? tiers[project] ?? [] : ['unit/x.test.ts']);",
+    'const at = Date.now();',
+    'if (outputFile) fs.writeFileSync(outputFile, JSON.stringify({ startTime: started, testResults: files.map((name, n) => ({',
+    '  name, status: test.status, startTime: at + 2 * n, endTime: at + 2 * n + 1, assertionResults: [test] })) }));',
     'process.exit(fail ? 1 : 0);',
     '',
   ].join('\n'));
@@ -185,11 +201,13 @@ function judged(report: string) {
 }
 
 describe('a gate run that stops and is resumed', () => {
-  // Every stage runs: pass A kills, the ConditionalExpression mutants time out and their reruns in a2 kill, but each
-  // set of files those reruns took fails with no mutant in alone-a2, so they are voided; the EqualityOperator mutants
-  // survive pass A, die in pass B and again alone in b2-1.
+  // Every stage runs: pass A kills, the ConditionalExpression mutants run past the runner's bound (a timeout) and
+  // their reruns in a2 kill, but each set of files those reruns took fails with no mutant in alone-a2, so they are
+  // voided; the EqualityOperator mutants survive pass A, and in pass B, which runs each on the files that reached it,
+  // the one no file reached survives and the others die, and again alone in b2-1.
   const env = {
-    SMDB_STANDIN_HANG_A: 'ConditionalExpression', SMDB_STANDIN_CONFIRM: '1', SMDB_STANDIN_KILL_B: '1', SMDB_STANDIN_REACH: '1',
+    SMDB_STANDIN_SLOW_A: 'ConditionalExpression', SMDB_STANDIN_CONFIRM: '1', SMDB_STANDIN_KILL_B: '1', SMDB_STANDIN_REACH: '1',
+    SMDB_STANDIN_UNREACHED_B: '2', SMDB_MUTATION_BOUND_START_MS: '4000',
     SMDB_STANDIN_FAIL_ALONE: 'alone-a2', SMDB_STANDIN_SET_MS: '2000', SMDB_TEST_SEED: '4242',
   };
   const cleanups: (() => void)[] = [];
@@ -197,16 +215,34 @@ describe('a gate run that stops and is resumed', () => {
   let setup: ReturnType<typeof setUp>;
   let whole: ReturnType<typeof judged>;
 
+  /** The mutants whose pass A run the runner ended at its bound, each with the mark it left in that run's dir. */
+  const boundedInA = (report: string, mutants: MutantRecord[]) => mutants.filter(m => m.mutator === env.SMDB_STANDIN_SLOW_A).map(m => {
+    expect(m.passes.a, keyOf(m)).toMatchObject({ status: 'Timeout', bounded: true, statusReason: expect.stringMatching(/^the gate's bound on the run ended it after \d+ s$/) });
+    const mark = readJson<{ ms: number; files: number }>(path.join(report, m.passes.a!.dir!, `${m.passes.a!.id}-bound.json`));
+    // Three times what the one file it took cost in that dir's run with no mutant, plus the stand-in's start.
+    const reach = readReach(path.join(report, m.passes.a!.dir!))!;
+    const take = selectFor(reach, m.passes.a!.id!)!;
+    expect(take, keyOf(m)).toHaveLength(1);
+    expect(mark, keyOf(m)).toEqual({ ms: 3 * reach.costs![reach.files.indexOf(take[0])] + Number(env.SMDB_MUTATION_BOUND_START_MS), files: 1 });
+    expect(text(path.join(report, m.passes.a!.dir!, `${m.passes.a!.id}-fast.log`))).toContain(`runner.mjs ended vitest after ${mark.ms} ms, the bound on this run\n`);
+    return m;
+  });
+
   beforeAll(async () => {
     setup = setUp(fn => cleanups.push(fn));
     const run = await setup.gateRun(['--mutate', setup.target, '--concurrency', '1'], { env });
     expect(run.code, `${run.stdout}\n${run.stderr}`).toBe(2);
     whole = judged(run.report!);
     // The stand-in reaches every stage, so a stop can land in each.
-    expect(Object.values(whole.outcomes).sort()).toEqual(expect.arrayContaining(['Killed', 'Inconclusive']));
+    expect(Object.values(whole.outcomes).sort()).toEqual(expect.arrayContaining(['Killed', 'Inconclusive', 'Survived']));
     for (const dir of ['a', 'alone-a', 'a2', 'control-a2', 'alone-a2', 'b', 'b2-1', 'control-b2']) expect(fs.existsSync(path.join(run.report!, dir, 'done.json')), dir).toBe(true);
     expect(sets(run.report!, 'alone-a2').length).toBeGreaterThan(1);
     expect(results(run.report!, 'b2-1').length).toBeGreaterThan(1);
+    expect(boundedInA(run.report!, whole.mutants).length).toBeGreaterThan(1);
+    expect(readReach(path.join(run.report!, 'b'))?.files).toEqual(['integration/p.test.ts', 'integration/q.test.ts', 'child/r.test.ts']);
+    const lone = whole.mutants.filter(m => m.passes.b?.unreached);
+    expect(lone.map(m => m.passes.b)).toEqual([{ id: env.SMDB_STANDIN_UNREACHED_B, dir: 'b', status: 'Survived', unreached: true }]);
+    expect(run.stdout).toContain(`(${UNREACHED_B})\n`);
   }, 1_800_000);
 
   /**
@@ -266,6 +302,8 @@ describe('a gate run that stops and is resumed', () => {
     expect(second.stdout).toMatch(new RegExp(`^ {2}a: ${kept.size} result\\(s\\) kept \\(a/\\); the ${forA1.length} with none run now in a-r1/$`, 'm'));
     const { mutants } = judged(report);
     for (const m of mutants) expect(m.passes.a?.dir, keyOf(m)).toBe(kept.has(keyOf(m)) ? 'a' : 'a-r1');
+    // The continuation bounds its runs by the costs its own run with no mutant left.
+    expect(boundedInA(report, mutants).filter(m => m.passes.a?.dir === 'a-r1').length).toBeGreaterThan(0);
   });
 
   it('in alone-a2 after a set failed keeps that set\'s failure and runs only the sets with no result', { timeout: 1_800_000 }, async () => {
@@ -280,7 +318,7 @@ describe('a gate run that stops and is resumed', () => {
     for (const set of rest) expect(saved.get('alone-a2')!.has(set), set).toBe(false);
     expect(second.stdout).toMatch(/^ {2}alone-a2: \d+ result\(s\) kept \(alone-a2\/\); the \d+ with none run now in alone-a2-r1\/$/m);
     // Every a2 result stays voided: the sets failed, before the stop and after it.
-    for (const m of judged(report).mutants.filter(one => one.passes.a2)) expect(m.passes.a2?.voided, keyOf(m)).toMatch(/failed together with no mutant \(alone-a2(?:-r1)?\/\)/);
+    for (const m of judged(report).mutants.filter(one => one.passes.a2)) expect(m.passes.a2?.voided, JSON.stringify(m.passes)).toMatch(/failed together with no mutant \(alone-a2(?:-r1)?\/\)/);
   });
 
   it('in b2 goes on with the reruns b2 has no result for, then the run with no mutant after them', { timeout: 1_800_000 }, async () => {
@@ -295,6 +333,41 @@ describe('a gate run that stops and is resumed', () => {
     expect(second.calls.some(call => call.dir === 'control-b2')).toBe(true);
     const { mutants } = judged(report);
     for (const m of mutants.filter(one => one.passes.b2)) expect(m.passes.b2?.dir, keyOf(m)).toBe(kept.has(keyOf(m)) ? 'b2-1' : 'b2-1-r1');
+  });
+
+  it('in pass B, which runs each survivor on the files that reached it, keeps the result no file reached as unreached and runs the rest on the reach of its own run with no mutant', { timeout: 1_800_000 }, async () => {
+    // Stopped once both mutants of the first span have a result, so the continuation's plan, and its ids, differ.
+    const lone = whole.mutants.find(m => m.passes.b?.unreached)!;
+    const { report, saved, second } = await stopAndResume(at => {
+      const listed = text(path.join(at, 'b', 'targets.json'));
+      const done = results(at, 'b');
+      return listed !== '' && done.some(r => r.key === keyOf(lone)) && done.length >= 2 && done.length < JSON.parse(listed).length;
+    });
+    const kept = saved.get('b')!;
+    expect(kept.has(keyOf(lone))).toBe(true);
+    const { mutants } = judged(report);
+    const now = mutants.find(m => keyOf(m) === keyOf(lone))!;
+    expect(now.passes.b).toEqual({ id: env.SMDB_STANDIN_UNREACHED_B, dir: 'b', status: 'Survived', unreached: true });
+    expect(second.stdout).toContain(`(${UNREACHED_B})\n`);
+    expect(second.stdout).toMatch(/^ {2}survivors no test of pass B reached \(.*\): 1$/m);
+    const rest = mutants.filter(m => m.passes.b?.dir === 'b-r1');
+    expect(rest.length).toBeGreaterThan(0);
+    for (const m of rest) expect(kept.has(keyOf(m)), keyOf(m)).toBe(false);
+    const reach = readReach(path.join(report, 'b-r1'))!;
+    expect(reach.files).toEqual(['integration/p.test.ts', 'integration/q.test.ts', 'child/r.test.ts']);
+    // Each took the one file its own run with no mutant says reached it, and the stand-in ran that file alone.
+    for (const m of rest) {
+      const id = m.passes.b!.id!;
+      const took = readJson<{ files: string[] | 'related' }>(path.join(report, 'b-r1', `${id}-reach.json`)).files;
+      expect(took, keyOf(m)).toEqual(selectFor(reach, id));
+      expect(took, keyOf(m)).toHaveLength(1);
+      expect(second.calls.filter(call => call.dir === 'b-r1' && call.id === id).map(call => call.include), keyOf(m)).toEqual([took]);
+      expect(m.passes.b, keyOf(m)).toMatchObject({ status: 'Killed' });
+      expect(m.passes.b?.unreached, keyOf(m)).toBeUndefined();
+    }
+    // The continuation numbers its mutants anew: an id of b-r1 names another mutant in b/.
+    const inB = new Map(planOf(text(path.join(report, 'b', 'plan.json')))!.map(m => [m.id, m.key]));
+    expect(rest.some(m => inB.get(m.passes.b!.id!) !== keyOf(m))).toBe(true);
   });
 });
 
