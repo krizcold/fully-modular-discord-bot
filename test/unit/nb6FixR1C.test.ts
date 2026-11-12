@@ -26,8 +26,10 @@ const safety = vi.hoisted(() => ({ recordCrash: () => undefined, isInSafeMode: (
 vi.mock('child_process', async orig => {
   const real = await orig<any>();
   const { fakeFork } = await import('../helpers/forkMock');
+  const { offlineExecSync } = await import('../helpers/offlineStore');
   const fork = vi.fn(() => fakeFork());
-  return { ...real, fork, default: { ...real, fork } };
+  const execSync = offlineExecSync(real.execSync);
+  return { ...real, fork, execSync, default: { ...real, fork, execSync } };
 });
 vi.mock('../../src/utils/updateSafety', () => ({ getSafetyManager: () => safety }));
 
@@ -47,6 +49,7 @@ import { exitChild, freshWriterLock, resetForks } from '../helpers/nb10Rig';
 import { webuiSessions } from '../helpers/nb6WebuiSession';
 import { lost } from '../helpers/sharedRows';
 import { readSourceText } from '../helpers/sourceText';
+import { remoteGit, seedStoreClone } from '../helpers/offlineStore';
 
 const ENV = dataPath('.env');
 const STORE = dataPath('global', 'appstore');
@@ -79,6 +82,8 @@ beforeEach(() => {
   fs.rmSync(dataPath('.shared-mirror.json'), { force: true });
   fs.rmSync(dataPath('_superseded'), { recursive: true, force: true });
   fs.mkdirSync(STORE, { recursive: true });
+  remoteGit.length = 0;
+  seedStoreClone();
   setBackendKind('postgres');
   setView(1, 'ALPHA');
   dm.setGuildDataBackend(null);
@@ -117,6 +122,7 @@ afterEach(async () => {
   if (envBefore === null) fs.rmSync(ENV, { force: true });
   else fs.writeFileSync(ENV, envBefore);
   vi.restoreAllMocks();
+  expect(remoteGit).toEqual([]);
 });
 
 async function route(method: 'get' | 'put', at: string, req: { params?: object; body?: object } = {}): Promise<{ status: number; body: any }> {

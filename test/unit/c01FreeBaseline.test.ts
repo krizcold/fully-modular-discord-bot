@@ -1,5 +1,5 @@
 import fs from 'fs';
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // C01, R54-J1 (lanes/C01/sheet.md): the Premium Free baseline view and its save read the bot child's queue-first
 // settings while the bot runs, and a save refuses while another write of the file is still queued.
@@ -11,11 +11,18 @@ vi.mock('../../src/webui/utils/installQueue', () => ({
 vi.mock('../../src/bot/internalSetup/utils/payment/paymentRegistry', () => ({
   getPaymentRegistry: () => ({ get: () => undefined, on: () => undefined, off: () => undefined }),
 }));
+vi.mock('child_process', async orig => {
+  const real = await orig<any>();
+  const { offlineExecSync } = await import('../helpers/offlineStore');
+  const execSync = offlineExecSync(real.execSync);
+  return { ...real, execSync, default: { ...real, execSync } };
+});
 
 import { createAppStoreRoutes } from '../../src/webui/routes/appstore';
 import { flushAll } from '../../src/bot/internalSetup/utils/dataManager';
 import { dataPath } from '../../src/utils/dataRoot';
 import { FakeChild, botFor, call, later, put, readJson, resetData, startApp } from '../helpers/configRig';
+import { remoteGit, seedStoreClone } from '../helpers/offlineStore';
 
 const child = new FakeChild();
 const settings = () => dataPath('global', 'examples', 'settings.json');
@@ -29,7 +36,10 @@ afterAll(async () => { await close(); });
 beforeEach(async () => {
   child.reset();
   await resetData();
+  remoteGit.length = 0;
+  seedStoreClone();
 });
+afterEach(() => { expect(remoteGit).toEqual([]); });
 
 const childHolds = (body: unknown, pending: boolean) => {
   child.global = req => (req.rel === 'examples/settings.json' ? { ok: true, contentJson: JSON.stringify(body), pending } : undefined);

@@ -15,8 +15,10 @@ const safety = vi.hoisted(() => ({ recordCrash: () => undefined, isInSafeMode: (
 vi.mock('child_process', async orig => {
   const real = await orig<any>();
   const { fakeFork } = await import('../helpers/forkMock');
+  const { offlineExecSync } = await import('../helpers/offlineStore');
   const fork = vi.fn(() => fakeFork());
-  return { ...real, fork, default: { ...real, fork } };
+  const execSync = offlineExecSync(real.execSync);
+  return { ...real, fork, execSync, default: { ...real, fork, execSync } };
 });
 vi.mock('../../src/utils/updateSafety', () => ({ getSafetyManager: () => safety }));
 // Its providers load by require, which this suite does not resolve; no row here takes a payment.
@@ -37,6 +39,7 @@ import { setView } from '../helpers/nb6Mirror';
 import { exitChild, freshWriterLock, resetForks } from '../helpers/nb10Rig';
 import { webuiSessions } from '../helpers/nb6WebuiSession';
 import { readSourceText } from '../helpers/sourceText';
+import { remoteGit, seedStoreClone } from '../helpers/offlineStore';
 
 const A = 'postgres://bot@db:5432/bot';
 const SHA_1 = 'a'.repeat(64);
@@ -57,6 +60,8 @@ beforeEach(() => {
   _resetSharedMirror();
   fs.rmSync(dataPath('global'), { recursive: true, force: true });
   fs.mkdirSync(dataPath('global', 'appstore'), { recursive: true });
+  remoteGit.length = 0;
+  seedStoreClone();
   setBackendKind('postgres');
   setView(1, 'ALPHA');
   dm.setGuildDataBackend(null);
@@ -90,6 +95,7 @@ afterEach(async () => {
   setBackendKind(null);
   freshWriterLock('webui');
   vi.restoreAllMocks();
+  expect(remoteGit).toEqual([]);
 });
 
 /** One route of the App Store router, called as express calls it. */
