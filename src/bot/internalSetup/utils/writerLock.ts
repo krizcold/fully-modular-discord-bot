@@ -5,8 +5,8 @@
 import * as fs from 'fs';
 import { dataPath } from '../../../utils/dataRoot';
 import { ProcessLock, parseHolder, realSeams, type LockHolder, type LockSeams, type TakeResult } from './processLock';
-import { cancelQueued, queuedFilePaths, queuedFileWrites, fileFlushOnTheWire } from './dataBackends/fileBackend';
-import { closeSharedWritesLost, forgetSharedFileKnowledge, isSharedPath, reopenSharedWrites, useWriterLockCheck } from './dataManager';
+import { cancelQueued, queuedFilePaths, queuedFileWrites, fileFlushOnTheWire, type CancelOutcome } from './dataBackends/fileBackend';
+import { closeSharedWritesLost, forgetSharedFileKnowledge, isSharedPath, reopenSharedWrites, useDeposedWrites, useWriterLockCheck } from './dataManager';
 import { deposeRows, reopenRows } from './sharedStore';
 import { stopCrashWrites } from './moduleCrashes';
 import { syncWords, type SyncKind } from './folderChain';
@@ -29,6 +29,19 @@ let readErrorLogged: string | null = null;
 let releaseRetry: { timer: NodeJS.Timeout; text: string; logged: string } | null = null;
 let deposedBy: LockHolder | null = null;
 const deposedListeners: Array<(holder: LockHolder) => void> = [];
+// The paths a deposition cancelled and has not named yet, each with the words of the process that took the lock.
+const unnamedLost = new Map<string, string>();
+const pendingAnswers = new Set<Promise<void>>();
+
+const deposedWrites = {
+  answered: () => Promise.allSettled([...pendingAnswers]).then(() => undefined),
+  nameLeft: () => {
+    for (const [p, words] of unnamedLost) {
+      console.error(`[Data] Can't confirm whether ${p} is saved: its write was still running when another process (${words}) took the data files' lock, and this process exits before it ends`);
+    }
+    unnamedLost.clear();
+  },
+};
 
 function theLock(): ProcessLock {
   if (!lock) {
@@ -243,14 +256,19 @@ function depose(holder: LockHolder): void {
   if (role === 'bot') stopCrashWrites();
   lock?.drop();
   stopCheck();
-  const paths = queuedFilePaths().filter(isSharedPath);
-  void cancelQueued(paths, undefined, { freeze: true }).then(results => {
-    for (const result of results) {
-      if (result.outcome === 'cancelled') console.error(`[Data] Not saved: ${result.path}; another process (${words}) took the data files' lock`);
-      if (result.outcome === 'unconfirmed') console.error(`${unconfirmedWords(result)}; another process (${words}) took the data files' lock`);
-    }
-  });
   console.error(`[Data] Another process (${words}) took the data files' lock; this process writes no data file from now on`);
+  const paths = queuedFilePaths().filter(isSharedPath);
+  for (const p of paths) unnamedLost.set(p, words);
+  const name = (result: CancelOutcome): void => {
+    if (!unnamedLost.delete(result.path)) return;
+    if (result.outcome === 'cancelled') console.error(`[Data] Not saved: ${result.path}; another process (${words}) took the data files' lock`);
+    if (result.outcome === 'unconfirmed') console.error(`${unconfirmedWords(result)}; another process (${words}) took the data files' lock`);
+  };
+  const answers: Promise<void> = cancelQueued(paths, undefined, { freeze: true, onAnswer: name })
+    .then(results => { for (const result of results) name(result); })
+    .finally(() => { pendingAnswers.delete(answers); });
+  pendingAnswers.add(answers);
+  useDeposedWrites(deposedWrites);
   for (const listener of deposedListeners) {
     try {
       listener(holder);

@@ -216,6 +216,24 @@ const EXIT_DRAIN_GIVEUP_MS = 3000;
 const AFTER_DRAIN_BOUND_MS = 5000;
 let exitDrain: Promise<void> | null = null;
 let closedForExit = false;
+
+/** The writes a deposition cancels: their answers, and the line for each one still unanswered at the exit. */
+export interface DeposedWrites {
+  answered(): Promise<void>;
+  nameLeft(): void;
+}
+
+let deposedWrites: DeposedWrites | null = null;
+
+/** Set by the writer lock (it imports this module): the exit drain waits for these answers within its bound. */
+export function useDeposedWrites(given: DeposedWrites | null): void {
+  deposedWrites = given;
+}
+
+/** Right before an exit: a line for each write a deposition lost and named neither saved nor not saved yet. */
+export function nameDeposedWritesLeft(): void {
+  deposedWrites?.nameLeft();
+}
 // The JSON restores between K4's rename and their end: the exit drain waits for every one.
 const restoreRenameSections = new Set<Promise<void>>();
 
@@ -327,6 +345,7 @@ export function drainForExit(boundMs: number): Promise<void> {
         closedForExit = true;
         await Promise.allSettled([...restoreRenameSections]);
         await drainUntilSettled(deadline, progress);
+        if (deposedWrites) await Promise.race([deposedWrites.answered(), pause(deadline - Date.now())]);
         logDrainLeft('Shutdown drain', getWorkingSet()?.dirtyGuildIds() ?? []);
         const files = queuedFileWrites() + rowOpsHeld().unsaved.length;
         if (files > 0) console.warn(`[Data] Shutdown drain left ${files} file(s) with queued writes`);
@@ -427,6 +446,7 @@ export function stopHandler(steps: () => Promise<void>): () => Promise<void> {
 export function stopProcess(): void {
   if (!processStop) {
     console.error('[Data] No stop handler is built yet; the bot process exits');
+    nameDeposedWritesLeft();
     process.exit(0);
   }
   void processStop();
@@ -514,6 +534,7 @@ export function installStopHandler(): void {
     } catch (error) {
       console.error('[Data] A stop step failed; the bot process exits:', error);
     } finally {
+      nameDeposedWritesLeft();
       process.exit(stopExitCode);
     }
   });

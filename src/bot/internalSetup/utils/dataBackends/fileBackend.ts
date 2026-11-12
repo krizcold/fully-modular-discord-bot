@@ -703,9 +703,10 @@ function cancelAnswer(p: string, records: LandingRecord[], seq: number, dropped:
  * last op landed meanwhile, 'unconfirmed' when lines of it are in the file but the disk did not confirm them (cut
  * when a try ended inside a line), or 'cancelled' once it deleted the pending entry and cleared its retry, with the
  * errno of the path's last failed flush. With freeze (a deposition), no new flush of these paths starts from the call on: a
- * path not on the wire is cancelled at once, and one on the wire is awaited and then cancelled or answered landed.
+ * path not on the wire is cancelled at once, and one on the wire is answered as soon as its try ends. onAnswer gets
+ * each path's answer when it is made.
  */
-export async function cancelQueued(paths: string[], sleep: (ms: number) => Promise<void> = delay, options: { freeze?: boolean } = {}): Promise<CancelOutcome[]> {
+export async function cancelQueued(paths: string[], sleep: (ms: number) => Promise<void> = delay, options: { freeze?: boolean; onAnswer?: (answer: CancelOutcome) => void } = {}): Promise<CancelOutcome[]> {
   // NB6 decision 16: a path of the row queue lands or is cancelled there.
   const rowPaths = rowCancel ? paths.filter(p => !pendingOps.has(p) && rowCancel!.holds(p)) : [];
   if (rowPaths.length > 0) {
@@ -758,15 +759,24 @@ export async function cancelQueued(paths: string[], sleep: (ms: number) => Promi
     lastFlushErrno.delete(p);
     return answer;
   };
-  const early = new Map<string, CancelOutcome>();
+  const answered = new Map<string, CancelOutcome>();
+  const answer = (p: string): CancelOutcome => {
+    const made = cancel(p);
+    answered.set(p, made);
+    options.onAnswer?.(made);
+    return made;
+  };
   const held = options.freeze ? paths.filter(p => !frozen.has(p)) : [];
   try {
     if (options.freeze) {
       for (const p of held) frozen.add(p);
-      for (const p of paths) if (!flushing.has(p)) early.set(p, cancel(p));
+      for (const p of paths) if (!flushing.has(p)) answer(p);
     }
-    while (paths.some(p => flushing.has(p))) await sleep(5);
-    return paths.map(p => early.get(p) ?? cancel(p));
+    while (paths.some(p => flushing.has(p))) {
+      await sleep(5);
+      if (options.freeze) for (const p of paths) if (!answered.has(p) && !flushing.has(p)) answer(p);
+    }
+    return paths.map(p => answered.get(p) ?? answer(p));
   } finally {
     for (const p of held) frozen.delete(p);
     for (const [p, seen] of later) {

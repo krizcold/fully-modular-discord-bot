@@ -29,7 +29,7 @@ import { endGuildRequests } from './webui/utils/guildRequests';
 import { startWebUI, flushBeforeExit } from './webui';
 import { ensureConfigPopulated } from './bot/internalSetup/utils/configManager';
 import { getSafetyManager } from './utils/updateSafety';
-import { setSharedWriteGate } from './bot/internalSetup/utils/dataManager';
+import { nameDeposedWritesLeft, setSharedWriteGate } from './bot/internalSetup/utils/dataManager';
 import { carryWrites, runSealed, writesOf } from './bot/internalSetup/utils/dataBackends/writeLedger';
 import { truthText, verdictOf } from './bot/internalSetup/utils/dataBackends/replyGate';
 import { holderWords, readWriterHolder } from './bot/internalSetup/utils/writerLock';
@@ -150,6 +150,7 @@ async function main() {
     await botManager.endLocalChain();
     await endGuildRequests();
     await flushBeforeExit();
+    nameDeposedWritesLeft();
     process.exit(0);
   });
 
@@ -160,6 +161,7 @@ async function main() {
     await botManager.endLocalChain();
     await endGuildRequests();
     await flushBeforeExit();
+    nameDeposedWritesLeft();
     process.exit(0);
   });
 }
