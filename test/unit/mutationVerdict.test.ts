@@ -158,15 +158,18 @@ describe('the passes a mutant goes through', () => {
 
   it('reads the mark in pass A, pass A with no checker and a2 only, and only in the result Stryker reports', () => {
     const gate = fs.readFileSync(path.join(__dirname, '..', 'mutation', 'touched.mjs'), 'utf8');
-    const read = "const bound = dir === 'a' || dir === 'a-unchecked' || dir === 'a2' ? endedByBound(r.status, boundMarkOf(dir, r.id), dir === 'a2') : null;";
+    // Those dirs and a resume's copies of them (resume.mjs boundedDir, a2Dir).
+    const read = 'const bound = boundedDir(dir) ? endedByBound(r.status, boundMarkOf(dir, r.id), a2Dir(dir)) : null;';
     expect(gate.split(read).length).toBe(2);
     expect(gate.split('boundMarkOf(').length).toBe(3);
     expect(gate.split('-bound.json').length).toBe(3);
     expect(gate.indexOf(read)).toBeGreaterThan(gate.indexOf('function resultOf('));
     expect(gate.indexOf(read)).toBeLessThan(gate.indexOf("return r.status === 'Killed' ? { ...result, ...classifyKill("));
     // a2 results are read as a rerun alone, and nothing between a2 and its checks takes a result back for its pass A.
-    expect(gate).toContain("m.passes[name] = r ? resultOf(dir, r, name === 'a2' || name === 'b2') : { id: null, dir, status: 'Missing' };");
+    expect(gate).toContain("  const alone = name === 'a2' || name === 'b2';\n");
+    expect(gate).toContain("m.passes[name] = line ? resultOf(dir, line, alone) : { id: null, dir, status: 'Missing' };");
     const a2 = gate.indexOf("    await passOn('a2', 'a2', 'a', confirmA, PASSES.a2);\n");
+    expect(a2).toBeGreaterThan(0);
     expect(gate.slice(a2).startsWith("    await passOn('a2', 'a2', 'a', confirmA, PASSES.a2);\n    if (confirmA.some(credited)) await control('a2'")).toBe(true);
   });
 
@@ -354,8 +357,11 @@ describe('the passes a mutant goes through', () => {
     const check = gate.indexOf('    await setCheck(confirmA);\n');
     expect(check).toBeGreaterThan(gate.indexOf("await control('a2'"));
     expect(check).toBeLessThan(gate.indexOf('const forB = toPassB(mutants);'));
-    // Each set's own budget, by the formula and the costs a2's reruns were bounded by.
-    expect(gate).toContain("  const costs = readCosts(path.join(reportDir, 'a2'));\n  const { lines, voided } = voidFailedSets(sets, runs, dir, strykerBudget('a2', PASSES.a2), files => boundFor(costs, files, A2_BOUND) ?? NaN);\n");
+    // Each set's own budget, by the formula and the costs a2's reruns were bounded by, in the a2 dir each rerun ran in.
+    expect(gate).toContain('  const budget = m => strykerBudget(a2At(m), PASSES.a2);\n');
+    expect(gate).toContain('  const ownBudget = (files, m) => boundFor(costsIn(a2At(m)), files, A2_BOUND) ?? NaN;\n');
+    expect(gate).toContain("  const { lines: why, voided } = voidFailedSets(sets, lines, 'alone-a2', budget, ownBudget);\n");
+    expect(gate).toContain("  const a2At = m => m.passes.a2?.dir ?? 'a2';\n");
   });
 
   it('counts no pass A kill when the gate stopped before its file ran alone with no mutant', () => {

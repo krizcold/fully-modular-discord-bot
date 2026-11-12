@@ -137,7 +137,8 @@ describe('the touched-line mutation gate', () => {
     expect(run.stdout).toMatch(/^Verdict: FAIL$/m);
     // Pass B's kills reran with the one file that killed them, and so did the run with no mutant after them.
     for (const dir of ['b2-1', 'control-b2']) {
-      const written = fs.readdirSync(path.join(root, reportDir!, dir)).filter(file => !['targets.json', 'run-ids.json', 'run-keys.json', 'dry-ms.txt', 'dry-timing.json'].includes(file));
+      const written = fs.readdirSync(path.join(root, reportDir!, dir))
+        .filter(file => !['targets.json', 'run-ids.json', 'run-keys.json', 'dry-ms.txt', 'dry-timing.json', 'plan.json', 'results.jsonl', 'checks.json', 'checks.jsonl', 'done.json'].includes(file));
       expect(written.some(file => file.endsWith('-child.json')), dir).toBe(true);
       expect(written.filter(file => !file.includes('-child.')), dir).toEqual([]);
     }

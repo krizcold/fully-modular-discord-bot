@@ -728,7 +728,9 @@ describe('the change', () => {
     // The gate asks before pass A.
     const gate = fs.readFileSync(path.join(botRoot, 'test', 'mutation', 'touched.mjs'), 'utf8');
     expect(gate.indexOf('if (compiler) throw new PassError(compiler);')).toBeGreaterThan(0);
-    expect(gate.indexOf('if (compiler) throw new PassError(compiler);')).toBeLessThan(gate.indexOf("dir: 'a', tier: 'a'"));
+    expect(gate.indexOf('if (compiler) throw new PassError(compiler);')).toBeLessThan(gate.indexOf("dir: dirA, tier: 'a'"));
+    // Pass A on the mutants a resume has no result for comes after it too.
+    expect(gate.indexOf('if (compiler) throw new PassError(compiler);')).toBeLessThan(gate.indexOf('keys: rest.map(recordKey), extra: extraA'));
   });
 
   it("refuses a checkout path Stryker would read as a glob, exactly where Stryker's own matcher matches no file under it", async () => {

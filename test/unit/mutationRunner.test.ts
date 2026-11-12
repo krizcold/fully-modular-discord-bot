@@ -1,10 +1,12 @@
-import { execFileSync, spawnSync } from 'child_process';
+import { execFileSync, spawn, spawnSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
+import { endTree } from '../helpers/endTree.mjs';
 import { pastBudget, strykerClock } from '../mutation/control.mjs';
 import { readCosts } from '../mutation/reach.mjs';
+import { lockOf, setLines } from '../mutation/resume.mjs';
 import { confirmed, endedByBound, type MutantRecord } from '../mutation/verdict.mjs';
 
 // The command every mutant run executes (mutation/runner.mjs), against a
@@ -13,7 +15,7 @@ import { confirmed, endedByBound, type MutantRecord } from '../mutation/verdict.
 
 const root = path.resolve(__dirname, '..', '..');
 
-interface Call { project: string; args: string[]; scale: string | null; mutant: string | null; include: string[] | null; coverage: string | null }
+interface Call { project: string; args: string[]; scale: string | null; mutant: string | null; include: string[] | null; coverage: string | null; pid: number }
 
 // fail: the tiers, or the test files, whose runs fail; hang: the test files whose runs never end; slow: the test files
 // (or 'related', a run of every related file) whose runs take 3 s before they end as they would; report: the test files
@@ -30,7 +32,7 @@ function fakeVitest(fail: string[], hang: string[] = [], slow: string[] = [], re
     'const listed = process.env.SMDB_MUTATION_INCLUDE;',
     "const include = listed ? JSON.parse(fs.readFileSync(listed, 'utf8')) : null;",
     'const coverage = process.env.SMDB_MUTATION_COVERAGE ?? null;',
-    `fs.appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ project, args, scale: process.env.SMDB_TEST_TIME_SCALE ?? null, mutant: process.env.__STRYKER_ACTIVE_MUTANT__ ?? null, include, coverage }) + '\\n');`,
+    `fs.appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ project, args, scale: process.env.SMDB_TEST_TIME_SCALE ?? null, mutant: process.env.__STRYKER_ACTIVE_MUTANT__ ?? null, include, coverage, pid: process.pid }) + '\\n');`,
     `const report = ${JSON.stringify(report)};`,
     "const outputFile = (args.find(arg => arg.startsWith('--outputFile=')) ?? '').slice('--outputFile='.length);",
     "if (report.length > 0 && outputFile && process.env.__STRYKER_ACTIVE_MUTANT__ === 'none') {",
@@ -60,6 +62,17 @@ function runner(fake: { script: string; out: string }, pass: string, confirm: st
       SMDB_MUTATION_CONFIRM: confirm, SMDB_MUTATION_ONLY: JSON.stringify(only), SMDB_MUTATION_RUN: '', __STRYKER_ACTIVE_MUTANT__: '7', ...env,
     },
   });
+}
+
+// Every gate run here gets a stand-in for vitest that records each call and fails, and a bound on its time, so a check
+// that broke and let the gate go on runs no real test.
+function guarded(env: NodeJS.ProcessEnv = process.env) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-guard-'));
+  onTestFinished(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const calls = path.join(dir, 'calls.jsonl');
+  const script = path.join(dir, 'vitest.cjs');
+  fs.writeFileSync(script, `require('fs').appendFileSync(${JSON.stringify(calls)}, 'called\\n');\nprocess.exit(1);\n`);
+  return { env: { ...env, SMDB_MUTATION_VITEST: script, SMDB_STANDIN_CALLS: calls }, timeout: 300_000, called: () => fs.existsSync(calls) };
 }
 
 describe('a mutant run', () => {
@@ -157,6 +170,54 @@ describe('a mutant run', () => {
     expect(fs.existsSync(path.join(fake.out, 'dry-alone-1.log'))).toBe(true);
     expect(fs.existsSync(path.join(fake.out, 'dry-alone-1.include.json'))).toBe(true);
     expect(fs.existsSync(path.join(fake.out, 'dry-ms.txt'))).toBe(true);
+    // And a line per finished set, which a resume reads (resume.mjs setLines).
+    expect(setLines(fs.readFileSync(path.join(fake.out, 'checks.jsonl'), 'utf8'))).toEqual({ lines: runs.map(({ files, code, ms }) => ({ key: JSON.stringify(files), files, code, ms })), problem: '' });
+  });
+
+  it('starts no set once the gate that started the run is gone, so a killed gate leaves no set to run twice', () => {
+    const sets = [{ files: ['unit/a.test.ts'], ms: 60_000 }];
+    const gone = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' });
+    const env = { __STRYKER_ACTIVE_MUTANT__: 'none', SMDB_MUTATION_SETS: JSON.stringify(sets), SMDB_MUTATION_FILES: '["test/mutation/control.mjs"]' };
+    const dead = fakeVitest([]);
+    expect(runner(dead, 'a', '', [], { ...env, SMDB_MUTATION_GATE_PID: gone.stdout }).status).toBe(1);
+    expect(dead.read()).toEqual([]);
+    expect(fs.existsSync(path.join(dead.out, 'checks.jsonl'))).toBe(false);
+    const live = fakeVitest([]);
+    expect(runner(live, 'a', '', [], { ...env, SMDB_MUTATION_GATE_PID: String(process.pid) }).status).toBe(0);
+    expect(live.read()).toHaveLength(1);
+    expect(fs.readdirSync(live.out).filter(name => /^runner-\d+\.json$/.test(name))).toEqual([]);
+  });
+
+  it('ends the set in flight once the gate is gone, with what it started, adds no line for it, and removes its runner file', { timeout: 60_000 }, async () => {
+    const fake = fakeVitest([], ['unit/hang.test.ts']);
+    const gate = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+    onTestFinished(() => { gate.kill(); });
+    const sets = [{ files: ['unit/hang.test.ts'], ms: 120_000 }, { files: ['unit/a.test.ts'], ms: 60_000 }];
+    const child = spawn(process.execPath, [path.join(root, 'test', 'mutation', 'runner.mjs')], {
+      stdio: 'ignore',
+      env: {
+        ...process.env, SMDB_MUTATION_VITEST: fake.script, SMDB_MUTATION_PASS: 'a', SMDB_MUTATION_FILES: '["test/mutation/control.mjs"]', SMDB_MUTATION_OUT: fake.out,
+        SMDB_MUTATION_CONFIRM: '', SMDB_MUTATION_ONLY: '[]', SMDB_MUTATION_RUN: '', __STRYKER_ACTIVE_MUTANT__: 'none', SMDB_MUTATION_SETS: JSON.stringify(sets),
+        SMDB_MUTATION_GATE_PID: String(gate.pid),
+      },
+    });
+    const exited = new Promise<number | null>(resolve => child.once('exit', code => resolve(code)));
+    onTestFinished(() => { if (child.exitCode === null && child.pid !== undefined) endTree(child.pid); });
+    const until = Date.now() + 30_000;
+    while (fake.read().length === 0 && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 100));
+    expect(fake.read()).toHaveLength(1);
+    const own = path.join(fake.out, `runner-${child.pid}.json`);
+    expect(lockOf(fs.readFileSync(own, 'utf8'))?.pid).toBe(child.pid);
+    gate.kill();
+    const begun = Date.now();
+    expect(await exited).toBe(1);
+    expect(Date.now() - begun).toBeLessThan(10_000);
+    const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    const [hung] = fake.read();
+    expect(alive(hung.pid)).toBe(false);
+    expect(fake.read()).toHaveLength(1);
+    expect(fs.existsSync(path.join(fake.out, 'checks.jsonl'))).toBe(false);
+    expect(fs.existsSync(own)).toBe(false);
   });
 
   it('ends a set\'s run past its bound, with what it started, and counts it as failed', () => {
@@ -464,8 +525,10 @@ describe('the run with no mutant after the reruns', () => {
 
 describe('the tree fingerprint', () => {
   it('ends the gate NO RESULT, exit 2, when git cannot list the tree', () => {
+    const guard = guarded({ ...process.env, GIT_DIR: path.join(os.tmpdir(), `smdb-no-git-${process.pid}`) });
     const run = spawnSync(process.execPath, [path.join(root, 'test', 'mutation', 'touched.mjs'), '--concurrency', '1'],
-      { cwd: root, encoding: 'utf8', env: { ...process.env, GIT_DIR: path.join(os.tmpdir(), `smdb-no-git-${process.pid}`) } });
+      { cwd: root, encoding: 'utf8', env: guard.env, timeout: guard.timeout });
+    expect(guard.called()).toBe(false);
     expect(run.status).toBe(2);
     expect(run.stdout).toMatch(/^Verdict: NO RESULT \(the gate could not read the tree: /m);
   });
@@ -495,7 +558,9 @@ describe('the tree fingerprint', () => {
       fs.rmSync(copy, { recursive: true, force: true });
     });
     fs.writeFileSync(path.join(copy, '.stryker-tmp'), '');
-    const run = spawnSync(process.execPath, [path.join(copy, 'test', 'mutation', 'touched.mjs')], { cwd: copy, encoding: 'utf8' });
+    const guard = guarded();
+    const run = spawnSync(process.execPath, [path.join(copy, 'test', 'mutation', 'touched.mjs')], { cwd: copy, encoding: 'utf8', env: guard.env, timeout: guard.timeout });
+    expect(guard.called()).toBe(false);
     expect(run.status, run.stderr).toBe(2);
     expect(run.stdout).toMatch(/^Verdict: NO RESULT \(the gate could not make \.stryker-tmp, where Stryker puts its sandboxes: /m);
   });
@@ -509,7 +574,9 @@ describe('the tree fingerprint', () => {
       unlink();
       fs.rmSync(outer, { recursive: true, force: true });
     });
-    const run = spawnSync(process.execPath, [path.join(copy, 'test', 'mutation', 'touched.mjs')], { cwd: copy, encoding: 'utf8' });
+    const guard = guarded();
+    const run = spawnSync(process.execPath, [path.join(copy, 'test', 'mutation', 'touched.mjs')], { cwd: copy, encoding: 'utf8', env: guard.env, timeout: guard.timeout });
+    expect(guard.called()).toBe(false);
     expect(run.status, run.stderr).toBe(2);
     expect(run.stdout).toMatch(/^Verdict: NO RESULT \(the checkout's path, .*\/bot \[old\], does not match itself read as a glob, as Stryker reads it: /m);
     expect(fs.existsSync(path.join(copy, '.stryker-tmp'))).toBe(false);
@@ -524,7 +591,9 @@ describe('the tree fingerprint', () => {
       unlink();
       fs.rmSync(outer, { recursive: true, force: true });
     });
-    const run = spawnSync(process.execPath, [path.join(copy, 'test', 'mutation', 'touched.mjs')], { cwd: copy, encoding: 'utf8' });
+    const guard = guarded();
+    const run = spawnSync(process.execPath, [path.join(copy, 'test', 'mutation', 'touched.mjs')], { cwd: copy, encoding: 'utf8', env: guard.env, timeout: guard.timeout });
+    expect(guard.called()).toBe(false);
     expect(run.status, run.stderr).toBe(2);
     expect(run.stdout).toMatch(/^Verdict: NO RESULT \(the checkout's path, .*\/node_modules_old\/bot, holds the text node_modules, as given or as its real path, /m);
     expect(fs.existsSync(path.join(copy, '.stryker-tmp'))).toBe(false);
@@ -555,7 +624,9 @@ describe('the tree fingerprint', () => {
     fs.writeFileSync(path.join(copy, '.gitignore'), 'node_modules/\n');
     execFileSync('git', ['init', '-q'], { cwd: copy });
     expect(execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { cwd: copy, encoding: 'utf8' })).not.toContain('node_modules');
-    const run = spawnSync(process.execPath, [path.join(copy, 'test', 'mutation', 'touched.mjs'), '--mutate', 'src/x.ts'], { cwd: copy, encoding: 'utf8' });
+    const guard = guarded();
+    const run = spawnSync(process.execPath, [path.join(copy, 'test', 'mutation', 'touched.mjs'), '--mutate', 'src/x.ts'], { cwd: copy, encoding: 'utf8', env: guard.env, timeout: guard.timeout });
+    expect(guard.called()).toBe(false);
     expect(run.status, run.stderr).toBe(2);
     expect(run.stderr).toMatch(/^--mutate cannot take src\/x\.ts: it could not be read \(E[A-Z]+\)$/m);
     // The sandboxes' dir ignores itself from before the first tree print, which comes before this refusal.
@@ -574,7 +645,9 @@ describe('the tree fingerprint', () => {
     copyGate(copy);
     for (const target of [path.join(root, 'test', 'node_modules'), empty]) {
       fs.symlinkSync(target, packages, 'junction');
-      const run = spawnSync(process.execPath, [path.join(copy, 'test', 'mutation', 'touched.mjs')], { cwd: copy, encoding: 'utf8' });
+      const guard = guarded();
+      const run = spawnSync(process.execPath, [path.join(copy, 'test', 'mutation', 'touched.mjs')], { cwd: copy, encoding: 'utf8', env: guard.env, timeout: guard.timeout });
+      expect(guard.called()).toBe(false);
       expect(run.status, run.stderr).toBe(2);
       expect(run.stdout, target).toMatch(/^Verdict: NO RESULT \(test\/node_modules is a link, not a dir of this checkout's own, .*; first remove the link itself, never what it names, with node -e "require\('fs'\)\.rmSync\('test\/node_modules'\)" from the bot root \(it refuses a real dir\), then run npm run test:install: npm ci through the link would empty the other checkout's test\/node_modules\)$/m);
       fs.unlinkSync(packages);
@@ -593,9 +666,11 @@ describe('the tree fingerprint', () => {
     const copy = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-noinstall-'));
     onTestFinished(() => fs.rmSync(copy, { recursive: true, force: true }));
     copyGate(copy);
-    const run = spawnSync(process.execPath, [path.join(copy, 'test', 'mutation', 'touched.mjs')], { cwd: copy, encoding: 'utf8' });
+    const guard = guarded();
+    const run = spawnSync(process.execPath, [path.join(copy, 'test', 'mutation', 'touched.mjs')], { cwd: copy, encoding: 'utf8', env: guard.env, timeout: guard.timeout });
+    expect(guard.called()).toBe(false);
     expect(run.status, run.stderr).toBe(2);
-    expect(run.stdout).toMatch(/^Verdict: NO RESULT \(the gate could not load: .*; run npm run test:install, adding -- --include=dev where a config or NODE_ENV=production leaves dev packages out\)$/m);
+    expect(run.stdout).toMatch(/^Verdict: NO RESULT \(the gate could not load:.*; run npm run test:install, adding -- --include=dev where a config or NODE_ENV=production leaves dev packages out\)$/m);
   });
 
   it('is taken, in the gate, before it reads a file: the --mutate checks and the plan', () => {
@@ -608,7 +683,8 @@ describe('the tree fingerprint', () => {
 
   it('gives pass A every target of a file, gates by any of them, and runs only when one can gate (ranges.mjs)', () => {
     const gate = fs.readFileSync(path.join(root, 'test', 'mutation', 'touched.mjs'), 'utf8');
-    expect(gate).toContain('gating: gatesIn(targets, file, r.location)');
+    expect(gate).toContain('gating: gatesIn(targets, file, location)');
+    expect(gate).toContain('mutants = planA.map(m => recordOf(m.file, m.location, m.mutator, m.replacement));');
     expect(gate).toContain('const canGate = target => target.gating === null || target.gating.length > 0;');
     // One list: Stryker mutates, and every run is given, the files a target can gate in (each with all its targets),
     // never one where code was only taken out, so each run with no mutant checks every file Stryker made code in.
@@ -618,7 +694,7 @@ describe('the tree fingerprint', () => {
     // The run with no mutant after the reruns makes their spans, with their time limits, bound above their budget.
     expect(gate).toContain("const rerun = tier === 'a' ? PASSES.a2 : PASSES.b2;");
     expect(gate).toContain('await stryker({ dir, tier, mutate: [...new Set(on.map(spanOf))], only, alone: true, extra: { ...rerun, dryRunOnly: true, dryRunTimeoutMinutes: controlBoundMinutes(rerun, only.length) } });');
-    expect(gate).toContain('const results = await pass({ dir, tier, mutate: [...new Set(on.map(spanOf))],');
+    expect(gate).toContain('if (rest.length > 0) await pass({ dir, tier, mutate: [...new Set(rest.map(spanOf))], only, keys: rest.map(recordKey), alone, extra });');
     // ... handed the very mutants the reruns ran on.
     expect(gate).toContain("await passOn('a2', 'a2', 'a', confirmA, PASSES.a2);");
     expect(gate).toContain("if (confirmA.some(credited)) await control('a2', 'a', confirmA, [], confirmA.some(m => outcome(m) === 'Timeout'));");
@@ -629,7 +705,7 @@ describe('the tree fingerprint', () => {
     expect(gate).toContain('inTree ??= ownNames(root, planned.keys());');
     const guard = gate.indexOf('if (!targets.some(canGate)) await finish();');
     expect(guard).toBeGreaterThan(0);
-    expect(guard).toBeLessThan(gate.indexOf("await pass({ dir: 'a'"));
+    expect(guard).toBeLessThan(gate.indexOf("await pass({ dir: dirA, tier: 'a'"));
   });
 });
 
@@ -640,8 +716,9 @@ describe('the gate under an old node', () => {
   const version = probe.status === 0 ? probe.stdout.trim() : '';
   const [major, minor] = version.split('.').map(Number);
   it.runIf(version !== '' && (major < 22 || (major === 22 && minor < 12)))('stops, naming the version, when SMDB_TEST_NODE is old too, instead of relaunching again', () => {
-    const run = spawnSync('node', [path.join(root, 'test', 'mutation', 'touched.mjs'), '--help'],
-      { encoding: 'utf8', timeout: 30_000, env: { ...process.env, SMDB_TEST_NODE: 'node', SMDB_MUTATION_RELAUNCHED: '' } });
+    const guard = guarded({ ...process.env, SMDB_TEST_NODE: 'node', SMDB_MUTATION_RELAUNCHED: '' });
+    const run = spawnSync('node', [path.join(root, 'test', 'mutation', 'touched.mjs'), '--help'], { encoding: 'utf8', timeout: 30_000, env: guard.env });
+    expect(guard.called()).toBe(false);
     expect(run.status).toBe(2);
     expect(run.stderr).toContain(`SMDB_TEST_NODE (node) runs v${version}`);
   });
@@ -827,7 +904,9 @@ describe('a property under the gate', () => {
 
   it('refuses a seed that is no integer, in the gate and in every test file, before the file makes its data root', { timeout: 180_000 }, () => {
     const env = { ...process.env, SMDB_TEST_SEED: '1.5' };
-    const gate = spawnSync(process.execPath, [path.join(root, 'test', 'mutation', 'touched.mjs'), '--mutate', 'src/bot/internalSetup/fleet/nodeIdentity.ts:1-1'], { cwd: root, encoding: 'utf8', timeout: 60_000, env });
+    const guard = guarded(env);
+    const gate = spawnSync(process.execPath, [path.join(root, 'test', 'mutation', 'touched.mjs'), '--mutate', 'src/bot/internalSetup/fleet/nodeIdentity.ts:1-1'], { cwd: root, encoding: 'utf8', timeout: 60_000, env: guard.env });
+    expect(guard.called()).toBe(false);
     expect(gate.status).toBe(2);
     expect(gate.stderr).toContain('SMDB_TEST_SEED must be an integer, not 1.5');
     const vitest = path.join(root, 'test', 'node_modules', 'vitest', 'vitest.mjs');

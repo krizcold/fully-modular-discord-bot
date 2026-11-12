@@ -192,9 +192,12 @@ export function confirmed(m, stopped = false) {
   const last = outcomeOf(latest(m));
   if (last === 'Recheck') return { outcome: 'Inconclusive', why: `${latest(m).inconclusive}, ${b ? 'in pass B, ' : ''}never rerun alone` };
   // Only a later pass can find no mutant at a place pass A made one: a rerun,
-  // pass B, or pass A again with no checker.
+  // pass B, pass A again with no checker, or pass A on the mutants a stopped
+  // run has no result for, which the plan it saved holds.
   if (last === 'Missing') {
-    return { outcome: 'Inconclusive', why: `pass ${b2 ? 'b2' : b ? 'b' : a2 ? 'a2' : 'A with no checker'} made no mutant at this place, so it ran no test on it` };
+    const dir = m.passes.a?.dir;
+    const inA = dir === undefined || dir.startsWith('a-unchecked') ? 'A with no checker' : `A in ${dir}/`;
+    return { outcome: 'Inconclusive', why: `pass ${b2 ? 'b2' : b ? 'b' : a2 ? 'a2' : inA} made no mutant at this place, so it ran no test on it` };
   }
   if (m.gating && b2 && last === 'Survived') {
     return { outcome: 'Inconclusive', why: `${failedInB(b)}, but not when that file ran alone, and the tests after it in pass B never ran on it` };
@@ -341,44 +344,54 @@ export function bySet(mutants, taken) {
  * each a2 timeout whose set took longer with no mutant than the budget that
  * rerun had: for one the runner ended at its own budget (bounded), the set's
  * own, `ownBudget(files)` (NaN when unknown); for one Stryker ended, `budget`,
- * the ms Stryker gave each a2 run (NaN when unknown). `runs` is what
- * dry-alone.json holds: per set, its files, exit and time. Returns a report
- * line per set and reason whose results were voided, and the number of sets
- * any result was voided in.
+ * the ms Stryker gave each a2 run (NaN when unknown). Either budget can be
+ * given per mutant, for a2 results from more than one dir of a2 (a resume's).
+ * `runs` is what dry-alone.json holds: per set, its files, exit and time, and
+ * the dir it ran in when that is not `dir`. Returns a report line per set and
+ * reason whose results were voided, and the number of sets any result was
+ * voided in.
  * @param {{ files: string[] | null, on: MutantRecord[] }[]} sets
  * @param {unknown} runs
  * @param {string} dir the dir of the runs with no mutant
- * @param {number} budget
- * @param {(files: string[]) => number} [ownBudget]
+ * @param {number | ((m: MutantRecord) => number)} budget
+ * @param {(files: string[], m: MutantRecord) => number} [ownBudget]
  * @returns {{ lines: string[], voided: number }}
  */
 export function voidFailedSets(sets, runs, dir, budget, ownBudget = () => NaN) {
   /** @type {string[]} */
   const lines = [];
   let count = 0;
-  /** @type {{ files?: unknown, code?: unknown, ms?: unknown }[]} */
+  /** @type {{ files?: unknown, code?: unknown, ms?: unknown, dir?: unknown }[]} */
   const list = Array.isArray(runs) ? runs.filter(r => r !== null && typeof r === 'object') : [];
   /** @param {number} ms */
   const seconds = ms => `${Math.round(ms / 1000)} s`;
   for (const { files, on } of sets) {
     const run = files ? list.find(r => JSON.stringify(r.files) === JSON.stringify(files)) : undefined;
+    const at = typeof run?.dir === 'string' ? run.dir : dir;
     const named = files ? files.join(', ') : '';
     const ms = typeof run?.ms === 'number' && Number.isFinite(run.ms) ? run.ms : NaN;
     const failed = !files
       ? 'the files its a2 run took could not be read'
-      : run?.code === undefined || typeof run.code !== 'number' ? `${named}, run together with no mutant (${dir}/), left no result`
-        : run.code !== 0 ? `${named} failed together with no mutant (${dir}/)` : '';
-    const took = `${named} took ${Number.isFinite(ms) ? seconds(ms) : 'a time that could not be read'} together with no mutant (${dir}/)`;
-    const slowStryker = ms <= budget ? '' : `${took}, not within the ${Number.isFinite(budget) ? seconds(budget) : 'unknown budget'} Stryker gave each a2 run`;
-    const own = files ? ownBudget(files) : NaN;
-    const slowOwn = ms <= own ? ''
-      : `${took}, not within ${Number.isFinite(own) ? `the ${seconds(own)}` : 'an unknown'} budget of that set alone (four times what its files take in a2's run with no mutant, plus a minute)`;
+      : run?.code === undefined || typeof run.code !== 'number' ? `${named}, run together with no mutant (${at}/), left no result`
+        : run.code !== 0 ? `${named} failed together with no mutant (${at}/)` : '';
+    const took = `${named} took ${Number.isFinite(ms) ? seconds(ms) : 'a time that could not be read'} together with no mutant (${at}/)`;
+    /** @param {MutantRecord} m */
+    const slowStryker = m => {
+      const limit = typeof budget === 'function' ? budget(m) : budget;
+      return ms <= limit ? '' : `${took}, not within the ${Number.isFinite(limit) ? seconds(limit) : 'unknown budget'} Stryker gave each a2 run`;
+    };
+    /** @param {MutantRecord} m */
+    const slowOwn = m => {
+      const own = files ? ownBudget(files, m) : NaN;
+      return ms <= own ? ''
+        : `${took}, not within ${Number.isFinite(own) ? `the ${seconds(own)}` : 'an unknown'} budget of that set alone (four times what its files take in a2's run with no mutant, plus a minute)`;
+    };
     /** @type {Map<string, number>} */
     const voided = new Map();
     for (const m of on) {
       const a2 = /** @type {PassResult} */ (m.passes.a2);
       const timeout = outcomeOf(a2) === 'Timeout';
-      const why = failed || (timeout ? (a2.bounded ? slowOwn : slowStryker) : '');
+      const why = failed || (timeout ? (a2.bounded ? slowOwn(m) : slowStryker(m)) : '');
       if (!why) continue;
       voided.set(why, (voided.get(why) ?? 0) + 1);
       m.passes.a2 = { ...a2, voided: `${timeout ? 'timed out' : `killed by ${a2.killedBy}`} in a2, but ${why}, so it proves nothing` };
@@ -405,9 +418,11 @@ export const toPassB = mutants => mutants.filter(m => m.gating && ['Survived', '
  * the run after the reruns, each entry with what failed there, if anything.
  * `standIn` is set when a test replaced vitest (runner.mjs's
  * SMDB_MUTATION_VITEST): such a run proves nothing about the code.
+ * `resumed` says, for a run that resumed a stopped one (touched.mjs
+ * --resume), what each stage it found saved kept and what it ran now.
  * @param {{ stamp: string, scope: string, emptyScope: boolean, skipped: { file: string, why: string }[], mutants: MutantRecord[],
  *   noMutant: { file: string, lines: number[] }[], brackets?: { file: string, lines: number[] }[], deleted?: { file: string, lines: number[] }[],
- *   unmatched: string[], report: string, stopped?: string[], treeChanged?: string[], controls?: string[], standIn?: string }} run
+ *   unmatched: string[], report: string, stopped?: string[], treeChanged?: string[], controls?: string[], resumed?: string[], standIn?: string }} run
  *   brackets: the changed lines that can move others (ranges.mjs structureLines): brackets and separators only, a brace
  *   of a block, or an else, case, default, catch or finally; deleted: where lines of code were taken out with fewer or
  *   none put back, each after the line named (0: the top)
@@ -465,6 +480,7 @@ export function judge(run) {
   const lines = [
     `L5 touched-line mutation, ${run.stamp}`,
     `Scope: ${run.scope}`,
+    ...(run.resumed?.length ? ['Resumed a stopped run (each stage goes on where it stopped, and no item of it runs twice):', ...run.resumed.map(line => `  ${line}`)] : []),
     `Mutated: ${made.length > 0 ? made.join(', ') : 'nothing'}`,
     ...(run.skipped.length > 0 ? ['Not mutated:', ...run.skipped.map(s => `  ${s.file}: ${s.why}`)] : []),
     ...(run.unmatched.length > 0 ? ['Patterns that made no mutant:', ...run.unmatched.map(p => `  ${p}`)] : []),

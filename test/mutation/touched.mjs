@@ -1,7 +1,7 @@
 // The L5 gate (VERIFY.md section 2): mutation on the lines a change touched,
 // through Stryker's command runner, so code that only child processes run is
 // mutated too. How to run it and read it: mutation/README.md.
-// Usage: node test/mutation/touched.mjs [--base REF] [--mutate PATTERN]... [--concurrency N] [--keep]
+// Usage: node test/mutation/touched.mjs [--base REF] [--mutate PATTERN]... [--resume DIR] [--concurrency N] [--keep]
 // Exit: 0 PASS, 1 FAIL, 2 NO RESULT or a usage error; any other code: interrupted.
 // Trust 0 and 1 only after a Verdict line: a process killed on Windows exits 1 too.
 import { execFileSync, spawnSync } from 'child_process';
@@ -12,18 +12,30 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { pastBudget, strykerClock } from './control.mjs';
 import { PACKAGE_LOCKS, treeChanges, treePrint } from './tree.mjs';
-import { canonicalName, fileOf as nameOf, keyOf } from './keys.mjs';
+import { canonicalName, keyOf } from './keys.mjs';
 import { A2_BOUND, COMMON, controlBoundMinutes, PASSES, setBoundMs, setsBoundMinutes } from './passes.mjs';
 import { boundFor, readCosts, TAKEN_FILE } from './reach.mjs';
+import {
+  a2Dir, boundedDir, chainOf, CHECKS_FILE, CHECKS_PLAN_FILE, CONTROL_KEY, controlLines, DONE_FILE, keysOf, LOCK_FILE, lockOf, mutantDir, nextDir, PLAN_FILE,
+  planOf, RESULTS_FILE, resultLines, resumeNumber, RUN_FILE, RUNNER_FILE, savedRun, setKey, setLines, setupChanges, someOf, STAGE_DIR, stageOf,
+} from './resume.mjs';
 
 /**
  * @typedef {import('./ranges.mjs').Location} Location
  * @typedef {import('./verdict.mjs').MutantRecord} MutantRecord
  * @typedef {import('./verdict.mjs').PassName} PassName
  * @typedef {import('./verdict.mjs').PassResult} PassResult
+ * @typedef {import('./resume.mjs').SavedResult} SavedResult
+ * @typedef {import('./resume.mjs').SetLine} SetLine
+ * @typedef {import('./resume.mjs').ControlLine} ControlLine
+ * @typedef {import('./resume.mjs').StageDir} StageDir
  * @typedef {{ file: string, patterns: string[], gating: number[] | null, deleted?: number[] }} PassTarget
  * @typedef {{ id: string, fileName: string, location: Location, mutatorName: string, replacement?: string, status: string, statusReason?: string }} StrykerResult
  * @typedef {import('@stryker-mutator/api/core').PartialStrykerOptions} Options
+ */
+/**
+ * @template {{ key: string }} L
+ * @typedef {import('./resume.mjs').Stage<L> & { chain: string[], dirs: (StageDir & { plan?: import('./resume.mjs').PlannedMutant[] | null, subset?: boolean })[] }} SavedStage
  */
 
 const [major, minor] = process.versions.node.split('.').map(Number);
@@ -68,11 +80,11 @@ const {
   structureLines, DATA_ROUTE_WHY, EXTRA_BREAK_WHY, GLOB_NAME_WHY, beyondTree, checkerDiffers, gatesIn, holdsDataRoute, holdsExtraBreak, linesOfTarget, mutatePatterns,
   notMutated, ownNames, planFromGit, rootGlobFree, rootRelatable, sandboxPatterns, strykerTakes, treeTsconfig, unmatchedPatterns, untouched,
 } = ranges;
-const { byKiller, bySet, classifyKill, endedByBound, judge, killedInA, onlyUnusedDirective, outcome, toConfirm, toPassB, toUncheck, uncreditFailedAlone, voidFailedSets } = verdicts;
+const { byKiller, bySet, classifyKill, endedByBound, judge, killedInA, onlyUnusedDirective, outcome, outcomeOf, toConfirm, toPassB, toUncheck, uncreditFailedAlone, voidFailedSets } = verdicts;
 
-const USAGE = 'usage: node test/mutation/touched.mjs [--base REF] [--mutate PATTERN]... [--concurrency N] [--keep]';
-/** @type {{ base: string, mutate: string[], concurrency: number, keep: boolean }} */
-const opts = { base: 'HEAD', mutate: [], concurrency: Math.max(1, Math.floor(os.availableParallelism() / 2)), keep: false };
+const USAGE = 'usage: node test/mutation/touched.mjs [--base REF] [--mutate PATTERN]... [--resume DIR] [--concurrency N] [--keep]';
+/** @type {{ base: string, baseGiven: boolean, mutate: string[], resume: string, concurrency: number, keep: boolean }} */
+const opts = { base: 'HEAD', baseGiven: false, mutate: [], resume: '', concurrency: Math.max(1, Math.floor(os.availableParallelism() / 2)), keep: false };
 const argv = process.argv.slice(2);
 for (let i = 0; i < argv.length; i++) {
   const arg = argv[i];
@@ -80,11 +92,16 @@ for (let i = 0; i < argv.length; i++) {
     if (i + 1 >= argv.length) { console.error(`${arg} needs a value\n${USAGE}`); process.exit(2); }
     return argv[++i];
   };
-  if (arg === '--base') opts.base = value();
+  if (arg === '--base') { opts.base = value(); opts.baseGiven = true; }
   else if (arg === '--mutate') opts.mutate.push(value());
+  else if (arg === '--resume') opts.resume = path.resolve(value());
   else if (arg === '--concurrency') opts.concurrency = Math.max(1, Number(value()) || 1);
   else if (arg === '--keep') opts.keep = true;
   else { console.error(USAGE); process.exit(2); }
+}
+if (opts.resume && (opts.baseGiven || opts.mutate.length > 0)) {
+  console.error(`--resume takes the scope from the stopped run's ${RUN_FILE}, so --base and --mutate cannot be given with it\n${USAGE}`);
+  process.exit(2);
 }
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -126,6 +143,128 @@ try {
 } catch (error) {
   console.log(`Verdict: NO RESULT (the gate could not read the tree: ${firstLine(error)})`);
   process.exit(2);
+}
+
+/**
+ * @param {string} file
+ * @returns {string | null}
+ */
+const readText = file => { try { return fs.readFileSync(file, 'utf8'); } catch { return null; } };
+
+/** @type {string[]} what the report says of a resume: what each stage it found saved kept and what it ran now */
+const resumed = [];
+
+/** @param {number} pid */
+const alive = pid => { try { process.kill(pid, 0); return true; } catch (error) { return /** @type {NodeJS.ErrnoException} */ (error).code === 'EPERM'; } };
+
+/**
+ * Takes the report dir for this run: lock.json, created only where none is
+ * (the 'wx' flag), with this process's id and start time, and removed at
+ * exit. One a process that no longer runs left (a gate that was killed) is
+ * taken over, and the report says so; one whose process runs, or that cannot
+ * be read, ends the run with `refuse`.
+ * @param {string} dir
+ * @param {(why: string) => never} refuse
+ */
+function takeLock(dir, refuse) {
+  const file = path.join(dir, LOCK_FILE);
+  const mine = `${JSON.stringify({ pid: process.pid, started: new Date().toISOString() })}\n`;
+  const write = () => {
+    try { fs.writeFileSync(file, mine, { flag: 'wx' }); return ''; } catch (error) { return /** @type {NodeJS.ErrnoException} */ (error).code ?? firstLine(error); }
+  };
+  let failed = write();
+  if (failed === 'EEXIST') {
+    const text = readText(file);
+    const held = lockOf(text ?? '');
+    if (!held) refuse(`its ${LOCK_FILE} cannot be read, so whether another gate run uses the dir is not known; remove ${LOCK_FILE} once none does`);
+    if (alive(held.pid)) {
+      refuse(`its ${LOCK_FILE} names process ${held.pid}, started ${held.started}, which still runs, so another gate run may be using the dir; if that process is no gate run, remove ${LOCK_FILE}`);
+    }
+    // Moved aside first, so of two resumes that both found it stale only one takes it.
+    const aside = path.join(dir, `lock-stale-${process.pid}.json`);
+    let moved = false;
+    try { fs.renameSync(file, aside); moved = true; } catch {}
+    if (moved && readText(aside) !== text) {
+      try { fs.renameSync(aside, file); } catch {}
+      refuse(`another gate run took its ${LOCK_FILE} while this one started`);
+    }
+    fs.rmSync(aside, { force: true });
+    failed = write();
+    if (!failed) resumed.push(`${LOCK_FILE} named process ${held.pid}, started ${held.started}, which no longer runs, so this resume took the report dir over`);
+  }
+  if (failed) refuse(failed === 'EEXIST' ? `another gate run took its ${LOCK_FILE} while this one started` : `its ${LOCK_FILE} could not be written (${failed})`);
+  process.on('exit', () => { if (readText(file) === mine) fs.rmSync(file, { force: true }); });
+}
+
+// A resume continues a stopped run in its report dir (README, "Stopping and
+// resuming"), on the tree that run started on: its results say nothing of
+// another. The print holds file times too, since the stopped run never
+// reached its own end-of-run check, so an edit made and undone while it ran
+// shows here.
+/** @type {import('./resume.mjs').RunSetup} the Node that runs every test command (runner.mjs) and a test's stand-in for vitest */
+const setup = { path: process.execPath, version: process.version, standIn: process.env.SMDB_MUTATION_VITEST ?? '' };
+/** @type {import('./resume.mjs').SavedRun | null} */
+let saved = null;
+let resumeN = 0;
+/**
+ * @param {string} why
+ * @returns {never}
+ */
+const refuse = why => {
+  console.log(`Verdict: NO RESULT (the run in ${posix(path.relative(root, opts.resume)) || '.'} cannot be resumed: ${why}; no pass ran)`);
+  process.exit(2);
+};
+/**
+ * Waits up to `ms` for every runner.mjs of a check of sets that a stage dir
+ * of `dir` names (resume.mjs runnerFile) to end: one left behind by a killed
+ * gate ends the set in flight by itself within a second of the gate's end, and
+ * until it ends it could still add a line. Returns what still runs then, or
+ * a file that cannot be read, as why the resume cannot go on; '' for none.
+ * @param {string} dir
+ * @param {number} ms
+ */
+function runnersLeft(dir, ms) {
+  const until = Date.now() + ms;
+  for (;;) {
+    let left = '';
+    for (const stage of fs.readdirSync(dir).filter(name => STAGE_DIR.test(name)).sort()) {
+      /** @type {string[]} */
+      let names = [];
+      try { names = fs.readdirSync(path.join(dir, stage)).filter(name => RUNNER_FILE.test(name)).sort(); } catch { names = []; }
+      for (const name of names) {
+        const text = readText(path.join(dir, stage, name));
+        if (text === null && !fs.existsSync(path.join(dir, stage, name))) continue;
+        const held = lockOf(text ?? '');
+        if (!held) return `${stage}/${name} cannot be read, so whether a run of sets of test files the stopped gate started still runs there is not known; remove it once none does`;
+        if (alive(held.pid)) left ||= `${stage}/${name} names process ${held.pid}, started ${held.started}, a run of sets of test files the stopped gate started, which still runs and could still add a result there; end that process and the processes under it, then resume`;
+      }
+    }
+    if (!left || Date.now() >= until) return left;
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200);
+  }
+}
+
+if (opts.resume) {
+  if (!fs.statSync(opts.resume, { throwIfNoEntry: false })?.isDirectory()) refuse(`it is no dir, so it holds no ${RUN_FILE}`);
+  takeLock(opts.resume, refuse);
+  const runners = runnersLeft(opts.resume, 10_000);
+  if (runners) refuse(runners);
+  /** @type {string | null} */
+  let text = null;
+  try { text = fs.readFileSync(path.join(opts.resume, RUN_FILE), 'utf8'); } catch { text = null; }
+  if (text === null) refuse(`it holds no ${RUN_FILE}, which a run writes before pass A starts, so what tree, scope and seed it ran on is not known`);
+  saved = savedRun(/** @type {string} */ (text));
+  if (!saved) refuse(`its ${RUN_FILE} cannot be read, so what tree, scope and seed it ran on is not known`);
+  const was = /** @type {import('./resume.mjs').SavedRun} */ (saved);
+  const changed = [...treeChanges(new Map(was.tree), planned), ...treeChanges(new Map(was.packages), packages)].sort();
+  if (changed.length > 0) {
+    refuse(`the tree or the packages differ from those the stopped run started on (a file's content, size or time, a file added or gone, or an install), so its results say nothing of this tree: ${someOf(changed)}`);
+  }
+  const ranWith = setupChanges(was.setup, setup);
+  if (ranWith.length > 0) refuse(`what ran its tests differs from what runs them now, so its results say nothing of a run here: ${ranWith.join('; ')}`);
+  opts.mutate = 'mutate' in was.scope ? was.scope.mutate : [];
+  process.env.SMDB_TEST_SEED = was.seed;
+  resumeN = resumeNumber(fs.readdirSync(opts.resume));
 }
 // Every sandbox holds those files and nothing else (ranges.mjs sandboxPatterns).
 const sandbox = sandboxPatterns([...planned.keys()]);
@@ -181,7 +320,7 @@ process.env.SMDB_TEST_SEED ||= String(crypto.randomInt(2 ** 31));
 const stamp = new Date().toISOString().replace(/[:.]/g, '-');
 // The process id too: two runs in one checkout that start in the same
 // millisecond would otherwise read each other's vitest reports.
-const reportDir = path.join(root, 'test', 'mutation', 'reports', `${stamp}-${process.pid}`);
+const reportDir = opts.resume || path.join(root, 'test', 'mutation', 'reports', `${stamp}-${process.pid}`);
 
 /** @type {PassTarget[]} */
 let targets = [];
@@ -227,10 +366,6 @@ function originalOf(file, location) {
   return text.length > 100 ? `${text.slice(0, 97)}...` : text;
 }
 
-/** @param {StrykerResult} r */
-const fileOf = r => nameOf(root, r.fileName);
-/** @param {StrykerResult} r */
-const resultKey = r => keyOf(fileOf(r), r.mutatorName, r.replacement ?? '', r.location);
 /** @param {MutantRecord} m */
 const recordKey = m => keyOf(m.file, m.mutator, m.replacement, m.location);
 /** @param {MutantRecord} m */
@@ -263,9 +398,10 @@ function dryFailures(name) {
 }
 
 /**
- * One pass's result for a mutant, with a kill checked against the reports.
+ * One pass's result for a mutant, as its stage saved it (results.jsonl), with
+ * a kill checked against the reports.
  * @param {string} dir the pass's report dir
- * @param {StrykerResult} r
+ * @param {{ id: string, status: string, statusReason?: string }} r
  * @param {boolean} [alone] a rerun of the mutant alone
  * @returns {PassResult}
  */
@@ -277,7 +413,7 @@ function resultOf(dir, r, alone = false) {
     return { ...result, inconclusive: 'a type error only because a @ts-expect-error went unused (TS2578), so no test ran on it' };
   }
   if (r.status === 'Survived' && ranNone(dir, r.id)) return { ...result, unreached: true };
-  const bound = dir === 'a' || dir === 'a-unchecked' || dir === 'a2' ? endedByBound(r.status, boundMarkOf(dir, r.id), dir === 'a2') : null;
+  const bound = boundedDir(dir) ? endedByBound(r.status, boundMarkOf(dir, r.id), a2Dir(dir)) : null;
   if (bound) return { ...result, ...bound };
   return r.status === 'Killed' ? { ...result, ...classifyKill(reportsOf(dir, r.id), alone) } : result;
 }
@@ -332,6 +468,160 @@ function takenInA(m) {
 
 class PassError extends Error {}
 
+/**
+ * A file a stage saved: its text, null when it is not there, or the problem
+ * when it is there but cannot be read.
+ * @param {string} dir
+ * @param {string} name
+ * @returns {{ text: string | null, problem: string }}
+ */
+function savedFile(dir, name) {
+  try {
+    return { text: fs.readFileSync(path.join(reportDir, dir, name), 'utf8'), problem: '' };
+  } catch (error) {
+    const code = /** @type {NodeJS.ErrnoException} */ (error).code;
+    return code === 'ENOENT' ? { text: null, problem: '' } : { text: null, problem: `${dir}/${name} cannot be read (${code ?? firstLine(error)})` };
+  }
+}
+
+/** @param {string} text */
+const isDone = text => { try { const done = JSON.parse(text); return done !== null && typeof done === 'object'; } catch { return false; } };
+
+/**
+ * One dir of a Stryker stage as it is on disk (resume.mjs mutantDir).
+ * @param {string} dir
+ * @returns {(StageDir & { plan: import('./resume.mjs').PlannedMutant[] | null, subset: boolean }) | { problem: string }}
+ */
+function savedMutantDir(dir) {
+  /** @type {Record<string, string | null>} */
+  const text = {};
+  for (const name of ['targets.json', PLAN_FILE, RESULTS_FILE, DONE_FILE]) {
+    const read = savedFile(dir, name);
+    if (read.problem) return { problem: read.problem };
+    text[name] = read.text;
+  }
+  const listed = text['targets.json'];
+  const keys = listed === null ? null : keysOf(listed);
+  if (listed !== null && !keys) return { problem: `${dir}/targets.json cannot be read` };
+  const plan = text[PLAN_FILE] === null ? null : planOf(/** @type {string} */ (text[PLAN_FILE]));
+  if (text[PLAN_FILE] !== null && !plan) return { problem: `${dir}/${PLAN_FILE} cannot be read` };
+  const { lines, problem } = resultLines(text[RESULTS_FILE] ?? '');
+  if (problem) return { problem: `${dir}/${RESULTS_FILE}: ${problem}` };
+  if (text[DONE_FILE] !== null && !isDone(/** @type {string} */ (text[DONE_FILE]))) return { problem: `${dir}/${DONE_FILE} cannot be read` };
+  const d = mutantDir({ dir, targets: keys, plan, results: lines, done: text[DONE_FILE] !== null });
+  return 'problem' in d ? d : { ...d, plan, subset: keys !== null };
+}
+
+/**
+ * One dir of a check with no mutant as it is on disk: the items it ran for
+ * (checks.json) and the lines `read` takes from checks.jsonl.
+ * @param {(text: string) => { lines: { key: string }[], problem: string }} read
+ * @returns {(dir: string) => StageDir | { problem: string }}
+ */
+const savedCheckDir = read => dir => {
+  /** @type {Record<string, string | null>} */
+  const text = {};
+  for (const name of [CHECKS_PLAN_FILE, CHECKS_FILE, DONE_FILE]) {
+    const file = savedFile(dir, name);
+    if (file.problem) return { problem: file.problem };
+    text[name] = file.text;
+  }
+  const listed = text[CHECKS_PLAN_FILE];
+  const forKeys = listed === null ? null : keysOf(listed);
+  if (listed !== null && !forKeys) return { problem: `${dir}/${CHECKS_PLAN_FILE} cannot be read` };
+  const { lines, problem } = read(text[CHECKS_FILE] ?? '');
+  if (problem) return { problem: `${dir}/${CHECKS_FILE}: ${problem}` };
+  if (text[DONE_FILE] !== null && !isDone(/** @type {string} */ (text[DONE_FILE]))) return { problem: `${dir}/${DONE_FILE} cannot be read` };
+  return { dir, forKeys, lines, missing: [], done: text[DONE_FILE] !== null };
+};
+
+/** @type {Set<string>} the dirs of the stages this run has walked */
+const walked = new Set();
+// Set once this run starts its first stage: from then on nothing is refused, only stopped.
+let ranNow = false;
+
+/**
+ * The dirs of stages a resume found that its walk did not reach: a stage after
+ * the first one that did not finish, or one this run does not come to.
+ */
+const unwalked = () => fs.readdirSync(reportDir).filter(name => STAGE_DIR.test(name) && !walked.has(name)).sort();
+
+/** A resume that has run nothing yet refuses a report dir that holds dirs of stages its walk did not reach. */
+function refuseUnwalked() {
+  const left = saved && !ranNow ? unwalked() : [];
+  if (left.length > 0) refuse(`it holds dirs of stages that come after the first stage that did not finish, or that this run does not reach: ${left.join(', ')}`);
+}
+
+/**
+ * A stage as its dirs left it (resume.mjs stageOf). A problem ends a resume
+ * that has run nothing yet with a refusal, and stops a run that has.
+ * @template {{ key: string }} L
+ * @param {string} stage
+ * @param {string[] | null} want
+ * @param {(dir: string) => (StageDir & { plan?: import('./resume.mjs').PlannedMutant[] | null, subset?: boolean }) | { problem: string }} read
+ * @returns {SavedStage<L>}
+ */
+function walkStage(stage, want, read) {
+  const chain = chainOf(fs.readdirSync(reportDir), stage);
+  for (const dir of chain) walked.add(dir);
+  /** @param {string} problem */
+  const fail = problem => {
+    if (saved && !ranNow) refuse(problem);
+    throw new PassError(`the saved results of ${stage} cannot be read: ${problem}`);
+  };
+  /** @type {SavedStage<L>['dirs']} */
+  const dirs = [];
+  for (const dir of chain) {
+    const d = read(dir);
+    if ('problem' in d) fail(d.problem);
+    else dirs.push(d);
+  }
+  const s = /** @type {import('./resume.mjs').Stage<L> | { problem: string }} */ (stageOf(dirs, want));
+  if ('problem' in s) fail(s.problem);
+  const found = /** @type {import('./resume.mjs').Stage<L>} */ (s);
+  if (saved && found.done) resumed.push(`${stage}: finished before this resume (${found.used.map(dir => `${dir}/`).join(', ')}); its ${found.settled.size} result(s) are read back, and none runs again`);
+  return { ...found, chain, dirs };
+}
+
+/**
+ * The dir a stage that has not finished runs its items in now, once a resume
+ * has checked that no dir of a later stage is there.
+ * @param {string} stage
+ * @param {SavedStage<{ key: string }>} s
+ */
+function beginStage(stage, s) {
+  refuseUnwalked();
+  ranNow = true;
+  const dir = nextDir(stage, s.chain, resumeN);
+  walked.add(dir);
+  if (s.settled.size > 0) {
+    resumed.push(`${stage}: ${s.settled.size} result(s) kept (${s.used.filter(d => [...s.settled.values()].some(v => v.dir === d)).map(d => `${d}/`).join(', ')}); ${s.missing.length > 0 ? `the ${s.missing.length} with none run now in ${dir}/` : 'none is left to run'}`);
+  } else if (saved && s.chain.length > 0 && s.targets) {
+    resumed.push(`${stage}: ${s.chain.map(d => `${d}/`).join(', ')} saved no result, so its ${s.targets.length} item(s) run now in ${dir}/`);
+  }
+  return dir;
+}
+
+/**
+ * Ends a stage that ran now: its saved results must cover every item it is
+ * for, and then done.json goes in its dir, as its last act, synchronously, and
+ * whole (written aside and renamed).
+ * @template {{ key: string }} L
+ * @param {string} stage
+ * @param {string[] | null} want
+ * @param {Parameters<typeof walkStage>[2]} read
+ * @param {string} dir
+ * @returns {SavedStage<L>}
+ */
+function finishStage(stage, want, read, dir) {
+  const s = /** @type {SavedStage<L>} */ (walkStage(stage, want, read));
+  if (s.missing.length > 0) throw new PassError(`${stage} in ${dir}/ ended with no saved result for ${s.missing.length} of the ${s.targets?.length ?? 0} item(s) it ran for`);
+  const file = path.join(reportDir, dir, DONE_FILE);
+  fs.writeFileSync(`${file}.tmp`, `${JSON.stringify({ finished: new Date().toISOString() })}\n`);
+  fs.renameSync(`${file}.tmp`, file);
+  return { ...s, done: true };
+}
+
 /** @type {Options} */
 const common = {
   ...COMMON,
@@ -369,6 +659,7 @@ async function stryker({ dir, tier, mutate, only = [], keys, alone = false, sets
   process.env.SMDB_MUTATION_OUT = out;
   process.env.SMDB_MUTATION_TARGETS = keys ? path.join(out, 'targets.json') : '';
   process.env.SMDB_MUTATION_RUN = keys ? path.join(out, 'run-ids.json') : '';
+  process.env.SMDB_MUTATION_GATE_PID = String(process.pid);
   if (keys) fs.writeFileSync(path.join(out, 'targets.json'), JSON.stringify(keys));
   if (sandbox.unkept.length > 0) {
     throw new PassError(`the gate cannot give Stryker ${sandbox.unkept.join(', ')} for a sandbox, for it would read the name as a glob; rename it`);
@@ -403,29 +694,46 @@ async function pass(run) {
  * ends after its run with no mutant (dryRunOnly). When the tests fail, a
  * machine or a container went bad during the reruns, so their results are
  * voided and the gate stops. When the reruns confirmed a timeout (`timed`),
- * the tests must also fit in the budget Stryker gave each rerun (control.mjs),
- * or the machine was as slow as the mutants seemed.
- * @param {PassName} after
+ * the tests must also fit in the budget Stryker gave each rerun (control.mjs)
+ * in each dir a timeout came from, or the machine was as slow as the mutants
+ * seemed. Its outcome is saved before done.json (resume.mjs CONTROL_KEY), and a
+ * resume reads it back.
+ * @param {'a2' | 'b2'} after
  * @param {'a' | 'b'} tier
  * @param {MutantRecord[]} on
  * @param {string[]} only the test files the reruns ran, or none
  * @param {boolean} [timed]
  */
 async function control(after, tier, on, only, timed = false) {
-  const dir = `control-${after}`;
-  const out = path.join(reportDir, dir);
-  console.log(`L5: the same tests once with no mutant, to check the machine after pass ${after}`);
-  let failed = '';
-  try {
-    const rerun = tier === 'a' ? PASSES.a2 : PASSES.b2;
-    await stryker({ dir, tier, mutate: [...new Set(on.map(spanOf))], only, alone: true, extra: { ...rerun, dryRunOnly: true, dryRunTimeoutMinutes: controlBoundMinutes(rerun, only.length) } });
-    if (timed) failed = pastBudget(path.join(reportDir, after), out, PASSES.a2);
-  } catch (error) {
-    if (error instanceof PassError) throw error;
-    failed = firstLine(error);
+  const stage = `control-${after}`;
+  const read = savedCheckDir(controlLines);
+  let s = /** @type {SavedStage<ControlLine>} */ (walkStage(stage, [CONTROL_KEY], read));
+  if (!s.done) {
+    const dir = beginStage(stage, s);
+    const out = path.join(reportDir, dir);
+    fs.mkdirSync(out, { recursive: true });
+    fs.writeFileSync(path.join(out, CHECKS_PLAN_FILE), JSON.stringify([CONTROL_KEY]));
+    console.log(`L5: the same tests once with no mutant, to check the machine after pass ${after}`);
+    let failed = '';
+    try {
+      const rerun = tier === 'a' ? PASSES.a2 : PASSES.b2;
+      await stryker({ dir, tier, mutate: [...new Set(on.map(spanOf))], only, alone: true, extra: { ...rerun, dryRunOnly: true, dryRunTimeoutMinutes: controlBoundMinutes(rerun, only.length) } });
+      const reruns = timed ? [...new Set(on.filter(m => outcome(m) === 'Timeout').map(m => m.passes[after]?.dir ?? after))] : [];
+      for (const at of reruns) {
+        failed = pastBudget(path.join(reportDir, at), out, PASSES.a2);
+        if (failed) break;
+      }
+    } catch (error) {
+      if (error instanceof PassError) throw error;
+      failed = firstLine(error);
+    }
+    fs.appendFileSync(path.join(out, CHECKS_FILE), `${JSON.stringify({ key: CONTROL_KEY, failed })}\n`);
+    s = finishStage(stage, [CONTROL_KEY], read, dir);
   }
+  const { dir, line } = /** @type {{ dir: string, line: ControlLine }} */ (s.settled.get(CONTROL_KEY));
+  const out = path.join(reportDir, dir);
   const logs = `${posix(path.relative(root, out))}/dry-*.log`;
-  if (failed) {
+  if (line.failed) {
     const why = `the run with no mutant after pass ${after} failed`;
     for (const m of on) {
       const result = m.passes[after];
@@ -433,7 +741,7 @@ async function control(after, tier, on, only, timed = false) {
     }
     const refusal = refusalIn(out);
     throw new PassError([
-      refusal.length > 0 ? `${why}: it refused the files the reruns ran on` : `${why} (${failed}), so what its reruns counted cannot be told from the machine's failures`,
+      refusal.length > 0 ? `${why}: it refused the files the reruns ran on` : `${why} (${line.failed}), so what its reruns counted cannot be told from the machine's failures`,
       ...dryFailures(dir), ...refusal, ...(fs.readdirSync(out).some(f => f.endsWith('.log')) ? [`its logs: ${logs}`] : []),
     ].join('\n'));
   }
@@ -443,14 +751,13 @@ async function control(after, tier, on, only, timed = false) {
 /**
  * Runs `sets` with no mutant, each in a vitest run of its own within its
  * bound, as a Stryker run of its own over `on`'s spans (a fresh sandbox, the
- * same code made and none of it active), and returns what dry-alone.json then
- * holds; one that cannot run stops the gate.
+ * same code made and none of it active); runner.mjs saves a line per finished
+ * set. One that cannot run stops the gate.
  * @param {string} dir
  * @param {MutantRecord[]} on
  * @param {{ files: string[], ms: number }[]} sets
  * @param {boolean} alone four times the config's time limits, as a2 ran
  * @param {string} what
- * @returns {Promise<unknown>}
  */
 async function runSets(dir, on, sets, alone, what) {
   const out = path.join(reportDir, dir);
@@ -463,7 +770,40 @@ async function runSets(dir, on, sets, alone, what) {
     if (error instanceof PassError) throw error;
     throw new PassError([`${what} could not run: ${firstLine(error)}`, ...refusalIn(out)].join('\n'));
   }
-  try { return JSON.parse(fs.readFileSync(path.join(out, 'dry-alone.json'), 'utf8')); } catch { return []; }
+}
+
+/**
+ * A check of sets of test files with no mutant, as a stage: a resume reads
+ * back one that finished and runs only the sets one that stopped has no line
+ * for, in a dir of its own. A set the runner left no line for, in a run that
+ * ended, left no result, and its line says so (code null), as a whole run
+ * counts it. Returns each set's line and the dir it ran in, by setKey.
+ * @param {string} stage
+ * @param {MutantRecord[]} on
+ * @param {{ files: string[], ms: number }[]} sets
+ * @param {boolean} alone
+ * @param {string} what
+ * @returns {Promise<Map<string, { dir: string, line: SetLine }>>}
+ */
+async function setStage(stage, on, sets, alone, what) {
+  const want = sets.map(set => setKey(set.files));
+  const read = savedCheckDir(setLines);
+  let s = /** @type {SavedStage<SetLine>} */ (walkStage(stage, want, read));
+  if (!s.done) {
+    const dir = beginStage(stage, s);
+    const out = path.join(reportDir, dir);
+    const missing = new Set(s.missing);
+    const rest = sets.filter(set => missing.has(setKey(set.files)));
+    fs.mkdirSync(out, { recursive: true });
+    fs.writeFileSync(path.join(out, CHECKS_PLAN_FILE), JSON.stringify(rest.map(set => setKey(set.files))));
+    if (rest.length > 0) {
+      await runSets(dir, on, rest, alone, what);
+      const have = new Set(setLines(readText(path.join(out, CHECKS_FILE)) ?? '').lines.map(line => line.key));
+      for (const set of rest.filter(one => !have.has(setKey(one.files)))) fs.appendFileSync(path.join(out, CHECKS_FILE), `${JSON.stringify({ files: set.files, code: null, ms: null })}\n`);
+    }
+    s = finishStage(stage, want, read, dir);
+  }
+  return /** @type {Map<string, { dir: string, line: SetLine }>} */ (s.settled);
 }
 
 /**
@@ -479,21 +819,23 @@ async function runSets(dir, on, sets, alone, what) {
 async function aloneCheck(all) {
   const killed = killedInA(all);
   if (killed.size === 0) return;
-  const dir = 'alone-a';
-  const out = path.join(reportDir, dir);
   const files = [...killed.keys()];
   const on = [...killed.values()].flat();
-  for (const m of on) /** @type {PassResult} */ (m.passes.a).pending = dir;
+  for (const m of on) /** @type {PassResult} */ (m.passes.a).pending = 'alone-a';
   console.log(`L5: each of the ${files.length} test file(s) that killed a mutant in pass A, alone with no mutant, so a kill counts only from a file that passes on its own`);
-  const runs = await runSets(dir, on, files.map(file => ({ files: [file], ms: setBoundMs(1, 1) })), false, 'the run of each file that killed a mutant in pass A, alone with no mutant,');
-  /** @type {Record<string, unknown>} */
-  const codes = {};
-  if (Array.isArray(runs)) {
-    for (const run of runs) if (Array.isArray(run?.files) && run.files.length === 1) codes[run.files[0]] = run.code;
+  const runs = await setStage('alone-a', on, files.map(file => ({ files: [file], ms: setBoundMs(1, 1) })), false, 'the run of each file that killed a mutant in pass A, alone with no mutant,');
+  /** @param {string} file */
+  const runOf = file => /** @type {{ dir: string, line: SetLine }} */ (runs.get(setKey([file])));
+  const dirs = [...new Set(files.map(file => runOf(file).dir))];
+  /** @type {Map<string, string>} */
+  const taken = new Map();
+  for (const dir of dirs) {
+    const here = new Map([...killed].filter(([file]) => runOf(file).dir === dir));
+    const codes = Object.fromEntries([...here.keys()].map(file => [file, runOf(file).line.code ?? undefined]));
+    for (const [file, why] of uncreditFailedAlone(here, codes, dir)) taken.set(file, why);
   }
-  const taken = uncreditFailedAlone(killed, codes, dir);
   for (const m of on) delete /** @type {PassResult} */ (m.passes.a).pending;
-  const logs = `${posix(path.relative(root, out))}/dry-alone-*.log`;
+  const logs = dirs.map(dir => `${posix(path.relative(root, path.join(reportDir, dir)))}/dry-alone-*.log`).join(', ');
   controls.push(`after pass A, each file that killed a mutant there, alone: ${files.length - taken.size} of ${files.length} passed (${logs})`);
   for (const [file, why] of taken) controls.push(`  ${file}: ${why}, so its ${killed.get(file)?.length} kill(s) in pass A do not count and rerun alone in a2`);
 }
@@ -524,25 +866,41 @@ function takenInA2(m) {
  * in a vitest run of its own, as a2 ran it (runSets, a2's time limits). A
  * result whose set failed there, left no result, ran past its bound, or (for a
  * timeout) took longer than the budget that rerun had (the set's own, from
- * a2's costs, for one the runner ended; Stryker's for one Stryker ended), is
- * voided (verdict.mjs voidFailedSets), and its mutant is inconclusive.
+ * the costs of the a2 dir it ran in, for one the runner ended; Stryker's there
+ * for one Stryker ended), is voided (verdict.mjs voidFailedSets), and its
+ * mutant is inconclusive.
  * @param {MutantRecord[]} on
  */
 async function setCheck(on) {
   const sets = bySet(on, takenInA2);
   if (sets.length === 0) return;
-  const dir = 'alone-a2';
-  const out = path.join(reportDir, dir);
-  for (const m of sets.flatMap(set => set.on)) /** @type {PassResult} */ (m.passes.a2).pending = dir;
+  for (const m of sets.flatMap(set => set.on)) /** @type {PassResult} */ (m.passes.a2).pending = 'alone-a2';
   const runnable = /** @type {{ files: string[], on: MutantRecord[] }[]} */ (sets.filter(set => set.files !== null));
   console.log(`L5: each of the ${sets.length} set(s) of fast test files an a2 kill or timeout ran on, once with no mutant, so a result counts only from a set that passes without it`);
-  const runs = runnable.length === 0 ? [] : await runSets(dir, runnable.flatMap(set => set.on), runnable.map(set => ({ files: set.files, ms: setBoundMs(set.files.length, 4) })), true,
+  const runs = runnable.length === 0 ? new Map() : await setStage('alone-a2', runnable.flatMap(set => set.on), runnable.map(set => ({ files: set.files, ms: setBoundMs(set.files.length, 4) })), true,
     'the run of each set of files an a2 result ran on, with no mutant,');
-  const costs = readCosts(path.join(reportDir, 'a2'));
-  const { lines, voided } = voidFailedSets(sets, runs, dir, strykerBudget('a2', PASSES.a2), files => boundFor(costs, files, A2_BOUND) ?? NaN);
+  /** @param {MutantRecord} m */
+  const a2At = m => m.passes.a2?.dir ?? 'a2';
+  /** @type {Map<string, import('./reach.mjs').Costs | null>} */
+  const costs = new Map();
+  /** @param {string} dir */
+  const costsIn = dir => {
+    if (!costs.has(dir)) costs.set(dir, readCosts(path.join(reportDir, dir)));
+    return costs.get(dir) ?? null;
+  };
+  /** @param {MutantRecord} m */
+  const budget = m => strykerBudget(a2At(m), PASSES.a2);
+  /**
+   * @param {string[]} files
+   * @param {MutantRecord} m
+   */
+  const ownBudget = (files, m) => boundFor(costsIn(a2At(m)), files, A2_BOUND) ?? NaN;
+  const lines = [...runs.values()].map(({ dir, line }) => ({ ...line, dir }));
+  const { lines: why, voided } = voidFailedSets(sets, lines, 'alone-a2', budget, ownBudget);
   for (const m of sets.flatMap(set => set.on)) delete /** @type {PassResult} */ (m.passes.a2).pending;
-  controls.push(`after pass a2, each set of files an a2 result ran on, with no mutant: ${sets.length - voided} of ${sets.length} held (${posix(path.relative(root, out))}/dry-alone-*.log)`);
-  for (const line of lines) controls.push(`  ${line}`);
+  const dirs = [...new Set(lines.map(line => line.dir))];
+  controls.push(`after pass a2, each set of files an a2 result ran on, with no mutant: ${sets.length - voided} of ${sets.length} held (${dirs.map(dir => `${posix(path.relative(root, path.join(reportDir, dir)))}/dry-alone-*.log`).join(', ') || 'none ran'})`);
+  for (const line of why) controls.push(`  ${line}`);
 }
 
 /**
@@ -572,27 +930,49 @@ function refusalIn(dir) {
 const credited = m => ['Killed', 'Timeout'].includes(outcome(m));
 
 /**
- * Runs a pass on exactly the given mutants and records its results on them.
+ * Runs a pass on exactly the given mutants, as a stage, and records its
+ * results on them from what the stage saved (results.jsonl): a resume reads
+ * back a stage that finished, and runs only the mutants one that stopped has
+ * no result for, in a dir of its own, so no mutant runs twice in a stage.
  * @param {PassName} name
- * @param {string} dir
+ * @param {string} stage the stage's dir name
  * @param {'a' | 'b'} tier
  * @param {MutantRecord[]} on
  * @param {Options} extra
  * @param {string[]} [only]
  */
-async function passOn(name, dir, tier, on, extra, only) {
-  if (name === 'a2') {
+async function passOn(name, stage, tier, on, extra, only) {
+  const alone = name === 'a2' || name === 'b2';
+  const want = on.map(recordKey);
+  let s = /** @type {SavedStage<SavedResult>} */ (walkStage(stage, want, savedMutantDir));
+  if (!s.done) {
+    const dir = beginStage(stage, s);
+    const missing = new Set(s.missing);
+    const rest = on.filter(m => missing.has(recordKey(m)));
     fs.mkdirSync(path.join(reportDir, dir), { recursive: true });
-    fs.writeFileSync(path.join(reportDir, dir, TAKEN_FILE), JSON.stringify(Object.fromEntries(on.map(m => [recordKey(m), takenInA(m)]))));
+    if (name === 'a2') fs.writeFileSync(path.join(reportDir, dir, TAKEN_FILE), JSON.stringify(Object.fromEntries(rest.map(m => [recordKey(m), takenInA(m)]))));
+    if (rest.length > 0) await pass({ dir, tier, mutate: [...new Set(rest.map(spanOf))], only, keys: rest.map(recordKey), alone, extra });
+    else fs.writeFileSync(path.join(reportDir, dir, 'targets.json'), '[]');
+    s = finishStage(stage, want, savedMutantDir, dir);
   }
-  const results = await pass({ dir, tier, mutate: [...new Set(on.map(spanOf))], only, keys: on.map(recordKey), alone: name === 'a2' || name === 'b2', extra });
-  const byKey = new Map(results.map(r => [resultKey(r), r]));
   for (const m of on) {
-    const r = byKey.get(recordKey(m));
-    m.passes[name] = r ? resultOf(dir, r, name === 'a2' || name === 'b2') : { id: null, dir, status: 'Missing' };
+    const { dir, line } = /** @type {{ dir: string, line: SavedResult | null }} */ (s.settled.get(recordKey(m)));
+    m.passes[name] = line ? resultOf(dir, line, alone) : { id: null, dir, status: 'Missing' };
   }
-  // A timeout in pass B or a b2 rerun counts against its mutant with no run after it to clear it, so it stands on the
-  // budget Stryker built from that pass's own run with no mutant, which a clock step during that run makes meaningless.
+  for (const dir of s.used) clockOfTimeouts(name, dir, on.filter(m => m.passes[name]?.dir === dir));
+}
+
+/**
+ * A timeout in pass B or a b2 rerun counts against its mutant with no run
+ * after it to clear it, so it stands on the budget Stryker built from that
+ * pass's own run with no mutant, which a clock step during that run makes
+ * meaningless: the gate then stops. `on` are the mutants whose `name` result
+ * came from `dir`.
+ * @param {PassName} name
+ * @param {string} dir
+ * @param {MutantRecord[]} on
+ */
+function clockOfTimeouts(name, dir, on) {
   if ((name === 'b' || name === 'b2') && on.some(m => m.passes[name]?.status === 'Timeout')) {
     const { clock } = strykerClock(path.join(reportDir, dir));
     if (clock) {
@@ -622,6 +1002,21 @@ function finish(stopped) {
     process.exit(2);
   }
   return new Promise(() => {});
+}
+
+/**
+ * A resume writes its own report in the stopped run's dir: an earlier one
+ * there (a run that stopped with a report, or an earlier resume's) is moved to
+ * a name of its own, never written over.
+ * @param {string} name
+ */
+function keepEarlier(name) {
+  const file = path.join(reportDir, name);
+  if (!fs.existsSync(file)) return;
+  const { name: base, ext } = path.parse(name);
+  let to = path.join(reportDir, `${base}-before-r${resumeN}${ext}`);
+  for (let n = 1; fs.existsSync(to); n++) to = path.join(reportDir, `${base}-before-r${resumeN}-${n}${ext}`);
+  fs.renameSync(file, to);
 }
 
 /**
@@ -656,9 +1051,13 @@ function report(stopped, treeChanged) {
     if (lines.length > 0) noMutant.push({ file: target.file, lines });
   }
   const seed = process.env.SMDB_TEST_SEED;
-  const result = judge({ stamp, scope: `${scope}; fast-check seed ${seed}`, emptyScope, skipped, mutants, noMutant, brackets, deleted, unmatched, report: posix(path.relative(root, reportDir)), stopped, treeChanged, controls, standIn: process.env.SMDB_MUTATION_VITEST });
+  const result = judge({
+    stamp, scope: `${scope}; fast-check seed ${seed}`, emptyScope, skipped, mutants, noMutant, brackets, deleted, unmatched, report: posix(path.relative(root, reportDir)), stopped, treeChanged, controls,
+    resumed, standIn: process.env.SMDB_MUTATION_VITEST,
+  });
   fs.mkdirSync(reportDir, { recursive: true });
-  fs.writeFileSync(path.join(reportDir, 'mutants.json'), `${JSON.stringify({ scope, seed, skipped, targets, mutants, controls, verdict: result.verdict, stopped, treeChanged }, null, 2)}\n`);
+  for (const name of saved ? ['mutants.json', 'summary.txt'] : []) keepEarlier(name);
+  fs.writeFileSync(path.join(reportDir, 'mutants.json'), `${JSON.stringify({ scope, seed, ...(saved ? { resume: resumeN, resumed } : {}), skipped, targets, mutants, controls, verdict: result.verdict, stopped, treeChanged }, null, 2)}\n`);
   fs.writeFileSync(path.join(reportDir, 'summary.txt'), `${result.lines.join('\n')}\n`);
   // On POSIX a pipe takes stdout asynchronously: exit only once it has all of it.
   process.stdout.write(`${result.lines.join('\n')}\n`, () => process.exit(result.code));
@@ -667,18 +1066,28 @@ function report(stopped, treeChanged) {
 try {
   // What to mutate: the explicit patterns (every mutant gates), or the change
   // from the merge-base of --base and HEAD to the working tree.
+  /** @type {{ base: string, mergeBase: string } | { mutate: string[] }} */
+  let runScope = { mutate: opts.mutate };
   if (opts.mutate.length > 0) {
     targets = opts.mutate.map(pattern => ({ file: fileOfPattern(pattern), patterns: [pattern], gating: null }));
   } else {
-    const base = git('merge-base', opts.base, 'HEAD').trim();
+    const label = saved && 'base' in saved.scope ? saved.scope.base : opts.base;
+    const base = saved && 'mergeBase' in saved.scope ? saved.scope.mergeBase : git('merge-base', opts.base, 'HEAD').trim();
     ({ targets, skipped, emptyScope } = planFromGit({ git, base, root, read: file => linesOf(file).join('\n') }));
-    scope = `the change from ${opts.base} (merge-base ${base.slice(0, 7)}) to the working tree`;
+    scope = `the change from ${label} (merge-base ${base.slice(0, 7)}) to the working tree`;
+    runScope = { base: label, mergeBase: base };
+  }
+  if (saved) {
+    if (JSON.stringify(targets) !== JSON.stringify(saved.targets)) {
+      refuse(`the plan made now from its scope (${scope}) differs from the targets it saved, so its results are not for these targets`);
+    }
+    fs.writeFileSync(path.join(reportDir, `resume-r${resumeN}.json`), `${JSON.stringify({ started: new Date().toISOString(), concurrency: opts.concurrency, keep: opts.keep })}\n`);
   }
   // Nothing that could gate (only places where code was taken out): the report names them, and Stryker is never
   // given an empty list to mutate.
   if (!targets.some(canGate)) await finish();
 
-  console.log(`L5: mutating ${scope}: ${changedFiles().length} file(s), pass A (in-process tests that import them)`);
+  console.log(`L5: ${saved ? `resuming the run in ${posix(path.relative(root, reportDir))}, ` : ''}mutating ${scope}: ${changedFiles().length} file(s), pass A (in-process tests that import them)`);
   // The type checker judges the tree's files only (ranges.mjs treeTsconfig, beyondTree), with the TypeScript and
   // the packages the root lockfile ships (checkerDiffers).
   const compiler = checkerDiffers(root);
@@ -689,23 +1098,85 @@ try {
   if (beyond.length > 0) {
     throw new PassError(`the type checker would judge ${beyond.join(', ')}, which a file in the tree imports or references but no sandbox holds, so a mutant that broke only it would count as killed with no test run; make the tree's file stop importing or referencing it, or add it to the tree if it belongs there`);
   }
-  fs.writeFileSync(path.join(root, checkerConfig), `${JSON.stringify(checker, null, 2)}\n`);
-  const resultsA = await pass({ dir: 'a', tier: 'a', mutate: mutatePatterns(mutated()), extra: { ...PASSES.a, concurrency: opts.concurrency, tsconfigFile: checkerConfig } })
-    .finally(() => fs.rmSync(path.join(root, checkerConfig), { force: true }));
-  const orphans = [...new Set(resultsA.map(fileOf).filter(file => !targets.some(t => t.file === file)))];
-  if (orphans.length > 0) throw new PassError(`Stryker mutated ${orphans.join(', ')}, which no target names, so the report could not answer for it`);
-  mutants = resultsA.map(r => {
-    const file = fileOf(r);
-    return {
-      file,
-      location: r.location,
-      mutator: r.mutatorName,
-      original: originalOf(file, r.location),
-      replacement: r.replacement ?? '',
-      gating: gatesIn(targets, file, r.location),
-      passes: { a: resultOf('a', r) },
-    };
+  // Saved before pass A starts, so a run that stops can be resumed (README, "Stopping and resuming"); the lock first,
+  // so no resume takes the dir while this run uses it.
+  if (!saved) {
+    try {
+      fs.mkdirSync(reportDir, { recursive: true });
+    } catch (error) {
+      throw new PassError(`the gate could not make its report dir: ${firstLine(error)}`);
+    }
+    takeLock(reportDir, why => { throw new PassError(`the gate could not take its report dir: ${why}`); });
+    try {
+      fs.writeFileSync(path.join(reportDir, RUN_FILE), `${JSON.stringify({ tree: [...planned], packages: [...packages], scope: runScope, targets, seed: process.env.SMDB_TEST_SEED, setup })}\n`);
+    } catch (error) {
+      throw new PassError(`the gate could not write ${RUN_FILE}, which a resume reads: ${firstLine(error)}`);
+    }
+  }
+  /**
+   * @param {string} file
+   * @param {Location} location
+   * @param {string} mutator
+   * @param {string} replacement
+   * @returns {MutantRecord}
+   */
+  const recordOf = (file, location, mutator, replacement) => ({
+    file, location, mutator, original: originalOf(file, location), replacement, gating: gatesIn(targets, file, location), passes: {},
   });
+  /** @param {string[]} files */
+  const orphansOf = files => {
+    const orphans = [...new Set(files.filter(file => !targets.some(t => t.file === file)))];
+    if (orphans.length > 0) throw new PassError(`Stryker mutated ${orphans.join(', ')}, which no target names, so the report could not answer for it`);
+  };
+  /**
+   * Pass A's plan: that of the first of its dirs that knew its mutants, which ran on every mutant.
+   * @param {SavedStage<SavedResult>} s
+   */
+  const planIn = s => {
+    const first = s.dirs.find(d => d.forKeys !== null);
+    if (!first) return null;
+    if (first.subset || !first.plan) {
+      const why = `${first.dir}/, the first run of pass A that knew its mutants, ran on only some of them, so no plan names them all`;
+      if (saved && !ranNow) refuse(why);
+      throw new PassError(why);
+    }
+    return first.plan;
+  };
+  // Pass A: every mutant Stryker makes, in plan order; on a resume, only those
+  // its plan holds with no saved result, in a dir of its own.
+  let stageA = /** @type {SavedStage<SavedResult>} */ (walkStage('a', null, savedMutantDir));
+  if (!stageA.done) {
+    const known = planIn(stageA);
+    const dirA = beginStage('a', stageA);
+    fs.writeFileSync(path.join(root, checkerConfig), `${JSON.stringify(checker, null, 2)}\n`);
+    try {
+      const extraA = { ...PASSES.a, concurrency: opts.concurrency, tsconfigFile: checkerConfig };
+      if (!known) {
+        if (saved) resumed.push(`a: the stopped run saved no plan of pass A, so it runs whole in ${dirA}/`);
+        await pass({ dir: dirA, tier: 'a', mutate: mutatePatterns(mutated()), extra: extraA });
+      } else {
+        const missing = new Set(stageA.missing);
+        const rest = known.filter(m => missing.has(m.key)).map(m => recordOf(m.file, m.location, m.mutator, m.replacement));
+        fs.mkdirSync(path.join(reportDir, dirA), { recursive: true });
+        if (rest.length > 0) {
+          console.log(`L5: pass A on the ${rest.length} mutant(s) the stopped run has no result for`);
+          await pass({ dir: dirA, tier: 'a', mutate: [...new Set(rest.map(spanOf))], keys: rest.map(recordKey), extra: extraA });
+        } else {
+          fs.writeFileSync(path.join(reportDir, dirA, 'targets.json'), '[]');
+        }
+      }
+    } finally {
+      fs.rmSync(path.join(root, checkerConfig), { force: true });
+    }
+    stageA = finishStage('a', null, savedMutantDir, dirA);
+  }
+  const planA = /** @type {import('./resume.mjs').PlannedMutant[]} */ (planIn(stageA) ?? []);
+  orphansOf(planA.map(m => m.file));
+  mutants = planA.map(m => recordOf(m.file, m.location, m.mutator, m.replacement));
+  for (const m of mutants) {
+    const { dir, line } = /** @type {{ dir: string, line: SavedResult | null }} */ (stageA.settled.get(recordKey(m)));
+    m.passes.a = line ? resultOf(dir, line) : { id: null, dir, status: 'Missing' };
+  }
 
   // Their run with no checker is their pass A, and they go on from it like any other.
   const unchecked = toUncheck(mutants);
@@ -737,7 +1208,9 @@ try {
     }
     if (confirmB.some(credited)) await control('b2', 'b', confirmB, [...killers.keys()]);
   }
+  refuseUnwalked();
   await finish();
 } catch (error) {
+  refuseUnwalked();
   await finish(error instanceof PassError ? error.message.split('\n') : [`the gate stopped: ${firstLine(error)}`]);
 }

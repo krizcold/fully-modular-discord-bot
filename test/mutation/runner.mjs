@@ -89,20 +89,22 @@ function tier(project, take, run = {}) {
 }
 
 /** @param {number} pid */
-const running = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
+const running = pid => { try { process.kill(pid, 0); return true; } catch (error) { return /** @type {NodeJS.ErrnoException} */ (error).code === 'EPERM'; } };
 
 /**
  * Runs `files` as tier() does, and ends it with every process it started
  * once it passes `ms`; resolves to its exit (1 when the bound fired or it
  * could not start), the time it took, whether the runner ended it (it was
  * still running when the bound fired, and did not exit on its own) and
- * vitest's own exit status.
+ * vitest's own exit status. With `stop`, it also ends them within a quarter
+ * second of `stop()` turning true.
  * @param {string[]} files
  * @param {string} name
  * @param {number} ms
+ * @param {() => boolean} [stop]
  * @returns {Promise<{ code: number, ms: number, ended: boolean, status: number | null }>}
  */
-async function bounded(files, name, ms) {
+async function bounded(files, name, ms, stop) {
   const { endTree } = await import('../helpers/endTree.mjs');
   const { args, env, log } = launch(projectOf(files[0]), files, { name });
   const begun = performance.now();
@@ -116,6 +118,12 @@ async function bounded(files, name, ms) {
       if (child.pid !== undefined) endTree(child.pid);
       child.kill('SIGKILL');
     }, ms);
+    const watch = stop ? setInterval(() => {
+      if (!stop()) return;
+      clearInterval(watch);
+      if (child.pid !== undefined) endTree(child.pid);
+      child.kill('SIGKILL');
+    }, 250) : undefined;
     // A test's stand-in only (unit/mutationRunner.test.ts): the stand-in exits while the runner is held, so the bound's timer runs before the exit is seen.
     const hold = process.env.SMDB_MUTATION_VITEST ? Number(process.env.SMDB_MUTATION_HOLD_MS) : NaN;
     if (hold > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, hold);
@@ -125,6 +133,7 @@ async function bounded(files, name, ms) {
       child.once('exit', (status, signal) => resolve({ status, signal }));
     });
     clearTimeout(timer);
+    clearInterval(watch);
     // A vitest that exited on its own between the check and the kill keeps its own exit: 0, or no signal on POSIX.
     const ended = killed && exit.status !== 0 && (process.platform === 'win32' || exit.signal !== null);
     if (ended) fs.writeSync(log, `runner.mjs ended vitest after ${ms} ms, the bound on this run${mutant === 'dry' ? ' with no mutant' : ''}\n`);
@@ -186,16 +195,30 @@ const related = ['related', ...files.map(file => path.relative(testDir, file).sp
 // The run with no mutant that checks what a pass counted (touched.mjs
 // aloneCheck and setCheck): each set of test files SMDB_MUTATION_SETS names
 // in a vitest run of its own, as a mutant run takes files, within the set's
-// own bound, and the exit and time of each in dry-alone.json; the run itself
-// passes, so Stryker reads no failure into it.
+// own bound, and the exit and time of each in dry-alone.json, and one line per
+// finished set appended to checks.jsonl, which a resume reads (resume.mjs); the
+// run itself passes, so Stryker reads no failure into it. Once the gate that
+// started the run is gone, it ends the set in flight and adds no line, so a
+// resume, which waits while runner-<pid>.json names a live process, runs that
+// set once, and no runner of a killed gate loads the machine under it.
 /** @type {{ files: string[], ms: number }[]} */
 const sets = JSON.parse(process.env.SMDB_MUTATION_SETS || '[]');
 if (mutant === 'dry' && sets.length > 0) {
+  const { CHECKS_FILE, runnerFile } = await import('./resume.mjs');
+  const gate = Number(process.env.SMDB_MUTATION_GATE_PID);
+  const own = path.join(out, runnerFile(process.pid));
+  fs.writeFileSync(own, `${JSON.stringify({ pid: process.pid, started: new Date().toISOString() })}\n`);
+  process.on('exit', () => { try { fs.rmSync(own, { force: true }); } catch {} });
+  const gone = () => Number.isSafeInteger(gate) && gate > 0 && !running(gate);
   /** @type {{ files: string[], code: number, ms: number }[]} */
   const runs = [];
   for (const [index, set] of sets.entries()) {
-    runs.push({ files: set.files, ...await bounded(set.files, `dry-alone-${index}`, set.ms) });
+    if (gone()) process.exit(1);
+    const run = { files: set.files, ...await bounded(set.files, `dry-alone-${index}`, set.ms, gone) };
+    if (gone()) process.exit(1);
+    runs.push(run);
     fs.writeFileSync(path.join(out, 'dry-alone.json'), JSON.stringify(runs));
+    fs.appendFileSync(path.join(out, CHECKS_FILE), `${JSON.stringify(run)}\n`);
   }
   end(0);
 }

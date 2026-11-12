@@ -15,7 +15,8 @@ active mutant travels in `__STRYKER_ACTIVE_MUTANT__` and reaches child processes
 | passes.mjs | (data) the Stryker options every pass shares, and each pass's own options and budget; unit/mutationRunner.test.ts |
 | stryker.json | (data) empty on purpose: every pass names it as its config file, so Stryker never reads one it finds in the bot root |
 | keys.mjs | (library) how a file and a mutant are named across passes; unit/mutationRanges.test.ts |
-| targets.mjs | (Stryker reporter) which mutant ids a later pass runs tests for, and Stryker's own time for each run with no mutant; unit/mutationRunner.test.ts and the bite |
+| targets.mjs | (Stryker reporter) each pass's plan (plan.json) and each result of a mutant the pass is for as Stryker reports it (results.jsonl), which mutant ids a later pass runs tests for, and Stryker's own time for each run with no mutant; unit/mutationRunner.test.ts, unit/mutationResume.test.ts and the bite |
+| resume.mjs | (library) reading what a run saved (run.json, lock.json, each stage's plan.json, results.jsonl, checks.json, checks.jsonl and done.json) and what a resume reads back and runs of each stage; unit/mutationResume.test.ts, and integration/mutationResumeGate.test.ts runs the gate on a stand-in for vitest, stops it and resumes it |
 | reach.mjs | (library) which test files a mutant run takes, fast ones in pass A and integration and child ones in pass B: the records of the pass's run with no mutant read into each file's ids and whether it is unsure; unit/mutationCoverage.test.ts |
 | ../helpers/mutationCoverage.ts, reachRecorder.cjs | the first setup file of the runs with no mutant that record reach (pass A's, for the fast tier, and pass B's, for the integration and child tiers), and the recorder it loads in each test file's process and, through NODE_OPTIONS, in each Node process under it: each mutant id at its first count, and each process started; unit/mutationCoverage.test.ts |
 | survivors.mjs | (read-only tool) pass A's survivors so far, from a run's report dir and sandbox while the run goes on or after it died; unit/mutationSurvivors.test.ts |
@@ -32,6 +33,7 @@ active mutant travels in `__STRYKER_ACTIVE_MUTANT__` and reaches child processes
 From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm test`):
 
     npm run test:mutate -- [--base REF] [--mutate PATTERN]... [--concurrency N] [--keep]
+    npm run test:mutate -- --resume test/mutation/reports/<run> [--concurrency N] [--keep]
     npm run test:mutate > l5.log; test $? -eq 0
 
 - With no option it mutates the change from HEAD to the working tree: the job before it is committed. For a job already
@@ -59,6 +61,10 @@ From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm 
   N = 1, since Stryker hands the type checker's slot to a test runner once checking ends. Pass B runs one at a time,
   as the reruns do: Stryker builds each run's budget from the pass's run with no mutant, made alone, and a hang in
   pass B counts against its mutant with no rerun to clear it, so the runs it judges are made the same way.
+- `--resume DIR` continues a run that stopped (a crash, a reboot, a kill) in its own report dir, on the tree, scope
+  and seed it saved there, with the Node and the stand-in for vitest it ran on: see "Stopping and resuming" below.
+  `--base` and `--mutate` cannot be given with it (a usage
+  error), since the scope is the stopped run's; `--concurrency` and `--keep` can.
 - `--keep` keeps the sandboxes in `.stryker-tmp/` for a look after the run. Without it every sandbox is removed, a
   failed pass's too, unless the run is interrupted: Stryker then exits at once and leaves that pass's sandbox (and,
   in pass A, `.stryker-tmp/tsconfig.l5-<pid>.json`), which is safe to delete (its node_modules are links, which a
@@ -66,7 +72,9 @@ From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm 
   alone (`kill <pid>`, `taskkill /F` without `/T`) also leaves the test commands it was running going, with nothing to
   bound them: as many as pass A runs at once (above), each a runner.mjs and the vitest under
   it. End each of those trees: find them by `runner.mjs` in their command line (on Windows the shell above each is
-  already gone, and ending a runner.mjs ends the Node processes under it). On POSIX, when the gate relaunched itself
+  already gone, and ending a runner.mjs ends the Node processes under it). A runner.mjs that runs sets of test files
+  with no mutant (`alone-a/`, `alone-a2/`) is the exception: it ends its vitest and itself within a second of the
+  gate's end, and adds no line for that set. On POSIX, when the gate relaunched itself
   under SMDB_TEST_NODE (two touched.mjs processes are listed), a kill of the first alone leaves the relaunched one
   going on to its next passes: end it first (on Windows it ends with the first). Ctrl-C in the gate's terminal
   reaches all of it. Test runs can leave throwaway dirs in the OS temp dir, `smdb-test-*` (a test file's data root)
@@ -77,7 +85,7 @@ From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm 
   above, under the root's `*.log`) or one outside the checkout: a file in the tree that the run writes to changes
   during the run, which ends it NO RESULT.
 - Exit 0 is PASS, 1 FAIL, 2 NO RESULT (nothing was tested, the tree changed during the run, or the gate stopped: the
-  report says which; or, with no report, the test packages are missing (`npm run test:install`) or test/node_modules
+  report says which; or, with no report, a resume was refused (below, "Stopping and resuming"), the test packages are missing (`npm run test:install`) or test/node_modules
   is a link (below), the checkout's path
   does not match itself read as a glob, as Stryker reads it (a `[ ]` class, a `{ }` with a comma or a range, an extglob
   such as `+( )`, or one minimatch cannot read: Stryker then matches no file to mutate), the checkout's path, as given
@@ -728,6 +736,101 @@ dryRunTimeoutMinutes), since a run past it ends the gate NO RESULT before any su
 minutes, since each b2 pass's run with no mutant takes one file, and the bound on the run with no mutant after b2,
 built from it, stays 120 minutes per file plus five.
 
+## Stopping and resuming
+
+A gate run over a large change takes days, and Stryker holds every result in memory until a pass ends, so a run that
+stops (a crash, a reboot, a kill) would keep nothing. The gate saves as it goes instead, and `--resume <report dir>`
+continues the run there. Stryker's own incremental mode stays off (`incremental: false`): with the command runner it
+reuses every status with no regard to the tests, its key holds no pass, and it writes its file only on a signal it
+can catch.
+
+A resume continues each stage where it stopped and never runs an item twice, so a stopped run cannot give a mutant
+more chances to be killed than a whole run. A check that ran again in full would give each flaky test or flaky
+machine a second roll: a kill an earlier attempt of the check had already taken back could stand on a fresh one that
+passes by chance.
+
+The stages, in the order a run makes them: pass A (`a`), pass A with no checker (`a-unchecked`), each killing file
+alone (`alone-a`), a2, the run with no mutant after it (`control-a2`), the sets an a2 result ran on (`alone-a2`),
+pass B (`b`), each b2 group (`b2-1`, `b2-2`, ...) and the run with no mutant after b2 (`control-b2`). A stage that
+has nothing to run (no unused `@ts-expect-error`, no pass A kill) makes no dir.
+
+What is saved, and when:
+
+- `run.json` in the report dir, once, before pass A starts: the tree's print as the gate took it at its start (every
+  file git lists: size, time and content), the print of the package locks, the scope (the merge-base commit of
+  `--base`, or the `--mutate` patterns), the targets planned from it, the fast-check seed, and what runs the tests
+  (`setup`: the Node binary's path and version, and a test's stand-in for vitest, `''` for none).
+- `lock.json` in the report dir, made with the exclusive flag before anything else is written there, holding the
+  process id and start time of the gate run or resume using the dir, and removed when it exits.
+- In each dir of a Stryker stage (pass A, a-unchecked, a2, pass B, each b2 group): `targets.json` (the keys of the
+  mutants it runs for; pass A on every mutant has none) before Stryker starts; `plan.json` when Stryker's plan is
+  ready and before any check or run: every planned mutant's id and key (keys.mjs, places from 1), file, place, mutator
+  and replacement; and `results.jsonl`, one line per result of a mutant the stage runs for, as Stryker reports it
+  (key, id, status, statusReason), CompileError and Ignored included. Stryker does not await a reporter, so each line
+  is one synchronous append, on disk before Stryker goes on. Every stage reads its results from these lines, in a new
+  run as in a resume, so a resume reads a stage back exactly as the run made it.
+- In each dir of a check with no mutant (alone-a, alone-a2, control-a2, control-b2): `checks.json` (the items it runs
+  for: each set of test files, or the one run) before it starts, and `checks.jsonl`, one line per finished item:
+  runner.mjs appends a set's files, exit and time as soon as that set ends, and the gate appends the outcome of the
+  run with no mutant after the reruns (why it failed, or `''`). A set the runner left no line for in a run that ended
+  gets a line with no exit, so it counts as having left no result, as in a whole run.
+- `done.json` in a stage's dir, as its last act, once every item it is for has its result saved and before the gate
+  acts on its outcome: written aside and renamed, so it is whole or not there.
+
+A resume first takes lock.json: one whose process still runs refuses the resume (another run may be using the dir;
+if that process is no gate run, remove the file), one that cannot be read refuses it too, and one whose process no
+longer runs (a gate that was killed) is taken over, which the report says. It then takes the tree's print and the
+package locks' print as a run does, and compares them with run.json's (tree.mjs treeChanges). Any difference ends it
+NO RESULT, exit 2, naming the first ten files that differ and their count, with no pass run: results made on another
+tree say nothing of this one. The print holds file times on purpose: the stopped run never reached its own
+end-of-run check, so an edit made and undone while it ran shows only by its time. A run.json that is missing or cannot
+be read ends it the same way, since the tree, scope and seed the results belong to are not known; so does a Node
+binary (path or version) or a stand-in for vitest other than the saved one, since every test command runs on that
+Node (runner.mjs) and a kill made under another one, or under a stand-in, says nothing of a run under this one; and so
+does a plan made now from the saved scope that differs from the saved targets. It then runs with the saved seed,
+whatever SMDB_TEST_SEED says, so a property draws the inputs it drew for the saved results.
+
+A resume then walks the stages in the same order (resume.mjs stageOf). A stage's dirs are its own name and the
+`-r<n>` forms earlier resumes made of it, in that order, and what the stage holds is every saved result in them:
+
+- A stage with `done.json` is not run again. Its saved results are its output, and the gate handles them with the
+  same code a new run uses on the results it has just saved, so what later stages read (the kills taken back, the
+  voided reruns, the mutants sent on) is what the stopped run had.
+- The first stage without `done.json` runs only the items that have no saved result, in `<stage>-r<n>`, and the saved
+  ones count as its results. For pass A these are the mutants of the plan its first dir saved (a run that stopped
+  before Stryker made that plan runs pass A whole); they run as a pass on a subset runs: their spans as the patterns,
+  their keys as the targets, the type checker on. A mutant the dir's plan does not hold is settled there as made at
+  no place, and runs nowhere again. Stryker makes a fresh run with no mutant before the remaining items in every
+  stage it runs (its budgets come from it), so their reach, costs and budgets come from that run in their own dir,
+  and each result is read against the dir it ran in.
+- Every later stage runs as in a new run.
+
+Nothing a resume reads is guessed at. Each of these ends it NO RESULT, exit 2 ("the run in <dir> cannot be resumed:
+<why>; no pass ran"), before any stage runs: a saved file that is there but cannot be read (a whole line of a
+`.jsonl` that does not read, among them a status Stryker never reports for a tested mutant, which the verdict would
+count as no failure); a result line for an item its dir did not run for; an item with two results, in one dir or in
+two; a result whose id is not the one its dir's plan gives its key; results with no `plan.json`; a dir that ran for
+other items than the stage is for now or had left; a dir after the one that holds `done.json`; `done.json` in a dir
+whose stage has items with no result; and a dir of a stage the walk does not reach (one after the first stage that
+did not finish, or one this run makes no use of). Only the last piece of a `.jsonl`, after its last line break, is
+dropped: that is the line the stop cut short.
+
+A runner.mjs that runs sets writes `runner-<pid>.json` (its process id and start time) in its dir before its first
+set and removes it when it exits. It watches the gate that started it (SMDB_MUTATION_GATE_PID): once that process is
+gone, it ends the set in flight with every process it started, adds no line for it, and exits. A resume, after it
+takes lock.json, waits up to ten seconds while a `runner-<pid>.json` in a stage's dir names a process that still runs,
+and then refuses ("names process <pid> ... which still runs and could still add a result there"); one that cannot be
+read refuses it too. So a set a killed gate left in flight runs again only once that run is gone and has left no line.
+This covers the runners of set checks only: the runner.mjs of a mutant run writes no such file, and when the gate's
+process alone is killed (not its tree) those runs and their vitest keep going until they end on their own, so stop
+the whole tree before a resume. A runner.mjs ended by a hard kill leaves its
+file naming a process that no longer runs, which a resume passes over.
+
+Resume `n` is one more than every `-r<n>` the report dir's names hold, and writes `resume-r<n>.json` when it starts.
+No dir of an earlier run is written again and nothing of it is deleted. A summary.txt or mutants.json already there
+is moved to `summary-before-r<n>.txt` or `mutants-before-r<n>.json` before the resume writes its own. A resumed run's
+end-of-run tree check is a new run's.
+
 ## The report
 
 `test/mutation/reports/<time>-<process id>/` (ignored by git; delete it whenever you like):
@@ -740,11 +843,18 @@ built from it, stays 120 minutes per file plus five.
   timeouts, the context mutants, the runs with no mutant that checked a pass (each file that killed in pass A run
   alone, naming each that failed there and why, the runs after the reruns, and each set an a2 result ran on, naming
   each whose results were voided and why), why the gate
-  stopped or which files changed during the run, and the verdict.
+  stopped or which files changed during the run, and the verdict. A resumed run's report says so under the scope:
+  each stage it read back whole, the stage it went on with (how many results it kept, from which dirs, and how many
+  items ran now and where), and a lock.json it took over.
 - `mutants.json` has the run's fast-check seed and every mutant: its place, original text and replacement, whether it
   gates, and per pass its status, the report dir its id is in (Stryker numbers each run's mutants anew), the test
   that killed it (for a mutant pass A met again with no checker, its pass A is that run, in `a-unchecked/`) and, as
-  `unreached`, whether its run in that pass (A, A with no checker, or B) took no test file because none reached it.
+  `unreached`, whether its run in that pass (A, A with no checker, or B) took no test file because none reached it. A
+  resumed run's also has `resume`, its number, and `resumed`, the lines of its report on what it read back and kept;
+  a saved result's dir is the one it ran in.
+- `run.json` holds what a resume reads first (above, "Stopping and resuming": the prints, the scope, the targets, the
+  seed and what ran the tests), `lock.json` is there while a run uses the dir, and each resume leaves
+  `resume-r<n>.json` (when it started, its concurrency and `--keep`).
 - `a/`, `a-unchecked/` (pass A again with no checker), `a2/`, `b/` and `b2-1/`, `b2-2/` (one per test file that failed in pass B: a kill, or a failure only on the machine's texts) hold, for each mutant run, one vitest
   JSON report and log per tier it ran (`<id>-<tier>.json` and `.log`; a run in `b/` can reach both integration and
   child; a nested mutant a pass is not for runs nothing; `dry-*` is the run with no mutant, `dry-ms.txt` its monotonic time and `dry-timing.json` Stryker's).
@@ -758,7 +868,10 @@ built from it, stays 120 minutes per file plus five.
   of named test files leaves the list it gave vitest in `<id>-<tier>.include.json` beside its report. `alone-a/`
   holds each file that killed in pass A run alone with no mutant, and `alone-a2/` each set an a2 kill or timeout ran
   on, run with no mutant (`dry-alone-<n>.json`, `.log` and `.include.json`, and `dry-alone.json`, the files, exit and
-  time in ms of each run). `control-a2/` and `control-b2/` hold the runs with no mutant after the reruns.
+  time in ms of each run). `control-a2/` and `control-b2/` hold the runs with no mutant after the reruns. Each stage's
+  dir also holds what a resume reads ("Stopping and resuming": `results.jsonl`, or `checks.json` and `checks.jsonl`,
+  and `done.json` once it finished). A resume adds `<stage>-r<n>/` for the first stage that had not finished, which
+  holds what the stage's own dir holds, for the items it ran there.
 
 The verdict is FAIL when a gating mutant ends Survived, NoCoverage, inconclusive (a pass that made no mutant at its place included), RuntimeError, or Ignored (a
 `// Stryker disable` comment needs the same justification in the notes as a survivor). A confirmed timeout counts as
@@ -896,6 +1009,23 @@ removed source file.
   and when the target (a throwaway untracked file) gains a way to `/data` during pass A, which pass A2's run with no
   mutant refuses, or during pass A2's reruns, which the run with no mutant after them refuses. Each is run with a
   mutant id left in the env, which the gate ignores.
+- integration/mutationResumeGate.test.ts (in the integration tier, as its gate runs take a quarter of an hour and
+  every fast test file whose processes reach mutated src runs in pass A of each such mutant) runs the gate on a
+  stand-in for vitest on a throwaway untracked file, in a run that reaches every stage: pass A kills and times out,
+  each a2 rerun kills, each set of files those reruns took fails with no mutant in `alone-a2/`, and pass B's kills
+  repeat in `b2-1/`. A whole run gives the reference. Then three runs are each killed, one inside pass A, one inside
+  `alone-a2/` after a set failed and before the next set ran, and one inside `b2-1/`, and resumed to the end: each
+  gives every mutant the outcome the whole run gives and the same verdict, runs nothing of a stage the stopped run
+  finished, runs no item the stopped stage had saved (it counts the stand-in's runs), takes over the killed run's
+  lock.json and runs on the saved seed. It also shows each refusal: a file's content or time changed, a file added, a
+  package lock changed, no or an unreadable run.json, another Node binary (version or path), another stand-in for
+  vitest, another scope, and `--base` or `--mutate` with `--resume`; then a resume of a run stopped before it saved a
+  plan runs pass A whole and goes on to the end, a resume of that finished run reads every stage back and runs
+  nothing, and copies of it with a result twice, a status Stryker never reports, a stage dir the walk does not reach,
+  results with no plan.json, or done.json over a stage with a result gone are each refused.
+  unit/mutationResume.test.ts tests the library: how the saved lines are read, a stage that finished read back, one
+  that stopped left with only its unsaved items, each problem that refuses a resume, the reporter's lines, and the lock
+  (a live process's refuses a resume, a dead one's is taken over).
 - The bite fails when the plumbing breaks: with the active mutant dropped from the child's env the child-only mutants
   survive, and with the scenario loading another checkout's dist pass B refuses at its first run.
 
