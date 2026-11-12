@@ -30,7 +30,7 @@ export function checkPanelPermissions(panel: PanelOptions, context: PanelContext
 
 /**
  * Check Web-UI specific permissions (no Discord interaction).
- * Web-UI always operates in MAIN_GUILD_ID context, so system-scope panels are allowed.
+ * System-scope panels pass the owner page and DEVS users only.
  */
 function checkWebUIPermissions(panel: PanelOptions, userId: string, fromRequest: boolean): boolean {
   // Main Web-UI uses 'web-ui-owner' - it's already authenticated at the deployment boundary (AppShield / localhost)
@@ -41,8 +41,8 @@ function checkWebUIPermissions(panel: PanelOptions, userId: string, fromRequest:
 
   // Guild Web-UI uses actual Discord user IDs from OAuth - check permissions normally
 
-  // Dev only check - uses getConfigProperty with correct priority (config.json > env > schema)
-  if (panel.devOnly) {
+  // A system-scope panel changes the setting for every server, so only DEVS reach it here.
+  if (panel.devOnly || panel.panelScope === 'system') {
     const devs = getConfigProperty<(string | number)[]>('DEVS') || [];
     const userIdStr = String(userId);
     const isDevUser = devs.some(dev => String(dev) === userIdStr);
@@ -57,8 +57,7 @@ function checkWebUIPermissions(panel: PanelOptions, userId: string, fromRequest:
     return false;
   }
 
-  // System-scope panels are allowed in Web-UI (which implicitly operates in MAIN_GUILD_ID)
-  return true; // Web-UI access allowed (already authenticated by NGINX/Express or OAuth)
+  return true;
 }
 
 /**
