@@ -234,6 +234,12 @@ export function useDeposedWrites(given: DeposedWrites | null): void {
 export function nameDeposedWritesLeft(): void {
   deposedWrites?.nameLeft();
 }
+
+/** Every exit of the bot and web UI processes: the writes a deposition lost are named first. */
+export function exitProcess(code: number): never {
+  nameDeposedWritesLeft();
+  return process.exit(code);
+}
 // The JSON restores between K4's rename and their end: the exit drain waits for every one.
 const restoreRenameSections = new Set<Promise<void>>();
 
@@ -446,8 +452,7 @@ export function stopHandler(steps: () => Promise<void>): () => Promise<void> {
 export function stopProcess(): void {
   if (!processStop) {
     console.error('[Data] No stop handler is built yet; the bot process exits');
-    nameDeposedWritesLeft();
-    process.exit(0);
+    exitProcess(0);
   }
   void processStop();
 }
@@ -534,8 +539,7 @@ export function installStopHandler(): void {
     } catch (error) {
       console.error('[Data] A stop step failed; the bot process exits:', error);
     } finally {
-      nameDeposedWritesLeft();
-      process.exit(stopExitCode);
+      exitProcess(stopExitCode);
     }
   });
   process.on('SIGTERM', () => void stopRunner?.());

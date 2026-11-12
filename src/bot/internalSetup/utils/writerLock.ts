@@ -5,7 +5,7 @@
 import * as fs from 'fs';
 import { dataPath } from '../../../utils/dataRoot';
 import { ProcessLock, parseHolder, realSeams, type LockHolder, type LockSeams, type TakeResult } from './processLock';
-import { cancelQueued, queuedFilePaths, queuedFileWrites, fileFlushOnTheWire, type CancelOutcome } from './dataBackends/fileBackend';
+import { answerEndedTries, cancelQueued, queuedFilePaths, queuedFileWrites, fileFlushOnTheWire, pathOnTheWire, type CancelOutcome } from './dataBackends/fileBackend';
 import { closeSharedWritesLost, forgetSharedFileKnowledge, isSharedPath, reopenSharedWrites, useDeposedWrites, useWriterLockCheck } from './dataManager';
 import { deposeRows, reopenRows } from './sharedStore';
 import { stopCrashWrites } from './moduleCrashes';
@@ -36,8 +36,15 @@ const pendingAnswers = new Set<Promise<void>>();
 const deposedWrites = {
   answered: () => Promise.allSettled([...pendingAnswers]).then(() => undefined),
   nameLeft: () => {
+    try {
+      answerEndedTries();
+    } catch (error) {
+      console.error('[Data] Could not read the answers of the writes a deposition cancelled:', error);
+    }
     for (const [p, words] of unnamedLost) {
-      console.error(`[Data] Can't confirm whether ${p} is saved: its write was still running when another process (${words}) took the data files' lock, and this process exits before it ends`);
+      console.error(pathOnTheWire(p)
+        ? `[Data] Can't confirm whether ${p} is saved: its write was still running when another process (${words}) took the data files' lock, and this process exits before it ends`
+        : `[Data] Can't confirm whether ${p} is saved: another process (${words}) took the data files' lock, and this process exits before it knows how the write ended`);
     }
     unnamedLost.clear();
   },

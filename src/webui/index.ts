@@ -9,7 +9,7 @@ import { WebSocketManager } from './websocketManager';
 import { getInstallQueue } from './utils/installQueue';
 import { setNotificationIPCDispatcher } from '../bot/internalSetup/utils/premiumNotifications';
 import { ensureDurableSessionSecret } from '../utils/envLoader';
-import { drainForExit, nameDeposedWritesLeft, setGuildWriteGate } from '../bot/internalSetup/utils/dataManager';
+import { drainForExit, exitProcess, setGuildWriteGate } from '../bot/internalSetup/utils/dataManager';
 import { stopSessionStore } from './auth/sessionManager';
 
 /**
@@ -151,15 +151,13 @@ export async function startWebUI(botManager: BotManager): Promise<void> {
     // Close HTTP server
     httpServer.close(() => {
       console.log('[WebUI] Server closed');
-      nameDeposedWritesLeft();
-      process.exit(0);
+      exitProcess(0);
     });
 
     // Force exit if graceful shutdown takes too long
     setTimeout(() => {
       console.error('[WebUI] Forced shutdown after timeout');
-      nameDeposedWritesLeft();
-      process.exit(1);
+      exitProcess(1);
     }, 10000); // 10 second timeout
   };
 

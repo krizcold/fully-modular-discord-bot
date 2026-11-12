@@ -45,7 +45,7 @@ if (isProd) {
 // Load environment variables
 import 'dotenv/config';
 
-import { beginStop, installStopHandler } from './internalSetup/utils/dataManager';
+import { beginStop, exitProcess, installStopHandler } from './internalSetup/utils/dataManager';
 import { configureWriterLock, onDeposed, releaseWriterLockAtExit, reportWriterStage, takeWriterLockForBoot } from './internalSetup/utils/writerLock';
 import { setupAddressesIpc } from '../utils/databaseAddress';
 import { setupMemoryIpc } from '../utils/memoryReading';
@@ -90,5 +90,5 @@ async function boot(): Promise<void> {
 
 boot().catch(error => {
   console.error('[Main] The bot process could not start:', error);
-  process.exit(1);
+  exitProcess(1);
 });

@@ -29,7 +29,7 @@ import { endGuildRequests } from './webui/utils/guildRequests';
 import { startWebUI, flushBeforeExit } from './webui';
 import { ensureConfigPopulated } from './bot/internalSetup/utils/configManager';
 import { getSafetyManager } from './utils/updateSafety';
-import { nameDeposedWritesLeft, setSharedWriteGate } from './bot/internalSetup/utils/dataManager';
+import { exitProcess, setSharedWriteGate } from './bot/internalSetup/utils/dataManager';
 import { carryWrites, runSealed, writesOf } from './bot/internalSetup/utils/dataBackends/writeLedger';
 import { truthText, verdictOf } from './bot/internalSetup/utils/dataBackends/replyGate';
 import { holderWords, readWriterHolder } from './bot/internalSetup/utils/writerLock';
@@ -99,7 +99,7 @@ async function main() {
     console.log('[Main] Web-UI started successfully');
   } catch (error) {
     console.error('[Main] Failed to start Web-UI:', error);
-    process.exit(1);
+    exitProcess(1);
   }
 
   // Skip bot start if in safe mode
@@ -150,8 +150,7 @@ async function main() {
     await botManager.endLocalChain();
     await endGuildRequests();
     await flushBeforeExit();
-    nameDeposedWritesLeft();
-    process.exit(0);
+    exitProcess(0);
   });
 
   process.on('SIGINT', async () => {
@@ -161,12 +160,11 @@ async function main() {
     await botManager.endLocalChain();
     await endGuildRequests();
     await flushBeforeExit();
-    nameDeposedWritesLeft();
-    process.exit(0);
+    exitProcess(0);
   });
 }
 
 main().catch((error) => {
   console.error('[Main] Fatal error:', error);
-  process.exit(1);
+  exitProcess(1);
 });

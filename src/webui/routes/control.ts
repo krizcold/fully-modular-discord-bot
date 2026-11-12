@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express';
 import { BotManager } from '../botManager';
 import { endGuildRequests } from '../utils/guildRequests';
 import { getWebuiLogs, clearWebuiLogs } from '../utils/logCapture';
-import { drainForExit, nameDeposedWritesLeft } from '../../bot/internalSetup/utils/dataManager';
+import { drainForExit, exitProcess } from '../../bot/internalSetup/utils/dataManager';
 
 // Drain the parent's write queue before a deterministic exit (bounded), so a
 // config write accepted just before Restart/Shutdown is not lost.
@@ -108,8 +108,7 @@ export function createControlRoutes(botManager: BotManager): Router {
           await endGuildRequests();
           await flushBeforeExit();
           console.log('[Control] Exiting process - Docker will restart container');
-          nameDeposedWritesLeft();
-          process.exit(0);
+          exitProcess(0);
         }, 500);
 
         return;
@@ -158,8 +157,7 @@ export function createControlRoutes(botManager: BotManager): Router {
         await endGuildRequests();
         await flushBeforeExit();
         console.log('[Control] Exiting process for full restart');
-        nameDeposedWritesLeft();
-        process.exit(0);
+        exitProcess(0);
       }, 500);
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';

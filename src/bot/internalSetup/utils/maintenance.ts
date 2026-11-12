@@ -15,7 +15,7 @@ import {
 } from './maintenanceGate';
 import { readMaintenanceFile } from '../../../utils/maintenanceFile';
 import { loadCredentials, resolveDataBackend } from '../../../utils/envLoader';
-import { addStopStep, isExitDraining, nameDeposedWritesLeft, resaveTarget, saveHeldWrites, stopProcess, unansweredRowOps, unsavedRowPaths } from './dataManager';
+import { addStopStep, exitProcess, isExitDraining, resaveTarget, saveHeldWrites, stopProcess, unansweredRowOps, unsavedRowPaths } from './dataManager';
 import { probePass, setStepLayers, stepLayers } from './dataBackends/mainDatabase';
 import { addressListInUse, parseAddressList, showEntry } from '../../../utils/databaseAddress';
 import { heldClauses, type HeldCounts } from './heldWords';
@@ -192,8 +192,7 @@ export function guardUncaught(error: unknown): void {
   if (isExitDraining()) return;
   console.error('[Error] Uncaught exception; the bot process exits:', error);
   countCrash(error);
-  nameDeposedWritesLeft();
-  process.exit(1);
+  exitProcess(1);
 }
 
 export function guardRejection(reason: unknown): void {
