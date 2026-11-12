@@ -8,7 +8,7 @@ import { randomUUID } from 'crypto';
 import { Client, Pool } from 'pg';
 import { guardPoolClients, shortLivedClient } from '../pgClient';
 import { FLUSH_STATEMENT_BYTES, FLUSH_WIRE_MAX, flushBoundMs, utf8Pieces } from '../storableData';
-import { pgConfig, showEntry } from '../../../../utils/databaseAddress';
+import { normalizeAddress, pgConfig, pgConfigCause, showAddress, showEntry } from '../../../../utils/databaseAddress';
 import type { ClientConfig, PoolClient, PoolConfig, QueryConfig, QueryResult } from 'pg';
 import {
   checkShape, encodingRefusal, freshPrivilegeRefusal, freshRefusal, gateRefusal, metaGateCause, readFoundList,
@@ -848,11 +848,12 @@ export class PostgresBackend implements DataBackend {
   readonly kind = 'postgres' as const;
 
   getPool(): Pool {
-    if (!this.pool) throw new Error('no database is chosen yet');
+    if (!this.pool) throw new Error(this.unusable ?? 'no database is chosen yet');
     return this.pool;
   }
 
   private pool: Pool | null = null;
+  private unusable: string | null = null;
   private entry: string | null = null;
   private poolEpoch = 0;
   private epoch = 0;
@@ -905,11 +906,27 @@ export class PostgresBackend implements DataBackend {
     this.chooser = opts.chooser;
     this.markerStoreId = opts.markerStoreId ?? (() => null);
     const entry = this.chooser.chosen();
-    if (entry !== null) this.useEntry(entry);
+    if (entry !== null) this.chooseEntry(entry);
   }
 
-  /** Raises the epoch and builds the data pool for the entry under it (the choice, or step (b) of a move). */
-  private useEntry(entry: string): void {
+  /** The choice: the pool built for the entry, else why the entry can't be used, which getPool then answers. */
+  private chooseEntry(entry: string): string | null {
+    const cause = this.useEntry(entry);
+    if (cause !== null) this.unusable = unusableEntry(entry, cause);
+    return cause === null ? null : this.unusable;
+  }
+
+  /**
+   * Raises the epoch and builds the data pool for the entry under it (the choice, or step (b) of a move). An entry
+   * pgConfig refuses changes nothing: the answer is why, else null.
+   */
+  private useEntry(entry: string): string | null {
+    let config: ClientConfig;
+    try {
+      config = pgConfig(entry);
+    } catch (error) {
+      return pgConfigCause(entry, error);
+    }
     this.epoch += 1;
     const epoch = this.epoch;
     const pool = this.makePool({
@@ -923,7 +940,7 @@ export class PostgresBackend implements DataBackend {
       // caller's first query on the same session (deprecated queueing, pg@9 throws).
       statement_timeout: STATEMENT_TIMEOUT_MS,
       idle_in_transaction_session_timeout: IDLE_IN_TX_TIMEOUT_MS,
-      ...pgConfig(entry),
+      ...config,
     });
     pool.on('error', error => {
       // Unhandled idle-client errors would crash the process.
@@ -935,6 +952,8 @@ export class PostgresBackend implements DataBackend {
     this.pool = pool;
     this.poolEpoch = epoch;
     this.entry = entry;
+    this.unusable = null;
+    return null;
   }
 
   private makePool(config: PoolConfig): Pool {
@@ -1141,13 +1160,19 @@ export class PostgresBackend implements DataBackend {
   }
 
   private async bootstrapLoop(): Promise<void> {
+    let chosen: string | null = null;
     if (!this.pool) {
-      const entry = await this.chooser.awaitChoice();
-      if (entry === null || this.stopped) return;
-      if (!this.pool) this.useEntry(entry);
+      chosen = await this.chooser.awaitChoice();
+      if (chosen === null || this.stopped) return;
     }
     let attempt = 0;
     while (!this.stopped) {
+      const unusable = !this.pool && chosen !== null ? this.chooseEntry(chosen) : null;
+      if (unusable !== null) {
+        console.warn(`[PostgresBackend] Bootstrap attempt ${attempt + 1} failed (retrying): ${unusable}`);
+        await this.sleep(backoffDelay(attempt++));
+        continue;
+      }
       try {
         await this.poolQuery('SELECT 1', [], ANSWER_BOUND_MS);
         const recovery = await this.poolQuery('SELECT pg_is_in_recovery() AS in_recovery', [], ANSWER_BOUND_MS);
@@ -1296,17 +1321,16 @@ export class PostgresBackend implements DataBackend {
     const refusal = await steps.checkTarget(entry);
     if (refusal !== null) {
       const { reason, details } = typeof refusal === 'string' ? { reason: refusal, details: [] } : refusal;
-      const line = moveCheckTexts.notMoving(target, reason);
-      if (!this.moveRefusalsLogged.has(line)) {
-        this.moveRefusalsLogged.add(line);
-        console.error(line);
-        for (const detail of refusalLogLines({ header: '', lines: details, reason, fix: '' }).slice(1)) console.error(detail);
-      }
+      this.logMoveRefusal(moveCheckTexts.notMoving(target, reason), refusalLogLines({ header: '', lines: details, reason, fix: '' }).slice(1));
       return false;
     }
     if (this.epoch !== startedUnder || this.latchWhy === null || this.stopped || steps.exitBegan?.()) return false;
     const old = this.pool;
-    this.useEntry(entry);
+    const unusable = this.useEntry(entry);
+    if (unusable !== null) {
+      this.logMoveRefusal(moveCheckTexts.notMoving(target, moveCheckTexts.unusable(unusable)));
+      return false;
+    }
     const epoch = this.epoch;
     this.moving = epoch;
     if (old) void old.end().catch(error => console.error('[PostgresBackend] The pool of the database this process left did not end cleanly:', error));
@@ -1324,6 +1348,13 @@ export class PostgresBackend implements DataBackend {
     this.state = 'ready';
     steps.moved(entry);
     return true;
+  }
+
+  private logMoveRefusal(line: string, details: string[] = []): void {
+    if (this.moveRefusalsLogged.has(line)) return;
+    this.moveRefusalsLogged.add(line);
+    console.error(line);
+    for (const detail of details) console.error(detail);
   }
 
   private endAttempt(epoch: number): false {
@@ -2800,9 +2831,19 @@ export const moveCheckTexts = {
   incomplete: (detail: string) => `the check of its store could not be completed (${detail})`,
   silent: (seconds: number) => `the database did not answer within ${seconds} s`,
   overBound: `the check of its store did not finish within ${MOVE_CHECK_BOUND_MS / 1000} s`,
+  unusable: (cause: string) => `its address can't be used (${cause})`,
   notMoving: (target: string, reason: string) =>
     `[Database] Not moving to ${target}: ${reason}; this process keeps its unsaved changes and stays stopped`,
 };
+
+/** Why the backend has no pool for the chosen entry, which pgConfig refused for `cause`. */
+function unusableEntry(entry: string, cause: string): string {
+  let name = 'the chosen address';
+  try {
+    name = `the address ${showAddress(normalizeAddress(entry.trim()))}`;
+  } catch { /* no URL, so no address to show */ }
+  return `${name} can't be used (${cause})`;
+}
 
 /** NB5F decision 5: the bootstrap's line when the check passed while the backend is held or latched. */
 export function notReadyLine(detail: string): string {

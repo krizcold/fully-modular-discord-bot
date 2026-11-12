@@ -1,5 +1,6 @@
 import net from 'net';
 import os from 'os';
+import nodePath from 'path';
 import type { ClientConfig } from 'pg';
 import { parseIntoClientConfig } from 'pg-connection-string';
 import { loadCredentials } from './envLoader';
@@ -136,12 +137,35 @@ export function classifyPoolClients(pool: { on(event: 'connect', listener: (clie
   });
 }
 
-function certificatePath(raw: string): string | null {
+/** The file a refused entry names that could not be read, from the error's own path, or null. */
+function unreadableFile(raw: string, error: unknown): string | null {
+  const { code, path: failed } = (error ?? {}) as { code?: unknown; path?: unknown };
+  if (typeof code !== 'string') return null;
+  let params: URLSearchParams;
   try {
-    return new URL(raw).searchParams.get('sslrootcert');
+    params = new URL(raw).searchParams;
   } catch {
     return null;
   }
+  const listed: Array<[string, string | null]> = [
+    ['its certificate file', params.get('sslrootcert')],
+    ['its client certificate file', params.get('sslcert')],
+    ['its key file', params.get('sslkey')],
+  ];
+  const named = listed.filter((pair): pair is [string, string] => Boolean(pair[1]));
+  if (named.length === 0) return null;
+  const hit = typeof failed === 'string'
+    ? named.find(([, file]) => nodePath.resolve(file) === nodePath.resolve(failed))
+    : named.length === 1 ? named[0] : undefined;
+  if (hit) return `${hit[0]} ${hit[1]} cannot be read (${code})`;
+  return typeof failed === 'string' ? `the file ${failed} it names cannot be read (${code})` : `a file it names cannot be read (${code})`;
+}
+
+/** Why pgConfig refused one entry, given the error it threw. */
+export function pgConfigCause(entry: string, error: unknown): string {
+  const raw = entry.trim();
+  if (!PREFIX.test(raw)) return 'it does not start with postgresql:// or postgres://';
+  return unreadableFile(raw, error) ?? 'it cannot be parsed as a database address';
 }
 
 /** DATA_BACKEND_URL split on commas; each entry is parsed again at every call, so a file that appears later counts. */
@@ -157,11 +181,8 @@ export function parseAddressList(value: string): ListEntry[] {
     try {
       return { index, raw, usable: true, config: pgConfig(raw), shown };
     } catch (error) {
-      const file = certificatePath(raw);
-      const code = (error as { code?: unknown })?.code;
-      if (file && typeof code === 'string') {
-        return { index, raw, usable: false, cause: `its certificate file ${file} cannot be read (${code})`, shown };
-      }
+      const unreadable = unreadableFile(raw, error);
+      if (unreadable) return { index, raw, usable: false, cause: unreadable, shown };
       return { index, raw, usable: false, cause: `entry ${index} cannot be parsed as a database address`, shown };
     }
   });
