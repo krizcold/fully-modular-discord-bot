@@ -989,13 +989,15 @@ removed source file.
 
 ## Proven locally
 
-- The bite, integration/mutationBite.test.ts: one gate run on two lines of src/bot/index.ts, the bot process's entry,
-  which no src file imports, so its related tests stay the few that boot it however many files import the rest. The
-  boot's standby check dies in pass A to those in-process tests; the base the entry registers the path aliases on,
-  which every in-process test mocks away and only a real process that loads an aliased import uses, survives pass A
-  and dies in pass B to child/nb10Scenarios.test.ts, again when rerun alone, and the run with no mutant after that
-  rerun passes. One mutant of the first line survives every test (no test boots the entry as a standby), so the run
-  also shows the FAIL verdict and how a survivor is listed. Each of its real passes leaves
+- The bite, integration/mutationBite.test.ts: one gate run on one line of each of two files whose related tests are
+  few. Every mutant of PayPal's environment line in src/bot/internalSetup/utils/payment/paypalProvider.ts, which only
+  a few unit tests import (the payment registry loads it by a lazy require), dies in pass A to those tests except one:
+  `''` in place of the default `'sandbox'` leaves the sandbox URL, since only `'live'` picks another, so no test can
+  kill it and the run also shows the FAIL verdict and how a survivor is listed. In src/bot/index.ts, the bot process's entry,
+  which no src file imports, the base the entry registers the path aliases on, which every in-process test mocks away
+  and only a real process that loads an aliased import uses, survives pass A and dies in pass B to
+  child/nb10Scenarios.test.ts, again when rerun alone, and the run with no mutant after that rerun passes. Each of its
+  real passes leaves
   Stryker's own time for its run with no mutant and runner.mjs's monotonic one, and the two agree, so a sound run is
   never taken for a clock step. The same file checks that an unknown
   base and a pattern that makes no mutant both end NO RESULT, exit 2, and that a glob, a missing file, a pattern with
