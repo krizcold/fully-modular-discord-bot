@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { describe, expect, it } from 'vitest';
 import { childEnv, FORK_GUARD, botRoot, freshDataDir, runScenario } from '../helpers/child';
+import { TIME_SCALE } from '../helpers/time.mjs';
 
 // NB10 child scenarios with real processes: 16 (two writers), 17 (a lock holder killed or exiting mid-rename),
 // 22 (a stop early in the boot, normal and maintenance) and 43 (a deposed exit seen by BotManager). Each runs on the
@@ -10,6 +11,8 @@ import { childEnv, FORK_GUARD, botRoot, freshDataDir, runScenario } from '../hel
 
 const SCENARIOS = path.join(botRoot, 'test', 'child', 'scenarios');
 const target = (dataDir: string) => path.join(dataDir, 'global', 'nb10kill', 'x.json');
+// Above the 70 s of bounded waits nb10Parent.cjs holds in its longest mode (maintenance), so one of those fails first.
+const PARENT_STEP_MS = 90_000 * TIME_SCALE;
 
 function startHolder(dataDir: string, role: 'hold' | 'exit', body: string): { child: ChildProcess; ready: Promise<void> } {
   const child = spawn(process.execPath, ['--require', FORK_GUARD, path.join(SCENARIOS, 'nb10LockHolder.cjs'), role, body], { cwd: dataDir, env: childEnv(dataDir), stdio: ['ignore', 'pipe', 'pipe'] });
@@ -26,7 +29,7 @@ const exited = (child: ChildProcess) => new Promise<void>(resolve => { if (child
 
 describe('NB10 test 16: two writers', () => {
   it('the two sides interleave; every accepted increment from the bot and the operator is in the final count, and every refusal answered changed', async () => {
-    const run = await runScenario<{ final: number; log: string; parentAccepted: number; childAccepted: number; refusals: Record<string, number> }>('nb10Parent.cjs', ['two-writers'], freshDataDir());
+    const run = await runScenario<{ final: number; log: string; parentAccepted: number; childAccepted: number; refusals: Record<string, number> }>('nb10Parent.cjs', ['two-writers'], freshDataDir(), PARENT_STEP_MS);
     const { final, log, parentAccepted, childAccepted, refusals } = run.result;
     expect(childAccepted).toBe(200);
     expect(parentAccepted).toBeGreaterThan(0);
@@ -43,13 +46,17 @@ describe('NB10 test 17: a lock holder that dies', () => {
     const dataDir = freshDataDir();
     const a = startHolder(dataDir, 'hold', '{"by":"A"}');
     await a.ready;
-    const b = runScenario<{ tookAt: number }>('nb10LockHolder.cjs', ['take', '{"by":"B"}'], dataDir);
-    await new Promise(resolve => setTimeout(resolve, 300));
+    let bWaits!: () => void;
+    const waiting = new Promise<void>(resolve => { bWaits = resolve; });
+    const b = runScenario<{ tookAt: number }>('nb10LockHolder.cjs', ['take', '{"by":"B"}'], dataDir, undefined, out => { if (out.includes('WAITING')) bWaits(); });
+    const first = await Promise.race([waiting.then(() => 'waiting'), b.then(() => 'took', () => 'failed')]);
+    if (first === 'failed') await b;
+    expect(first).toBe('waiting');
     const killedAt = Date.now();
     a.child.kill('SIGKILL');
     await exited(a.child);
     const { result } = await b;
-    expect(result.tookAt - killedAt).toBeLessThan(1_000);
+    expect(result.tookAt - killedAt).toBeLessThan(1_000 * TIME_SCALE);
     expect(fs.readFileSync(target(dataDir), 'utf8')).toBe('{"by":"B"}');
     await new Promise(resolve => setTimeout(resolve, 500));
     expect(fs.readFileSync(target(dataDir), 'utf8')).toBe('{"by":"B"}');
@@ -71,13 +78,13 @@ describe('NB10 test 17: a lock holder that dies', () => {
 
 describe('NB10 test 22: a stop early in the boot', () => {
   it('a global.write accepted at shared, with its flush slowed, lands before the exit, and the exit code is 0', async () => {
-    const run = await runScenario<{ reply: any; exitCode: number | null; onDisk: string | null }>('nb10Parent.cjs', ['stop-early'], freshDataDir());
+    const run = await runScenario<{ reply: any; exitCode: number | null; onDisk: string | null }>('nb10Parent.cjs', ['stop-early'], freshDataDir(), PARENT_STEP_MS);
     expect(run.result.exitCode).toBe(0);
     expect(run.result.onDisk).toBe('{"landed":true}');
   });
 
   it('in a maintenance boot whose shard count keeps failing: global.write is refused, a premium change lands before the exit, and the exit code is 0', async () => {
-    const run = await runScenario<any>('nb10Parent.cjs', ['maintenance'], freshDataDir());
+    const run = await runScenario<any>('nb10Parent.cjs', ['maintenance'], freshDataDir(), PARENT_STEP_MS);
     const r = run.result;
     expect(r.retrying).toBe(true);
     expect(r.refused).toMatchObject({ ok: false, code: 'maintenance', error: 'nb10 maintenance' });
@@ -98,7 +105,7 @@ describe('NB10 test 43: a deposed exit seen by BotManager', () => {
   const count = (text: string, part: string) => text.split(part).length - 1;
 
   it('deposed by its own check while a large metrics:snapshot is on the channel: exit 75, no crash, the holder named', async () => {
-    const run = await runScenario<any>('nb10Parent.cjs', ['deposed', 'snapshot'], freshDataDir());
+    const run = await runScenario<any>('nb10Parent.cjs', ['deposed', 'snapshot'], freshDataDir(), PARENT_STEP_MS);
     const r = run.result;
     noCrash(r);
     expect(r.deposedLines).toEqual([`[BotManager] The bot process stopped: a data bundle import (pid ${r.parentPid}) took the data files' lock`]);
@@ -125,24 +132,24 @@ describe('NB10 test 43: a deposed exit seen by BotManager', () => {
   };
 
   it("deposed by its 5 s check with a held write, a journaled event and a held gateway close: each loss is logged once, and it exits 75 after its stop steps", async () => {
-    const run = await runScenario<any>('nb10Parent.cjs', ['deposed', 'real'], freshDataDir(), 50_000);
+    const run = await runScenario<any>('nb10Parent.cjs', ['deposed', 'real'], freshDataDir(), PARENT_STEP_MS);
     realDeposed(run.result);
-  }, 60_000);
+  });
 
   it('a SIGTERM sent while the deposed bot runs its held gateway close changes nothing: one stop sequence, exit 75 after the drain', async () => {
-    const run = await runScenario<any>('nb10Parent.cjs', ['deposed', 'real-sigterm'], freshDataDir(), 50_000);
+    const run = await runScenario<any>('nb10Parent.cjs', ['deposed', 'real-sigterm'], freshDataDir(), PARENT_STEP_MS);
     expect(run.result.sigtermSent).toBe(true);
     realDeposed(run.result);
-  }, 60_000);
+  });
 
   it('a child that exits 75 with no message is no crash, and the holder is read from the lock file', async () => {
-    const run = await runScenario<any>('nb10Parent.cjs', ['deposed', 'no-message'], freshDataDir());
+    const run = await runScenario<any>('nb10Parent.cjs', ['deposed', 'no-message'], freshDataDir(), PARENT_STEP_MS);
     noCrash(run.result);
     expect(run.result.deposedLines).toEqual(["[BotManager] The bot process stopped: a data bundle import (pid 31) took the data files' lock"]);
   });
 
   it('a child that sends deposed and then exits 1 is a crash', async () => {
-    const run = await runScenario<any>('nb10Parent.cjs', ['deposed', 'exit-1'], freshDataDir());
+    const run = await runScenario<any>('nb10Parent.cjs', ['deposed', 'exit-1'], freshDataDir(), PARENT_STEP_MS);
     expect(run.result.exitCode).toBe(1);
     expect(run.result.crashed).toBe(true);
     expect(run.result.crashCountAfter).toBe(run.result.crashCountBefore + 1);

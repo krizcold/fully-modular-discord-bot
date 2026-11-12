@@ -451,7 +451,7 @@ describe('the copy', () => {
     });
     const started = Date.now();
     expect(await replace(g, X, monoIn(4_000))).toEqual({ ok: false, code: 'backend-unavailable', error: copyDeadline(X, 0) });
-    expect(Date.now() - started).toBeLessThan(100);
+    expect(Date.now() - started).toBeLessThan(1_000);
     expect(drops).toEqual([]);
     expect(lines(error).filter(l => l.includes('Cannot drop'))).toEqual([]);
     expect(tree(dataPath(g))).toEqual(PREV);

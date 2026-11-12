@@ -2,7 +2,8 @@
 // /data/global/nb10kill/x.json through the facade, and then, by its role argument:
 //   hold       prints HELD once its write is on the wire (a slow rename) and waits to be killed
 //   exit       prints EXITING and calls process.exit while its rename is on the wire
-//   take       prints RESULT with the time it took the lock, once its own write landed
+//   take       prints WAITING when its first try finds the lock held, and RESULT with the time it took the lock,
+//              once its own write landed
 // Usage: node nb10LockHolder.cjs <hold|exit|take> <body>
 const path = require('path');
 const fs = require('fs');
@@ -27,8 +28,9 @@ const dataManager = require(path.join(dist, 'dataManager.js'));
 
 async function main() {
   writerLock.configureWriterLock('bot');
-  for (;;) {
+  for (let tries = 0; ; tries++) {
     if (writerLock.takeWriterLock().kind === 'taken') break;
+    if (tries === 0) process.stdout.write('WAITING\n');
     await new Promise(resolve => setTimeout(resolve, 20));
   }
   const tookAt = Date.now();

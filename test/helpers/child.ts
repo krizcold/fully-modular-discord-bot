@@ -38,13 +38,13 @@ export function childEnv(dataDir: string): NodeJS.ProcessEnv {
 // child's cwd is its data dir, so a `dotenv/config` import in the bot finds no
 // .env; its env is childEnv's. It fails on a missing RESULT line, a nonzero
 // exit, a timeout (and ends the step's processes, helpers/endTree.mjs), or a bot module
-// loaded from anywhere but this repo's dist.
-export function runScenario<T>(script: string, args: string[], dataDir: string, timeoutMs = STEP_MS): Promise<ScenarioRun<T>> {
+// loaded from anywhere but this repo's dist. onStdout gets the step's whole stdout so far after each chunk.
+export function runScenario<T>(script: string, args: string[], dataDir: string, timeoutMs = STEP_MS, onStdout?: (stdout: string) => void): Promise<ScenarioRun<T>> {
   const env = childEnv(dataDir);
   const child = spawn(process.execPath, ['--require', FORK_GUARD, path.join(SCENARIOS, script), ...args], { cwd: dataDir, env, stdio: ['ignore', 'pipe', 'pipe'] });
   let stdout = '';
   let stderr = '';
-  child.stdout.on('data', chunk => { stdout += chunk; });
+  child.stdout.on('data', chunk => { stdout += chunk; onStdout?.(stdout); });
   child.stderr.on('data', chunk => { stderr += chunk; });
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {

@@ -69,12 +69,19 @@ async function twoWriters(manager) {
   return { final: stored.n, log: stored.log, parentAccepted: accepted, childAccepted, refusals };
 }
 
-async function stopEarly(manager) {
+/** Waits until the child prints, after `from`, that the slowed flush of `file` is on the wire. */
+async function flushStarted(out, from, file) {
+  const line = `[nb10Child] slowed rename to ${file} started`;
+  if (!await until(() => out.text.indexOf(line, from) !== -1, 10_000)) throw new Error(`the child never printed: ${line}`);
+}
+
+async function stopEarly(manager, out) {
   const child = manager.botProcess;
   let exitCode = null;
   child.on('exit', code => { exitCode = code; });
+  const from = out.text.length;
   const sent = manager.runSharedOp('global.write', { rel: 'nb10stop/x.json', contentJson: '{"landed":true}', expectSha: 'absent' });
-  await sleep(300);
+  await flushStarted(out, from, 'x.json');
   child.send({ type: 'nb10:sigterm' });
   const reply = await sent;
   await until(() => exitCode !== null, 30_000);
@@ -88,8 +95,9 @@ async function maintenanceStop(manager, out) {
   child.on('exit', code => { exitCode = code; });
   const retrying = await until(() => out.text.includes('Could not fetch the shard count from Discord'), 10_000);
   const refused = await manager.runSharedOp('global.write', { rel: 'nb10stop/x.json', contentJson: '{"landed":true}', expectSha: 'absent' });
+  const from = out.text.length;
   const sent = manager.runSharedOp('premium.setMessages', { args: [{ moduleBlocked: 'nb10 maintenance stop' }] });
-  await sleep(300);
+  await flushStarted(out, from, 'premium-tiers.json');
   child.send({ type: 'nb10:sigterm' });
   const reply = await sent;
   await until(() => exitCode !== null, 30_000);
@@ -113,7 +121,6 @@ async function deposed(manager, out) {
     const prepared = new Promise(resolve => child.on('message', m => { if (m && m.type === 'nb10:prepared') resolve(); }));
     child.send({ type: 'nb10:prepare' });
     await prepared;
-    await sleep(300);
   }
   const crashRestartsBefore = manager.crashRestarts;
   const crashCountBefore = getSafetyManager().getStatus().crashCount;
@@ -125,7 +132,6 @@ async function deposed(manager, out) {
   const tookAt = Date.now();
   if (!real) child.send({ type: 'nb10:depose', variant });
   if (variant === 'real-sigterm' && await until(() => out.text.includes('[nb10Child] gateway close step started'), 15_000)) {
-    await sleep(500);
     if (exitCode === null) {
       child.send({ type: 'nb10:sigterm' });
       sigtermSent = true;
@@ -166,7 +172,7 @@ async function main() {
   const out = childOutput(manager.botProcess);
   await until(() => manager.childStage === (mode === 'stop-early' ? 'shared' : 'guild'), 20_000);
   const result = mode === 'two-writers' ? await twoWriters(manager)
-    : mode === 'stop-early' ? await stopEarly(manager)
+    : mode === 'stop-early' ? await stopEarly(manager, out)
       : mode === 'maintenance' ? await maintenanceStop(manager, out)
         : await deposed(manager, out);
   const loaded = Object.keys(require.cache).filter(file => file !== __filename && !file.includes(`${path.sep}node_modules${path.sep}`));
