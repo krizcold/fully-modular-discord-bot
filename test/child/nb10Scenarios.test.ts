@@ -27,17 +27,40 @@ function startHolder(dataDir: string, role: 'hold' | 'exit', body: string): { ch
 
 const exited = (child: ChildProcess) => new Promise<void>(resolve => { if (child.exitCode !== null || child.signalCode !== null) resolve(); else child.on('exit', () => resolve()); });
 
+type TwoWriters = {
+  final: number; log: string; ids: number[]; childAccepted: number; accepted: number[]; changed: number[]; pending: number[];
+  other: string[]; readRefusals: string[]; stalled: boolean;
+};
+
+async function twoWriters(variant: string[]): Promise<TwoWriters> {
+  const run = await runScenario<TwoWriters>('nb10Parent.cjs', ['two-writers', ...variant], freshDataDir(), PARENT_STEP_MS);
+  const r = run.result;
+  expect(r.readRefusals).toEqual([]);
+  expect(r.other).toEqual([]);
+  expect(r.childAccepted).toBe(200);
+  expect(r.accepted.length).toBeGreaterThan(0);
+  expect(r.ids).toEqual([...new Set(r.ids)].sort((a, b) => a - b));
+  expect(r.accepted.filter(id => !r.ids.includes(id))).toEqual([]);
+  expect(r.changed.filter(id => r.ids.includes(id))).toEqual([]);
+  expect(r.ids.filter(id => !r.accepted.includes(id) && !r.pending.includes(id))).toEqual([]);
+  expect(r.pending.filter(id => !r.ids.includes(id))).toEqual([]);
+  expect(r.final).toBe(r.childAccepted + r.ids.length);
+  expect(r.log).toHaveLength(r.final);
+  expect(r.log.split('').filter(c => c === 'c')).toHaveLength(r.childAccepted);
+  expect(r.log.split('').filter(c => c === 'p')).toHaveLength(r.ids.length);
+  expect(r.log).toMatch(/c+p+c/);
+  return r;
+}
+
 describe('NB10 test 16: two writers', () => {
-  it('the two sides interleave; every accepted increment from the bot and the operator is in the final count, and every refusal answered changed', async () => {
-    const run = await runScenario<{ final: number; log: string; parentAccepted: number; childAccepted: number; refusals: Record<string, number> }>('nb10Parent.cjs', ['two-writers'], freshDataDir(), PARENT_STEP_MS);
-    const { final, log, parentAccepted, childAccepted, refusals } = run.result;
-    expect(childAccepted).toBe(200);
-    expect(parentAccepted).toBeGreaterThan(0);
-    expect(final).toBe(parentAccepted + childAccepted);
-    expect(log).toHaveLength(final);
-    expect(log.split('').filter(c => c === 'p')).toHaveLength(parentAccepted);
-    expect(log).toMatch(/c+p+c/);
-    expect(Object.keys(refusals).filter(code => code !== 'changed')).toEqual([]);
+  it('the two sides interleave; every accepted increment from the bot and the operator is in the final file, no write refused changed is, and every other answer is pending', async () => {
+    await twoWriters([]);
+  });
+
+  it('a rename stalled past the confirm bound: the operator write in it answers pending and lands later', async () => {
+    const r = await twoWriters(['stall']);
+    expect(r.stalled).toBe(true);
+    expect(r.pending.length).toBeGreaterThan(0);
   });
 });
 

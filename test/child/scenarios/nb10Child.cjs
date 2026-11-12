@@ -3,7 +3,9 @@
 // the stop handler and its deposition listener, and no Discord client is made. NB10_CHILD_MODE picks what the
 // replacement does:
 //   two-writers   on {type:'nb10:go'} increments /data/global/nb10two/counter.json 200 times through the facade, one
-//                 every 2 ms, each marking 'c' in the file's log
+//                 every 2 ms, each marking 'c' in the file's log and keeping the operator's ids; with NB10_STALL_MS,
+//                 the first rename of counter.json that carries a new operator id after the log reads c+p+c waits
+//                 that long first, printing "stalled rename to counter.json started"
 //   stop-early    reports shared only (bootShards held); its flushes take NB10_SLOW_MS longer, each printing a
 //                 "slowed rename to <file> started" line as its wait begins
 //   maintenance   the real runMaintenanceBoot (maintenance.json says maintenance) with a shard count that keeps failing;
@@ -27,13 +29,30 @@ const failing = { write: null, append: null };
 const refused = { write: null, append: null };
 const refusal = which => new Promise(resolve => { refused[which] = resolve; });
 
+const stallMs = Number(process.env.NB10_STALL_MS || 0);
+const stall = { done: false, landedIds: 0 };
+
 const realRename = fs.promises.rename.bind(fs.promises);
 fs.promises.rename = async (from, to) => {
   if (slowMs > 0 && String(to).endsWith('.json')) {
     process.stdout.write(`[nb10Child] slowed rename to ${path.basename(String(to))} started\n`);
     await sleep(slowMs);
   }
-  return realRename(from, to);
+  if (mode !== 'two-writers' || path.basename(String(to)) !== 'counter.json') return realRename(from, to);
+  let body = {};
+  try {
+    body = JSON.parse(fs.readFileSync(from, 'utf8'));
+  } catch {
+    body = {};
+  }
+  const ids = Array.isArray(body.ids) ? body.ids.length : 0;
+  if (stallMs > 0 && !stall.done && ids > stall.landedIds && /c+p+c/.test(body.log || '')) {
+    stall.done = true;
+    process.stdout.write('[nb10Child] stalled rename to counter.json started\n');
+    await sleep(stallMs);
+  }
+  await realRename(from, to);
+  stall.landedIds = ids;
 };
 // A whole write's temp file is opened 'w': on a failing path that open rejects with EIO, so a try never waits on the
 // disk. An append opens its file 'a+': on a failing path, that handle's write rejects with EIO before any byte.
@@ -100,7 +119,7 @@ function listen(writerLock, dataManager) {
     } else if (message.type === 'nb10:go' && mode === 'two-writers') {
       let accepted = 0;
       for (let i = 0; i < 200; i++) {
-        const outcome = dataManager.updateGlobalModuleData('counter.json', 'nb10two', { n: 0, log: '' }, c => ({ n: c.n + 1, log: `${c.log || ''}c` }));
+        const outcome = dataManager.updateGlobalModuleData('counter.json', 'nb10two', { n: 0, log: '' }, c => ({ ...c, n: c.n + 1, log: `${c.log || ''}c` }));
         if (outcome.outcome === 'saved') accepted++;
         await sleep(2);
       }

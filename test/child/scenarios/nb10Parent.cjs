@@ -1,7 +1,7 @@
 // The web UI side of the NB10 scenarios: the compiled BotManager, whose fork starts nb10Child.cjs (the real
 // dist/bot/index.js with a stand-in clientInitializer) in place of the bot. Prints one RESULT line of JSON with the
 // scenario's outcome and the bot modules it loaded.
-// Usage: node nb10Parent.cjs two-writers | stop-early | maintenance | deposed <real|real-sigterm|snapshot|no-message|exit-1>
+// Usage: node nb10Parent.cjs two-writers [stall] | stop-early | maintenance | deposed <real|real-sigterm|snapshot|no-message|exit-1>
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
@@ -20,6 +20,8 @@ process.env.CLIENT_ID = '1';
 process.env.GUILD_ID = '2';
 process.env.NB10_CHILD_MODE = mode;
 if (mode === 'stop-early' || mode === 'maintenance') process.env.NB10_SLOW_MS = '1500';
+// Longer than the bot's CONFIRM_MS (8 s, replyGate.ts), so the operator write in the stalled rename answers pending.
+if (mode === 'two-writers' && variant === 'stall') process.env.NB10_STALL_MS = '9000';
 
 const warns = [];
 const realWarn = console.warn;
@@ -46,27 +48,33 @@ function childOutput(child) {
   return out;
 }
 
-async function twoWriters(manager) {
+async function twoWriters(manager, out) {
   const child = manager.botProcess;
   const done = new Promise(resolve => child.on('message', m => { if (m && m.type === 'nb10:done') resolve(m.accepted); }));
-  let accepted = 0;
-  const refusals = {};
+  const accepted = [];
+  const changed = [];
+  const pending = [];
+  const other = [];
+  const readRefusals = [];
   for (let i = 0; i < 200; i++) {
     const read = await manager.readGlobalData({ rel: 'nb10two/counter.json' });
     if (i === 0) child.send({ type: 'nb10:go' });
-    if (!read || read.ok !== true) { refusals[`read:${read && read.code}`] = (refusals[`read:${read && read.code}`] || 0) + 1; continue; }
-    const current = read.contentJson === undefined ? { n: 0, log: '' } : JSON.parse(read.contentJson);
+    if (!read || read.ok !== true) { readRefusals.push(`${i}:${read && read.code}`); continue; }
+    const current = read.contentJson === undefined ? { n: 0, log: '', ids: [] } : JSON.parse(read.contentJson);
     const reply = await manager.runSharedOp('global.write', {
-      rel: 'nb10two/counter.json', contentJson: JSON.stringify({ n: current.n + 1, log: `${current.log || ''}p` }), expectSha: sha(read.contentJson ?? null),
+      rel: 'nb10two/counter.json', contentJson: JSON.stringify({ ...current, n: current.n + 1, log: `${current.log || ''}p`, ids: [...(current.ids || []), i] }), expectSha: sha(read.contentJson ?? null),
     });
-    if (reply && reply.ok) accepted++;
-    else refusals[reply && reply.code] = (refusals[reply && reply.code] || 0) + 1;
+    if (reply && reply.ok) accepted.push(i);
+    else if (reply && reply.code === 'changed') changed.push(i);
+    else if (reply && reply.code === 'unconfirmed' && reply.answer === 'pending') pending.push(i);
+    else other.push(`${i}:${reply && reply.code}:${reply && reply.answer}`);
   }
   const childAccepted = await done;
   await manager.shutdown(false);
   await until(() => !manager.isRunning(), 30_000);
   const stored = JSON.parse(fs.readFileSync(dataPath('global', 'nb10two', 'counter.json'), 'utf8'));
-  return { final: stored.n, log: stored.log, parentAccepted: accepted, childAccepted, refusals };
+  const stalled = out.text.includes('[nb10Child] stalled rename to counter.json started');
+  return { final: stored.n, log: stored.log, ids: stored.ids || [], childAccepted, accepted, changed, pending, other, readRefusals, stalled };
 }
 
 /** Waits until the child prints, after `from`, that the slowed flush of `file` is on the wire. */
@@ -171,7 +179,7 @@ async function main() {
   if (!started.success) throw new Error(`the bot did not start: ${JSON.stringify(started)}`);
   const out = childOutput(manager.botProcess);
   await until(() => manager.childStage === (mode === 'stop-early' ? 'shared' : 'guild'), 20_000);
-  const result = mode === 'two-writers' ? await twoWriters(manager)
+  const result = mode === 'two-writers' ? await twoWriters(manager, out)
     : mode === 'stop-early' ? await stopEarly(manager, out)
       : mode === 'maintenance' ? await maintenanceStop(manager, out)
         : await deposed(manager, out);
