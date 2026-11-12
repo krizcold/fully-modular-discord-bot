@@ -1179,7 +1179,7 @@ export class AppStoreManager {
   addRepository(
     name: string,
     url: string,
-    branch: string = 'main',
+    branch?: string,
     githubToken?: string
   ): AppStoreRepository {
     const repo = this.newRepository(name, url, branch, githubToken);
@@ -1187,13 +1187,13 @@ export class AppStoreManager {
   }
 
   /** addRepository with decision 28's answers: it resolves once the change is stored and the file holds it. */
-  async addRepositoryAwaited(name: string, url: string, branch: string = 'main', githubToken?: string): Promise<AppStoreRepository> {
+  async addRepositoryAwaited(name: string, url: string, branch?: string, githubToken?: string): Promise<AppStoreRepository> {
     if (!isSharedStoreDoc(REPOS_CONFIG_PATH)) return this.addRepository(name, url, branch, githubToken);
     const repo = this.newRepository(name, url, branch, githubToken);
     return this.awaited('repository list', () => this.addRepositoryLocked(repo));
   }
 
-  private newRepository(name: string, url: string, branch: string, githubToken?: string): AppStoreRepository {
+  private newRepository(name: string, url: string, branch: string | undefined, githubToken?: string): AppStoreRepository {
     const normalized = this.normalizeGitUrl(url);
 
     // Use branch extracted from URL if user didn't specify one explicitly
