@@ -2,6 +2,7 @@ import path from 'path';
 import fs from 'fs';
 import { DATA_ROOT, dataPath } from '../../../utils/dataRoot';
 import { recordLoadFailure } from './loadFailures';
+import { assertGuildId } from './dataKeys';
 
 /**
  * Get the root directory of the bot.
@@ -92,6 +93,7 @@ export function getModuleDataPath(moduleName: string, guildId?: string | null): 
   const dataRoot = DATA_ROOT;
 
   if (guildId) {
+    assertGuildId(guildId);
     return path.join(dataRoot, guildId, moduleName);
   } else {
     return path.join(dataRoot, 'global', moduleName);

@@ -7,6 +7,16 @@ export class GuildKeyError extends Error {
   }
 }
 
+/** A Discord guild id: all digits, the one name a guild folder under the data root has. */
+export function isGuildId(id: unknown): id is string {
+  return typeof id === 'string' && /^\d+$/.test(id);
+}
+
+/** Throws GuildKeyError, naming the id, for a guild id that is not a Discord id. */
+export function assertGuildId(id: unknown): asserts id is string {
+  if (!isGuildId(id)) throw new GuildKeyError(`[Data] The guild id ${JSON.stringify(id) ?? String(id)} is not a Discord id; refused`);
+}
+
 export interface GuildKey {
   module: string;
   filename: string;

@@ -98,7 +98,7 @@ import type { DataBackend, FenceToken, LateCommit, ReplacedBatch, RestoreOutcome
 import { resolveDataBackend, useSharedDocReader } from '../../../utils/envLoader';
 import { currentLedger, currentSince, recordRefusal, recordTicket } from './dataBackends/writeLedger';
 import { markBarrier, noteScopeRefusal, noteScopeTicket, pendingFor, saveMark, stampOf, type SaveMark } from './dataBackends/scopeRecord';
-import { canonicalGuildKey, GuildKeyError, type GuildKey } from './dataKeys';
+import { assertGuildId, canonicalGuildKey, GuildKeyError, isGuildId, type GuildKey } from './dataKeys';
 import { isMaintenanceGateClosed } from './maintenanceGate';
 import { stoppedServing } from './servingGate';
 import type { HeldCounts } from './heldWords';
@@ -155,7 +155,7 @@ const servedByPostgres = (): boolean => resolveDataBackend() === 'postgres';
 function wsRouted(options: DataOptions): string | null {
   if ((options.scope || 'guild') !== 'guild') return null;
   const guildId = options.guildId;
-  if (!guildId) return null;
+  if (!isGuildId(guildId)) return null;
   return servedByPostgres() ? guildId : null;
 }
 
@@ -647,6 +647,7 @@ export function forgetSharedFileKnowledge(): void {
  * Flush every queued op for one guild.
  */
 export async function flushGuild(guildId: string): Promise<void> {
+  assertGuildId(guildId);
   await flushGuildFiles(guildId);
   const ws = getWorkingSet();
   if (ws && servedByPostgres()) {
@@ -663,7 +664,7 @@ export function listGuilds(): string[] {
   if (!ws || !servedByPostgres()) return listGuildDirs();
   const ids = new Set<string>(ws.readyGuilds());
   for (const id of ownedCatalog) ids.add(id);
-  return [...ids].filter(id => /^\d+$/.test(id));
+  return [...ids].filter(isGuildId);
 }
 
 /**
@@ -671,6 +672,7 @@ export function listGuilds(): string[] {
  * backend routes the guild.
  */
 export function listGuildDataFiles(guildId: string, category?: string): string[] {
+  assertGuildId(guildId);
   const ws = getWorkingSet();
   if (ws && servedByPostgres()) {
     return ws.listFiles(guildId, category ?? '') ?? [];
@@ -742,9 +744,10 @@ const worstSave = (answers: SaveOutcome[]): SaveOutcome =>
  * number, or a mark kept from before a restart) answers 'unavailable'. It answers for every writer of the scope, not
  * the caller alone. category narrows file writes and refusals to that module's folder; a guild served from the
  * database answers for its whole working set, so another module's slower write can make it 'pending'. Raw atomic
- * writes are not counted.
+ * writes are not counted. A scope that is neither 'global' nor a Discord id answers 'refused': every write to it is.
  */
 export async function confirmSaved(scope: string, options: { since?: SaveMark; deadlineMs?: number; category?: string } = {}): Promise<SaveOutcome> {
+  if (scope !== 'global' && !isGuildId(scope)) return 'refused';
   const mark = options.since ?? currentSince();
   const since = mark === undefined ? 0 : stampOf(mark);
   if (since === null) return 'unavailable';
@@ -783,6 +786,7 @@ export async function confirmSaved(scope: string, options: { since?: SaveMark; d
  * cannot be read throws.
  */
 export function readGuildDocRaw(guildId: string, module: string, filename: string): string | null {
+  assertGuildId(guildId);
   const ws = getWorkingSet();
   if (ws && servedByPostgres()) {
     const key = canonicalGuildKey(module, filename);
@@ -801,6 +805,7 @@ function guildDocFilePath(guildId: string, module: string, filename: string): st
  * working set serves the guild.
  */
 export function guildDocFileQueue(guildId: string, module: string, filename: string): { pending: boolean; failing: boolean } | null {
+  assertGuildId(guildId);
   if (getWorkingSet() && servedByPostgres()) return null;
   const filePath = guildDocFilePath(guildId, module, filename);
   return { pending: filesPending([filePath]), failing: flushFailingFiles([filePath]) };
@@ -811,6 +816,7 @@ export function guildDocFileQueue(guildId: string, module: string, filename: str
  * the guild is file-routed or the set is not ready (caller uses its fs scan).
  */
 export function listGuildDataKeys(guildId: string): { module: string; filename: string }[] | null {
+  assertGuildId(guildId);
   const ws = getWorkingSet();
   if (ws && servedByPostgres()) {
     return ws.listAllKeys(guildId);
@@ -823,6 +829,7 @@ export function listGuildDataKeys(guildId: string): { module: string; filename: 
  * collision's reason, or null when the key fits, the set is not loaded or the guild is file-routed.
  */
 export function guildWritePlacement(guildId: string, module: string, filename: string): string | null {
+  assertGuildId(guildId);
   const ws = getWorkingSet();
   if (!ws || !servedByPostgres()) return null;
   const key = canonicalGuildKey(module, filename);
@@ -919,9 +926,10 @@ function getDataDirectory(options: DataOptions): string {
   }
 
   // Guild data: /data/{guildId}/
-  if (!options.guildId) {
+  if (options.guildId === undefined || options.guildId === null) {
     throw new Error('[DataManager] guildId is required for guild-scoped data');
   }
+  assertGuildId(options.guildId);
 
   const dir = path.join(BASE_DATA_DIR, options.guildId);
   if (options.category) {
@@ -934,13 +942,17 @@ function getDataDirectory(options: DataOptions): string {
  * Get the full file path for a data file
  */
 function getDataFilePath(filename: string, options: DataOptions): string {
-  if ((options.scope || 'guild') === 'guild') canonicalGuildKey(options.category, filename);
+  if ((options.scope || 'guild') === 'guild') guildKeyOf(filename, options);
   const dir = getDataDirectory(options);
   return path.join(dir, filename);
 }
 
-/** The canonical key of a guild-scope call; throws GuildKeyError for a key that leaves the guild folder or ends in '/'. */
+/**
+ * The canonical key of a guild-scope call; throws GuildKeyError for a guild id given that is not a Discord id, or a key
+ * that leaves the guild folder or ends in '/'.
+ */
 function guildKeyOf(filename: string, options: DataOptions): GuildKey {
+  if (options.guildId !== undefined && options.guildId !== null) assertGuildId(options.guildId);
   return canonicalGuildKey(options.category, filename);
 }
 
@@ -957,7 +969,7 @@ export function isGuildDataPath(absPath: string): boolean {
   const rel = path.relative(BASE_DATA_DIR, path.resolve(absPath));
   if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) return false;
   const first = rel.split(path.sep)[0];
-  return /^\d+$/.test(first) || first === '_graveyard';
+  return isGuildId(first) || first === '_graveyard';
 }
 
 function refuseWhileGated(): void {
@@ -1019,7 +1031,7 @@ function guildRawKey(absPath: string): { guildId: string; key: string } | null {
   const rel = path.relative(BASE_DATA_DIR, path.resolve(absPath));
   if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) return null;
   const parts = rel.split(path.sep);
-  if (parts.length < 2 || !/^\d+$/.test(parts[0])) return null;
+  if (parts.length < 2 || !isGuildId(parts[0])) return null;
   return { guildId: parts[0], key: parts.slice(1).join('/') };
 }
 
@@ -1400,8 +1412,9 @@ function docOf(filename: string, options: DataOptions): string {
   return `${owner}:${options.category ?? ''}/${filename}`;
 }
 
-/** The scope confirmSaved answers a facade write under: 'global', or its guild id. */
-const scopeOf = (options: DataOptions): string => (options.scope === 'global' ? 'global' : options.guildId ?? '');
+/** The scope confirmSaved answers a facade write under: 'global', its guild id, or null for a guild id that is not a Discord id. */
+const scopeOf = (options: DataOptions): string | null =>
+  (options.scope === 'global' ? 'global' : isGuildId(options.guildId) ? options.guildId : null);
 
 /**
  * Records a tracked write's outcome in the entry's ledger (writeLedger.ts), and a refusal's cause before its throw;
@@ -1409,14 +1422,14 @@ const scopeOf = (options: DataOptions): string => (options.scope === 'global' ? 
  * whole: the write replaces the whole document (a save or a delete); an earlier refusal of that document then cannot
  * be confirmed either way, since the rewrite may or may not carry the refused change.
  */
-function recorded<R extends SaveTracked | AppendTracked | DeleteTracked>(doc: string, scope: string, whole: boolean, accept: () => R): R {
+function recorded<R extends SaveTracked | AppendTracked | DeleteTracked>(doc: string, scope: string | null, whole: boolean, accept: () => R): R {
   let result: R;
   try {
     result = accept();
   } catch (error) {
     if (error instanceof DataBackendUnavailableError) {
       recordRefusal(error.causeKey, doc);
-      noteScopeRefusal(scope, doc);
+      if (scope !== null) noteScopeRefusal(scope, doc);
     }
     throw error;
   }
@@ -1424,11 +1437,11 @@ function recorded<R extends SaveTracked | AppendTracked | DeleteTracked>(doc: st
   const ticket = 'ticket' in outcome ? outcome.ticket : undefined;
   if (ticket) {
     recordTicket(ticket, whole ? doc : undefined);
-    noteScopeTicket(scope, ticket, whole ? doc : undefined);
+    if (scope !== null) noteScopeTicket(scope, ticket, whole ? doc : undefined);
   } else if (outcome.outcome === 'frozen' || outcome.outcome === 'refused') {
     if (outcome.outcome === 'frozen') recordRefusal('frozen', doc);
     else recordRefusal(outcome.cause, doc, outcome.reason);
-    noteScopeRefusal(scope, doc);
+    if (scope !== null) noteScopeRefusal(scope, doc);
   }
   return result;
 }
@@ -1966,7 +1979,7 @@ function guildOfPath(absPath: string): string | null {
   const rel = path.relative(BASE_DATA_DIR, path.resolve(absPath));
   if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) return null;
   const first = rel.split(path.sep)[0];
-  return /^\d+$/.test(first) ? first : null;
+  return isGuildId(first) ? first : null;
 }
 
 /** A raw write under a guild folder while an operation holds the guild: refused, as the facade's writes are. */
@@ -2029,6 +2042,7 @@ function operationStop(deadline: bigint, floorMs: number): RestoreStop | null {
 }
 
 export const RESTORE_TEXTS = {
+  notGuildId: (guildId: unknown) => `${JSON.stringify(guildId) ?? String(guildId)} is not a Discord server id; nothing was restored`,
   noEntry: 'no graveyard entry for this guild',
   alreadyRunning: 'a restore of this server is already running; nothing was restored; its answer comes within a minute',
   deleteRunning: "a delete of this server's data is running; nothing was restored; try again once it ends",
@@ -2104,6 +2118,7 @@ export function restoreNoAnswerEnding(guildId: string, x: number | undefined, n:
 }
 
 export const DELETE_TEXTS = {
+  notGuildId: (guildId: unknown) => `${JSON.stringify(guildId) ?? String(guildId)} is not a Discord server id; nothing was removed`,
   failed: 'guild data delete failed; nothing was removed',
   alreadyRunning: "a delete of this server's data is already running; nothing was removed",
   restoreRunning: 'a restore of this server from the graveyard is running; nothing was removed; try again once it ends',
@@ -2164,6 +2179,7 @@ function stopAnswer(stop: RestoreStop, what: 'restore' | 'delete'): { ok: false;
  * deadline: a process.hrtime.bigint() reading; nothing is retired or renamed after it.
  */
 export async function deleteGuildNamespace(guildId: string, reason: string, flushMs = 30000, deadline: bigint = deadlineIn(OPERATION_BOUND_MS)): Promise<DeleteReply> {
+  if (!isGuildId(guildId)) return { ok: false, code: 'invalid', error: DELETE_TEXTS.notGuildId(guildId) };
   refuseGuildChangeInMaintenance();
   const running = guildDataOps.get(guildId);
   if (running === 'delete') return { ok: false, code: 'invalid', error: DELETE_TEXTS.alreadyRunning };
@@ -2296,6 +2312,7 @@ async function retireFiles(guildId: string, reason: string, deadline: bigint): P
  * replace: the server's current data moves to a new graveyard entry in the same step, instead of refusing the restore.
  */
 export async function restoreGuildFromGraveyard(guildId: string, retiredAt?: number, deadline: bigint = deadlineIn(OPERATION_BOUND_MS), replace = false): Promise<GraveyardReply> {
+  if (!isGuildId(guildId)) return { ok: false, code: 'invalid', error: RESTORE_TEXTS.notGuildId(guildId) };
   refuseGuildChangeInMaintenance();
   if (closedForExit) throw new DataBackendUnavailableError('node-stopping', RESTORE_TEXTS.nodeStopping);
   const running = guildDataOps.get(guildId);

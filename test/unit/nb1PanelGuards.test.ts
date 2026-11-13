@@ -188,7 +188,7 @@ describe('a panel stored again during a Discord call is kept', () => {
 describe('cleanupExpiredPanels', () => {
   it('removes sessions not updated for a day and keeps the others', async () => {
     setBackendKind('file');
-    const guildId = `nb1-exp-${Date.now()}`;
+    const guildId = `${Date.now()}1`;
     const now = vi.spyOn(Date, 'now').mockReturnValue(Date.now() - 24 * 60 * 60 * 1000 - 1000);
     await storePersistentPanel('exp', panel('m-1'), guildId, 's-old');
     await storePersistentPanel('exp-all', panel('m-2'), guildId, 's-old');
@@ -212,7 +212,7 @@ describe('an unparsable panel registry file is moved aside', () => {
     ['guild', 'corrupt', 'not json'],
   ])('a %s %s file is moved aside and the store succeeds', async (scope, _kind, bytes) => {
     setBackendKind('file');
-    const guildId = scope === 'guild' ? `nb1-f6-${Date.now()}` : undefined;
+    const guildId = scope === 'guild' ? `${Date.now()}2` : undefined;
     const file = registryPath(guildId);
     fs.mkdirSync(path.dirname(file), { recursive: true });
     for (const name of fs.readdirSync(path.dirname(file))) {

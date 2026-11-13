@@ -182,17 +182,15 @@ describe('raw writes under a held guild', () => {
     expect(fs.existsSync(dataPath(g))).toBe(false);
   });
 
-  it.each([['abc123'], ['123abc']])('a folder named %s is no guild folder: a raw write there is accepted while a restore holds that id', async name => {
-    const release = holdLookup();
+  it.each([['abc123'], ['123abc']])('a folder named %s is no guild folder: its restore is refused at once and a raw write there is accepted', async name => {
     const restoring = restoreGuildFromGraveyard(name);
-    expect(guildDataOpOf(name)).toBe('restore');
+    expect(guildDataOpOf(name)).toBeUndefined();
+    expect(await restoring).toEqual({ ok: false, code: 'invalid', error: `"${name}" is not a Discord server id; nothing was restored` });
     const abs = dataPath(name, 'm', 'r.json');
     const ledger = openLedger('panel');
     expect(runInLedger(ledger, 'm', () => writeRawAtomic(abs, '{"r":1}'))).toBe(true);
     expect(ledger.refusedDocs()).toEqual([]);
     expect(warnLines().some(l => l.includes('refused'))).toBe(false);
-    release();
-    expect(await restoring).toEqual({ ok: false, code: 'invalid', error: 'no graveyard entry for this guild' });
     await flushAll();
     expect(fs.readFileSync(abs, 'utf8')).toBe('{"r":1}');
   });

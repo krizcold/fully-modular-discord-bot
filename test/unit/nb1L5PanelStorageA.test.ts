@@ -55,6 +55,7 @@ import { setBackendKind } from '../helpers/backendKind';
 
 const inst = (messageId: string) => ({ messageId, channelId: 'c', userId: 'u', createdAt: 0, lastUpdated: 0, state: 'a' }) as any;
 let errors: any;
+const G = '9331000000000011';
 
 beforeEach(() => {
   s.db = {};
@@ -75,49 +76,49 @@ afterEach(() => {
 describe('an unparsable panel registry file is moved aside only when it is safe', () => {
   it('a file that does not parse is moved aside', async () => {
     s.file = '{bad';
-    expect((await storePersistentPanel('p', inst('m'), 'g')).success).toBe(true);
+    expect((await storePersistentPanel('p', inst('m'), G)).success).toBe(true);
     expect(s.renamed).toHaveLength(1);
   });
 
   it('a guild served by Postgres moves nothing', async () => {
     setBackendKind('postgres');
     s.file = '{bad';
-    await storePersistentPanel('p', inst('m'), 'g');
+    await storePersistentPanel('p', inst('m'), G);
     expect(s.renamed).toEqual([]);
   });
 
   it('a file with a queued write is not moved', async () => {
     s.pending = true;
     s.file = '{bad';
-    await storePersistentPanel('p', inst('m'), 'g');
+    await storePersistentPanel('p', inst('m'), G);
     expect(s.renamed).toEqual([]);
   });
 
   it('a file that parses is not moved', async () => {
     s.file = '{}';
-    await storePersistentPanel('p', inst('m'), 'g');
+    await storePersistentPanel('p', inst('m'), G);
     expect(s.renamed).toEqual([]);
   });
 
   it('a failed move tells the operator the file could not be moved aside', async () => {
     s.file = '{bad';
     s.renameFails = true;
-    await storePersistentPanel('p', inst('m'), 'g');
+    await storePersistentPanel('p', inst('m'), G);
     expect(String(errors.mock.calls[0][0])).toMatch(/^\[Panels\] The panel registry .*persistent-panels\.json does not parse and could not be moved aside:$/);
   });
 });
 
 describe('the stored value an update starts from', () => {
   it.each([['null', null], ['a string', 'x']])('%s is replaced by records', async (_label, value) => {
-    s.db.g = value;
-    expect((await storePersistentPanel('p', inst('m'), 'g')).success).toBe(true);
-    expect((s.db.g as any).p.messageId).toBe('m');
+    s.db[G] = value;
+    expect((await storePersistentPanel('p', inst('m'), G)).success).toBe(true);
+    expect((s.db[G] as any).p.messageId).toBe('m');
   });
 });
 
 describe('the not-saved log', () => {
   it('a saved update logs nothing', async () => {
-    await storePersistentPanel('p', inst('m'), 'g');
+    await storePersistentPanel('p', inst('m'), G);
     expect(errors).not.toHaveBeenCalled();
   });
 
@@ -134,19 +135,19 @@ describe('the not-saved log', () => {
 
 describe('getPersistentPanel reads only well-formed records', () => {
   it('a null record is no panel, with or without a session', async () => {
-    s.db.g = { p: null };
-    expect(await getPersistentPanel('p', 'g', 's')).toBeNull();
+    s.db[G] = { p: null };
+    expect(await getPersistentPanel('p', G, 's')).toBeNull();
   });
 
   it('a string record is no panel, with or without a session', async () => {
-    s.db.g = { p: 'abc' };
-    expect(await getPersistentPanel('p', 'g', 's')).toBeNull();
-    expect(await getPersistentPanel('p', 'g')).toBeNull();
+    s.db[G] = { p: 'abc' };
+    expect(await getPersistentPanel('p', G, 's')).toBeNull();
+    expect(await getPersistentPanel('p', G)).toBeNull();
   });
 
   it('an object without a messageId is no panel', async () => {
-    s.db.g = { p: { foo: 1 } };
-    expect(await getPersistentPanel('p', 'g')).toBeNull();
+    s.db[G] = { p: { foo: 1 } };
+    expect(await getPersistentPanel('p', G)).toBeNull();
   });
 });
 
@@ -154,49 +155,49 @@ describe('removePersistentPanel removes only the instance it names', () => {
   const sessions = () => ({ p: { sessions: { s: inst('m'), t: inst('n') } } });
 
   it('a missing or null panel removes nothing', async () => {
-    s.db.g = { p: null };
-    expect(await removePersistentPanel('p', 'g')).toBe(false);
-    expect(await removePersistentPanel('p', 'g', 's')).toBe(false);
-    expect(await removePersistentPanel('none', 'g')).toBe(false);
+    s.db[G] = { p: null };
+    expect(await removePersistentPanel('p', G)).toBe(false);
+    expect(await removePersistentPanel('p', G, 's')).toBe(false);
+    expect(await removePersistentPanel('none', G)).toBe(false);
   });
 
   it('a string panel removes nothing for a session', async () => {
-    s.db.g = { p: 'abc' };
-    expect(await removePersistentPanel('p', 'g', 's')).toBe(false);
+    s.db[G] = { p: 'abc' };
+    expect(await removePersistentPanel('p', G, 's')).toBe(false);
   });
 
   it('a missing session removes nothing', async () => {
-    s.db.g = sessions();
-    expect(await removePersistentPanel('p', 'g', 'x')).toBe(false);
-    expect(await removePersistentPanel('p', 'g', 'x', 'm')).toBe(false);
-    expect(s.db.g).toEqual(sessions());
+    s.db[G] = sessions();
+    expect(await removePersistentPanel('p', G, 'x')).toBe(false);
+    expect(await removePersistentPanel('p', G, 'x', 'm')).toBe(false);
+    expect(s.db[G]).toEqual(sessions());
   });
 
   it('a session on another message stays', async () => {
-    s.db.g = sessions();
-    expect(await removePersistentPanel('p', 'g', 's', 'other')).toBe(false);
-    expect(s.db.g).toEqual(sessions());
+    s.db[G] = sessions();
+    expect(await removePersistentPanel('p', G, 's', 'other')).toBe(false);
+    expect(s.db[G]).toEqual(sessions());
   });
 
   it('a session is removed with or without its message, and the panel stays while it has sessions', async () => {
-    s.db.g = sessions();
-    expect(await removePersistentPanel('p', 'g', 's')).toBe(true);
-    expect(Object.keys((s.db.g as any).p.sessions)).toEqual(['t']);
-    expect(await removePersistentPanel('p', 'g', 't', 'n')).toBe(true);
-    expect(s.db.g).toEqual({});
+    s.db[G] = sessions();
+    expect(await removePersistentPanel('p', G, 's')).toBe(true);
+    expect(Object.keys((s.db[G] as any).p.sessions)).toEqual(['t']);
+    expect(await removePersistentPanel('p', G, 't', 'n')).toBe(true);
+    expect(s.db[G]).toEqual({});
   });
 
   it('a panel without sessions is removed without a message id', async () => {
-    s.db.g = { q: inst('m') };
-    expect(await removePersistentPanel('q', 'g')).toBe(true);
-    expect(s.db.g).toEqual({});
+    s.db[G] = { q: inst('m') };
+    expect(await removePersistentPanel('q', G)).toBe(true);
+    expect(s.db[G]).toEqual({});
   });
 });
 
 describe('storePersistentPanel with a session over a record that is not an object', () => {
   it('replaces a string record with sessions', async () => {
-    s.db.g = { p: 'abc' };
-    expect((await storePersistentPanel('p', inst('m'), 'g', 's')).success).toBe(true);
-    expect((s.db.g as any).p.sessions.s.messageId).toBe('m');
+    s.db[G] = { p: 'abc' };
+    expect((await storePersistentPanel('p', inst('m'), G, 's')).success).toBe(true);
+    expect((s.db[G] as any).p.sessions.s.messageId).toBe('m');
   });
 });

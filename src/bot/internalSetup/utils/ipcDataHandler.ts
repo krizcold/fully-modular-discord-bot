@@ -39,7 +39,7 @@ import { isInternalGlobalRel } from './configDiscovery';
 import { DataBackendUnavailableError, getWorkingSet } from './dataBackends/workingSet';
 import { awaitGuildDataReady, servedElsewhere } from './dataBackends/boot';
 import { getDataReadiness } from './dataBackends/dataReadiness';
-import { canonicalGuildKey } from './dataKeys';
+import { canonicalGuildKey, isGuildId } from './dataKeys';
 import { stoppedServing } from './servingGate';
 import { truthText } from './dataBackends/replyGate';
 import { checkWriterLock, deposedHolder, deposedText } from './writerLock';
@@ -145,7 +145,7 @@ function validSegment(value: string, allowSubpath: boolean): boolean {
 }
 
 function validateWrite(req: GuildDataWriteRequest): string | null {
-  if (!/^\d+$/.test(req.guildId ?? '')) return 'invalid guildId';
+  if (!isGuildId(req.guildId)) return 'invalid guildId';
   if (req.op !== 'write' && req.op !== 'delete' && req.op !== 'delete-namespace' && req.op !== 'restore-graveyard') return 'invalid op';
   if (req.op === 'delete-namespace' || req.op === 'restore-graveyard') return null;
   if (req.module !== '' && !validSegment(req.module, false)) return 'invalid module';
@@ -346,7 +346,7 @@ function compareRead(req: GuildDataWriteRequest): DataWriteReply | null {
 }
 
 export async function applyOperatorDataRead(req: GuildDataReadRequest): Promise<DataReadReply> {
-  if (!/^\d+$/.test(req.guildId ?? '')) return { ok: false, code: 'invalid', error: 'invalid guildId' };
+  if (!isGuildId(req.guildId)) return { ok: false, code: 'invalid', error: 'invalid guildId' };
   if (req.module !== '' && !validSegment(req.module, false)) return { ok: false, code: 'invalid', error: 'invalid module' };
   if (req.filename !== undefined && !validSegment(req.filename, true)) return { ok: false, code: 'invalid', error: 'invalid filename' };
   if (notHeldHere(req.guildId)) return { ok: false, code: 'not-held' };

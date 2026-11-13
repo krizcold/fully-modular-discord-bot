@@ -358,7 +358,12 @@ export function createConfigRoutes(botManager: BotManager): Router {
    */
   router.get('/list', async (req: Request, res: Response) => {
     try {
-      const guildId = req.query.guildId as string | undefined;
+      const scope = guildOf(req.query.guildId);
+      if (!scope.ok) {
+        res.status(400).json({ success: false, error: 'Invalid guildId format' });
+        return;
+      }
+      const guildId = scope.guildId ?? undefined;
       if (refuseGuildOffStore(guildId, res, false)) return;
 
       // If guild ID provided, return guild-specific configs + data files

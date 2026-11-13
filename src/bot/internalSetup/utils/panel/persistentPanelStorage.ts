@@ -14,6 +14,7 @@ import {
   updateModuleData,
 } from '../dataManager';
 import { getPending } from '../dataBackends/fileBackend';
+import { isGuildId } from '../dataKeys';
 import { PersistentPanelInstance } from '@bot/types/panelTypes';
 import { DATA_ROOT } from '../../../../utils/dataRoot';
 import { resolveDataBackend } from '../../../../utils/envLoader';
@@ -43,8 +44,8 @@ export async function loadPersistentPanels(guildId?: string): Promise<any> {
  */
 function moveUnparsableAside(guildId: string | undefined): void {
   if (isClosedForExit() || (guildId && areGuildWritesClosed())) return;
-  if (guildId && resolveDataBackend() === 'postgres') return;
-  const file = path.join(DATA_ROOT, guildId ?? 'global', STORAGE_NAMESPACE, STORAGE_FILE);
+  if (guildId && (resolveDataBackend() === 'postgres' || !isGuildId(guildId))) return;
+  const file = path.join(DATA_ROOT, guildId || 'global', STORAGE_NAMESPACE, STORAGE_FILE);
   if (getPending(file)) return;
   let bytes: string;
   try {

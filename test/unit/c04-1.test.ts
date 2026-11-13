@@ -55,45 +55,45 @@ function responseText(res: any): string {
 
 describe('C04-1 persistent panel records live in the guild data', () => {
   it('stores the record through the guild data layer, so it moves with the guild', async () => {
-    const result = await storePersistentPanel('p_move', instance('m1'), 'g-move');
+    const result = await storePersistentPanel('p_move', instance('m1'), '9331000000000001');
     expect(result.success).toBe(true);
-    const moved = loadModuleData<any>('persistent-panels.json', 'g-move', '_panels', {});
+    const moved = loadModuleData<any>('persistent-panels.json', '9331000000000001', '_panels', {});
     expect(moved.p_move?.messageId).toBe('m1');
-    expect(fs.existsSync(dataPath('g-move', 'persistent-panels.json'))).toBe(false);
+    expect(fs.existsSync(dataPath('9331000000000001', 'persistent-panels.json'))).toBe(false);
   });
 
   it('a press on the recorded message of a postgres guild is active', async () => {
-    h.pgGuilds.add('g-press');
+    h.pgGuilds.add('9331000000000002');
     setBackendKind('postgres');
     try {
-      expect((await storePersistentPanel('p_press', instance('m2'), 'g-press')).success).toBe(true);
-      expect(h.docs.has('g-press|_panels|persistent-panels.json')).toBe(true);
-      expect(fs.existsSync(dataPath('g-press', 'persistent-panels.json'))).toBe(false);
-      expect(await isActiveInstance('p_press', 'm2', 'g-press')).toBe('active');
-      expect(await isActiveInstance('p_press', 'other', 'g-press')).toBe('replaced');
+      expect((await storePersistentPanel('p_press', instance('m2'), '9331000000000002')).success).toBe(true);
+      expect(h.docs.has('9331000000000002|_panels|persistent-panels.json')).toBe(true);
+      expect(fs.existsSync(dataPath('9331000000000002', 'persistent-panels.json'))).toBe(false);
+      expect(await isActiveInstance('p_press', 'm2', '9331000000000002')).toBe('active');
+      expect(await isActiveInstance('p_press', 'other', '9331000000000002')).toBe('replaced');
     } finally {
-      h.pgGuilds.delete('g-press');
+      h.pgGuilds.delete('9331000000000002');
       setBackendKind(null);
     }
   });
 
   it('a missing record is told apart from a newer instance', async () => {
-    expect(await isActiveInstance('p_none', 'm3', 'g-none')).toBe('missing');
+    expect(await isActiveInstance('p_none', 'm3', '9331000000000003')).toBe('missing');
   });
 
   it('a failed save answers false and does not report success', async () => {
     h.failSave = true;
     try {
-      const result = await storePersistentPanel('p_fail', instance('m4'), 'g-fail');
+      const result = await storePersistentPanel('p_fail', instance('m4'), '9331000000000004');
       expect(result.success).toBe(false);
-      expect(await removePersistentPanel('p_fail', 'g-fail')).toBe(false);
+      expect(await removePersistentPanel('p_fail', '9331000000000004')).toBe(false);
     } finally {
       h.failSave = false;
     }
-    await storePersistentPanel('p_fail2', instance('m5'), 'g-fail2');
+    await storePersistentPanel('p_fail2', instance('m5'), '9331000000000005');
     h.failSave = true;
     try {
-      expect(await removePersistentPanel('p_fail2', 'g-fail2')).toBe(false);
+      expect(await removePersistentPanel('p_fail2', '9331000000000005')).toBe(false);
     } finally {
       h.failSave = false;
     }
@@ -102,18 +102,18 @@ describe('C04-1 persistent panel records live in the guild data', () => {
 
 describe('C04-1 the guild Config Editor leaves files with no schema alone', () => {
   it('does not list a guild file that has no config schema', () => {
-    writeRaw(dataPath('g-list', 'loose', 'notes.json'), '{"a":1}');
-    writeRaw(dataPath('g-list', 'persistent-panels.json'), '{"p":{"messageId":"m"}}');
-    const ids = discoverGuildConfigFiles('g-list').map(f => f.id);
+    writeRaw(dataPath('9331000000000006', 'loose', 'notes.json'), '{"a":1}');
+    writeRaw(dataPath('9331000000000006', 'persistent-panels.json'), '{"p":{"messageId":"m"}}');
+    const ids = discoverGuildConfigFiles('9331000000000006').map(f => f.id);
     expect(ids.some(id => id.includes('notes.json'))).toBe(false);
     expect(ids.some(id => id.includes('persistent-panels.json'))).toBe(false);
   });
 
   it('an unchanged Edit of a file with no schema deletes nothing and says why', async () => {
-    const file = dataPath('g-edit', 'persistent-panels.json');
+    const file = dataPath('9331000000000007', 'persistent-panels.json');
     writeRaw(file, '{"p":{"messageId":"m"}}');
     const context: any = {
-      guildId: 'g-edit',
+      guildId: '9331000000000007',
       userId: 'u1',
       interaction: { fields: { getTextInputValue: () => '{}' } },
     };
@@ -139,7 +139,7 @@ describe('C04-1 an open whose record was not saved is not left posted', () => {
       messages: { delete: async (id: string) => { deleted.push(id); } },
     };
     const context: any = {
-      guildId: 'g-open', userId: 'u1',
+      guildId: '9331000000000008', userId: 'u1',
       client: { channels: { fetch: async () => channel } },
       interaction: { channel },
     };
@@ -167,7 +167,7 @@ describe('C04-1 an open whose record was not saved is not left posted', () => {
       messages: { delete: async () => { throw Object.assign(new Error('rate limited'), { code: 0 }); } },
     };
     const context: any = {
-      guildId: 'g-open2', userId: 'u1',
+      guildId: '9331000000000009', userId: 'u1',
       client: { channels: { fetch: async () => channel } },
       interaction: { channel },
     };
@@ -187,7 +187,7 @@ describe('C04-1 an open whose record was not saved is not left posted', () => {
 describe('C04-1 a reset of a file with no schema says so', () => {
   it('answers the no-schema text, not a temporary refusal', async () => {
     const context: any = {
-      guildId: 'g-reset', userId: 'u1',
+      guildId: '9331000000000010', userId: 'u1',
       interaction: { fields: { getTextInputValue: () => 'RESET' } },
     };
     const res = await configEditorGuildPanel.handleModal!(context, 'reset_persistent-panels.json');

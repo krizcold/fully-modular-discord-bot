@@ -14,7 +14,7 @@ import { checkWriterLock, configureWriterLock, deposedHolder, holderWords, relea
 import type { TakeResult } from './processLock';
 import { MIGRATION_FILE, readDataFacts } from './dataBackends/recognitionGuard';
 import { resolveDataBackend, type DataBackendKind } from '../../../utils/envLoader';
-import { canonicalGuildKey, GuildKeyError } from './dataKeys';
+import { assertGuildId, canonicalGuildKey, GuildKeyError, isGuildId } from './dataKeys';
 import { decodeStorable, keyRefusal, KeyTree, pathKeyOf } from './storableData';
 import { FolderSyncError, syncFolder, syncFolderChain, syncFoldersUnder, syncWords, writeFileSynced, type ChainAnswer } from './folderChain';
 
@@ -118,6 +118,7 @@ async function* walkFiles(base: string, rel: string = ''): AsyncGenerator<string
  * from the CLI) is not reached, which is why the bundle verbs refuse a live bot.
  */
 export async function* exportNamespace(guildId: string): AsyncGenerator<FileRecord> {
+  assertGuildId(guildId);
   await flushGuild(guildId);
   const base = path.join(DATA_ROOT, guildId);
   for await (const relPath of walkFiles(base)) {
@@ -141,6 +142,7 @@ export async function importNamespace(
   records: AsyncGenerator<FileRecord> | Iterable<FileRecord>,
   destDir: string,
 ): Promise<{ fileCount: number; totalBytes: number }> {
+  assertGuildId(guildId);
   await fs.promises.mkdir(destDir, { recursive: true });
   const destResolved = path.resolve(destDir);
   let fileCount = 0;
@@ -222,15 +224,13 @@ interface BundleSummary {
   namespaceHash: string;
 }
 
-const GUILD_ID = /^\d+$/;
-
 /**
  * Why a bundle export or import of this guild must not run, or null. The bundle
  * reads and writes /data/<guild> directly, so it is only true to its word for a
  * file-routed guild with no bot process beside it.
  */
 export function bundleRefusal(guildId: string, botRunning: 'yes' | 'no' | 'unknown', migrating: 'yes' | 'no' | 'unknown' = 'no'): string | null {
-  if (!GUILD_ID.test(guildId)) return `"${guildId}" is not a guild id`;
+  if (!isGuildId(guildId)) return `"${guildId}" is not a guild id`;
   const facts = readDataFacts();
   if (!facts.ok) return facts.reason;
   if (migrating === 'yes') return 'a data migration is running; run the bundle once it ends';
@@ -274,6 +274,7 @@ function encodeSummary(files: { relPath: string; size: number; sha256: string }[
  * there untouched. A guild with no data dir is refused, never exported empty.
  */
 export async function writeBundle(guildId: string, filePath: string): Promise<BundleSummary> {
+  assertGuildId(guildId);
   const guildDir = path.join(DATA_ROOT, guildId);
   const stat = await fs.promises.stat(guildDir).catch(() => null);
   if (!stat || !stat.isDirectory()) throw new Error(`[DataInterchange] Guild ${guildId} has no data dir at ${guildDir}; nothing exported`);
@@ -459,7 +460,7 @@ async function importBundleHeld(filePath: string): Promise<BundleImportResult> {
   if (first.done) throw new Error('[DataInterchange] Bundle is empty; nothing to import');
   const firstRecord = first.value;
   const guildId = firstRecord.guildId;
-  if (!GUILD_ID.test(guildId)) {
+  if (!isGuildId(guildId)) {
     await gen.return(undefined);
     throw new Error(`[DataInterchange] Bundle names "${guildId}", which is not a guild id`);
   }

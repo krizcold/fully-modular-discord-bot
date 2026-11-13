@@ -3,6 +3,7 @@ import * as path from 'path';
 import { dataPath } from '../../../utils/dataRoot';
 import { dataExists, listGuildDataKeys } from './dataManager';
 import { getPending } from './dataBackends/fileBackend';
+import { assertGuildId } from './dataKeys';
 import type { ModuleConfigSchema, DataFileMetadata, DataFileSchema } from '../../types/moduleTypes';
 
 // Detect production environment
@@ -244,6 +245,7 @@ export function discoverConfigFiles(): ConfigFileMetadata[] {
  * @returns Array of discovered configs: only files with a config schema (includes schemas even if no override file exists)
  */
 export function discoverGuildConfigFiles(guildId: string): ConfigFileMetadata[] {
+  assertGuildId(guildId);
   const discovered = new Map<string, ConfigFileMetadata>();
 
   // 1. Load all module schemas from disk
@@ -544,6 +546,7 @@ export function discoverModuleDataSchemasFromDisk(): DataFileMetadata[] {
  * @returns Array of discovered data files (includes schemas even if no file exists)
  */
 export function discoverGuildDataFiles(guildId: string): DataFileMetadata[] {
+  assertGuildId(guildId);
   const discovered = new Map<string, DataFileMetadata>();
   const configFileIds = new Set<string>();  // Track config file IDs to exclude from data
   const modulesPath = path.join(__dirname, '../../modules');
