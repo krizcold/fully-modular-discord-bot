@@ -87,13 +87,13 @@ describe('what the boot installs', () => {
     expect(process.listeners('unhandledRejection')).toContain(guardRejection);
   });
 
-  it('an IPC listener that answers a data read with the maintenance refusal (beside the shared-op listener)', async () => {
+  it('an IPC listener that answers a data read with the maintenance refusal (beside the shared-op and backup listeners)', async () => {
     (process as { send?: unknown }).send = () => true;
     const before = process.listeners('message');
     try {
       await bootNoShard('hook');
       const added = process.listeners('message').filter(listener => !before.includes(listener));
-      expect(added).toHaveLength(2);
+      expect(added).toHaveLength(3);
       for (const listener of added) (listener as (message: unknown) => void)({ type: 'data:guild-read', requestId: 'r1' });
       await vi.waitFor(() => expect(sent.some(m => m.requestId === 'r1')).toBe(true));
       expect(sent.filter(m => m.requestId === 'r1')).toHaveLength(1);

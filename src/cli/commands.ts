@@ -6,13 +6,13 @@
  */
 
 import * as path from 'path';
-import { Client, CliResponse } from './client';
+import { Client, CliResponse, MIN_REQUEST_MS } from './client';
 import { emit, printJson, fail, table, jsonMode, EXIT_OK, EXIT_ERR, EXIT_TIMEOUT, EXIT_USAGE } from './output';
 import { flagStr, flagInt } from './args';
 import { waitForEvent, pollUntil } from './waiter';
 import { DATA_ROOT } from '../utils/dataRoot';
 import { bundleRefusal, importBundle, readBundle, writeBundle } from '../bot/internalSetup/utils/dataInterchange';
-import { FolderSyncError } from '../bot/internalSetup/utils/folderChain';
+import { FolderSyncError, setDiskRole } from '../bot/internalSetup/utils/folderChain';
 import { restoreNoAnswerEnding } from '../bot/internalSetup/utils/dataManager';
 
 interface Ctx {
@@ -270,6 +270,14 @@ const HANDLERS: Record<string, Handler> = {
     emit(res, c.flags, (b) => printRestored(guildId, b));
   },
 
+  // --- the bot's own JSON backups (NB8) ---
+  'backups list': (c) =>
+    simple(c, 'GET', '/api/backups', undefined, (b) =>
+      table(((b as { snapshots?: Record<string, unknown>[] }).snapshots) || [], ['name', 'kind', 'takenAt', 'files', 'bytes', 'test']),
+    ),
+  'backups restore': (c) => backupsRestore(c),
+  'backups settings': (c) => simple(c, 'PUT', '/api/backups/settings', parseBody(c, true)),
+
   // --- misc + cross-cutting ---
   health: (c) => simple(c, 'GET', '/api/health'),
   api: async (c) => {
@@ -403,7 +411,7 @@ async function bundleExport(ctx: Ctx): Promise<void> {
   const guildId = need(ctx, 0, 'guildId');
   const file = need(ctx, 1, 'file');
   const panel = await ctx.client.panelAnswers();
-  const refusal = bundleRefusal(guildId, panel.bot, panel.migration);
+  const refusal = bundleRefusal(guildId, panel.bot, panel.migration, panel.restoring);
   if (refusal) fail(`bundle export refused: ${refusal}`, EXIT_ERR);
   let summary;
   try {
@@ -429,8 +437,9 @@ async function bundleImport(ctx: Ctx): Promise<void> {
     await gen.return(undefined);
   }
   const panel = await ctx.client.panelAnswers();
-  const refusal = bundleRefusal(guildId!, panel.bot, panel.migration);
+  const refusal = bundleRefusal(guildId!, panel.bot, panel.migration, panel.restoring);
   if (refusal) fail(`bundle import refused: ${refusal}`, EXIT_ERR);
+  setDiskRole('a data bundle import');
   let result;
   try {
     result = await importBundle(file);
@@ -538,6 +547,60 @@ async function dataMigrate(ctx: Ctx): Promise<void> {
   printJson(result.body ?? {});
   process.stderr.write(`smdb: ${result.message}\n`);
   process.exit(result.code);
+}
+
+const BACKUPS_STATUS_CMD = 'smdb api GET /api/backups';
+const RESTORE_WAIT_MS = 2 * 60 * 60_000;
+
+function waitWords(ms: number): string {
+  const s = Math.round(ms / 1000);
+  const [n, unit] = s % 3600 === 0 ? [s / 3600, 'hour'] : s % 60 === 0 ? [s / 60, 'minute'] : [s, 'second'];
+  return `${n} ${unit}${n === 1 ? '' : 's'}`;
+}
+
+/**
+ * `backups restore <name>` (decisions 13 and 61): posts, then polls GET /api/backups every 2 s until a latch stands, or
+ * no restore runs and the record has a result or stopped part way. Prints the restore's record and its line; exits 0
+ * only when the restore is done.
+ */
+async function backupsRestore(ctx: Ctx): Promise<void> {
+  const name = need(ctx, 0, 'name');
+  const waitMs = timeoutMs(ctx, RESTORE_WAIT_MS);
+  const deadline = Date.now() + waitMs;
+  let posted: CliResponse;
+  try {
+    posted = await ctx.client.request('POST', '/api/backups/restore', { body: { name }, timeoutMs: Math.max(MIN_REQUEST_MS, deadline - Date.now()) });
+  } catch (error) {
+    return fail(`can't confirm whether the restore of ${name} started (${error instanceof Error ? error.message : String(error)}); check with: ${BACKUPS_STATUS_CMD}`, EXIT_ERR);
+  }
+  const answer = (posted.body && typeof posted.body === 'object' ? posted.body : {}) as { success?: unknown; error?: unknown; state?: unknown; name?: unknown; note?: unknown };
+  if (!posted.ok || answer.success !== true) {
+    printJson(posted.body);
+    return fail(typeof answer.error === 'string' ? answer.error : `HTTP ${posted.status}`, EXIT_ERR);
+  }
+  if (answer.state === 'running' && answer.name !== name) {
+    printJson(posted.body);
+    return fail(typeof answer.note === 'string' ? answer.note : `a restore of ${String(answer.name)} is already running`, EXIT_ERR);
+  }
+  const ended = 'data && data.restore && (data.restore.latch || (!data.restore.running && (data.restore.result || data.restore.state === "stuck" || data.restore.state === "unfinished" || data.restore.state === "unknown")))';
+  let result: { ok: boolean; body: unknown; timedOut?: boolean };
+  try {
+    result = await pollUntil(ctx.client, { path: '/api/backups', expr: ended, intervalMs: 2000, timeoutMs: Math.max(0, deadline - Date.now()), requestMinMs: MIN_REQUEST_MS });
+  } catch (error) {
+    return fail(`can't confirm the outcome of the restore of ${name}: the status request failed (${error instanceof Error ? error.message : String(error)}); check with: ${BACKUPS_STATUS_CMD}`, EXIT_ERR);
+  }
+  const restore = ((result.body as { restore?: unknown } | null)?.restore ?? null) as { name?: unknown; stage?: unknown; state?: unknown; result?: unknown; latch?: unknown; line?: unknown } | null;
+  printJson(restore);
+  if (!result.ok) {
+    const why = result.timedOut ? 'the status request had no answer' : `its record says ${String(restore?.stage ?? 'nothing')}`;
+    return fail(`can't confirm the outcome of the restore of ${name} within ${waitWords(waitMs)}; ${why}; check with: ${BACKUPS_STATUS_CMD}`, EXIT_TIMEOUT);
+  }
+  if (restore?.state === 'unknown') return fail(String(restore.line ?? ''), EXIT_ERR);
+  if (!restore?.latch && restore?.name !== name) {
+    return fail(`can't confirm that the restore of ${name} ran: the restore record names ${String(restore?.name)}; check with: ${BACKUPS_STATUS_CMD}`, EXIT_ERR);
+  }
+  process.stderr.write(`smdb: ${String(restore.line ?? '')}\n`);
+  process.exit(!restore.latch && restore.result === 'done' ? EXIT_OK : EXIT_ERR);
 }
 
 export async function dispatch(client: Client, positionals: string[], flags: Record<string, string | boolean>): Promise<void> {

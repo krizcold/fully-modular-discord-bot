@@ -46,6 +46,7 @@ if (isProd) {
 import 'dotenv/config';
 
 import { beginStop, exitProcess, installStopHandler } from './internalSetup/utils/dataManager';
+import { setDiskRole } from './internalSetup/utils/folderChain';
 import { configureWriterLock, onDeposed, releaseWriterLockAtExit, reportWriterStage, takeWriterLockForBoot } from './internalSetup/utils/writerLock';
 import { setupAddressesIpc } from '../utils/databaseAddress';
 import { setupMemoryIpc } from '../utils/memoryReading';
@@ -76,6 +77,7 @@ async function standbyBoot(): Promise<void> {
 
 // Every writer of the data files runs after the writer lock is taken: clientInitializer loads only then.
 async function boot(): Promise<void> {
+  setDiskRole('bot');
   if (process.env.SMDB_RESHARD_STANDBY) return standbyBoot();
   configureWriterLock('bot');
   setupAddressesIpc();

@@ -41,4 +41,11 @@ describe('smdb --help', () => {
     expect(cap.out).toContain('data migrate --to postgres|file   (bot stopped; exits 0 only when the migration is done)');
     expect(cap.exits[0]).toBe(2);
   });
+
+  it("starts every section line's verbs at the same column", () => {
+    const sections = cap.out.split('\n').filter(l => /^[A-Za-z]+: {2,}\S/.test(l));
+    const columns = sections.map(l => l.indexOf(':') + 1 + l.slice(l.indexOf(':') + 1).search(/\S/));
+    expect(sections.length).toBeGreaterThan(8);
+    expect([...new Set(columns)]).toEqual([11]);
+  });
 });

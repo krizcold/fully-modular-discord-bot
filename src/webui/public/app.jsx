@@ -40,6 +40,8 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [containerRestarting, setContainerRestarting] = useState(false);
   const [newerBuild, setNewerBuild] = useState(null);
+  // The header badge's alert: the newer of the bot status's and the Data backups section's last read.
+  const [backupAlert, setBackupAlert] = useState(null);
 
   // Wrapper so every tab change (button clicks, programmatic switches)
   // updates the URL alongside the React state.
@@ -114,6 +116,10 @@ function App() {
       unsubscribeConnection();
     };
   }, []);
+
+  useEffect(() => {
+    setBackupAlert(status && status.backups ? status.backups.alert : null);
+  }, [status]);
 
   async function loadData() {
     try {
@@ -250,6 +256,11 @@ function App() {
               {status.running ? '● Online' : status.crashed ? '⚠ Crashed' : '○ Offline'}
             </span>
           )}
+          {backupAlert && (
+            <span className="status-badge crashed" style={{ marginLeft: '8px' }} title={backupAlert.text}>
+              {backupAlert.case === 'test-failed' ? 'Backup test failed' : 'Backup failed'}
+            </span>
+          )}
         </span>
       </div>
 
@@ -267,15 +278,18 @@ function App() {
 
       <div className="tab-content">
         {currentTab === 'dashboard' && (
-          <BotControlPanel
-            status={status}
-            onStart={startBot}
-            onRestart={restartBot}
-            onShutdown={shutdownBot}
-            loading={loading}
-            configured={setupStatus?.configured}
-            containerRestarting={containerRestarting}
-          />
+          <>
+            <BotControlPanel
+              status={status}
+              onStart={startBot}
+              onRestart={restartBot}
+              onShutdown={shutdownBot}
+              loading={loading}
+              configured={setupStatus?.configured}
+              containerRestarting={containerRestarting}
+            />
+            <DataBackupsPanel api={api} onBackupAlert={setBackupAlert} />
+          </>
         )}
 
         {currentTab === 'panels' && <PanelsPanel />}

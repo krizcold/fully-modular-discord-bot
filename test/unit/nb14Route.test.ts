@@ -104,7 +104,7 @@ const which = (x: number | undefined, n: number | undefined) => (x === undefined
 const replaceEnding = (x: number | undefined, n: number | undefined) => `Within a minute the outcome is fixed (if the bot stopped mid-step, once it has started again). If \`smdb graveyard list\` then lists an entry for this server ${which(x, n)}, the replace moved the server's data from before into that entry (an empty reason means its note could not be written). If not, either the server had no data or nothing changed. ${tail(x)} ${MAIN}`;
 const plainEnding = (x: number | undefined) => `The outcome is fixed within a minute. ${tail(x)} ${MAIN}`;
 const liveText = (x: number) => `server ${G} has data saved since entry ${x} was deleted; nothing was restored. To put entry ${x} in place and move the current data to the graveyard as a new entry, run: smdb graveyard restore ${G} ${x} --replace`;
-const WARNING = "The disk did not confirm the move of this server's folder (EIO), so a power cut can undo the restore. Check the disk.";
+const WARNING = "The disk did not confirm the move of this server's folder (EIO), so a power cut can undo the restore. Check the disk, then restart the machine.";
 const row = (guildId: string, retiredAt: number) => ({ guildId, retiredAt, reason: 'webui-operator-delete', rows: 2 });
 
 beforeEach(async () => {

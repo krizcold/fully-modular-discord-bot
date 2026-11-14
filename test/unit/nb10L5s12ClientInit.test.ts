@@ -73,7 +73,7 @@ vi.mock('../../src/bot/internalSetup/utils/maintenance', async orig => ({
 }));
 
 let booted: Promise<() => Promise<void>> | null = null;
-/** Boots clientInitializer once and answers the stop step it added (the last one, the drain's). */
+/** Boots clientInitializer once and answers the drain's stop step (the first of two; the second aborts a backup take). */
 function stopStep(): Promise<() => Promise<void>> {
   booted ??= (async () => {
     const realSend = process.send;
@@ -87,13 +87,13 @@ function stopStep(): Promise<() => Promise<void>> {
     try {
       void (await import('../../src/bot/internalSetup/clientInitializer')).main().catch(console.error);
       await vi.waitFor(() => expect(ctl.reported).toContain('guild'), { timeout: 5000, interval: 5 });
-      await vi.waitFor(() => expect(ctl.steps.length).toBeGreaterThan(0), { timeout: 5000, interval: 5 });
+      await vi.waitFor(() => expect(ctl.steps).toHaveLength(2), { timeout: 5000, interval: 5 });
     } finally {
       (process as any).send = realSend;
       if (role === undefined) delete process.env.BOT_PROCESS_ROLE;
       else process.env.BOT_PROCESS_ROLE = role;
     }
-    return ctl.steps[ctl.steps.length - 1];
+    return ctl.steps[0];
   })();
   return booted;
 }

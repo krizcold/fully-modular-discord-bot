@@ -13,7 +13,7 @@ import {
   updateGlobalModuleData,
   updateModuleData,
 } from '../dataManager';
-import { getPending } from '../dataBackends/fileBackend';
+import { getPending, noteDataOp } from '../dataBackends/fileBackend';
 import { isGuildId } from '../dataKeys';
 import { PersistentPanelInstance } from '@bot/types/panelTypes';
 import { DATA_ROOT } from '../../../../utils/dataRoot';
@@ -60,6 +60,7 @@ function moveUnparsableAside(guildId: string | undefined): void {
   const aside = `${file}.corrupt-${Date.now()}`;
   try {
     fs.renameSync(file, aside);
+    noteDataOp();
   } catch (error) {
     console.error(`[Panels] The panel registry ${file} does not parse and could not be moved aside:`, error);
     return;

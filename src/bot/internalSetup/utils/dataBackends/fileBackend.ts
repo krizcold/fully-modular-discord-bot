@@ -85,6 +85,13 @@ const scheduled = new Set<string>();
 const frozen = new Set<string>();
 /** One per deposition's cancel still waiting: it answers at once each of its paths whose try has ended. */
 const frozenLooks = new Set<() => void>();
+// The landing log a backup's take reads: the clock moves as each started try leaves flushing; landings is kept only
+// while a take watches.
+let clock = 0;
+let landings: Map<string, number> | null = null;
+let landingWatchers = 0;
+let epoch = 0;
+let opsInFlight = 0;
 let opSeq = 0;
 // Per path a ticket was issued for, while an op is queued for it: the seq of
 // the last op that landed, so an op at or below it landed itself or was
@@ -474,6 +481,8 @@ async function flushPath(absPath: string): Promise<boolean> {
     }
     return !chain.failed;
   } finally {
+    clock += 1;
+    landings?.set(absPath, clock);
     flushing.delete(absPath);
     tryRecords.delete(absPath);
   }
@@ -814,6 +823,66 @@ export function pathOnTheWire(p: string): boolean {
 /** Right before an exit: each deposition's cancel answers now every path whose try ended since its last poll. */
 export function answerEndedTries(): void {
   for (const look of [...frozenLooks]) look();
+}
+
+/** The landing clock: one more at the end of every flush try that started. */
+export function landClock(): number {
+  return clock;
+}
+
+/** The clock of this path's last ended try while a watch is open; undefined otherwise. */
+export function landedAt(absPath: string): number | undefined {
+  return landings?.get(absPath);
+}
+
+/** The paths with a try ended while a watch is open. */
+export function landedPaths(): string[] {
+  return landings ? [...landings.keys()] : [];
+}
+
+/** The paths whose try is on the wire now. */
+export function flushingPaths(): string[] {
+  return [...flushing];
+}
+
+/** Opens a watch of the landings; the answer drops it (idempotent), and the log goes once no watch is open. */
+export function watchLandings(): () => void {
+  landingWatchers += 1;
+  landings ??= new Map();
+  let open = true;
+  return () => {
+    if (!open) return;
+    open = false;
+    landingWatchers -= 1;
+    if (landingWatchers === 0) landings = null;
+  };
+}
+
+/** Moves with every counted directory operation, at its start and at its end. */
+export function dirEpoch(): number {
+  return epoch;
+}
+
+export function dataOpsInFlight(): number {
+  return opsInFlight;
+}
+
+/** A directory operation that spans awaits: counted until the answer (idempotent) ends it. */
+export function beginDataOp(): () => void {
+  epoch += 1;
+  opsInFlight += 1;
+  let open = true;
+  return () => {
+    if (!open) return;
+    open = false;
+    opsInFlight -= 1;
+    epoch += 1;
+  };
+}
+
+/** A synchronous directory move that has happened. */
+export function noteDataOp(): void {
+  epoch += 1;
 }
 
 /** File flushes landed so far (the exit drain's progress test). */
@@ -1190,36 +1259,41 @@ async function moveGuildDirToGraveyard(guildId: string, reason: string, writerLo
   const deadline = performance.now() + 5000;
   while ([...flushing].some(p => p === src || p.startsWith(src + path.sep)) && performance.now() < deadline) await delay(5);
   const graveyardRoot = path.join(BASE_DATA_DIR, GRAVEYARD_DIR);
-  await fs.promises.mkdir(graveyardRoot, { recursive: true });
-  const dest = path.join(graveyardRoot, `${guildId}-${nextGraveyardName(guildId)}`);
+  const endOp = beginDataOp();
+  try {
+    await fs.promises.mkdir(graveyardRoot, { recursive: true });
+    const dest = path.join(graveyardRoot, `${guildId}-${nextGraveyardName(guildId)}`);
 
-  for (let attempt = 0; ; attempt++) {
-    if (writerLost()) {
-      console.error(`[DataManager] Cannot move ${guildId} to graveyard: another process took the data files; nothing was removed`);
-      return false;
-    }
-    if (stopBeforeTry()) return false;
-    try {
-      await fs.promises.rename(src, dest);
-      dropGuildView(guildId);
-      break;
-    } catch (error) {
-      dropGuildView(guildId);
-      if (attempt >= 9) {
-        console.error(`[DataManager] Failed to move ${guildId} to graveyard:`, error);
+    for (let attempt = 0; ; attempt++) {
+      if (writerLost()) {
+        console.error(`[DataManager] Cannot move ${guildId} to graveyard: another process took the data files; nothing was removed`);
         return false;
       }
-      await delay(25 * (attempt + 1));
+      if (stopBeforeTry()) return false;
+      try {
+        await fs.promises.rename(src, dest);
+        dropGuildView(guildId);
+        break;
+      } catch (error) {
+        dropGuildView(guildId);
+        if (attempt >= 9) {
+          console.error(`[DataManager] Failed to move ${guildId} to graveyard:`, error);
+          return false;
+        }
+        await delay(25 * (attempt + 1));
+      }
     }
-  }
 
-  try {
-    await writeGraveyardNote(dest, { guildId, reason, ts: Date.now() });
-  } catch (error) {
-    console.warn(`[DataManager] Failed to write graveyard marker for ${guildId}:`, error);
+    try {
+      await writeGraveyardNote(dest, { guildId, reason, ts: Date.now() });
+    } catch (error) {
+      console.warn(`[DataManager] Failed to write graveyard marker for ${guildId}:`, error);
+    }
+    console.log(`[DataManager] Guild ${guildId} moved to graveyard (${reason})`);
+    return true;
+  } finally {
+    endOp();
   }
-  console.log(`[DataManager] Guild ${guildId} moved to graveyard (${reason})`);
-  return true;
 }
 
 export interface FileGraveyardEntry {
@@ -1414,6 +1488,7 @@ export function recoverGraveyardRestores(): void {
     fsyncDataDirsSync();
     console.log(`[DataManager] Finished the replace of guild ${guildId}'s data with entry ${x}; its data from before is entry ${n}`);
   }
+  noteDataOp();
 }
 
 export type FileRestoreOutcome =
@@ -1617,17 +1692,22 @@ async function restoreGuildDir(guildId: string, retiredAt: number | undefined, h
   if (copySync.failed) return failCopy(copySyncAnswer(guildId, x, { dir: copySync.dir, errno: copySync.code, kind: copySync.kind }));
 
   // The check before the renames, one synchronous run: the gates, the copy's deadline, the lock file and X.
-  const stop = hooks.stop(COPY_FLOOR_MS);
-  if (stop) return failCopy(stop === 'out-of-time' ? { ok: false, why: 'copy-deadline', x, copied } : { ok: false, why: 'stopped', stop });
-  if (hooks.writerTaken()) return failCopy(writerLostAnswer(guildId));
-  if (!fs.existsSync(entryPath)) return failCopy({ ok: false, why: 'no-entry' });
-  if (!moving) return putPlainCopy(guildId, x, n, reason, usedAt, restorePath, hooks, failCopy);
-
-  const endSection = hooks.enterSection();
+  const endOp = beginDataOp();
   try {
-    return await replaceInSection(guildId, x, n, reason, usedAt, restorePath, hooks);
+    const stop = hooks.stop(COPY_FLOOR_MS);
+    if (stop) return await failCopy(stop === 'out-of-time' ? { ok: false, why: 'copy-deadline', x, copied } : { ok: false, why: 'stopped', stop });
+    if (hooks.writerTaken()) return await failCopy(writerLostAnswer(guildId));
+    if (!fs.existsSync(entryPath)) return await failCopy({ ok: false, why: 'no-entry' });
+    if (!moving) return await putPlainCopy(guildId, x, n, reason, usedAt, restorePath, hooks, failCopy);
+
+    const endSection = hooks.enterSection();
+    try {
+      return await replaceInSection(guildId, x, n, reason, usedAt, restorePath, hooks);
+    } finally {
+      endSection();
+    }
   } finally {
-    endSection();
+    endOp();
   }
 }
 
@@ -1869,7 +1949,10 @@ export async function sweepGraveyard(skip: (guildId: string) => boolean = () => 
     }
     if (usedAt !== null && usedAt >= cutoff) continue;
     const aside = `${SWEEP_PREFIX}${name}`;
-    if (renameAside(name, aside, 'entry')) toRemove.push({ aside, entry: name });
+    if (renameAside(name, aside, 'entry')) {
+      noteDataOp();
+      toRemove.push({ aside, entry: name });
+    }
   }
   for (const { aside, entry } of toRemove) {
     try {
@@ -1999,8 +2082,8 @@ export async function cleanOrphanTmpFiles(dir: string = BASE_DATA_DIR): Promise<
   for (const entry of entries) {
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) {
-      // A data migration's staging and superseded folders keep every file as it was.
-      if (atRoot && (entry.name === '_superseded' || entry.name.startsWith('.migrate-'))) continue;
+      // A data migration's staging and superseded folders, and the backups, keep every file as it was.
+      if (atRoot && (entry.name === '_superseded' || entry.name === '_snapshots' || entry.name.startsWith('.migrate-'))) continue;
       await cleanOrphanTmpFiles(full);
     } else if (entry.isFile() && entry.name.endsWith('.tmp')) {
       try {

@@ -89,6 +89,9 @@ export function mount(file: string, name: string, props: Record<string, any>, gl
   const compiled = ts.transpileModule(source, { compilerOptions: { jsx: ts.JsxEmit.React, target: ts.ScriptTarget.ES2020 } }).outputText;
   const names = Object.keys(globals);
   const Component = new Function('React', ...names, `${compiled}\nreturn ${name};`)(React, ...names.map(n => globals[n]));
+  // A script that renders itself as it loads (app.jsx's ReactDOM.render) ran its hooks already; the mount starts fresh.
+  hooks.length = 0;
+  effects = [];
 
   function render() {
     index = 0;

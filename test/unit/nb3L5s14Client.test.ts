@@ -38,15 +38,15 @@ const late = (ms: number) => new Promise<'no answer'>(done => setTimeout(() => d
 
 describe('panelAnswers', () => {
   it('reads running and migration from a 200 status', async () => {
-    answer(200, { status: { running: true, migration: null } });
-    expect(await client.panelAnswers(2000)).toEqual({ bot: 'yes', migration: 'no' });
-    answer(200, { status: { running: false, migration: { jobId: 'job-1', to: 'postgres' } } });
-    expect(await client.panelAnswers(2000)).toEqual({ bot: 'no', migration: 'yes' });
+    answer(200, { status: { running: true, migration: null, backups: { alert: null, restoring: false } } });
+    expect(await client.panelAnswers(2000)).toEqual({ bot: 'yes', migration: 'no', restoring: 'no' });
+    answer(200, { status: { running: false, migration: { jobId: 'job-1', to: 'postgres' }, backups: { alert: null, restoring: false } } });
+    expect(await client.panelAnswers(2000)).toEqual({ bot: 'no', migration: 'yes', restoring: 'no' });
   });
 
   it('answers unknown for a status that is not 200, whatever its body says', async () => {
     answer(503, { status: { running: true, migration: null } });
-    expect(await client.panelAnswers(2000)).toEqual({ bot: 'unknown', migration: 'unknown' });
+    expect(await client.panelAnswers(2000)).toEqual({ bot: 'unknown', migration: 'unknown', restoring: 'unknown' });
   });
 
   it('answers unknown for a running value that is not a boolean', async () => {
@@ -65,7 +65,7 @@ describe('panelAnswers', () => {
 
   it('answers unknown at once when the answer is cut mid-body', async () => {
     cutMidBody();
-    expect(await Promise.race([client.panelAnswers(10_000), late(1500)])).toEqual({ bot: 'unknown', migration: 'unknown' });
+    expect(await Promise.race([client.panelAnswers(10_000), late(1500)])).toEqual({ bot: 'unknown', migration: 'unknown', restoring: 'unknown' });
   });
 });
 

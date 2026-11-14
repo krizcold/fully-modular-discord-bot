@@ -94,7 +94,7 @@ describe('the restore verb', () => {
   });
 
   it('E1: a warning in the answer goes to stderr after the restored line, and the exit is success', async () => {
-    const W = "The disk did not confirm the move of this server's folder (EIO), so a power cut can undo the restore. Check the disk.";
+    const W = "The disk did not confirm the move of this server's folder (EIO), so a power cut can undo the restore. Check the disk, then restart the machine.";
     const { client } = fakeClient({ status: 200, ok: true, body: { success: true, retiredAt: 5000, reason: 'r', warning: W } });
     await run(client, [G]);
     expect(stdout.join('')).toBe(`restored server ${G} from the entry deleted at ${new Date(5000).toISOString()} (retiredAt 5000, reason r)\n`);

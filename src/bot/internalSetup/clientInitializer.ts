@@ -15,6 +15,7 @@ import { getMetricsCollector } from './utils/metrics/metricsCollector';
 import { startSamplers, stopSamplers } from './utils/metrics/samplers';
 import { addReleaseStep, addStopStep, getGuildDataBackend, sweepGraveyard, DataBackendUnavailableError } from './utils/dataManager';
 import { setupSharedOpsIPC } from './utils/sharedOps';
+import { setupBackupIPC } from './utils/ipcBackupHandler';
 import { reportWriterStage } from './utils/writerLock';
 import { initDataBackendLayer, awaitDataStartupBarrier, dispatchGated, dataUnavailableMessage } from './utils/dataBackends/boot';
 import { getWorkingSet } from './utils/dataBackends/workingSet';
@@ -645,6 +646,7 @@ export async function runBot(opts: RunBotOptions): Promise<void> {
   setupFleetIPCHandlers();
   setupMetricsIPCHandlers();
   setupSharedOpsIPC();
+  setupBackupIPC();
   reportWriterStage('shared');
 
   // Every shard runs in this process.

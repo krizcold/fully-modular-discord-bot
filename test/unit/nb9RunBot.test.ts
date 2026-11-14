@@ -219,7 +219,7 @@ describe('test 19: runBot (C11, 28)', () => {
     expect(h.order.filter(n => !n.startsWith('report ') || n === 'report shared')).toEqual([
       'decideBoot', 'addStopStep', 'addReleaseStep', 'addReleaseStep', 'addReleaseStep', 'setupMaintenanceIPCAtBoot',
       'initDataBackendLayer', 'watchDataBackend', 'setupFleetIPCHandlers', 'setupMetricsIPCHandlers', 'setupSharedOpsIPC',
-      'report shared', 'bootShards', 'buildClient', 'markDiscordStarted', 'startIngest',
+      'addStopStep', 'report shared', 'bootShards', 'buildClient', 'markDiscordStarted', 'startIngest',
     ]);
     expect(h.boots).toEqual([[]]);
     expect(h.client.emitted).toEqual([]);
