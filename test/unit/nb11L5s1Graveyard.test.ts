@@ -25,6 +25,8 @@ const isTmpOf = (p: unknown, target: string) => {
 };
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 const late = (ms: number) => sleep(ms).then(() => 'late' as const);
+// Below the move's own 5 s bound, so a move that waited for the flush still loses the race, with room for a loaded machine.
+const RACE_MS = 4000;
 async function until(check: () => boolean, label: string): Promise<void> {
   const start = Date.now();
   while (!check()) {
@@ -141,7 +143,7 @@ describe('graveyardGuildDir', () => {
     await until(() => hold.tmps.length === 1, 'the flush on the wire');
 
     try {
-      expect(await Promise.race([graveyardGuildDir(gA, 'nb11-other'), late(1000)])).toBe(true);
+      expect(await Promise.race([graveyardGuildDir(gA, 'nb11-other'), late(RACE_MS)])).toBe(true);
       expect(fs.existsSync(dataPath(gA))).toBe(false);
       expect(await entryFile(gA)).toBe('{"n":1}');
     } finally {
@@ -161,11 +163,13 @@ describe('graveyardGuildDir', () => {
     const start = performance.now();
     vi.spyOn(performance, 'now').mockReturnValueOnce(start).mockReturnValue(start + 5000);
     const moved = graveyardGuildDir(g, 'nb11-bound');
-    vi.mocked(performance.now).mockRestore();
     try {
-      expect(await Promise.race([moved, late(1000)])).toBe(true);
+      // The clock stays at the bound until the race settles: the move may read it again after an await.
+      expect(await Promise.race([moved, late(RACE_MS)])).toBe(true);
+      vi.mocked(performance.now).mockRestore();
       expect(await entryFile(g)).toBe('{"n":1}');
     } finally {
+      vi.mocked(performance.now).mockRestore?.();
       hold.fail(errno('EIO'));
       dropPendingForGuild(g);
     }
