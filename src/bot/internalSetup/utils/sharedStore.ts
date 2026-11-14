@@ -1177,6 +1177,7 @@ async function webuiSharedTx<S>(spec: WebuiTxSpec<S>): Promise<SharedTxOutcome<S
     return { kind: 'committed', results };
   } catch (error) {
     const failedAt = performance.now();
+    const failed = sent;
     if (commitSent && commitMayHaveLanded(error)) {
       destroy = true;
       return { kind: 'unknown', ...describeFailure(error) };
@@ -1185,7 +1186,7 @@ async function webuiSharedTx<S>(spec: WebuiTxSpec<S>): Promise<SharedTxOutcome<S
     const answered = typeof (error as { code?: unknown } | null)?.code === 'string';
     destroy = !answered || !(await rollback());
     const timeout = (error as { code?: unknown } | null)?.code === '57014'
-      ? { timeout: { bytes: sent.bytes, elapsedMs: failedAt - sent.at, boundMs: sent.bound, atBound: failedAt - sent.at >= sent.bound } }
+      ? { timeout: { bytes: failed.bytes, elapsedMs: failedAt - failed.at, boundMs: failed.bound, atBound: failedAt - failed.at >= failed.bound } }
       : {};
     return { kind: 'failed', step, ...describeFailure(error), ...timeout };
   } finally {
