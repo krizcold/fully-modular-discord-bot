@@ -832,6 +832,19 @@ describe('the time limits', () => {
     const { setsBoundMinutes } = await import('../mutation/passes.mjs');
     expect(setsBoundMinutes([{ ms: 90_000 }, { ms: 60_000 }])).toBe(8);
   });
+
+  it('cap the bound on many sets at the largest whole minutes setTimeout can hold', async () => {
+    const { MAX_BOUND_MINUTES, setsBoundMinutes } = await import('../mutation/passes.mjs');
+    expect(MAX_BOUND_MINUTES).toBe(35_791);
+    expect(MAX_BOUND_MINUTES * 60_000).toBeLessThanOrEqual(2_147_483_647);
+    expect(setsBoundMinutes([{ ms: 1_388_310_000 }, { ms: 1_388_310_000 }])).toBe(MAX_BOUND_MINUTES);
+  });
+
+  it('cap one set\'s bound at the longest timer Node can hold', async () => {
+    const { setBoundMs, TIMER_LIMIT_MS } = await import('../mutation/passes.mjs');
+    expect(setBoundMs(1_377, 4)).toBe(TIMER_LIMIT_MS);
+    expect(setBoundMs(1_376, 4)).toBe(1_376 * 4 * 390_000 + 60_000);
+  });
 });
 
 describe('the Stryker options', () => {
@@ -848,6 +861,8 @@ describe('the Stryker options', () => {
     // control-b2 runs every file that failed in pass B, each of which could take a whole b2 budget.
     expect(controlBoundMinutes(PASSES.b2, 3)).toBe(365);
     expect(controlBoundMinutes(PASSES.a2, 0)).toBe(246);
+    const { MAX_BOUND_MINUTES } = await import('../mutation/passes.mjs');
+    expect(controlBoundMinutes(PASSES.a2, 1_000)).toBe(MAX_BOUND_MINUTES);
     // A run with no mutant of every related fast file took 27.9 minutes on a busy machine.
     for (const name of ['a', 'a2'] as const) expect(PASSES[name].dryRunTimeoutMinutes, name).toBe(60);
   });

@@ -10,7 +10,9 @@
 import { createHash } from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import { RUN_BOUND } from './passes.mjs';
+import { RUN_BOUND, TIMER_LIMIT_MS } from './passes.mjs';
+
+export { TIMER_LIMIT_MS };
 
 /**
  * @typedef {{ files: string[], unsure: number[], reached: Record<string, number[]>, costs?: number[] }} Reach files: the
@@ -36,8 +38,6 @@ export const TAKEN_FILE = 'taken.json';
 export const RUN_KEYS_FILE = 'run-keys.json';
 // In a2's dir: what each file cost in a2's run with no mutant (writeCosts).
 export const COSTS_FILE = 'dry-costs.json';
-// Node's limit on a timer: a longer one fires at once.
-export const TIMER_LIMIT_MS = 2 ** 31 - 1;
 
 /**
  * @param {string} testDir

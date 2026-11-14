@@ -59,6 +59,11 @@ export const RUN_BOUND = { factor: 3, startMs: 120_000 };
  */
 export const A2_BOUND = { factor: PASSES.a2.timeoutFactor, startMs: PASSES.a2.timeoutMS };
 
+// Node's limit on a timer: a longer one fires at once.
+export const TIMER_LIMIT_MS = 2 ** 31 - 1;
+// Stryker hands its bound's minutes * 60,000 to a timer.
+export const MAX_BOUND_MINUTES = Math.floor(TIMER_LIMIT_MS / 60_000);
+
 /**
  * The bound, in minutes, on the run with no mutant after a pass's reruns
  * alone (touched.mjs control()): above the largest budget Stryker can give a
@@ -66,12 +71,12 @@ export const A2_BOUND = { factor: PASSES.a2.timeoutFactor, startMs: PASSES.a2.ti
  * timeoutMS) and five minutes for Stryker's overhead, so the budget, not the
  * bound, judges that run's time. That run takes every file `files` reruns
  * took, one each (control-b2: every file that failed in pass B), so the bound
- * is that budget times their number.
+ * is that budget times their number, capped at MAX_BOUND_MINUTES.
  * @param {{ timeoutFactor: number, timeoutMS: number, dryRunTimeoutMinutes: number }} rerun
  * @param {number} [files]
  */
 export const controlBoundMinutes = ({ timeoutFactor, timeoutMS, dryRunTimeoutMinutes }, files = 1) =>
-  Math.ceil(Math.max(1, files) * (timeoutFactor * dryRunTimeoutMinutes + timeoutMS / 60_000)) + 5;
+  Math.min(MAX_BOUND_MINUTES, Math.ceil(Math.max(1, files) * (timeoutFactor * dryRunTimeoutMinutes + timeoutMS / 60_000)) + 5);
 
 /**
  * The bound, in ms, on one vitest run with no mutant of `files` fast test
@@ -79,16 +84,17 @@ export const controlBoundMinutes = ({ timeoutFactor, timeoutMS, dryRunTimeoutMin
  * (touched.mjs aloneCheck and setCheck): per file, the config's hook limit for
  * a beforeAll and an afterAll and its test limit (vitest.config.ts), plus a
  * minute to start. A run past it ends, with every process it started, and
- * counts as failed.
+ * counts as failed. It is capped at TIMER_LIMIT_MS, since runner.mjs gives it to a timer.
  * @param {number} files
  * @param {number} scale
  */
-export const setBoundMs = (files, scale) => Math.max(1, files) * scale * (2 * 180_000 + 30_000) + 60_000;
+export const setBoundMs = (files, scale) => Math.min(TIMER_LIMIT_MS, Math.max(1, files) * scale * (2 * 180_000 + 30_000) + 60_000);
 
 /**
  * Stryker's bound, in minutes, on a run with no mutant that runs each of
  * `sets` in a vitest run of its own: the sum of their bounds and five minutes
  * for Stryker's overhead, so a set's own bound, not Stryker's, ends a hang.
+ * It is capped at MAX_BOUND_MINUTES, which loses nothing for that reason.
  * @param {{ ms: number }[]} sets
  */
-export const setsBoundMinutes = sets => Math.ceil(sets.reduce((sum, set) => sum + set.ms, 0) / 60_000) + 5;
+export const setsBoundMinutes = sets => Math.min(MAX_BOUND_MINUTES, Math.ceil(sets.reduce((sum, set) => sum + set.ms, 0) / 60_000) + 5);
