@@ -1,5 +1,6 @@
 import { ComponentType, InteractionResponseType, ModalBuilder, TextInputStyle } from 'discord.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => (await import('../helpers/longConfirm')).longConfirm(await orig<any>()));
 
 import { confirmWrite, saveData, saveDataOutcome } from '../../src/bot/internalSetup/utils/dataManager';
 import { ledgerOf, openLedger, runInLedger } from '../../src/bot/internalSetup/utils/dataBackends/writeLedger';

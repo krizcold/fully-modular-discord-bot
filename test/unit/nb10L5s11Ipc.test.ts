@@ -15,7 +15,7 @@ const h = vi.hoisted(() => ({
 }));
 
 vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => {
-  const real = await orig<any>();
+  const real = (await import('../helpers/longConfirm')).longConfirm(await orig<any>());
   return {
     ...real,
     restoreGuildFromGraveyard: (...a: any[]) => (h.restore ? h.restore(...a) : real.restoreGuildFromGraveyard(...a)),

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => (await import('../helpers/longConfirm')).longConfirm(await orig<any>()));
 
 import { applyOperatorDataRead, applyOperatorDataWrite } from '../../src/bot/internalSetup/utils/ipcDataHandler';
 import { setStoppedServingHook } from '../../src/bot/internalSetup/utils/servingGate';

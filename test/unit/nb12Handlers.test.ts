@@ -7,7 +7,7 @@ const local = vi.hoisted(() => ({ commands: [] as any[] }));
 const bot = vi.hoisted(() => ({ client: null as any }));
 const confirms = vi.hoisted(() => ({ calls: 0 }));
 vi.mock('../../src/bot/internalSetup/utils/dataManager', async importOriginal => {
-  const real = await importOriginal<typeof import('../../src/bot/internalSetup/utils/dataManager')>();
+  const real = (await import('../helpers/longConfirm')).longConfirm(await importOriginal<typeof import('../../src/bot/internalSetup/utils/dataManager')>());
   return { ...real, confirmWrite: (...args: Parameters<typeof real.confirmWrite>) => { confirms.calls += 1; return real.confirmWrite(...args); } };
 });
 vi.mock('../../src/bot/internalSetup/utils/getLocalCommands', () => ({ default: () => local.commands }));

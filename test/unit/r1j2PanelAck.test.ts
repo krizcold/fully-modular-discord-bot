@@ -1,5 +1,6 @@
 import { ActionRowBuilder, ComponentType, DiscordAPIError, InteractionResponseType, ModalBuilder, TextInputBuilder, TextInputStyle, type Client } from 'discord.js';
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest';
+vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => (await import('../helpers/longConfirm')).longConfirm(await orig<any>()));
 
 import { answerWrites } from '../../src/bot/internalSetup/utils/dataBackends/replyGate';
 import { saveData } from '../../src/bot/internalSetup/utils/dataManager';

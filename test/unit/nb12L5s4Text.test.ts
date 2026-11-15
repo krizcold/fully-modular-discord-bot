@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => (await import('../helpers/longConfirm')).longConfirm(await orig<any>()));
 import { operatorRefusalText, verdictOf } from '../../src/bot/internalSetup/utils/dataBackends/replyGate';
 import { WriteLedger, openLedger } from '../../src/bot/internalSetup/utils/dataBackends/writeLedger';
 

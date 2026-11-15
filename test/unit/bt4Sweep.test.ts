@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { ComponentType } from 'discord.js';
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest';
+vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => (await import('../helpers/longConfirm')).longConfirm(await orig<any>()));
 
 import { saveData, saveDataOutcome } from '../../src/bot/internalSetup/utils/dataManager';
 import { freezeGuildWrites } from '../helpers/freezeGuild';

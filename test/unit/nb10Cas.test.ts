@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => (await import('../helpers/longConfirm')).longConfirm(await orig<any>()));
 import { dataPath } from '../../src/utils/dataRoot';
 import { applyOperatorDataWrite, applyOperatorGlobalRead, shaOfRaw } from '../../src/bot/internalSetup/utils/ipcDataHandler';
 import { applySharedOp } from '../../src/bot/internalSetup/utils/sharedOps';

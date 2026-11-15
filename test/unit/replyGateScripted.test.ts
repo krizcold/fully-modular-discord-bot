@@ -10,7 +10,7 @@ type Rule = { match: (ticket: { kind: string; guildId?: string }) => boolean; an
 const script = vi.hoisted(() => ({ rules: [] as Rule[], refuseOnce: new Set<string>() }));
 
 vi.mock('../../src/bot/internalSetup/utils/dataManager', async importOriginal => {
-  const real = await importOriginal<typeof import('../../src/bot/internalSetup/utils/dataManager')>();
+  const real = (await import('../helpers/longConfirm')).longConfirm(await importOriginal<typeof import('../../src/bot/internalSetup/utils/dataManager')>());
   return {
     ...real,
     confirmWrite: async (...args: Parameters<typeof real.confirmWrite>) => {

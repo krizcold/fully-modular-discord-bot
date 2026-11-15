@@ -10,7 +10,7 @@ const h = vi.hoisted(() => ({
 }));
 
 vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => {
-  const real = await orig<any>();
+  const real = (await import('../helpers/longConfirm')).longConfirm(await orig<any>());
   return {
     ...real,
     deleteDataTracked: (...a: any[]) => (h.del ? h.del(...a) : real.deleteDataTracked(...a)),

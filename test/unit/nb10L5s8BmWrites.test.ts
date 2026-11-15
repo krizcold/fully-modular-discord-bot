@@ -1,5 +1,6 @@
 import fs from 'fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => (await import('../helpers/longConfirm')).longConfirm(await orig<any>()));
 
 // NB10 mutation survivors (chunk 8, botManager.ts): the answers of a guild write and a shared op, by route: the child,
 // the local chain (its label at the web UI's exit, a deposition mid-op) and a refusal the op waits out or answers.

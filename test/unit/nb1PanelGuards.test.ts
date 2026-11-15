@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => (await import('../helpers/longConfirm')).longConfirm(await orig<any>()));
 
 vi.mock('../../src/bot/internalSetup/utils/botManagerAPI', async importOriginal => ({
   ...(await importOriginal<object>()),

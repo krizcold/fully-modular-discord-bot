@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => (await import('../helpers/longConfirm')).longConfirm(await orig<any>()));
 
 // A file name holding a backslash cannot be made on Windows: a key "...zz-badkey..." under a module reads here as if
 // it held a backslash in that place. A lone segment (the IPC's own check) stays as given.

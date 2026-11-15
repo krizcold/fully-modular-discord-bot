@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const inject = vi.hoisted(() => ({ refuse: new Map<string, string>() }));
 vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => {
-  const real = await orig<typeof import('../../src/bot/internalSetup/utils/dataManager')>();
+  const real = (await import('../helpers/longConfirm')).longConfirm(await orig<typeof import('../../src/bot/internalSetup/utils/dataManager')>());
   const ledger = await import('../../src/bot/internalSetup/utils/dataBackends/writeLedger');
   const guard = (filename: string, options: any) => {
     const cause = inject.refuse.get(filename);
