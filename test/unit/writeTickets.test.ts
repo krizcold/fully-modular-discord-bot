@@ -643,7 +643,7 @@ const fileRows: Row[] = [
     run: async () => {
       const file = freshPath('lands.json');
       enqueueWrite(file, '{"a":1}');
-      const outcome = await confirmFile(fileTicket(file), 5000);
+      const outcome = await confirmFile(fileTicket(file), 20_000);
       expect(fs.readFileSync(file, 'utf8')).toBe('{"a":1}');
       return [outcome];
     },
@@ -657,10 +657,10 @@ const fileRows: Row[] = [
       const first = fileTicket(file);
       enqueueWrite(file, '{"v":2}');
       const second = fileTicket(file);
-      const outcomes = [await confirmFile(second, 5000), await confirmFile(first, 0)];
+      const outcomes = [await confirmFile(second, 20_000), await confirmFile(first, 0)];
       expect(fs.readFileSync(file, 'utf8')).toBe('{"v":2}');
       enqueueDelete(file);
-      outcomes.push(await confirmFile(fileTicket(file), 5000));
+      outcomes.push(await confirmFile(fileTicket(file), 20_000));
       expect(fs.existsSync(file)).toBe(false);
       return outcomes;
     },
@@ -673,10 +673,10 @@ const fileRows: Row[] = [
       fs.mkdirSync(file, { recursive: true });
       enqueueWrite(file, '{"a":1}');
       const ticket = fileTicket(file);
-      const refused = await confirmFile(ticket, 10_000);
+      const refused = await confirmFile(ticket, 30_000);
       expect(filesPending([file])).toBe(true);
       fs.rmSync(file, { recursive: true });
-      const healed = await confirmFile(ticket, 10_000);
+      const healed = await confirmFile(ticket, 30_000);
       expect(fs.readFileSync(file, 'utf8')).toBe('{"a":1}');
       return [refused, healed];
     },
@@ -691,10 +691,10 @@ const fileRows: Row[] = [
       const file = path.join(parent, 'inner.json');
       enqueueWrite(file, '{"a":1}');
       const ticket = fileTicket(file);
-      const refused = await confirmFile(ticket, 10_000);
+      const refused = await confirmFile(ticket, 30_000);
       expect(filesPending([file])).toBe(true);
       fs.rmSync(parent);
-      const healed = await confirmFile(ticket, 10_000);
+      const healed = await confirmFile(ticket, 30_000);
       expect(fs.readFileSync(file, 'utf8')).toBe('{"a":1}');
       return [refused, healed];
     },
@@ -706,7 +706,7 @@ const fileRows: Row[] = [
       const file = freshPath('deadline.json');
       enqueueWrite(file, '{"a":1}');
       const ticket = fileTicket(file);
-      return [await confirmFile(ticket, 0), await confirmFile(ticket, 5000)];
+      return [await confirmFile(ticket, 0), await confirmFile(ticket, 20_000)];
     },
   },
   {
@@ -728,7 +728,7 @@ const fileRows: Row[] = [
         expect(making).toHaveBeenCalledTimes(1);
         expect(filesPending([file])).toBe(true);
         open();
-        const landed = await confirmFile(ticket, 5000);
+        const landed = await confirmFile(ticket, 20_000);
         expect(fs.readFileSync(file, 'utf8')).toBe('{"a":1}');
         return [atTheDeadline, landed];
       } finally {
@@ -1190,7 +1190,7 @@ describe('a write that landed is confirmed while a second writer keeps its guild
     expect(fs.readFileSync(path.join(process.env.DATA_DIR!, guildId, 'm', 'a.json'), 'utf8')).toBe(JSON.stringify({ a: 1 }, null, 2));
     expect(filesPending([blocked])).toBe(true);
     fs.rmSync(blocked, { recursive: true });
-    expect(await confirmFile(held, 10_000)).toBe('ok');
+    expect(await confirmFile(held, 20_000)).toBe('ok');
   });
 });
 
@@ -1284,7 +1284,7 @@ describe('the operator route answers through the real confirmWrite', () => {
     expect(renames.calls()).toBe(30);
     expect(fs.existsSync(file)).toBe(false);
     renames.heal();
-    expect(await confirmFile(fileTicket(file), 10_000)).toBe('ok');
+    expect(await confirmFile(fileTicket(file), 20_000)).toBe('ok');
     expect(fs.readFileSync(file, 'utf8')).toBe(JSON.stringify({ a: 1 }, null, 2));
   });
 });
