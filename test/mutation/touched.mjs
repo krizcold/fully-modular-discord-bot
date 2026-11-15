@@ -14,7 +14,7 @@ import { pastBudget, strykerClock } from './control.mjs';
 import { PACKAGE_LOCKS, treeChanges, treePrint } from './tree.mjs';
 import { canonicalName, keyOf } from './keys.mjs';
 import { A2_BOUND, COMMON, controlBoundMinutes, PASSES, setBoundMs, setsBoundMinutes } from './passes.mjs';
-import { boundFor, readCosts, TAKEN_FILE } from './reach.mjs';
+import { boundFor, dryNotes, failuresIn, flakyFiles, readAgain, readCosts, TAKEN_FILE } from './reach.mjs';
 import {
   a2Dir, boundedDir, chainOf, CHECKS_FILE, CHECKS_PLAN_FILE, CONTROL_KEY, controlLines, DONE_FILE, keysOf, LOCK_FILE, lockOf, mutantDir, nextDir, PLAN_FILE,
   planOf, RESULTS_FILE, resultLines, resumeNumber, RUN_FILE, RUNNER_FILE, savedRun, setKey, setLines, setupChanges, someOf, STAGE_DIR, stageOf,
@@ -80,7 +80,7 @@ const {
   structureLines, DATA_ROUTE_WHY, EXTRA_BREAK_WHY, GLOB_NAME_WHY, beyondTree, checkerDiffers, gatesIn, holdsDataRoute, holdsExtraBreak, linesOfTarget, mutatePatterns,
   notMutated, ownNames, planFromGit, rootGlobFree, rootRelatable, sandboxPatterns, strykerTakes, treeTsconfig, unmatchedPatterns, untouched,
 } = ranges;
-const { byKiller, bySet, classifyKill, endedByBound, judge, killedInA, onlyUnusedDirective, outcome, outcomeOf, toConfirm, toPassB, toUncheck, uncreditFailedAlone, voidFailedSets } = verdicts;
+const { byKiller, bySet, classifyKill, endedByBound, judge, killedInA, onlyUnusedDirective, outcome, outcomeOf, toConfirm, toPassB, toUncheck, uncreditFailedAlone, uncreditFlaky, voidFailedSets } = verdicts;
 
 const USAGE = 'usage: node test/mutation/touched.mjs [--base REF] [--mutate PATTERN]... [--resume DIR] [--concurrency N] [--keep]';
 /** @type {{ base: string, baseGiven: boolean, mutate: string[], resume: string, concurrency: number, keep: boolean }} */
@@ -383,18 +383,17 @@ function reportsOf(name, id) {
 }
 
 /**
- * What failed in the run with no mutant that a dir holds, a line per test file.
+ * What failed in the run with no mutant that a dir holds, a line per test
+ * file, and what else its dir says of it (reach.mjs dryNotes: its unhandled
+ * errors and its reruns alone).
  * @param {string} name
  */
 function dryFailures(name) {
-  /** @type {string[]} */
-  const lines = [];
-  for (const report of reportsOf(name, 'dry')) for (const file of report.testResults ?? []) {
-    if (file.status !== 'failed') continue;
-    const failed = (file.assertionResults ?? []).filter((/** @type {{ status: string }} */ t) => t.status === 'failed');
-    lines.push(`the run with no mutant failed in ${file.name}: ${(failed[0]?.failureMessages?.[0] ?? file.message ?? '').split('\n')[0]}`);
-  }
-  return lines;
+  const out = path.join(reportDir, name);
+  return [
+    ...reportsOf(name, 'dry').flatMap(failuresIn).map(file => `the run with no mutant failed in ${file.name}: ${file.first}`),
+    ...dryNotes(out, posix(path.relative(root, out))),
+  ];
 }
 
 /**
@@ -660,6 +659,8 @@ async function stryker({ dir, tier, mutate, only = [], keys, alone = false, sets
   process.env.SMDB_MUTATION_TARGETS = keys ? path.join(out, 'targets.json') : '';
   process.env.SMDB_MUTATION_RUN = keys ? path.join(out, 'run-ids.json') : '';
   process.env.SMDB_MUTATION_GATE_PID = String(process.pid);
+  // Stryker's bound on the run with no mutant (its default is 5 minutes), which the reruns alone in it keep within (runner.mjs dryTier).
+  process.env.SMDB_MUTATION_DRY_MS = String((extra.dryRunTimeoutMinutes ?? 5) * 60_000);
   if (keys) fs.writeFileSync(path.join(out, 'targets.json'), JSON.stringify(keys));
   if (sandbox.unkept.length > 0) {
     throw new PassError(`the gate cannot give Stryker ${sandbox.unkept.join(', ')} for a sandbox, for it would read the name as a glob; rename it`);
@@ -804,6 +805,27 @@ async function setStage(stage, on, sets, alone, what) {
     s = finishStage(stage, want, read, dir);
   }
   return /** @type {Map<string, { dir: string, line: SetLine }>} */ (s.settled);
+}
+
+/**
+ * Sends to a2 each pass A kill (or one of its run with no checker) whose test
+ * file a run with no mutant of pass A failed in beside other files and that
+ * then passed alone (verdict.mjs uncreditFlaky), before alone-a, which that
+ * file would pass. The files come from the dirs pass A's results came from
+ * (reach.mjs flakyFiles): each ran its mutants only once its run with no
+ * mutant had passed, and that run passes only once its dry-again.json is
+ * written whole (runner.mjs end), so a resume reads the same files and sends
+ * the same mutants to a2. A record there that cannot be read stops the gate:
+ * which kills stand on one run would not be known.
+ * @param {MutantRecord[]} all
+ */
+function flakyCheck(all) {
+  const dirs = [...new Set(all.map(m => m.passes.a?.dir).filter(dir => typeof dir === 'string'))].sort();
+  const { flaky, problem } = flakyFiles(reportDir, dirs);
+  if (problem) throw new PassError(`the record of pass A's reruns alone, ${posix(path.relative(root, reportDir))}/${problem}, so which pass A kills came from a file seen failing under load is not known`);
+  for (const [file, kills] of uncreditFlaky(all, flaky)) {
+    controls.push(`after pass A: ${file} failed in the run with no mutant of ${flaky.get(file)}/ beside other files and passed alone, so its ${kills} kill(s) in pass A do not count and rerun alone in a2`);
+  }
 }
 
 /**
@@ -1051,14 +1073,20 @@ function report(stopped, treeChanged) {
     const lines = untouched(target.file, text, linesOfTarget(target, text.split('\n').length), spans);
     if (lines.length > 0) noMutant.push({ file: target.file, lines });
   }
+  // Every dir of a stage this run walked, a stopped run's kept ones included; only a run with no mutant that passed.
+  const passedAlone = [...walked].sort().flatMap(dir => {
+    const { record, problem } = readAgain(path.join(reportDir, dir));
+    if (problem) return [`${dir}/: ${problem}, so which files passed alone there is not known`];
+    return record?.passed ? record.reruns.filter(r => r.code === 0).map(r => `${dir}/: ${r.file} (${posix(path.relative(root, path.join(reportDir, dir, r.name)))}.log)`) : [];
+  });
   const seed = process.env.SMDB_TEST_SEED;
   const result = judge({
     stamp, scope: `${scope}; fast-check seed ${seed}`, emptyScope, skipped, mutants, noMutant, brackets, deleted, unmatched, report: posix(path.relative(root, reportDir)), stopped, treeChanged, controls,
-    resumed, standIn: process.env.SMDB_MUTATION_VITEST,
+    passedAlone, resumed, standIn: process.env.SMDB_MUTATION_VITEST,
   });
   fs.mkdirSync(reportDir, { recursive: true });
   for (const name of saved ? ['mutants.json', 'summary.txt'] : []) keepEarlier(name);
-  fs.writeFileSync(path.join(reportDir, 'mutants.json'), `${JSON.stringify({ scope, seed, ...(saved ? { resume: resumeN, resumed } : {}), skipped, targets, mutants, controls, verdict: result.verdict, stopped, treeChanged }, null, 2)}\n`);
+  fs.writeFileSync(path.join(reportDir, 'mutants.json'), `${JSON.stringify({ scope, seed, ...(saved ? { resume: resumeN, resumed } : {}), skipped, targets, mutants, controls, passedAlone, verdict: result.verdict, stopped, treeChanged }, null, 2)}\n`);
   fs.writeFileSync(path.join(reportDir, 'summary.txt'), `${result.lines.join('\n')}\n`);
   // On POSIX a pipe takes stdout asynchronously: exit only once it has all of it.
   process.stdout.write(`${result.lines.join('\n')}\n`, () => process.exit(result.code));
@@ -1185,6 +1213,7 @@ try {
     console.log(`L5: pass A again, with no type checker, on ${unchecked.length} mutant(s) whose only type error is an unused @ts-expect-error`);
     await passOn('a', 'a-unchecked', 'a', unchecked, { ...PASSES.a, checkers: [], concurrency: opts.concurrency });
   }
+  flakyCheck(mutants);
   await aloneCheck(mutants);
 
   const confirmA = toConfirm(mutants, 'a');

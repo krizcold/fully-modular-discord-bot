@@ -275,6 +275,39 @@ describe('the passes a mutant goes through', () => {
     expect(toPassB(all)).toContain(fails);
   });
 
+  it('reruns alone in a2 each pass A kill from a file a run with no mutant of pass A saw failing beside other files and passing alone', async () => {
+    const { uncreditFlaky } = await import('../mutation/verdict.mjs');
+    const flakyKill = mutant(1, true, { a: pass('Killed', { killedBy: 'unit/flaky.test.ts > waits', dir: 'a-unchecked' }) });
+    const unchecked = mutant(2, true, { a: pass('Killed', { killedBy: 'unit/flaky.test.ts > other', dir: 'a' }) });
+    const sound = mutant(3, true, { a: pass('Killed', { killedBy: 'unit/a.test.ts > reads', dir: 'a' }) });
+    const context = mutant(4, false, { a: pass('Killed', { killedBy: 'unit/flaky.test.ts > waits', dir: 'a' }) });
+    const survived = mutant(5, true, { a: pass('Survived', { dir: 'a' }) });
+    const all = [flakyKill, unchecked, sound, context, survived];
+    const taken = uncreditFlaky(all, new Map([['unit/flaky.test.ts', 'a'], ['unit/other.test.ts', 'a']]));
+    expect([...taken]).toEqual([['unit/flaky.test.ts', 3]]);
+    expect(flakyKill.passes.a).toEqual({ id: '1', status: 'Killed', dir: 'a-unchecked', recheck: 'unit/flaky.test.ts > waits',
+      inconclusive: 'killed in pass A by unit/flaky.test.ts > waits, but unit/flaky.test.ts: it failed in the run with no mutant of a/ beside other files and then passed alone, as a file that fails under load does, so the kill proves nothing' });
+    // A gating one goes to a2 and counts only if it repeats there; alone-a no longer runs its file for it.
+    expect(toConfirm(all, 'a')).toEqual([flakyKill, unchecked]);
+    expect([...killedInA(all).keys()]).toEqual(['unit/a.test.ts']);
+    expect(outcome(sound)).toBe('Killed');
+    expect(outcome(context)).toBe('Inconclusive');
+    flakyKill.passes.a2 = pass('Killed', { killedBy: 'unit/flaky.test.ts > waits' });
+    expect(outcome(flakyKill)).toBe('Killed');
+    unchecked.passes.a2 = pass('Survived');
+    expect(toPassB(all)).toEqual([unchecked, survived]);
+    expect([...uncreditFlaky([mutant(6, true, { a: pass('Killed', { killedBy: 'unit/a.test.ts > reads' }) })], new Map())]).toEqual([]);
+  });
+
+  it('takes back the kills of files seen failing under load after pass A and its run with no checker, before alone-a, from the dirs its results came from', () => {
+    const gate = fs.readFileSync(path.join(__dirname, '..', 'mutation', 'touched.mjs'), 'utf8');
+    const flaky = gate.indexOf('  flakyCheck(mutants);\n');
+    expect(flaky).toBeGreaterThan(gate.indexOf("await passOn('a', 'a-unchecked'"));
+    expect(flaky).toBeLessThan(gate.indexOf('  await aloneCheck(mutants);\n'));
+    expect(gate).toContain('const dirs = [...new Set(all.map(m => m.passes.a?.dir).filter(dir => typeof dir === \'string\'))].sort();');
+    expect(gate).toContain('const { flaky, problem } = flakyFiles(reportDir, dirs);');
+  });
+
   it('checks pass A\'s kills alone after its run with no checker, before any rerun', () => {
     const gate = fs.readFileSync(path.join(__dirname, '..', 'mutation', 'touched.mjs'), 'utf8');
     const check = gate.indexOf('  await aloneCheck(mutants);\n');

@@ -12,7 +12,9 @@
 // failed), each in its tier; or, with no mutant, each set of files
 // SMDB_MUTATION_SETS names, in a vitest run of its own (touched.mjs aloneCheck
 // and setCheck). Every run stops at its
-// first failed test, or after a tier that fails. A rerun alone (SMDB_MUTATION_CONFIRM=1) and every run with
+// first failed test, or after a tier that fails, but a tier of a run with no
+// mutant other than a check of sets, which runs every file to its end and reruns
+// alone each file it failed in beside other files (dryTier). A rerun alone (SMDB_MUTATION_CONFIRM=1) and every run with
 // no mutant give the config's test and hook limits and a step's default bound four times their time
 // (passes.mjs ALONE_TIME_SCALE, as SMDB_TEST_TIME_SCALE, read by vitest.config.ts and helpers/child.ts), so a slow machine cannot fail a run
 // with no mutant and stop the gate; a mutant's run in pass A or B keeps scale 1. A limit
@@ -23,7 +25,7 @@ import { spawn, spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { ALONE_TIME_SCALE } from './passes.mjs';
+import { ALONE_TIME_SCALE, aloneBoundMs } from './passes.mjs';
 
 const started = performance.now();
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -45,12 +47,14 @@ const mutant = active === 'none' ? 'dry' : active;
  * Runs one tier on `take`: the test files given (relative to test/), the
  * tests related to the mutated files, or every test of the tier. `coverage` is
  * the dir the runs with no mutant of pass A and pass B record reach in; no
- * other run is given one, whatever the caller's shell set.
+ * other run is given one, whatever the caller's shell set. A run `whole` runs
+ * every file to its end, past a failed test, and leaves its unhandled errors
+ * beside its report (unhandled.mjs, as `<name>.unhandled.json`).
  * @param {string} project
  * @param {string[] | 'related' | 'all'} take
- * @param {{ coverage?: string, name?: string }} [run] name: the report's and the log's, in `out`
+ * @param {{ coverage?: string, name?: string, whole?: boolean }} [run] name: the report's and the log's, in `out`
  */
-function launch(project, take, { coverage, name = `${mutant}-${project}` } = {}) {
+function launch(project, take, { coverage, name = `${mutant}-${project}`, whole = false } = {}) {
   const files = Array.isArray(take) ? take : null;
   const base = path.join(out, name);
   /** @type {NodeJS.ProcessEnv} */
@@ -58,7 +62,10 @@ function launch(project, take, { coverage, name = `${mutant}-${project}` } = {})
   delete env.SMDB_MUTATION_COVERAGE;
   delete env.SMDB_MUTATION_INCLUDE;
   delete env.SMDB_MUTATION_SETS;
+  delete env.SMDB_MUTATION_UNHANDLED;
+  delete env.SMDB_MUTATION_DRY_MS;
   if (coverage) env.SMDB_MUTATION_COVERAGE = coverage;
+  if (whole) env.SMDB_MUTATION_UNHANDLED = `${base}.unhandled.json`;
   // vitest.config.ts takes exactly these files, from a file: vitest run <files> takes every path that holds a
   // name, and a long list can pass Windows' limit on a command line.
   if (files) {
@@ -69,14 +76,17 @@ function launch(project, take, { coverage, name = `${mutant}-${project}` } = {})
   // time must match the run with no mutant it is timed against. No results
   // cache: every sandbox links the one in test/node_modules, so earlier runs
   // would choose which file a run takes first.
-  const args = [vitest, ...(take === 'related' ? related : ['run']), '--bail=1', '--no-cache', '--maxWorkers=1', '--project', project, '--reporter=json', `--outputFile=${base}.json`];
+  const args = [
+    vitest, ...(take === 'related' ? related : ['run']), ...(whole ? [] : ['--bail=1']), '--no-cache', '--maxWorkers=1', '--project', project, '--reporter=json',
+    ...(whole ? [`--reporter=${path.join(testDir, 'mutation', 'unhandled.mjs')}`] : []), `--outputFile=${base}.json`,
+  ];
   return { args, env, log: fs.openSync(`${base}.log`, 'w') };
 }
 
 /**
  * @param {string} project
  * @param {string[] | 'related' | 'all'} take
- * @param {{ coverage?: string, name?: string }} [run]
+ * @param {{ coverage?: string, name?: string, whole?: boolean }} [run]
  */
 function tier(project, take, run = {}) {
   const { args, env, log } = launch(project, take, run);
@@ -99,16 +109,17 @@ const running = pid => { try { process.kill(pid, 0); return true; } catch (error
  * could not start), the time it took, whether the runner ended it (it was
  * still running when the bound fired, and did not exit on its own) and
  * vitest's own exit status. With `stop`, it also ends them within a quarter
- * second of `stop()` turning true.
+ * second of `stop()` turning true. `coverage` as in launch().
  * @param {string[]} files
  * @param {string} name
  * @param {number} ms
  * @param {() => boolean} [stop]
+ * @param {string} [coverage]
  * @returns {Promise<{ code: number, ms: number, ended: boolean, status: number | null }>}
  */
-async function bounded(files, name, ms, stop) {
+async function bounded(files, name, ms, stop, coverage) {
   const { endTree } = await import('../helpers/endTree.mjs');
-  const { args, env, log } = launch(projectOf(files[0]), files, { name });
+  const { args, env, log } = launch(projectOf(files[0]), files, { name, coverage });
   const begun = performance.now();
   try {
     const child = spawn(process.execPath, args, { cwd: testDir, stdio: ['ignore', log, log], env });
@@ -182,18 +193,130 @@ if (mutant === 'dry') {
     process.exit(1);
   }
 }
+const { AGAIN_FILE, AGAIN_UNWRITTEN_FILE, dropRecords, testName } = await import('./reach.mjs');
+/** @type {import('./reach.mjs').Again[]} the reruns alone of this run with no mutant (dryTier) */
+const again = [];
+/**
+ * Leaves the reruns alone in AGAIN_FILE, with whether the run with no mutant
+ * passed (null while it runs), written aside and renamed, so the file is
+ * whole or as it was. Returns why it could not be written, '' when it was.
+ * @param {boolean | null} passed
+ */
+const writeAgain = passed => {
+  const file = path.join(out, AGAIN_FILE);
+  try {
+    fs.writeFileSync(`${file}.tmp`, JSON.stringify({ passed, reruns: again }));
+    fs.renameSync(`${file}.tmp`, file);
+    return '';
+  } catch (error) {
+    try { fs.rmSync(`${file}.tmp`, { force: true }); } catch {}
+    return /** @type {NodeJS.ErrnoException} */ (error).code ?? String(error);
+  }
+};
 /**
  * Ends the run. A run with no mutant leaves its time, which the run with no
  * mutant after a rerun's timeouts is held to (control.mjs), by a monotonic
- * clock, which no clock step moves.
+ * clock, which no clock step moves; its reruns alone are part of it. One that
+ * reran files alone fails when its record of them cannot be written: the gate
+ * reads it to send a kill of such a file to a2 (touched.mjs flakyCheck), so it
+ * must not go on without it. Why goes to AGAIN_UNWRITTEN_FILE, if that can be written.
  * @param {number} code
  */
 const end = code => {
+  let exit = code;
+  if (mutant === 'dry' && again.length > 0) {
+    const failed = writeAgain(code === 0);
+    if (failed) {
+      exit = 1;
+      try { fs.writeFileSync(path.join(out, AGAIN_UNWRITTEN_FILE), `${AGAIN_FILE} could not be written (${failed})\n`); } catch {}
+    }
+  }
   if (mutant === 'dry') fs.writeFileSync(path.join(out, 'dry-ms.txt'), String(Math.round(performance.now() - started)));
-  process.exit(code);
+  process.exit(exit);
 };
 // Relative to test/: more files fit on a command line than with the sandbox's absolute paths.
 const related = ['related', ...files.map(file => path.relative(testDir, file).split(path.sep).join('/')), '--run'];
+
+// Stryker's bound on this run with no mutant (touched.mjs sets it), less a
+// minute for Stryker's start before the runner and the runner's end after its
+// last vitest: no rerun alone starts past it, and none runs past it.
+const dryMs = Number(process.env.SMDB_MUTATION_DRY_MS);
+const deadline = dryMs > 0 ? started + dryMs - 60_000 : Infinity;
+
+/**
+ * The test files a failed tier of a run with no mutant failed in, relative to
+ * test/ and in its report's order, when they are the whole failure and other
+ * files ran beside them: each file vitest marked failed (a test, a hook or the
+ * file itself) and each file an unhandled error names. null when the failure
+ * cannot be laid on them: no report or no record of unhandled errors that
+ * reads (vitest itself failed), a report of one file, no file named, or an
+ * unhandled error that names no file of the report.
+ * @param {string} project
+ * @returns {string[] | null}
+ */
+function failedBeside(project) {
+  /** @type {{ testResults?: { name?: unknown, status?: unknown }[] }} */
+  let report;
+  /** @type {unknown} */
+  let errors;
+  try {
+    report = JSON.parse(fs.readFileSync(path.join(out, `dry-${project}.json`), 'utf8'));
+    errors = JSON.parse(fs.readFileSync(path.join(out, `dry-${project}.unhandled.json`), 'utf8'));
+  } catch {
+    return null;
+  }
+  const results = report?.testResults;
+  if (!Array.isArray(results) || !Array.isArray(errors) || !results.every(result => typeof result?.name === 'string')) return null;
+  const names = [...new Set(results.map(result => testName(testDir, /** @type {string} */ (result.name))))];
+  if (names.length < 2) return null;
+  const failed = new Set(results.filter(result => result.status === 'failed').map(result => testName(testDir, /** @type {string} */ (result.name))));
+  for (const error of errors) {
+    const file = typeof error?.file === 'string' ? testName(testDir, error.file) : null;
+    if (file === null || !names.includes(file)) return null;
+    failed.add(file);
+  }
+  return failed.size > 0 ? names.filter(name => failed.has(name)) : null;
+}
+
+/**
+ * Runs one tier of a run with no mutant on `take` (as tier() does), every file
+ * to its end. When it fails only in test files that ran beside others
+ * (failedBeside), each of them reruns alone, one at a time, in a vitest run of
+ * its own at the same time scale, within its bound (passes.mjs aloneBoundMs)
+ * and what is left of Stryker's; with `coverage`, its records from the failed
+ * run are dropped first, so the reach holds the rerun's. The tier passes when
+ * every one passes alone, and fails at the first that does not (README, "A
+ * run with no mutant that fails beside other files"). Resolves to its exit,
+ * the time (Date.now) after the whole tier's vitest exited, and the runner's
+ * time to then, by the monotonic clock, which the costs of that vitest's
+ * report are made against.
+ * @param {string} project
+ * @param {string[] | 'related' | 'all'} take
+ * @param {string} [coverage]
+ * @returns {Promise<{ code: number, end: number, took: number }>}
+ */
+async function dryTier(project, take, coverage) {
+  for (const name of [`dry-${project}.json`, `dry-${project}.unhandled.json`]) fs.rmSync(path.join(out, name), { force: true });
+  const code = tier(project, take, { coverage, whole: true });
+  const ran = { end: Date.now(), took: performance.now() - started };
+  const failed = code === 0 ? [] : failedBeside(project);
+  if (failed === null) return { code, ...ran };
+  for (const file of failed) {
+    const name = `dry-again-${again.length}`;
+    const bound = Math.min(aloneBoundMs(project), Math.floor(deadline - performance.now()));
+    if (bound <= 0) {
+      again.push({ tier: project, file, name, code: null, ms: 0, bound: 0, why: "no time was left within Stryker's bound on the run with no mutant" });
+      writeAgain(null);
+      return { code: 1, ...ran };
+    }
+    if (coverage) dropRecords(coverage, testDir, file);
+    const run = await bounded([file], name, bound, undefined, coverage);
+    again.push({ tier: project, file, name, code: run.code, ms: run.ms, bound, end: Date.now(), ...(run.ended ? { ended: true } : {}) });
+    writeAgain(null);
+    if (run.code !== 0) return { code: 1, ...ran };
+  }
+  return { code: 0, ...ran };
+}
 // The run with no mutant that checks what a pass counted (touched.mjs
 // aloneCheck and setCheck): each set of test files SMDB_MUTATION_SETS names
 // in a vitest run of its own, as a mutant run takes files, within the set's
@@ -227,7 +350,7 @@ if (mutant === 'dry' && sets.length > 0) {
 if (only.length > 0) {
   for (const project of ['fast', 'integration', 'child']) {
     const these = only.filter(file => projectOf(file) === project);
-    if (these.length > 0 && tier(project, these)) end(1);
+    if (these.length > 0 && (mutant === 'dry' ? (await dryTier(project, these)).code : tier(project, these))) end(1);
   }
   end(0);
 }
@@ -238,22 +361,25 @@ if (only.length > 0) {
 // name their files above.
 if (pass === 'b') {
   const { COVERAGE_DIR, REACH_FILE, readReach, selectFor, writeReach } = await import('./reach.mjs');
-  const whole = () => tier('integration', 'related') || tier('child', 'all');
-  if (confirm) end(whole());
+  /** @param {string} [coverage] */
+  const whole = async coverage => (mutant === 'dry'
+    ? (await dryTier('integration', 'related', coverage)).code || (await dryTier('child', 'all', coverage)).code
+    : tier('integration', 'related') || tier('child', 'all'));
+  if (confirm) end(await whole());
   else if (mutant === 'dry') {
     const coverage = path.join(out, COVERAGE_DIR);
     fs.rmSync(coverage, { recursive: true, force: true });
     try { fs.rmSync(path.join(out, REACH_FILE), { force: true }); } catch {}
-    const code = tier('integration', 'related', { coverage }) || tier('child', 'all', { coverage });
+    const code = await whole(coverage);
     // With no reach left, every mutant run takes every related integration file and the whole child tier.
-    if (code === 0) try { writeReach(out, testDir, ['integration', 'child']); } catch { try { fs.rmSync(path.join(out, REACH_FILE), { force: true }); } catch {} }
+    if (code === 0) try { writeReach(out, testDir, ['integration', 'child'], undefined, undefined, again); } catch { try { fs.rmSync(path.join(out, REACH_FILE), { force: true }); } catch {} }
     end(code);
   } else {
     const reach = readReach(out);
     const take = reach && reach.files.every(file => projectOf(file) !== 'fast') ? selectFor(reach, mutant) : null;
     // One that cannot be written only leaves the report without "no test of pass B reached it".
     try { fs.writeFileSync(path.join(out, `${mutant}-reach.json`), JSON.stringify({ files: take ?? 'related' })); } catch {}
-    if (take === null) end(whole());
+    if (take === null) end(await whole());
     else {
       for (const project of ['integration', 'child']) {
         const these = take.filter(file => projectOf(file) === project);
@@ -291,9 +417,9 @@ async function runTake(take, bound) {
 // them is bounded by what they cost there, as Stryker bounds the whole pass.
 if (confirm) {
   if (mutant === 'dry') {
-    const code = tier('fast', 'related');
-    try { writeCosts(out, testDir, Date.now(), performance.now() - started); } catch { try { fs.rmSync(path.join(out, COSTS_FILE), { force: true }); } catch {} }
-    end(code);
+    const run = await dryTier('fast', 'related');
+    try { writeCosts(out, testDir, run.end, run.took, again); } catch { try { fs.rmSync(path.join(out, COSTS_FILE), { force: true }); } catch {} }
+    end(run.code);
   }
   const take = takenBefore(out, mutant);
   await runTake(take, boundFor(readCosts(out), take, { ...A2_BOUND, startMs: boundStartMs(process.env, A2_BOUND.startMs) }));
@@ -304,10 +430,10 @@ if (confirm) {
 if (mutant === 'dry') {
   const coverage = path.join(out, COVERAGE_DIR);
   fs.rmSync(coverage, { recursive: true, force: true });
-  const code = tier('fast', 'related', { coverage });
+  const run = await dryTier('fast', 'related', coverage);
   // With no reach left, every mutant run takes every related file.
-  try { writeReach(out, testDir, ['fast'], Date.now(), performance.now() - started); } catch { try { fs.rmSync(path.join(out, REACH_FILE), { force: true }); } catch {} }
-  end(code);
+  try { writeReach(out, testDir, ['fast'], run.end, run.took, again); } catch { try { fs.rmSync(path.join(out, REACH_FILE), { force: true }); } catch {} }
+  end(run.code);
 }
 const reach = readReach(out);
 const take = selectFor(reach, mutant);
