@@ -85,6 +85,27 @@ describe('a mutant run', () => {
     expect(calls[0].args).toEqual(expect.arrayContaining(['related', '../src/a.ts', '--bail=1', '--no-cache']));
   });
 
+  it('gives every run with no mutant four times the time, as a rerun alone, and a mutant run of pass A or B the config\'s', () => {
+    const dry = { __STRYKER_ACTIVE_MUTANT__: 'none', SMDB_MUTATION_FILES: '["test/mutation/control.mjs"]' };
+    const sets = { ...dry, SMDB_MUTATION_SETS: JSON.stringify([{ files: ['unit/a.test.ts'], ms: 60_000 }]) };
+    const runs: [string, string, string[], NodeJS.ProcessEnv, string[]][] = [
+      ['pass A with no mutant', 'a', [], dry, ['fast']],
+      ['pass B with no mutant', 'b', [], dry, ['integration', 'child']],
+      ['alone-a', 'a', [], sets, ['fast']],
+      ['named files with no mutant', 'b', ['child/c.test.ts'], dry, ['child']],
+    ];
+    for (const [what, pass, only, env, tiers] of runs) {
+      const fake = fakeVitest([]);
+      expect(runner(fake, pass, '', only, env).status, what).toBe(0);
+      expect(fake.read().map(call => [call.project, call.scale]), what).toEqual(tiers.map(project => [project, '4']));
+    }
+    for (const pass of ['a', 'b']) {
+      const fake = fakeVitest([]);
+      expect(runner(fake, pass, '').status, pass).toBe(0);
+      expect(fake.read().map(call => [call.mutant, call.scale]), pass).toEqual((pass === 'a' ? ['fast'] : ['integration', 'child']).map(() => ['7', '1']));
+    }
+  });
+
   it('refuses, before any mutant, a file that holds a way to /data as the pass copied it', () => {
     const fake = fakeVitest([]);
     // The id touched.mjs gives every run with no mutant.
@@ -820,16 +841,14 @@ describe('the time limits', () => {
     expect((config.test.hookTimeout - PASSES.b.timeoutMS) / PASSES.b.timeoutFactor).toBe(60_000);
   });
 
-  it('bound a run of a set with no mutant above a beforeAll, an afterAll and a test of each file at their limits, and Stryker above every set', async () => {
-    for (const scale of [1, 4]) {
-      vi.stubEnv('SMDB_TEST_TIME_SCALE', String(scale));
-      vi.resetModules();
-      const config = (await import('../vitest.config')).default as { test: { testTimeout: number; hookTimeout: number } };
-      const { setBoundMs } = await import('../mutation/passes.mjs');
-      expect(setBoundMs(1, scale), String(scale)).toBe(2 * config.test.hookTimeout + config.test.testTimeout + 60_000);
-      expect(setBoundMs(3, scale) - 60_000, String(scale)).toBe(3 * (setBoundMs(1, scale) - 60_000));
-    }
-    const { setsBoundMinutes } = await import('../mutation/passes.mjs');
+  it('bound a run of a set with no mutant above a beforeAll, an afterAll and a test of each file at their limits with no mutant, and Stryker above every set', async () => {
+    vi.stubEnv('SMDB_TEST_TIME_SCALE', '4');
+    vi.resetModules();
+    const config = (await import('../vitest.config')).default as { test: { testTimeout: number; hookTimeout: number } };
+    const { ALONE_TIME_SCALE, setBoundMs, setsBoundMinutes } = await import('../mutation/passes.mjs');
+    expect(ALONE_TIME_SCALE).toBe(4);
+    expect(setBoundMs(1)).toBe(2 * config.test.hookTimeout + config.test.testTimeout + 60_000);
+    expect(setBoundMs(3) - 60_000).toBe(3 * (setBoundMs(1) - 60_000));
     expect(setsBoundMinutes([{ ms: 90_000 }, { ms: 60_000 }])).toBe(8);
   });
 
@@ -842,8 +861,8 @@ describe('the time limits', () => {
 
   it('cap one set\'s bound at the longest timer Node can hold', async () => {
     const { setBoundMs, TIMER_LIMIT_MS } = await import('../mutation/passes.mjs');
-    expect(setBoundMs(1_377, 4)).toBe(TIMER_LIMIT_MS);
-    expect(setBoundMs(1_376, 4)).toBe(1_376 * 4 * 390_000 + 60_000);
+    expect(setBoundMs(1_377)).toBe(TIMER_LIMIT_MS);
+    expect(setBoundMs(1_376)).toBe(1_376 * 4 * 390_000 + 60_000);
   });
 });
 
@@ -869,7 +888,7 @@ describe('the Stryker options', () => {
 
   it("bound pass B's own run with no mutant at two hours, and b2's, which the bound after the reruns is built from, at fifteen minutes", async () => {
     const { controlBoundMinutes, PASSES } = await import('../mutation/passes.mjs');
-    expect(PASSES.b.dryRunTimeoutMinutes).toBe(120);
+    expect(PASSES.b.dryRunTimeoutMinutes).toBe(180);
     expect(PASSES.b2.dryRunTimeoutMinutes).toBe(15);
     expect(PASSES.a.dryRunTimeoutMinutes).toBe(60);
     expect(PASSES.a2.dryRunTimeoutMinutes).toBe(60);

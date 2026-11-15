@@ -640,7 +640,7 @@ const common = {
  * those that reached it in pass B's run with no mutant); `only`, when given,
  * names the test files to run instead. A run `alone` (the reruns, a2 and b2,
  * and the runs with no mutant after them) gets four times the config's time
- * limits. `keys`, when given, are the mutants the pass is for: Stryker makes
+ * limits, as every run with no mutant does (runner.mjs). `keys`, when given, are the mutants the pass is for: Stryker makes
  * every mutant its spans hold, and the others run no test (targets.mjs).
  * `sets`, when given, are sets of test files the run with no mutant runs each
  * in a vitest run of its own, within the set's bound in ms (aloneCheck,
@@ -756,7 +756,7 @@ async function control(after, tier, on, only, timed = false) {
  * @param {string} dir
  * @param {MutantRecord[]} on
  * @param {{ files: string[], ms: number }[]} sets
- * @param {boolean} alone four times the config's time limits, as a2 ran
+ * @param {boolean} alone a2's Stryker options in place of pass A's (every run with no mutant gets four times the config's time limits)
  * @param {string} what
  */
 async function runSets(dir, on, sets, alone, what) {
@@ -811,7 +811,8 @@ async function setStage(stage, on, sets, alone, what) {
  * checker) alone, once, with no mutant: a mutant's run there took only the
  * files that reached it, so a file that fails on its own (for one, without
  * state a dropped file leaves behind) would count as a kill. runSets runs
- * each file as such a run takes files, at pass A's time limits. A kill whose
+ * each file as such a run takes files, at four times the config's time limits,
+ * as every run with no mutant (runner.mjs). A kill whose
  * file failed there, or ran past its bound, is taken back (verdict.mjs
  * uncreditFailedAlone), and its mutant reruns alone in a2.
  * @param {MutantRecord[]} all
@@ -823,7 +824,7 @@ async function aloneCheck(all) {
   const on = [...killed.values()].flat();
   for (const m of on) /** @type {PassResult} */ (m.passes.a).pending = 'alone-a';
   console.log(`L5: each of the ${files.length} test file(s) that killed a mutant in pass A, alone with no mutant, so a kill counts only from a file that passes on its own`);
-  const runs = await setStage('alone-a', on, files.map(file => ({ files: [file], ms: setBoundMs(1, 1) })), false, 'the run of each file that killed a mutant in pass A, alone with no mutant,');
+  const runs = await setStage('alone-a', on, files.map(file => ({ files: [file], ms: setBoundMs(1) })), false, 'the run of each file that killed a mutant in pass A, alone with no mutant,');
   /** @param {string} file */
   const runOf = file => /** @type {{ dir: string, line: SetLine }} */ (runs.get(setKey([file])));
   const dirs = [...new Set(files.map(file => runOf(file).dir))];
@@ -877,7 +878,7 @@ async function setCheck(on) {
   for (const m of sets.flatMap(set => set.on)) /** @type {PassResult} */ (m.passes.a2).pending = 'alone-a2';
   const runnable = /** @type {{ files: string[], on: MutantRecord[] }[]} */ (sets.filter(set => set.files !== null));
   console.log(`L5: each of the ${sets.length} set(s) of fast test files an a2 kill or timeout ran on, once with no mutant, so a result counts only from a set that passes without it`);
-  const runs = runnable.length === 0 ? new Map() : await setStage('alone-a2', runnable.flatMap(set => set.on), runnable.map(set => ({ files: set.files, ms: setBoundMs(set.files.length, 4) })), true,
+  const runs = runnable.length === 0 ? new Map() : await setStage('alone-a2', runnable.flatMap(set => set.on), runnable.map(set => ({ files: set.files, ms: setBoundMs(set.files.length) })), true,
     'the run of each set of files an a2 result ran on, with no mutant,');
   /** @param {MutantRecord} m */
   const a2At = m => m.passes.a2?.dir ?? 'a2';

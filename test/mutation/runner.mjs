@@ -12,9 +12,10 @@
 // failed), each in its tier; or, with no mutant, each set of files
 // SMDB_MUTATION_SETS names, in a vitest run of its own (touched.mjs aloneCheck
 // and setCheck). Every run stops at its
-// first failed test, or after a tier that fails. A rerun alone (SMDB_MUTATION_CONFIRM=1) gives the config's
-// test and hook limits and a step's default bound four times their time
-// (SMDB_TEST_TIME_SCALE, read by vitest.config.ts and helpers/child.ts); a limit
+// first failed test, or after a tier that fails. A rerun alone (SMDB_MUTATION_CONFIRM=1) and every run with
+// no mutant give the config's test and hook limits and a step's default bound four times their time
+// (passes.mjs ALONE_TIME_SCALE, as SMDB_TEST_TIME_SCALE, read by vitest.config.ts and helpers/child.ts), so a slow machine cannot fail a run
+// with no mutant and stop the gate; a mutant's run in pass A or B keeps scale 1. A limit
 // a test sets itself is not scaled. Vitest's output goes to files, one JSON report and one log
 // per run, because Stryker buffers what a command prints with Node's 1 MB exec
 // limit and an overflow would end the run and count as a kill.
@@ -22,6 +23,7 @@ import { spawn, spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { ALONE_TIME_SCALE } from './passes.mjs';
 
 const started = performance.now();
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -52,7 +54,7 @@ function launch(project, take, { coverage, name = `${mutant}-${project}` } = {})
   const files = Array.isArray(take) ? take : null;
   const base = path.join(out, name);
   /** @type {NodeJS.ProcessEnv} */
-  const env = { ...process.env, SMDB_TEST_TIME_SCALE: confirm ? '4' : '1' };
+  const env = { ...process.env, SMDB_TEST_TIME_SCALE: String(confirm || mutant === 'dry' ? ALONE_TIME_SCALE : 1) };
   delete env.SMDB_MUTATION_COVERAGE;
   delete env.SMDB_MUTATION_INCLUDE;
   delete env.SMDB_MUTATION_SETS;

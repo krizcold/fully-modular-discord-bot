@@ -31,7 +31,9 @@ export const PASSES = {
   // Its run with no mutant takes every related integration file and the whole
   // child tier on one worker, more than an hour for a change to widely imported
   // files, and one past this bound ends the gate NO RESULT before any survivor runs.
-  b: { ...BUILD, concurrency: 1, timeoutMS: 60_000, timeoutFactor: 2, dryRunTimeoutMinutes: 120 },
+  // The bound leaves room for a child test and its hooks to hang at four times
+  // their limits, so vitest's report names the file before Stryker ends the run.
+  b: { ...BUILD, concurrency: 1, timeoutMS: 60_000, timeoutFactor: 2, dryRunTimeoutMinutes: 180 },
   // A pass B failure rerun with one file: an hour is above anything vitest's own
   // limits let that file take after its first failure (the rest of a child
   // test, then its hooks), so a rerun that fails always leaves its report.
@@ -79,16 +81,22 @@ export const controlBoundMinutes = ({ timeoutFactor, timeoutMS, dryRunTimeoutMin
   Math.min(MAX_BOUND_MINUTES, Math.ceil(Math.max(1, files) * (timeoutFactor * dryRunTimeoutMinutes + timeoutMS / 60_000)) + 5);
 
 /**
+ * The factor runner.mjs gives the config's time limits (SMDB_TEST_TIME_SCALE,
+ * helpers/time.mjs) in a rerun alone and in every run with no mutant; a
+ * mutant's run in pass A or B gets 1.
+ */
+export const ALONE_TIME_SCALE = 4;
+
+/**
  * The bound, in ms, on one vitest run with no mutant of `files` fast test
- * files at time scale `scale`, in the runs that check what a pass counted
- * (touched.mjs aloneCheck and setCheck): per file, the config's hook limit for
- * a beforeAll and an afterAll and its test limit (vitest.config.ts), plus a
+ * files, in the runs that check what a pass counted (touched.mjs aloneCheck
+ * and setCheck): per file, the config's hook limit for a beforeAll and an
+ * afterAll and its test limit (vitest.config.ts) at ALONE_TIME_SCALE, plus a
  * minute to start. A run past it ends, with every process it started, and
  * counts as failed. It is capped at TIMER_LIMIT_MS, since runner.mjs gives it to a timer.
  * @param {number} files
- * @param {number} scale
  */
-export const setBoundMs = (files, scale) => Math.min(TIMER_LIMIT_MS, Math.max(1, files) * scale * (2 * 180_000 + 30_000) + 60_000);
+export const setBoundMs = files => Math.min(TIMER_LIMIT_MS, Math.max(1, files) * ALONE_TIME_SCALE * (2 * 180_000 + 30_000) + 60_000);
 
 /**
  * Stryker's bound, in minutes, on a run with no mutant that runs each of
