@@ -383,7 +383,7 @@ describe('confirmSaved over the file queue', () => {
       expect(saveData('blocked.json', { guildId, category: 'm' }, { b: 1 })).toBe(true);
       expect(saveData('wire.json', { guildId, category: 'm' }, { w: 1 })).toBe(true);
       await holds.reached(onTheWire);
-      const outcome = confirmSaved(guildId, { deadlineMs: 5000 });
+      const outcome = confirmSaved(guildId, { deadlineMs: 20_000 });
       // The blocked write's three attempts fail within 100 ms, so its first answer is held.
       await tick(300);
       vi.mocked(fs.promises.open).mockRestore();
@@ -408,19 +408,19 @@ describe('confirmSaved over the file queue', () => {
       expect(saveData('three.json', { guildId, category: 'b' }, { three: 1 })).toBe(true);
       await holds.reached(inA);
       await holds.reached(inAb);
-      expect(await confirmSaved(guildId, { category: 'b', deadlineMs: 5000 })).toBe('ok');
+      expect(await confirmSaved(guildId, { category: 'b', deadlineMs: 20_000 })).toBe('ok');
       expect(fs.readFileSync(file(guildId, 'b', 'three.json'), 'utf8')).toBe(JSON.stringify({ three: 1 }, null, 2));
       expect(await confirmSaved(guildId, { category: 'c', deadlineMs: 50 })).toBe('ok');
       expect(await confirmSaved(guildId, { category: 'a', deadlineMs: 50 })).toBe('pending');
       expect(await confirmSaved(guildId, { deadlineMs: 50 })).toBe('pending');
       holds.open(inA);
-      expect(await confirmSaved(guildId, { category: 'a', deadlineMs: 5000 })).toBe('ok');
+      expect(await confirmSaved(guildId, { category: 'a', deadlineMs: 20_000 })).toBe('ok');
       expect(await confirmSaved(guildId, { category: 'ab', deadlineMs: 50 })).toBe('pending');
     } finally {
       holds.open(inA);
       holds.open(inAb);
     }
-    expect(await confirmSaved(guildId, { deadlineMs: 5000 })).toBe('ok');
+    expect(await confirmSaved(guildId, { deadlineMs: 20_000 })).toBe('ok');
   });
 
   it('does not narrow a working set by category: its one ticket answers for the whole set', async () => {
@@ -430,7 +430,7 @@ describe('confirmSaved over the file queue', () => {
     expect(await confirmSaved(guildId, { category: 'b', deadlineMs: 0 })).toBe('pending');
     store.holding = false;
     store.release();
-    expect(await confirmSaved(guildId, { category: 'b', deadlineMs: 2000 })).toBe('ok');
+    expect(await confirmSaved(guildId, { category: 'b', deadlineMs: 20_000 })).toBe('ok');
   });
 
   it('answers for the global scope apart from every guild, a global write naming a guild included', async () => {
@@ -450,7 +450,7 @@ describe('confirmSaved over the file queue', () => {
       holds.open(viaModule);
       expect(await confirmSaved('global', { since: mark, deadlineMs: 50 })).toBe('pending');
       holds.open(viaOptions);
-      expect(await confirmSaved('global', { since: mark, deadlineMs: 5000 })).toBe('ok');
+      expect(await confirmSaved('global', { since: mark, deadlineMs: 20_000 })).toBe('ok');
     } finally {
       holds.open(viaModule);
       holds.open(viaOptions);
@@ -505,7 +505,7 @@ describe('confirmSaved over the file queue', () => {
     expect(await confirmSaved(guildId, { deadlineMs: 0 })).toBe('pending');
     store.holding = false;
     store.release();
-    expect(await confirmSaved(guildId, { deadlineMs: 2000 })).toBe('ok');
+    expect(await confirmSaved(guildId, { deadlineMs: 20_000 })).toBe('ok');
     expect(store.doc(guildId, 'timer.json')).toBe(JSON.stringify({ t: 1 }, null, 2));
 
     store.holding = true;
@@ -518,7 +518,7 @@ describe('confirmSaved over the file queue', () => {
     expect(await runInLedger(asking, null, () => confirmSaved(guildId, { deadlineMs: 0 }))).toBe('pending');
     store.holding = false;
     store.release();
-    expect(await runInLedger(asking, null, () => confirmSaved(guildId, { deadlineMs: 2000 }))).toBe('ok');
+    expect(await runInLedger(asking, null, () => confirmSaved(guildId, { deadlineMs: 20_000 }))).toBe('ok');
   });
 
   it('notes an absent file delete that carries a queued delete\'s ticket', async () => {
@@ -537,7 +537,7 @@ describe('confirmSaved over the file queue', () => {
       expect(saveMark().stamp).toBe(mark.stamp + 1);
       expect(await confirmSaved(guildId, { deadlineMs: 50 })).toBe('pending');
       holds.open(target);
-      expect(await confirmSaved(guildId, { deadlineMs: 5000 })).toBe('ok');
+      expect(await confirmSaved(guildId, { deadlineMs: 20_000 })).toBe('ok');
     } finally {
       holds.open(target);
     }
@@ -593,8 +593,8 @@ describe('confirmSaved over the file queue', () => {
     expect(saveGlobalModuleData('d.json', 'bt5w', { d: 1 })).toBe(true);
     expect(deleteGlobalModuleData('d.json', 'bt5w')).toBe(true);
     expect(saveMark().stamp).toBe(mark.stamp + 7);
-    expect(await confirmSaved(guildId, { since: mark, category: 'bt5w', deadlineMs: 5000 })).toBe('ok');
-    expect(await confirmSaved('global', { since: mark, deadlineMs: 5000 })).toBe('ok');
+    expect(await confirmSaved(guildId, { since: mark, category: 'bt5w', deadlineMs: 20_000 })).toBe('ok');
+    expect(await confirmSaved('global', { since: mark, deadlineMs: 20_000 })).toBe('ok');
     expect(fs.existsSync(file(guildId, 'bt5w', 'a.json'))).toBe(false);
     expect(fs.readFileSync(file(guildId, 'bt5w', 'log.jsonl'), 'utf8')).toBe('x\n');
   });

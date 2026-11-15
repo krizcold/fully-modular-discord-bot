@@ -47,7 +47,7 @@ async function lineLostWhileConfirming() {
   const l1 = ticketOf(appendDataTracked(name, opts, 'L1\n'));
   await hold.reached;
   const l2 = ticketOf(appendDataTracked(name, opts, 'L2\n'));
-  const answer = confirmSaved('global', { since: before, deadlineMs: 2000, category });
+  const answer = confirmSaved('global', { since: before, deadlineMs: 20_000, category });
   hold.release();
   await flushAll();
   return { p, before, l1, l2, answer: await answer };

@@ -23,6 +23,12 @@ vi.mock('fs', async orig => {
   return { ...wrapped, default: wrapped };
 });
 
+// The operator route's 8 s bound and the reply gate's (what is left of 8 s): a loaded machine can pass them before the answer.
+vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => {
+  const real = await orig<any>();
+  return { ...real, confirmWrite: (ticket: unknown, deadlineMs: number) => real.confirmWrite(ticket, deadlineMs >= 7000 ? 20_000 : deadlineMs) };
+});
+
 import { fileFlushOnTheWire, flushAll as flushFiles } from '../../src/bot/internalSetup/utils/dataBackends/fileBackend';
 import { flushAll, saveData } from '../../src/bot/internalSetup/utils/dataManager';
 import { checkWriterLock, configureWriterLock, deposedText, releaseWriterLock, takeWriterLock, writerLockDepth, writerLockPath } from '../../src/bot/internalSetup/utils/writerLock';

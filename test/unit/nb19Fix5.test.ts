@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const h = vi.hoisted(() => ({
   chain: null as null | { dir: string; before: () => void; answer: { failed: true; kind: 'open'; dir: string; errno: string; error: null } },
-  holdTemp: null as null | { file: string; until: Promise<void> },
+  holdTemp: null as null | { file: string; until: Promise<void>; reach: () => void },
   openFolder: null as null | string,
 }));
 
@@ -56,6 +56,7 @@ import { deferredText } from '../../src/bot/internalSetup/utils/moduleApply';
 
 let n = 0;
 let errors: string[];
+let releases: Array<() => void> = [];
 const guild = () => `8${Date.now() % 1_000_000}${++n}`;
 const T2 = (p: string, dir: string) => {
   const { why, next } = syncWords('open', dir, 'EMFILE');
@@ -75,39 +76,51 @@ beforeEach(() => {
   vi.spyOn(fs.promises, 'open').mockImplementation((async (file: fs.PathLike, flags?: string | number, mode?: fs.Mode) => {
     const p = String(file);
     const hold = h.holdTemp;
-    if (flags === 'w' && hold && p.startsWith(`${hold.file}.`) && p.endsWith('.tmp')) await hold.until;
+    if (flags === 'w' && hold && p.startsWith(`${hold.file}.`) && p.endsWith('.tmp')) {
+      hold.reach();
+      await hold.until;
+    }
     return realOpen(file, flags, mode);
   }) as typeof fs.promises.open);
 });
 afterEach(async () => {
   h.chain = null;
   h.holdTemp = null;
+  for (const release of releases) release();
+  releases = [];
   await flushAll();
   vi.restoreAllMocks();
   resetFolderSyncFailureForTests();
 });
 
-/** W1's chain answers 'open' while W2 is enqueued, and W2's temp open waits until release() runs. */
+/**
+ * W1's chain answers 'open' while W2 is enqueued, and W2's temp open waits until release() runs. reached resolves at
+ * W2's temp open, once W1's failed range is known.
+ */
 function replacedWhileNewerFlushes(name: string) {
   const p = dataPath(guild(), 'm', name);
   const dir = path.dirname(p);
   let release!: () => void;
   const until = new Promise<void>(resolve => { release = resolve; });
+  releases.push(release);
+  let reach!: () => void;
+  const reached = new Promise<void>(resolve => { reach = resolve; });
   h.chain = {
     dir,
     before: () => {
       enqueueWrite(p, '{"v":2}');
-      h.holdTemp = { file: p, until };
+      h.holdTemp = { file: p, until, reach };
     },
     answer: { failed: true, kind: 'open', dir, errno: 'EMFILE', error: null },
   };
   enqueueWrite(p, '{"v":1}');
-  return { p, dir, t1: fileTicket(p), release };
+  return { p, dir, t1: fileTicket(p), release, reached };
 }
 
 describe('DL-1 and O1: the deadline passes while the newer write of the path is flushing', () => {
   it('confirmFile answers unavailable with the kinded range of the replaced try, logged once', async () => {
-    const { p, dir, t1, release } = replacedWhileNewerFlushes('x.json');
+    const { p, dir, t1, release, reached } = replacedWhileNewerFlushes('x.json');
+    await reached;
     expect(await confirmFile(t1, 400)).toBe('unavailable');
     expect(fileTicketState(t1)).toBe('unconfirmed');
     expect(fileTicketFailure(t1)).toMatchObject({ what: 'whole', kind: 'open', dir, errno: 'EMFILE', cut: false });
@@ -121,7 +134,8 @@ describe('DL-1 and O1: the deadline passes while the newer write of the path is 
   });
 
   it('confirmWrite answers unavailable and the reader words T1 of kind open from the ticket', async () => {
-    const { p, dir, t1, release } = replacedWhileNewerFlushes('y.json');
+    const { p, dir, t1, release, reached } = replacedWhileNewerFlushes('y.json');
+    await reached;
     expect(await confirmWrite(t1, 400)).toBe('unavailable');
     const failure = fileTicketFailure(t1);
     expect(failure?.kind).toBe('open');
@@ -131,7 +145,8 @@ describe('DL-1 and O1: the deadline passes while the newer write of the path is 
   });
 
   it('the re-read at deadline 0 while the newer write is flushing answers unavailable too', async () => {
-    const { dir, t1, release } = replacedWhileNewerFlushes('z.json');
+    const { dir, t1, release, reached } = replacedWhileNewerFlushes('z.json');
+    await reached;
     expect(await confirmFile(t1, 400)).toBe('unavailable');
     expect(await confirmFile(t1, 0)).toBe('unavailable');
     expect(fileTicketFailure(t1)).toMatchObject({ kind: 'open', dir });

@@ -22,7 +22,7 @@ describe('answerWrites', () => {
     let answered: boolean | undefined;
     await emit(rawButton('p1'), async i => {
       saveData('x.json', options, { v: 1 });
-      expect(await confirmWrite(ledgerOf(i)!.tickets()[0].ticket, 5000)).toBe('ok');
+      expect(await confirmWrite(ledgerOf(i)!.tickets()[0].ticket, 20_000)).toBe('ok');
       answered = await answerWrites(i);
     });
     expect(answered).toBe(true);

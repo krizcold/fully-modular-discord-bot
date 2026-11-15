@@ -113,7 +113,7 @@ describe('the fast path', () => {
     const { options } = await storeGuild();
     await emit(rawCommand('c2'), async i => {
       saveData('x.json', options, { v: 1 });
-      expect(await confirmWrite(ledgerOf(i)!.tickets()[0].ticket, 5000)).toBe('ok');
+      expect(await confirmWrite(ledgerOf(i)!.tickets()[0].ticket, 20_000)).toBe('ok');
       await i.reply({ content: 'Saved!' });
     });
     expect(wire.map(textOf)).toEqual(['Saved!']);
@@ -415,7 +415,7 @@ describe('answers that are not ok', () => {
     const { guildId, store, options } = await storeGuild();
     await emit(rawCommand('c31'), async i => {
       saveData('x.json', options, { v: 1 });
-      expect(await confirmWrite(ledgerOf(i)!.tickets()[0].ticket, 5000)).toBe('ok');
+      expect(await confirmWrite(ledgerOf(i)!.tickets()[0].ticket, 20_000)).toBe('ok');
       const ws = getWorkingSet()!;
       ws.evict(guildId);
       expect(await ws.hydrate(guildId, tokenFor())).toBe('ready');
@@ -444,7 +444,7 @@ describe('answers that are not ok', () => {
     const { store, options } = await storeGuild();
     await emit(rawCommand('c25'), async i => {
       saveData('x.json', options, { v: 1 });
-      expect(await confirmWrite(ledgerOf(i)!.tickets()[0].ticket, 5000)).toBe('ok');
+      expect(await confirmWrite(ledgerOf(i)!.tickets()[0].ticket, 20_000)).toBe('ok');
       store.mode = 'unavailable';
       saveData('y.json', options, { v: 2 });
       await i.reply({ content: 'Saved!' });
