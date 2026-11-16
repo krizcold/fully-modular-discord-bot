@@ -265,6 +265,14 @@ docker run -d --name smdb-pg -p 5432:5432 -e POSTGRES_USER=smdb -e POSTGRES_PASS
 then `DATA_BACKEND=postgres` and `DATA_BACKEND_URL=postgresql://smdb:dev@localhost:5432/smdb`.
 A wrong or absent database shows as a visible "waiting on data backend" status, not a stack trace.
 The database provisions its own schema on first contact, in one transaction; there is nothing to create by hand.
+A machine whose /data/.backend.json records a store id (the first boot that serves writes it there) makes no store:
+it refuses a database that holds none (no smdb_data schema, or one with no table), naming the recorded id, and
+changes nothing in it; point `DATA_BACKEND_URL` at the database that holds that store, or restore its backup there,
+or, to start a new, empty store in this database, set storeId to null in /data/.backend.json and restart the bot
+(the old store's data is not in this database).
+A boot whose data layer refuses, on either backend, leaves the shared files under /data, the App Store modules and
+config.json as they are and starts no module auto-updater; the web UI's changes to shared files and its global reads
+answer with the refusal (HTTP 503) until the bot restarts.
 The server must be PostgreSQL 13 or later, and the database's encoding UTF8; at boot the bot refuses an older server
 (naming its version) and any other server_encoding, before it reads smdb_data.
 Bot processes that boot at the same time run this check one after another, under a bootstrap lock that a data
@@ -282,8 +290,9 @@ schema that inherits from one of smdb_data's tables join its reads.
 It also refuses a smdb_data that holds tables or other relations but no schema version, since it can't confirm
 what made them or that they are complete; point the bot at another database or rename that schema aside. It
 refuses a smdb_data whose version table, smdb_data.meta, it can't read (a changed column type, row level security,
-a dropped primary key); correct meta to the shape the log gives, and do not rename the schema aside, since its
-tables hold this bot's data and the next boot would make and serve a new, empty store beside them. A database
+a dropped primary key); correct meta to the shape the log gives, and do not rename the schema aside while its tables
+hold this bot's data: every row would stay in the renamed schema, and the next boot would make a new, empty store
+beside it, or refuse the database on a machine whose /data/.backend.json records a store id. A database
 provisioned by another schema version of the bot is refused the same way. A store of this version and shape whose
 smdb_data.meta has no store_id row gets a new one, unless the machine's /data/.backend.json records a store id: then
 it is refused, since the bot can't confirm that this database holds that store, and the log prints the statement that
