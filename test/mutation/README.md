@@ -22,7 +22,7 @@ active mutant travels in `__STRYKER_ACTIVE_MUTANT__` and reaches child processes
 | ../helpers/mutationCoverage.ts, reachRecorder.cjs | the first setup file of the runs with no mutant that record reach (pass A's, for the fast tier, and pass B's, for the integration and child tiers), and the recorder it loads in each test file's process and, through NODE_OPTIONS, in each Node process under it: each mutant id at its first count, and each process started; unit/mutationCoverage.test.ts |
 | survivors.mjs | (read-only tool) pass A's survivors so far, from a run's report dir and sandbox while the run goes on or after it died; unit/mutationSurvivors.test.ts |
 | tree.mjs | (library) the fingerprint of the tree a run reads and of the packages it loads, taken before the plan and before the verdict; unit/mutationRanges.test.ts and the bite |
-| ../helpers/time.mjs | the factor on the config's test and hook limits and a child step's default bound (4 in a rerun alone and in every run with no mutant, 1 in a mutant's run in pass A or B; a limit a test, hook or step sets itself is not scaled) |
+| ../helpers/time.mjs | the factor on the config's test and hook limits, a child step's default bound and the default bound of vi.waitFor and vi.waitUntil (helpers/setup.ts) (4 in a rerun alone and in every run with no mutant, 1 in a mutant's run in pass A or B; a limit a test, hook, step or wait sets itself is not scaled) |
 | ../helpers/env.ts, setup.ts | what a test and its children keep of the environment, and the run's fast-check seed |
 | ../helpers/forkGuard.cjs | a process started with an env of its own that lacks DATA_DIR throws (fork, spawn, exec, execFile, a Worker), in a test and in a child step |
 | ../helpers/build.cjs | builds dist the way `npm run build` does, stamped and locked; pass B's buildCommand |
@@ -490,8 +490,8 @@ and then; a kill from a file pass A's run with no mutant saw failing under load 
 
 Every Stryker run starts with its run with no mutant, and when that fails Stryker stops ("There were failed tests in
 the initial test run": its command runner reads only runner.mjs's exit code) and the gate ends NO RESULT. With
-several gate runs on one machine, a timing test whose own wait is not scaled (helpers/time.mjs scales only the
-config's limits) fails there beside other files and passes alone, a different one each time. So each tier of a run
+several gate runs on one machine, a timing test whose own wait is not scaled (helpers/time.mjs scales the
+config's limits and the default bound of a wait, never a bound a test names) fails there beside other files and passes alone, a different one each time. So each tier of a run
 with no mutant runs every file to its end (no `--bail`), and when it fails only in test files that ran beside other
 files of that vitest run, runner.mjs reruns each of them alone, one at a time, in a vitest run of its own with no
 mutant at scale 4 (runner.mjs dryTier). When every one passes alone, the tier counts as passed (runner.mjs exits 0 for
