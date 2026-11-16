@@ -1,8 +1,9 @@
 /**
  * smdb verb registry. Each verb maps 1:1 onto an existing bot web-panel route; the
  * CLI holds no business logic. Uncurated or future routes are reachable via `api`.
- * The one exception is `bundle`, which calls the same dataInterchange primitives as
- * src/tools/dataBundle.ts so export/import round-trips run from one entry point.
+ * The exceptions are `bundle`, which calls the same dataInterchange primitives as
+ * src/tools/dataBundle.ts so export/import round-trips run from one entry point, and
+ * `data provision`, which opens its own connection to DATA_BACKEND_URL.
  */
 
 import * as path from 'path';
@@ -14,6 +15,8 @@ import { DATA_ROOT } from '../utils/dataRoot';
 import { bundleRefusal, importBundle, readBundle, writeBundle } from '../bot/internalSetup/utils/dataInterchange';
 import { FolderSyncError, setDiskRole } from '../bot/internalSetup/utils/folderChain';
 import { restoreNoAnswerEnding } from '../bot/internalSetup/utils/dataManager';
+import { provisionEmptyStore } from '../bot/internalSetup/utils/storeProvision';
+import { loadCredentials } from '../utils/envLoader';
 
 interface Ctx {
   client: Client;
@@ -145,6 +148,7 @@ const HANDLERS: Record<string, Handler> = {
   'config restore': (c) => simple(c, 'POST', '/api/config/restore', parseBody(c, true)),
   'data get': (c) => simple(c, 'GET', `/api/config/data/get${qs({ file: need(c, 0, 'file'), guildId: flagStr(c.flags, 'guild') })}`),
   'data migrate': (c) => dataMigrate(c),
+  'data provision': (c) => dataProvision(c),
   'data update': (c) => simple(c, 'POST', '/api/config/data/update', parseBody(c, true)),
 
   // --- appstore ---
@@ -547,6 +551,16 @@ async function dataMigrate(ctx: Ctx): Promise<void> {
   printJson(result.body ?? {});
   process.stderr.write(`smdb: ${result.message}\n`);
   process.exit(result.code);
+}
+
+/** `data provision`: the store id and the layout version on stdout, one line each, or one JSON object in JSON mode. */
+async function dataProvision(ctx: Ctx): Promise<void> {
+  if (ctx.args.length > 0) fail('data provision takes no arguments', EXIT_USAGE);
+  const outcome = await provisionEmptyStore(loadCredentials().DATA_BACKEND_URL ?? '');
+  if (outcome.state !== 'created') fail(outcome.line, EXIT_ERR);
+  if (jsonMode(ctx.flags)) printJson({ storeId: outcome.storeId, layoutVersion: outcome.version });
+  else process.stdout.write(`store id: ${outcome.storeId}\nlayout version: ${outcome.version}\n`);
+  process.exit(EXIT_OK);
 }
 
 const BACKUPS_STATUS_CMD = 'smdb api GET /api/backups';

@@ -42,7 +42,7 @@ const PROBE_BOUND_MS = 2_000;
 const DRAIN_BOUND_MS = 10_000;
 const INSERT_BATCH = 500;
 const CLIENT_KEEPALIVE_MS = 30_000;
-const COMMIT_BOUND_MS = 120_000;
+export const COMMIT_BOUND_MS = 120_000;
 const ANSWER_BOUND_MS = 120_000;
 const CLOSE_BOUND_MS = 5_000;
 const SECOND_LOOK_MS = 1_000;
@@ -113,12 +113,12 @@ const keysWord = (n: number) => `${n} owner message ${n === 1 ? 'key' : 'keys'}`
 const sameChannel = (a: OwnerChannelValue, b: OwnerChannelValue) =>
   a.kind === b.kind && (a.kind !== 'id' || a.id === (b as { id: string }).id);
 /** Decision 16's refusal of a list; an empty entry is named by decision 18's check, not counted as a live copy. */
-function addressListText(url: string): string {
+export function addressListText(url: string, needs = 'a migration'): string {
   if (parseAddressList(url).some(entry => entry.raw === '')) {
     const named = checkAddressList(url);
     if (named !== null) return named;
   }
-  return `DATA_BACKEND_URL lists ${url.trim().split(/\s*,\s*|\s+/).length} database addresses (live copies on other machines); a migration needs one database address, so remove the live copies first`;
+  return `DATA_BACKEND_URL lists ${url.trim().split(/\s*,\s*|\s+/).length} database addresses (live copies on other machines); ${needs} needs one database address, so remove the live copies first`;
 }
 
 export const JOB_ID = /^[A-Za-z0-9-]{8,40}$/;
@@ -802,7 +802,7 @@ async function readMetaStoreId(session: PgSession, schema: string): Promise<stri
 }
 
 /** Waits at most boundMs for work; undefined when the bound passed first. */
-async function within<T>(work: Promise<T>, boundMs: number): Promise<{ value: T } | undefined> {
+export async function within<T>(work: Promise<T>, boundMs: number): Promise<{ value: T } | undefined> {
   work.catch(() => undefined);
   let timer: NodeJS.Timeout | undefined;
   try {
@@ -816,7 +816,7 @@ async function within<T>(work: Promise<T>, boundMs: number): Promise<{ value: T 
 }
 
 /** Destroys a session's socket, so the server ends the session and releases its locks. */
-function destroySession(session: PgSession): void {
+export function destroySession(session: PgSession): void {
   try {
     (session as { connection?: { stream?: { destroy?: () => void } } }).connection?.stream?.destroy?.();
   } catch { /* already gone */ }
