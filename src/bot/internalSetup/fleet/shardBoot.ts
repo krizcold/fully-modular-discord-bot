@@ -45,6 +45,8 @@ export interface ShardBootContext {
   startIngest(token: string | undefined): void;
   /** NB9 D1: true only for a promoted standby whose grant is exactly its standby's set and count (the sessions stay). */
   keptSessions?: boolean;
+  /** NB35: the data layer's reason when it refused to serve; absent unless the data layer refused. */
+  dataRefusal?: string;
 }
 
 /** NB9 29, 41, C5 and E1: what a promoted Postgres standby hands its serve. */
@@ -228,6 +230,7 @@ async function runBoot(given: StandbyTaken | JsonTaken | null): Promise<ShardBoo
       claims,
     });
     ledger.charge(granted);
+    const data = getDataBootStatus();
     context = {
       nodeId,
       nodeName,
@@ -236,6 +239,7 @@ async function runBoot(given: StandbyTaken | JsonTaken | null): Promise<ShardBoo
         runtime.setToken(token);
       },
       ...(keptSessions ? { keptSessions: true } : {}),
+      ...(data.state === 'refused' ? { dataRefusal: data.refusalReason ?? 'no reason recorded' } : {}),
     };
     return context;
   };

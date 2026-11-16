@@ -18,13 +18,14 @@ import { getPremiumManager, invalidatePremiumCache, MigrationBusy, settlePremium
 import { getPaymentRegistry } from './payment/paymentRegistry';
 import { invalidateDummyCaches } from './payment/dummyProvider';
 import { refreshShared, sharedBootCause, sharedBootCauseLocal, sharedBootDone } from './sharedMirror';
+import { getDataBootStatus } from './dataBackends/boot';
 
 export interface SharedOpRequest {
   op: string;
   args?: any;
 }
 
-export type SharedOpCode = 'invalid' | 'maintenance' | 'held-elsewhere' | 'changed' | 'changed-since-open' | 'unconfirmed' | 'failed' | 'starting';
+export type SharedOpCode = 'invalid' | 'maintenance' | 'held-elsewhere' | 'changed' | 'changed-since-open' | 'unconfirmed' | 'failed' | 'starting' | 'refused';
 
 export type SharedOpReply =
   | { ok: true; result?: unknown }
@@ -373,9 +374,23 @@ export function sharedStartingText(type: 'shared:op' | 'data:global-read', cause
     : `The bot is waiting for the database (${cause}) before it brings the shared files up to date${saved}. Try again once the database answers.`;
 }
 
-/** C24: a Postgres bot serves shared ops and global reads once bootShared ended; a maintenance boot never runs it. */
+/** NB35: the child's answer once the data layer refused the database, so bootShared never runs in this process. */
+export function sharedRefusedText(type: 'shared:op' | 'data:global-read', reason: string): string {
+  const saved = type === 'shared:op' ? '; nothing was saved' : '';
+  return `The data layer refused this database (${reason}), so the bot does not read or change the shared files${saved}. The bot's log says how to fix it; restart the bot once it is fixed.`;
+}
+
+/**
+ * C24: a Postgres bot serves shared ops and global reads once bootShared ended; a maintenance boot never runs it. NB35: a
+ * refused boot of either backend answers the refusal, before sharedBootDone() reads DATA_BACKEND.
+ */
 function startingReply(type: 'shared:op' | 'data:global-read'): SharedOpReply | null {
-  if (isMaintenanceBoot() || sharedBootDone()) return null;
+  if (isMaintenanceBoot()) return null;
+  const data = getDataBootStatus();
+  if (data.state === 'refused') {
+    return { ok: false, code: 'refused', status: 503, error: sharedRefusedText(type, data.refusalReason ?? 'no reason recorded') };
+  }
+  if (sharedBootDone()) return null;
   return { ok: false, code: 'starting', error: sharedStartingText(type, sharedBootCause(), sharedBootCauseLocal()) };
 }
 

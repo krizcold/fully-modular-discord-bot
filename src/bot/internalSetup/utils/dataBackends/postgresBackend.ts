@@ -14,7 +14,7 @@ import {
   checkShape, encodingRefusal, freshPrivilegeRefusal, freshRefusal, gateRefusal, metaGateCause, readFoundList,
   refusalLogLines, relationPrivileges, shapeRefusal, sortDifferences, unversionedRefusal, privilegeDifference,
   freshVersionRefusal, serverRelease, serverVersionRefusal, storeIdRefusal, ScratchBuildFailed, scratchRefusal,
-  ddlErrorRetries, schemaDdlRefusal,
+  ddlErrorRetries, schemaDdlRefusal, noStoreRefusal,
 } from './storeShape';
 import type { FoundList, Refusal, ShapeCheck, ShapeMode } from './storeShape';
 import type {
@@ -373,7 +373,7 @@ function matchesSchemaVersion(raw: string): boolean {
  */
 export type ProvisionVerdict = { state: 'provisioned' } | { state: 'mismatch'; found: string } | { state: 'shape'; reason: string; fix: string } | { state: 'stopped' };
 
-export type MismatchCause = 'version' | 'shape' | 'privileges' | 'encoding' | 'server' | 'identity' | 'scratch' | 'provision';
+export type MismatchCause = 'version' | 'shape' | 'privileges' | 'encoding' | 'server' | 'identity' | 'nostore' | 'scratch' | 'provision';
 
 /** What a refused check does after its ROLLBACK, on the same connection, outside any transaction. */
 type Latch = (client: Sender) => void | Promise<void>;
@@ -1592,7 +1592,12 @@ export class PostgresBackend implements DataBackend {
       const other = verdict.found;
       return () => this.latchSchemaMismatch(other);
     }
-    if (verdict.kind === 'empty') return this.provisionFresh(client, verdict.found);
+    if (verdict.kind === 'empty') {
+      // NB35: a new store here would get another id than the one this machine records, so nothing is made.
+      const recorded = this.markerStoreId();
+      if (recorded) return () => this.latchRefusal('nostore', noStoreRefusal(recorded, verdict.found));
+      return this.provisionFresh(client, verdict.found);
+    }
     const storeId = await client.query(`SELECT 1 FROM ONLY smdb_data.meta WHERE key = 'store_id'`);
     if (storeId.rows.length === 0) {
       // A new id would be refused by every machine whose marker records the old one, so with one recorded nothing is written.
@@ -1689,6 +1694,7 @@ export class PostgresBackend implements DataBackend {
       case 'encoding': return `the database's server_encoding is ${this.mismatchFound}, not UTF8`;
       case 'server': return `the database server is PostgreSQL ${this.mismatchFound}, older than 13`;
       case 'identity': return "the database's smdb_data.meta holds no store_id";
+      case 'nostore': return 'the database holds no store';
       case 'scratch': return 'the bot could not build its copy of its schema to compare with';
       case 'provision': return 'the bot could not make its schema in the database';
       default: return `the database holds schema version ${this.mismatchFound}`;

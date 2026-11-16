@@ -652,24 +652,30 @@ export async function runBot(opts: RunBotOptions): Promise<void> {
 
   // NB6 decision 14, C25 and D4: the populate builds on the root config's row, so the shared files come first.
   if (backend instanceof PostgresBackend) addStopStep(stopSharedPass);
-  // NB6 45 (1) and (3): the applies a stop cut off are put back first; the boot pass's applies stop after their swap.
-  if (backend instanceof PostgresBackend) {
-    recoverModuleApplies();
-    beginBootApplies();
-  }
-  if ((await bootShared()) === 'stopped') return new Promise<never>(() => undefined);
-  if (backend instanceof PostgresBackend) await bootCompileModules();
+  // NB35: bootShards returns once the data verdict is in; a refused data layer gets no shared file, module or config write.
+  const dataRefusal = fleet.dataRefusal;
+  if (dataRefusal !== undefined) {
+    console.error(`[Shared] Left the shared files, the App Store modules and config.json as they are: the data layer refused to serve (${dataRefusal})`);
+  } else {
+    // NB6 45 (1) and (3): the applies a stop cut off are put back first; the boot pass's applies stop after their swap.
+    if (backend instanceof PostgresBackend) {
+      recoverModuleApplies();
+      beginBootApplies();
+    }
+    if ((await bootShared()) === 'stopped') return new Promise<never>(() => undefined);
+    if (backend instanceof PostgresBackend) await bootCompileModules();
 
-  // PHASE 0: Ensure config.json is fully populated with schema
-  console.log('[Bot] Synchronizing config.json with schema...');
-  ensureConfigPopulated();
+    // PHASE 0: Ensure config.json is fully populated with schema
+    console.log('[Bot] Synchronizing config.json with schema...');
+    ensureConfigPopulated();
+  }
 
   // Create a temporary client for module loading (intents will be determined after)
   const tempClient = new Client({ intents: [GatewayIntentBits.Guilds] });
 
   // PHASE 1: Load modules and extract intents
   const moduleIntents = await loadModules(tempClient);
-  if (backend instanceof PostgresBackend) startSharedPass({ guildRequests: requestGuildRequestPass });
+  if (backend instanceof PostgresBackend && dataRefusal === undefined) startSharedPass({ guildRequests: requestGuildRequestPass });
 
   // PHASE 2: Collect intents from internal framework events
   const internalEventsDirRelative = path.join(scanRoot, 'bot', 'internalSetup', 'events');
@@ -855,6 +861,10 @@ export async function runBot(opts: RunBotOptions): Promise<void> {
 
     if (stoppedServing()) {
       console.log('[Shards] Panel recovery and the module auto-updater stopped: this process stopped serving its shards');
+      return;
+    }
+    if (dataRefusal !== undefined) {
+      console.log('[Bot] The module auto-updater did not start: the data layer refused to serve, so the App Store modules stay as they are');
       return;
     }
     // Start module auto-update scheduler (checks every 30min if enabled).

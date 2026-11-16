@@ -737,7 +737,7 @@ export function unversionedRefusal(found: FoundList, result: ShapeResult, cause?
     header: `schema-mismatch: smdb_data holds ${n} object(s) and its schema_version can't be read (${cause}), ${confirm}; refusing to serve`,
     lines,
     reason: `the database's smdb_data holds objects and its schema_version can't be read (${cause}), ${confirm}: ${shown}${more}${tail}`,
-    fix: `${KEPT}smdb_data.meta is this bot's version table: correct it to the shape the difference lines give (key text, value text NOT NULL, its primary key meta_pkey, row level security off) and restart the bot; do not rename smdb_data aside while its tables hold this bot's data, since the next boot would then make and serve a new, empty store and leave every row in the renamed schema`,
+    fix: `${KEPT}smdb_data.meta is this bot's version table: correct it to the shape the difference lines give (key text, value text NOT NULL, its primary key meta_pkey, row level security off) and restart the bot; do not rename smdb_data aside while its tables hold this bot's data, since every row would then stay in the renamed schema and the next boot would make a new, empty store beside it, or refuse the database on a machine whose /data/.backend.json records a store id`,
   };
 }
 
@@ -837,7 +837,22 @@ export function storeIdRefusal(markerStoreId: string): Refusal {
     header: `schema-mismatch: ${reason}; refusing to serve`,
     lines: [],
     reason,
-    fix: `${KEPT}if this is the database this deployment was set up with, add its store id (INSERT INTO smdb_data.meta (key, value) VALUES ('store_id', '${literal}')) and restart the bot; otherwise point DATA_BACKEND_URL, in the web UI env editor, at this deployment's database and restart the bot; do not rename smdb_data aside while its tables hold this bot's data, since the next boot would then make and serve a new, empty store`,
+    fix: `${KEPT}if this is the database this deployment was set up with, add its store id (INSERT INTO smdb_data.meta (key, value) VALUES ('store_id', '${literal}')) and restart the bot; otherwise point DATA_BACKEND_URL, in the web UI env editor, at this deployment's database and restart the bot; do not rename smdb_data aside while its tables hold this bot's data, since the next boot would then find no store there and leave every row in the renamed schema`,
+  };
+}
+
+/**
+ * NB35: a database that holds no store, while this machine's marker records the store id of the deployment's store; a
+ * new store there would get another id, which the identity check then refuses.
+ */
+export function noStoreRefusal(markerStoreId: string, found: FoundList): Refusal {
+  const what = found.schemaExists ? 'its smdb_data schema holds no table' : 'it has no smdb_data schema';
+  const reason = `this machine's /data/.backend.json records store ${markerStoreId}, but the configured database ${found.db} holds no store (${what}), so this bot made no store there`;
+  return {
+    header: `schema-mismatch: ${reason}; refusing to serve`,
+    lines: [],
+    reason,
+    fix: `${KEPT}point DATA_BACKEND_URL, in the web UI env editor, at the database that holds store ${markerStoreId}, or restore that store's backup into this database, then restart the bot; or, to start a new, empty store in this database, set storeId to null in /data/.backend.json and restart the bot (the old store's data is not in this database)`,
   };
 }
 

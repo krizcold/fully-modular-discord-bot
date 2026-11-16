@@ -165,6 +165,7 @@ describe("the framework's clientReady once-handler", () => {
     const client = Object.assign(new EventEmitter(), { user: { tag: 'bot#0001' } });
     const install = onceHandlerFromSource({
       client,
+      dataRefusal: undefined,
       stoppedServing,
       isMaintenanceGateClosed,
       awaitDataStartupBarrier: () => new Promise<string>(resolve => { barrier = resolve; }),
