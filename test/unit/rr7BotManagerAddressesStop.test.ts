@@ -205,6 +205,36 @@ describe('enterMaintenance maps the held counts', () => {
     expect(answer.note).not.toBe("can't confirm whether the held changes were saved");
     expect(logs).not.toContain(NO_RESULT);
   });
+
+  it('saved null because work still runs, with nothing held: the note names the running work and has no empty clause (NX5 G8-14)', async () => {
+    const running = 'premium: 1 member notice(s) not sent and recorded yet';
+    const answer = await enter({ saved: null, unansweredGuilds: 0, unconfirmedFiles: 0, running });
+    expect(answer).toEqual({
+      saved: null, unansweredGuilds: 0, unconfirmedFiles: 0,
+      note: `still running and may save changes: ${running}; can't confirm that every change is saved`,
+    });
+    expect(logs).not.toContain(NO_RESULT);
+  });
+
+  it('saved null with a held count and work running: the held clause, then the running work, then the held changes (NX5 G8-14)', async () => {
+    const running = 'premium: 1 change(s) waiting for a payment provider';
+    const answer = await enter({ saved: null, unansweredGuilds: 1, unconfirmedFiles: 0, running });
+    expect(answer.note).toBe(`1 guild(s) hold a save the database did not answer, which may have landed; still running and may save changes: ${running}; can't confirm whether the held changes were saved`);
+  });
+
+  it('saved false with work running: the note adds the running work after the held clauses (NX5 G8-14)', async () => {
+    const running = 'premium: 1 change(s) waiting for a payment provider';
+    const answer = await enter({ saved: false, unsavedGuilds: 0, unsavedFiles: 1, unansweredGuilds: 0, unconfirmedFiles: 0, running });
+    expect(answer).toEqual({
+      saved: false, unsavedGuilds: 0, unsavedFiles: 1,
+      note: `0 guild(s) and 1 file(s) hold changes that could not be saved; still running and may save changes: ${running}`,
+    });
+  });
+
+  it('saved false with nothing running: the note is the held clauses alone', async () => {
+    const answer = await enter({ saved: false, unsavedGuilds: 1, unsavedFiles: 0, unansweredGuilds: 0, unconfirmedFiles: 0 });
+    expect(answer.note).toBe('1 guild(s) and 0 file(s) hold changes that could not be saved');
+  });
 });
 
 describe('the local op chain', () => {

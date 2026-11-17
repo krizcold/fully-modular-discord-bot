@@ -37,6 +37,7 @@ import { dataPath } from '../../../utils/dataRoot';
 import {
   addAfterDrainStep,
   addFinalStopStep,
+  addHeldSaver,
   appendDataTracked,
   DataBackendUnavailableError,
   deleteDataTracked,
@@ -44,8 +45,10 @@ import {
   onSharedApplied,
   onWriterTake,
   readRawStrict,
+  removeHeldSaver,
   saveDataTracked,
   sharedWritesClosedLost,
+  type HeldSaver,
 } from './dataManager';
 import { confirmFile, enqueueAppend, fileTicket, fileTicketFailure, fileTicketState, type FileTicket } from './dataBackends/fileBackend';
 import { syncWords } from './folderChain';
@@ -97,7 +100,8 @@ import {
   type SaveOutcome,
 } from './premiumItems';
 import { dispatchPremiumNotification } from './premiumNotifications';
-import { isMaintenanceBoot, isMaintenanceGateClosed } from './maintenanceGate';
+import { isMaintenanceBoot, isMaintenanceGateClosed, MaintenanceRefusal, orderRefusesGlobalWrite, runHeldResave } from './maintenanceGate';
+import { OpenWork } from './openWork';
 import type {
   ProviderSubscriptionState,
   SubscriptionView,
@@ -622,6 +626,15 @@ const CONFIRM_MS = 8_000;
 const PREMIUM_KEY = 'global/premium-tiers.json';
 const AUDIT_KEY = 'global/premium-tiers.audit.jsonl';
 const READ_BOUND_MS = 10_000;
+/** The kinds of premium's open work (NX5 ruling G8-14), as a maintenance answer names them. */
+const CHANGE_WORK = 'change(s) waiting for a payment provider';
+const EVENT_WORK = 'provider event(s) being applied';
+const MIGRATION_WORK = 'run(s) of due price migrations';
+const NOTICE_WORK = 'member notice(s) not sent and recorded yet';
+const SAVE_WORK = 'save(s) of premium-tiers.json waiting for the database';
+const REPLAY_WORK = 'replay(s) of kept provider events';
+const MARKS_WORK = "replay audit line(s) and journal deletes waiting for the save of the replay's marks";
+const RESUME_WORK = 'provider resume call(s)';
 /** NB4's liveness test of a journal line's writer (sheets/NB4.md:823). */
 const LIVE_SQL = 'SELECT process_id, takeover_seconds, seen_at > now() - make_interval(secs => takeover_seconds) AS live FROM smdb_data.shard_nodes WHERE process_id = ANY($1)';
 
@@ -711,11 +724,17 @@ export function errnoOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/** A cache the bot process stops at its final stop step and at a deposition (decisions 12 and 20 of NB10). */
+/**
+ * A cache the bot process stops at its final stop step and at a deposition (decisions 12 and 20 of NB10); the save run
+ * behind a maintenance answer saves what it holds (NX5 ruling G8-9).
+ */
 export interface StoppableCache {
   finalStop(): void;
   markStopped(kind: StopKind): void;
   logLossesAtExit?(): void;
+  resaveHeld?(): void;
+  heldFiles?(): string[];
+  openWork?(): string | null;
 }
 
 const stopTargets = new Set<StoppableCache>();
@@ -724,6 +743,7 @@ let processHooksInstalled = false;
 export function registerCacheStop(target: StoppableCache): void {
   stopTargets.add(target);
   addFinalStopStep(() => target.finalStop());
+  if (target.resaveHeld && target.heldFiles) addHeldSaver(target as HeldSaver);
   if (deposedHolder()) target.markStopped('deposed');
   if (processHooksInstalled) return;
   processHooksInstalled = true;
@@ -743,6 +763,7 @@ export function registerCacheStop(target: StoppableCache): void {
 
 export function unregisterCacheStop(target: StoppableCache): void {
   stopTargets.delete(target);
+  removeHeldSaver(target as HeldSaver);
 }
 
 /** Where a subscription's subscription.install.paid line stands (decision 13 of NB10). */
@@ -953,6 +974,10 @@ export class PremiumManager {
   private lastRefusal: LedgerCause | null = null;
   /** Ops of premium-tiers.json from this process accepted and not settled (decision 96's gate). */
   private openSaves = 0;
+  /** NX5 ruling G8-14: every piece of premium's asynchronous work, open until it wrote or gave up. */
+  private readonly work = new OpenWork('premium');
+  /** Ends the count of the replay's lines while a save of its marks is in flight. */
+  private endMarksWork: (() => void) | null = null;
 
   /** Listener: mirror provider events into the cache. */
   private paidEventHandler = (event: ProviderEvent): void => {
@@ -982,7 +1007,7 @@ export class PremiumManager {
   }
 
   private handOutsideNext(event: ProviderEvent, hand: number, made: SaveOp | null | Promise<InstallOutcome>): void {
-    void (async () => {
+    void this.work.run(EVENT_WORK, async () => {
       const outcome = made instanceof Promise ? await this.installOutcome(made) : made?.outcome ? await made.outcome : null;
       if (!outcome || typeof outcome !== 'object' || outcome.refused !== 'changed-elsewhere') return;
       if (hand >= 3) {
@@ -998,7 +1023,7 @@ export class PremiumManager {
         this.ensureLoaded();
         this.handOutsideNext(event, hand + 1, this.handleEvent(event));
       }));
-    })().catch(error => console.error('[PremiumManager] A provider event could not be handed again:', error));
+    }).catch(error => console.error('[PremiumManager] A provider event could not be handed again:', error));
   }
 
   /** An install's save outcome (64's in-flight form), for the re-hand. */
@@ -1014,10 +1039,10 @@ export class PremiumManager {
     if (event.type === 'subscription.created') {
       const providerSubId = event.providerSubId;
       const before = this.inFlight.get(providerSubId);
-      const promise: Promise<InstallOutcome> = (async () => {
+      const promise: Promise<InstallOutcome> = this.work.run(EVENT_WORK, async () => {
         if (before) await before.promise;
         return this.installAsyncSubscription(event);
-      })().catch(err => {
+      }).catch(err => {
         console.error('[PremiumManager] installAsyncSubscription failed:', err);
         return { skipped: err instanceof Error ? err.message : String(err) };
       });
@@ -1562,13 +1587,18 @@ export class PremiumManager {
 
   private refusalText(): string {
     if (this.stopped) return `Nothing was saved: ${stopWords(this.stopped)}.`;
-    return this.unreadableText() ?? this.heldEventsText() ?? 'Premium cannot take changes right now; nothing was saved.';
+    const text = this.unreadableText() ?? this.heldEventsText();
+    if (text) return text;
+    return orderRefusesGlobalWrite()
+      ? 'Nothing was saved: the bot is in maintenance.'
+      : 'Premium cannot take changes right now; nothing was saved.';
   }
 
   /** A mutating method's entry check: true when it must refuse, recorded in the current ledger, before it changes the cache. */
   private refusedAtEntry(): boolean {
     this.ensureLoaded();
-    const cause: LedgerCause | null = this.stopped ? stopCause(this.stopped) : this.unreadable ? 'io' : this.replay ? 'not-ready' : null;
+    const cause: LedgerCause | null = this.stopped ? stopCause(this.stopped) : this.unreadable ? 'io' : this.replay ? 'not-ready'
+      : orderRefusesGlobalWrite() ? 'maintenance' : null;
     if (!cause) return false;
     recordRefusal(cause, PREMIUM_DOC);
     return true;
@@ -1638,7 +1668,7 @@ export class PremiumManager {
         this.dropOwed = false;
         this.unstorableSave = false;
         if (tracked.ticket.kind === 'file') this.lastSaveTicket = tracked.ticket;
-        if (this.raisedMarks && !this.marksTicket && (tracked.ticket.kind === 'file' || tracked.ticket.kind === 'row')) this.marksTicket = tracked.ticket;
+        if (this.raisedMarks && !this.marksTicket && (tracked.ticket.kind === 'file' || tracked.ticket.kind === 'row')) this.setMarksTicket(tracked.ticket);
         if (tracked.ticket.kind === 'row') {
           const outcome = this.watchOp(tracked.ticket, taken);
           this.answerWaits(outcome);
@@ -1701,15 +1731,15 @@ export class PremiumManager {
       if (install) install.ticket = ticket;
     }
     this.openSaves += 1;
-    return rowOutcome(ticket).then(outcome => {
+    return this.work.track(SAVE_WORK, rowOutcome(ticket).then((outcome): SaveOutcome => {
       this.openSaves -= 1;
       if (outcome === 'landed') {
         landItems(items, ticket);
-        return 'landed' as const;
+        return 'landed';
       }
       if (outcome === 'unconfirmed') {
         failItems(items, 'unconfirmed', this.itemSink);
-        return 'unconfirmed' as const;
+        return 'unconfirmed';
       }
       const cause = outcome.refused.cause;
       if (cause === 'changed-elsewhere') {
@@ -1718,7 +1748,7 @@ export class PremiumManager {
       }
       failItems(items, { refused: cause, words: causeWords(cause) }, this.itemSink);
       return { refused: cause };
-    });
+    }));
   }
 
   /** A held save made on a cache another machine's change refused: its retry would be refused too, so it is now. */
@@ -1911,11 +1941,14 @@ export class PremiumManager {
     }
   }
 
-  /** One pass outside any ledger: the held save, then the held audit lines in order until one is refused. */
+  /**
+   * One pass outside any ledger: the held save, then the held audit lines in order until one is refused. They are
+   * changes premium accepted, so a save order's refusal does not refuse them (NX5 ruling G8-9).
+   */
   private runPass(): void {
     this.passing = true;
     try {
-      outsideLedgers(() => {
+      outsideLedgers(() => runHeldResave(() => {
         if (this.saveHeld) {
           this.writeCache();
           if (this.saveHeld) return;
@@ -1933,10 +1966,27 @@ export class PremiumManager {
             held.install.ticket = result.ticket;
           }
         }
-      });
+      }));
     } finally {
       this.passing = false;
     }
+  }
+
+  /** The save run behind a maintenance answer: one pass now; the retry timer keeps its turn for what stays held. */
+  resaveHeld(): void {
+    if (this.stopped || this.disposed || (!this.saveHeld && this.heldLines.length === 0)) return;
+    this.runPass();
+  }
+
+  /** The files whose accepted change premium holds unsaved: the held save, and the audit file behind held lines. */
+  heldFiles(): string[] {
+    if (this.disposed) return [];
+    return [...(this.saveHeld ? [CONFIG_PATH] : []), ...(this.heldLines.length > 0 ? [AUDIT_PATH] : [])];
+  }
+
+  /** NX5 ruling G8-14: premium's open asynchronous work in words; null when none is open. */
+  openWork(): string | null {
+    return this.disposed ? null : this.work.words();
   }
 
   /** A deposition: nothing more is written, and every later save, line, event and notice is refused or logged. */
@@ -2144,7 +2194,7 @@ export class PremiumManager {
     this.replayBuffer = [];
     this.replayHanded = 0;
     outsideLedgers(() => {
-      void Promise.resolve().then(() => runSealed('console', null, 'premium', ledger => this.runReplay(ledger)));
+      void this.work.track(REPLAY_WORK, Promise.resolve().then(() => runSealed('console', null, 'premium', ledger => this.runReplay(ledger))));
     });
   }
 
@@ -2325,7 +2375,7 @@ export class PremiumManager {
       }
       this.config.eventsApplied = marks;
       this.raisedMarks = marks;
-      this.marksTicket = null;
+      this.setMarksTicket(null);
       this.replay = null;
       left = true;
       this.replayLineIds = disk.map(l => l.id).filter((id): id is string => typeof id === 'string');
@@ -2350,6 +2400,16 @@ export class PremiumManager {
     }
   }
 
+  /**
+   * The ticket of the save that carries the replay's marks. While one is set and its lines are not written, premium
+   * counts them as open work (ruling G8-14); with none set no save of them is in flight, and the journal keeps the events.
+   */
+  private setMarksTicket(ticket: FileTicket | RowTicket | null): void {
+    this.marksTicket = ticket;
+    this.endMarksWork?.();
+    this.endMarksWork = ticket ? this.work.begin(MARKS_WORK) : null;
+  }
+
   /** Waits, outside any ledger, for a save carrying the replay's marks to land; then appends its lines and deletes the journal. */
   private watchMarks(): void {
     outsideLedgers(() => {
@@ -2366,18 +2426,21 @@ export class PremiumManager {
           }
           if (ticket.kind === 'row') {
             const settled = await rowOutcome(ticket);
-            if (settled !== 'landed' && this.marksTicket === ticket) this.marksTicket = null;
+            if (settled !== 'landed' && this.marksTicket === ticket) this.setMarksTicket(null);
             if (settled === 'landed') continue;
             await sleepOutside(WATCH_IDLE_MS);
             continue;
           }
           const answer = await confirmFile(ticket, CONFIRM_MS);
           if (answer === 'ok') continue;
-          if (answer === 'unavailable' && !landed(ticket) && this.marksTicket === ticket) this.marksTicket = null;
+          if (answer === 'unavailable' && !landed(ticket) && this.marksTicket === ticket) this.setMarksTicket(null);
           await sleepOutside(WATCH_IDLE_MS);
         }
       })().catch(error => {
         console.error(`[PremiumManager] The watch for the replay's save failed (${error instanceof Error ? error.message : String(error)})`);
+      }).finally(() => {
+        this.endMarksWork?.();
+        this.endMarksWork = null;
       });
     });
   }
@@ -2414,10 +2477,10 @@ export class PremiumManager {
   /**
    * Every member notice goes through here (decisions 63 and 64): with `{ carry }` it is sent once the op of the save
    * that takes the carry landed; standalone at once. After the stop or a deposition none is sent, and each is logged.
+   * A follow-up that records the outcome goes in `after`: the notice is premium's open work until it ran (G8-14).
    */
-  private notify(guildId: string, kind: NotificationType, payload: NotificationPayload, link: Link): Promise<NotifyOutcome> {
-    if (this.stopped || 'standalone' in link) return this.sendNotice(guildId, kind, payload);
-    return new Promise<NotifyOutcome>(resolve => {
+  private notify(guildId: string, kind: NotificationType, payload: NotificationPayload, link: Link, after?: (outcome: NotifyOutcome) => void): Promise<NotifyOutcome> {
+    const outcome = this.stopped || 'standalone' in link ? this.sendNotice(guildId, kind, payload) : new Promise<NotifyOutcome>(resolve => {
       link.carry.items.push(makeItem({
         kind: 'notice',
         id: crypto.randomUUID(),
@@ -2431,8 +2494,10 @@ export class PremiumManager {
           console.warn(`[PremiumManager] The ${kind} notice for guild ${guildId} was not sent: ${told}`);
           resolve({ delivered: false, cause });
         },
+        forget: () => resolve({ delivered: false, cause: 'the change it announces was not saved' }),
       }));
     });
+    return this.work.track(NOTICE_WORK, after ? outcome.then(o => { after(o); return o; }) : outcome);
   }
 
   private sendNotice(guildId: string, kind: NotificationType, payload: NotificationPayload): Promise<NotifyOutcome> {
@@ -2622,8 +2687,8 @@ export class PremiumManager {
    */
   setGlobalModuleConfig(moduleName: string, partial: Partial<GlobalModuleConfig>, base?: Record<string, any>): boolean {
     this.ensureLoaded();
-    if (this.stopped || this.replay) {
-      recordRefusal(this.stopped ? stopCause(this.stopped) : 'not-ready', PREMIUM_DOC);
+    if (this.stopped || this.replay || orderRefusesGlobalWrite()) {
+      recordRefusal(this.stopped ? stopCause(this.stopped) : this.replay ? 'not-ready' : 'maintenance', PREMIUM_DOC);
       return false;
     }
     const ok = saveGlobalModuleConfig(moduleName, partial, base);
@@ -3197,7 +3262,7 @@ export class PremiumManager {
       if (resumed.source === 'paid' && resumed.providerId && resumed.providerSubId) {
         const provider = getPaymentRegistry().get(resumed.providerId);
         if (provider?.resumeSubscription && provider.capabilities.supportsPause) {
-          provider.resumeSubscription(resumed.providerSubId, newEndDate).catch((err: any) => {
+          void this.work.track(RESUME_WORK, provider.resumeSubscription(resumed.providerSubId, newEndDate)).catch((err: any) => {
             console.warn(err?.code === 'unconfirmed'
               ? `[PremiumManager] Can't confirm that the Dummy provider saved the resume of subscription ${resumed.providerSubId} (${err.reason}); the bot's copy holds it active. If the provider's record stays paused, the Dummy provider resumes it within about 2 minutes.`
               : `[PremiumManager] provider resumeSubscription failed for '${resumed.providerId}': ${err?.message || err}`);
@@ -3232,7 +3297,11 @@ export class PremiumManager {
    * is higher priority, manual goes to paused queue; if active is lower,
    * manual takes the active slot; same priority manual replaces (manual wins ties).
    */
-  async grantManual(
+  grantManual(guildId: string, tierId: string, durationDays: number | null, notes?: string, grantedBy?: string): Promise<boolean> {
+    return this.work.run(CHANGE_WORK, () => this.grantManualRun(guildId, tierId, durationDays, notes, grantedBy));
+  }
+
+  private async grantManualRun(
     guildId: string,
     tierId: string,
     durationDays: number | null,
@@ -3374,7 +3443,16 @@ export class PremiumManager {
    * async providers (Stripe / LS / PayPal) return a redirect/handoff URL and
    * install via `subscription.created` after the webhook arrives.
    */
-  async initiatePaidSubscription(
+  initiatePaidSubscription(
+    guildId: string,
+    tierId: string,
+    offeringId: string,
+    opts: { providerId: string; variantId: string; couponCode?: string; userId?: string; autoRenewOptOut?: boolean },
+  ): Promise<InitiateResult> {
+    return this.work.run(CHANGE_WORK, () => this.initiatePaidRun(guildId, tierId, offeringId, opts));
+  }
+
+  private async initiatePaidRun(
     guildId: string,
     tierId: string,
     offeringId: string,
@@ -3553,7 +3631,11 @@ export class PremiumManager {
    * reflect the change. We propagate provider errors so the UI shows the
    * actual cause instead of a false-positive success.
    */
-  async cancelPaidSubscription(guildId: string): Promise<boolean> {
+  cancelPaidSubscription(guildId: string): Promise<boolean> {
+    return this.work.run(CHANGE_WORK, () => this.cancelPaidRun(guildId));
+  }
+
+  private async cancelPaidRun(guildId: string): Promise<boolean> {
     if (this.refusedAtEntry()) return false;
     const active = this.config.subscriptions[guildId]?.active;
     if (!active || active.source !== 'paid') return false;
@@ -3586,7 +3668,11 @@ export class PremiumManager {
   }
 
   /** Reactivate a cancelled paid sub while still inside its active window. */
-  async reactivatePaidSubscription(guildId: string): Promise<boolean> {
+  reactivatePaidSubscription(guildId: string): Promise<boolean> {
+    return this.work.run(CHANGE_WORK, () => this.reactivatePaidRun(guildId));
+  }
+
+  private async reactivatePaidRun(guildId: string): Promise<boolean> {
     if (this.refusedAtEntry()) return false;
     const active = this.config.subscriptions[guildId]?.active;
     if (!active || active.source !== 'paid') return false;
@@ -3616,8 +3702,8 @@ export class PremiumManager {
    * slot, resumes the next paused entry. Provider call must succeed before
    * we wipe local state.
    */
-  async cancelPaidSubscriptionImmediately(guildId: string): Promise<boolean> {
-    return (await this.cancelActiveImmediately(guildId)) === 'done';
+  cancelPaidSubscriptionImmediately(guildId: string): Promise<boolean> {
+    return this.work.run(CHANGE_WORK, async () => (await this.cancelActiveImmediately(guildId)) === 'done');
   }
 
   private async cancelActiveImmediately(guildId: string): Promise<CancelStep> {
@@ -3708,8 +3794,8 @@ export class PremiumManager {
    * Cancel a paused subscription (paid or manual) and remove it from the
    * queue. Provider call must succeed before we drop the queue entry.
    */
-  async cancelAndRemovePausedSubscription(guildId: string, subscriptionId: string): Promise<boolean> {
-    return (await this.cancelPausedStep(guildId, subscriptionId)) === 'done';
+  cancelAndRemovePausedSubscription(guildId: string, subscriptionId: string): Promise<boolean> {
+    return this.work.run(CHANGE_WORK, async () => (await this.cancelPausedStep(guildId, subscriptionId)) === 'done');
   }
 
   private async cancelPausedStep(guildId: string, subscriptionId: string): Promise<CancelStep> {
@@ -3866,7 +3952,11 @@ export class PremiumManager {
     };
   }
 
-  async adoptOrphan(guildId: string, providerId: string, providerSubId: string, shown?: unknown): Promise<boolean> {
+  adoptOrphan(guildId: string, providerId: string, providerSubId: string, shown?: unknown): Promise<boolean> {
+    return this.work.run(CHANGE_WORK, () => this.adoptOrphanRun(guildId, providerId, providerSubId, shown));
+  }
+
+  private async adoptOrphanRun(guildId: string, providerId: string, providerSubId: string, shown?: unknown): Promise<boolean> {
     if (this.refusedAtEntry()) return false;
     const key = `${providerId}:${providerSubId}`;
     const seen = this.adoptEnded.get(key) ?? 0;
@@ -4029,7 +4119,11 @@ export class PremiumManager {
     throw new Error(`Subscription '${providerSubId}' was not adopted: ${why}.`);
   }
 
-  async cancelOrphan(providerId: string, providerSubId: string): Promise<boolean> {
+  cancelOrphan(providerId: string, providerSubId: string): Promise<boolean> {
+    return this.work.run(CHANGE_WORK, () => this.cancelOrphanRun(providerId, providerSubId));
+  }
+
+  private async cancelOrphanRun(providerId: string, providerSubId: string): Promise<boolean> {
     if (this.refusedAtEntry()) return false;
     const provider = getPaymentRegistry().get(providerId);
     if (!provider) throw new Error(`Provider '${providerId}' is not registered.`);
@@ -4229,7 +4323,11 @@ export class PremiumManager {
    * save stops it with the link kept, so the same request can finish the change; the op's verdict answers the failure.
    * The subscriptions are read again before each step, since other changes may move or remove them meanwhile.
    */
-  async unlinkProviderAccount(guildId: string, providerId: string): Promise<boolean> {
+  unlinkProviderAccount(guildId: string, providerId: string): Promise<boolean> {
+    return this.work.run(CHANGE_WORK, () => this.unlinkProviderRun(guildId, providerId));
+  }
+
+  private async unlinkProviderRun(guildId: string, providerId: string): Promise<boolean> {
     if (this.refusedAtEntry()) return false;
     const links = this.config.providerAccountLinks[providerId] || {};
     const externalAccountId = Object.entries(links).find(([, gid]) => gid === guildId)?.[0];
@@ -4582,7 +4680,7 @@ export class PremiumManager {
       details: opts.message || `Your subscription will move from "${sourceTier.displayName}" to "${targetTier.displayName}". Open the subscription panel to accept or decline.`,
     };
     for (const d of migration.decisions) {
-      void this.notify(d.guildId, 'migration.scheduled', notice, { carry }).then((outcome) => {
+      void this.notify(d.guildId, 'migration.scheduled', notice, { carry }, (outcome) => {
         if (outcome.delivered) this.markMigrationNotified(migration.id, d.subscriptionId, new Date().toISOString());
         else console.warn(`[PremiumManager] Migration ${migration.id} request not delivered to guild ${d.guildId}: ${outcome.cause}`);
       });
@@ -4671,9 +4769,13 @@ export class PremiumManager {
    * surface partial failures. Migration.status flips to 'applied' once
    * all decisions resolve (success or failure).
    */
-  async processDueMigrations(): Promise<void> {
+  processDueMigrations(): Promise<void> {
+    return this.work.run(MIGRATION_WORK, () => this.processDueRun());
+  }
+
+  private async processDueRun(): Promise<void> {
     this.ensureLoaded();
-    if (this.cannotWrite() || this.migrationsRunning) return;
+    if (this.cannotWrite() || this.migrationsRunning || this.refusedAtEntry()) return;
     const now = Date.now();
     const tried = new Set<string>();
     // Read again before each one: a migration cancelled or applied while an earlier one ran is left alone.
@@ -4682,7 +4784,7 @@ export class PremiumManager {
     if (!nextDue()) return;
     this.migrationsRunning = true;
     try {
-      for (let migration = nextDue(); migration && !this.cannotWrite(); migration = nextDue()) {
+      for (let migration = nextDue(); migration && !this.cannotWrite() && !orderRefusesGlobalWrite(); migration = nextDue()) {
         tried.add(migration.id);
         await this.applyMigration(migration);
       }
@@ -4725,12 +4827,24 @@ export class PremiumManager {
     const policy = this.config.migrationSilencePolicy;
     const stamp = new Date().toISOString();
 
+    let decided = false;
+    // Ruling G8-11: while the order holds no new decision is applied; those made are saved and the rest stay pending.
+    const stopForOrder = (): void => {
+      if (decided) this.save({ carry });
+      else forgetItems(carry.items.splice(0));
+    };
     for (const decision of migration.decisions) {
       if (this.cannotWrite()) {
         forgetItems(carry.items.splice(0));
         return;
       }
       if (decision.appliedAt) continue;
+      if (orderRefusesGlobalWrite()) {
+        stopForOrder();
+        return;
+      }
+      const decidedEarlier = decided;
+      decided = true;
       // Skip if guild lost their sub (cancelled before effective date).
       const subs = this.config.subscriptions[decision.guildId];
       if (!subs) {
@@ -4773,6 +4887,7 @@ export class PremiumManager {
       const effective = wasSilent
         ? (policy === 'continue' ? 'accepted' : 'declined')
         : decision.decision;
+      const asked = decision.decision;
       if (wasSilent) decision.decision = 'silent-applied';
 
       try {
@@ -4803,6 +4918,12 @@ export class PremiumManager {
           decision.outcome = 'cancelled';
         }
       } catch (err: any) {
+        if (err instanceof MaintenanceRefusal) {
+          decision.decision = asked;
+          decided = decidedEarlier;
+          stopForOrder();
+          return;
+        }
         decision.outcome = 'failed';
         decision.outcomeNote = err?.message || String(err);
       }

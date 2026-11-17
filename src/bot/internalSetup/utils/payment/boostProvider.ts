@@ -42,7 +42,7 @@
 import type { Client } from 'discord.js';
 import { providerCredentials } from '@/utils/envLoader';
 import { getPaymentRegistry } from './paymentRegistry';
-import { isMaintenanceGateClosed } from '../maintenanceGate';
+import { isMaintenanceGateClosed, runAcceptedOp } from '../maintenanceGate';
 import type {
   PaymentProvider,
   ProviderCapabilities,
@@ -185,7 +185,11 @@ export class ServerBoostingProvider implements PaymentProvider {
    * Walk the configured target guild's boosters and grant the wired
    * boost variant on each guild those boosters own.
    */
-  private async tick(): Promise<void> {
+  private tick(): Promise<void> {
+    return runAcceptedOp(() => this.tickRun());
+  }
+
+  private async tickRun(): Promise<void> {
     if (!this.client || isMaintenanceGateClosed()) return;
     const c = providerCredentials('boost');
     const targetId = c.BOOST_TARGET_GUILD_ID;

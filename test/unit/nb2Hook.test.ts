@@ -289,3 +289,85 @@ describe('ruling B: BotManager.leaveMaintenance', () => {
     });
   });
 });
+
+// NX5 test 3a (sheets/NX5.md decision 11, rulings J3, L1 and L2): the child's leave answers leaving false with the
+// source that holds it, or null with the read that failed; the web UI passes the cause or the failed read on, says the
+// still-starting bot runs normally only when nothing holds it, and an IPC failure carries no mark. Fails today
+// (botManager.ts:1748-1754 know only leaving true).
+describe('NX5 test 3a: BotManager.leaveMaintenance passes the child\'s cause on', () => {
+  const call = (self: object) => (BotManager.prototype as any).leaveMaintenance.call(self);
+  const child = (reply: () => Promise<unknown>) => ({ isRunning: () => true, botProcess: {}, stageReached: () => true, sendIPCMessage: vi.fn(reply) });
+
+  it.each([
+    ['order', 'The bot stays in maintenance: the main database holds a maintenance order. It leaves when that order ends.'],
+    ['login', 'The bot stays in maintenance: the main database refuses its login. It leaves once the login is accepted and no maintenance order holds it.'],
+    ['file', 'The bot stays in maintenance: its saved maintenance state still says maintenance. It leaves once that state says running.'],
+  ])('leaving false with heldBy %s gives restarting false, stays and that cause\'s sentence', async (heldBy, note) => {
+    expect(await call(child(async () => ({ leaving: false, heldBy })))).toEqual({ restarting: false, stays: heldBy, note });
+  });
+
+  it.each(['no answer within 3 seconds', 'the database did not answer', 'a timeout'])(
+    'leaving null with why "%s" gives restarting null, unread and the failed-read sentence, which names the main database and not its order',
+    async why => {
+      const result = await call(child(async () => ({ leaving: null, why })));
+      expect(result).toEqual({
+        restarting: null,
+        unread: why,
+        note: `Can't confirm whether the bot restarts: it could not read the main database (${why}). It leaves maintenance once a read shows nothing holds it.`,
+      });
+      expect(result.note).not.toMatch(/order/);
+    },
+  );
+
+  it('the still-starting answer carries starting true and the conditional note', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const self = { isRunning: () => true, botProcess: {}, stageReached: () => false, sendIPCMessage: vi.fn() };
+    expect(await call(self)).toEqual({
+      restarting: false,
+      starting: true,
+      note: 'The bot process is still starting; it reads maintenance.json as it opens the data files, and it runs normally unless the main database refuses its login or holds a maintenance order.',
+    });
+    expect(self.sendIPCMessage).not.toHaveBeenCalled();
+  });
+
+  it('an IPC failure carries no mark (guard)', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const result = await call(child(async () => { throw new Error('IPC request timed out'); }));
+    expect(result).not.toHaveProperty('stays');
+    expect(result).not.toHaveProperty('unread');
+    expect(result).not.toHaveProperty('starting');
+  });
+
+  it('L1: a child whose read takes 6 s against its 3 s bound answers null at 3 s, and the web UI returns that answer with unread, never "it did not answer the request"', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
+    try {
+      const self = child(() => new Promise(resolve => {
+        setTimeout(() => resolve({ leaving: null, why: 'no answer within 3 seconds' }), 3_000);
+      }));
+      let result: any = 'pending';
+      void call(self).then((r: unknown) => { result = r; });
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(self.sendIPCMessage).toHaveBeenCalledWith('maintenance:leave', {}, 5_000);
+      expect(result).toMatchObject({ restarting: null, unread: 'no answer within 3 seconds' });
+      expect(result.note).not.toMatch(/did not answer the request/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('the hook route passes stays, unread and starting on unchanged (guard)', async () => {
+    writeHookFile();
+    bot.serving = false;
+    bot.leave.mockImplementation(async () => ({ restarting: false, stays: 'order', note: 'The bot stays in maintenance: the main database holds a maintenance order. It leaves when that order ends.' }));
+    const res = await hook({ state: 'running' });
+    expect(res.body).toMatchObject({ success: true, state: 'running', restarting: false, stays: 'order' });
+    bot.leave.mockImplementation(async () => ({ restarting: null, unread: 'a timeout', note: 'n' }));
+    expect((await hook({ state: 'running' })).body).toMatchObject({ restarting: null, unread: 'a timeout' });
+    bot.leave.mockImplementation(async () => ({ restarting: false, starting: true, note: 'n' }));
+    expect((await hook({ state: 'running' })).body).toMatchObject({ restarting: false, starting: true });
+  });
+});
+
+function writeHookFile(): void {
+  fs.writeFileSync(maintenanceFilePath(), JSON.stringify({ state: 'maintenance', message: 'm', since: new Date().toISOString() }));
+}

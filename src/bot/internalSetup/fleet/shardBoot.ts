@@ -6,7 +6,10 @@ import { PostgresBackend } from '../utils/dataBackends/postgresBackend';
 import { getWorkingSet } from '../utils/dataBackends/workingSet';
 import { cleanOrphanTmpFiles, setGuildViewCache } from '../utils/dataBackends/fileBackend';
 import { isMaintenanceGateClosed } from '../utils/maintenanceGate';
-import { canRestart, leaveRestartAsked, maintenanceUnfit, noteClaimsLapsed, requestRestart, restartForShards, startLeave } from '../utils/maintenance';
+import {
+  attachSaveOrderSource, canRestart, dropSaveOrderRead, leaveRestartAsked, maintenanceUnfit, noteClaimsLapsed, noteSaveOrder, requestRestart,
+  restartForShards, startLeave,
+} from '../utils/maintenance';
 import { setStoppedServingHook } from '../utils/servingGate';
 import { reshardOverlap, resolveDataBackend, shardCapacity, shardReturnEnabled, takeoverSeconds } from '../../../utils/envLoader';
 import { showEntry } from '../../../utils/databaseAddress';
@@ -307,7 +310,13 @@ async function runBoot(given: StandbyTaken | JsonTaken | null): Promise<ShardBoo
   const entry = pg?.chosenEntry() ?? '';
   const onRefused = () => { if (pg) pg.notifyLoginRefused(); };
   const store = storeFactory ? storeFactory(entry, timings, onRefused) : new ClaimStore(entry, timings, onRefused);
-  pg?.onDatabaseChanged(next => store.retarget?.(next));
+  pg?.onDatabaseChanged(next => {
+    store.retarget?.(next);
+    dropSaveOrderRead();
+  });
+  if (store.readSaveOrder && store.writeSaveAck) {
+    attachSaveOrderSource({ me: { processId, nodeId, nodeName }, read: () => store.readSaveOrder!(), writeAck: ack => store.writeSaveAck!(ack) });
+  }
   const slots = store as ClaimStoreApi & { reserveIdentifySlot?: IdentifyReserve };
   if (slots.reserveIdentifySlot) serveReserve = (bucket, holder, signal) => slots.reserveIdentifySlot!(bucket, holder, signal);
   if (!standby && slots.reserveIdentifySlot) {
@@ -386,6 +395,7 @@ async function runBoot(given: StandbyTaken | JsonTaken | null): Promise<ShardBoo
     guildsOfShard: shardId => getWorkingSet()?.guildsOfShard(shardId) ?? [],
     ...(standby ? { fromStandby: true, standbyPairs: standby.pairs } : {}),
     onPage: page => reshard?.onPage(page),
+    onSaveOrder: noteSaveOrder,
   });
   claims = shardClaims;
   let ledgerRef: IdentifyLedger | null = null;

@@ -42,7 +42,7 @@ afterEach(() => {
 async function boot(): Promise<Client | null> {
   return runMaintenanceBoot(
     { cause: 'login-refused', message: 'down for s13' },
-    { shards: async () => 1, login: async () => undefined, loginProbe: async () => 'refused', retryMs: 3_600_000, sleep: async () => undefined },
+    { shards: async () => 1, login: async () => undefined, retryMs: 3_600_000, sleep: async () => undefined },
   );
 }
 

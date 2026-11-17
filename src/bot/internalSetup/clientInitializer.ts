@@ -44,6 +44,7 @@ import { LoadedModule } from '../types/moduleTypes';
 import { ensureConfigPopulated } from './utils/configManager';
 import { decideBoot, installMaintenanceGate, markDiscordStarted, runMaintenanceBoot, setupMaintenanceIPCAtBoot, watchDataBackend } from './utils/maintenance';
 import { isMaintenanceGateClosed } from './utils/maintenanceGate';
+import { attachEntitlementBridge } from './utils/entitlementBridge';
 import { PostgresBackend } from './utils/dataBackends/postgresBackend';
 import { noteShardReconnect, stopMainWatch } from './utils/dataBackends/mainDatabase';
 import { claimsStop, endStandbyMaintenanceAnswers, l20Line, type RunBotOptions } from './fleet/standbyBoot';
@@ -896,12 +897,7 @@ export async function runBot(opts: RunBotOptions): Promise<void> {
   // web-UI process never sees these events.
   try {
     const registry = getPaymentRegistry();
-    const discord = registry.get('discord');
-    if (discord && (discord as any).attachGatewayBridge) {
-      (discord as any).attachGatewayBridge((eventName: string, handler: (payload: any) => void) => {
-        client.on(eventName as any, handler);
-      });
-    }
+    attachEntitlementBridge(client);
     // ServerBoostingProvider polls Discord's premium-subscriptions endpoint
     // on the configured target guild. Its setClient() also fires an
     // immediate tick if the timer is already running, so we don't have

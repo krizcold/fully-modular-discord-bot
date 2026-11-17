@@ -97,21 +97,6 @@ describe('the stop step of a maintenance boot', () => {
   });
 });
 
-describe('the login watcher of a maintenance boot', () => {
-  it('runs only for a refused login, not for the hook', async () => {
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
-    const probe = vi.fn(async () => 'refused' as const);
-    await jsonBoot({ loginProbe: probe, retryMs: 1000 }, 'hook');
-    await vi.advanceTimersByTimeAsync(3500);
-    expect(probe).not.toHaveBeenCalled();
-    _resetMaintenance();
-    _setMaintenanceTiming({ filePollMs: 600_000 });
-    await jsonBoot({ loginProbe: probe, retryMs: 1000 }, 'login-refused');
-    await vi.advanceTimersByTimeAsync(3500);
-    expect(probe).toHaveBeenCalledTimes(3);
-  });
-});
-
 describe('the Discord steps of a maintenance boot', () => {
   it('a shard count fetch that fails is logged by name and tried again', async () => {
     let calls = 0;

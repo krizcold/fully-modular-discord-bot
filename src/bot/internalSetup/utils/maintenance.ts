@@ -3,6 +3,7 @@
 
 import { ActivityType, Client, GatewayIntentBits, MessageFlags, type PresenceData } from 'discord.js';
 import {
+  acceptedOpsRunning,
   DEFAULT_MAINTENANCE_MESSAGE,
   handlersInFlight,
   isMaintenanceBoot,
@@ -10,13 +11,16 @@ import {
   maintenanceCause,
   maintenanceText,
   markMaintenanceBoot,
+  orderRefusesSharedOps,
   setMaintenanceGate,
+  setOrderRefusal,
   type MaintenanceCause,
 } from './maintenanceGate';
 import { readMaintenanceFile } from '../../../utils/maintenanceFile';
 import { loadCredentials, resolveDataBackend } from '../../../utils/envLoader';
-import { addStopStep, exitProcess, isExitDraining, resaveTarget, saveHeldWrites, stopProcess, unansweredRowOps, unsavedRowPaths } from './dataManager';
-import { probePass, setStepLayers, stepLayers } from './dataBackends/mainDatabase';
+import { addStopStep, exitProcess, hasHeldWrites, heldElsewhere, isExitDraining, openWorkElsewhere, resaveTarget, saveHeldWrites, stopProcess, unansweredRowOps, unsavedRowPaths } from './dataManager';
+import { PASS_BOUND_MS, probePass, setStepLayers, stepLayers, writableAnswer, connectCause, type ProbeAnswer, type SaveOrderRow } from './dataBackends/mainDatabase';
+import type { SaveAck } from '../fleet/claimStore';
 import { addressListInUse, parseAddressList, showEntry } from '../../../utils/databaseAddress';
 import { heldClauses, type HeldCounts } from './heldWords';
 import { STOPPED_SERVING_TEXT, stoppedServing } from './servingGate';
@@ -27,7 +31,7 @@ import { getWorkingSet } from './dataBackends/workingSet';
 import { unsavedFilePaths } from './dataBackends/fileBackend';
 import { isLoginRefused } from './dataBackends/postgresBackend';
 import { shortLivedClient } from './pgClient';
-import { getPaymentRegistry } from './payment/paymentRegistry';
+import { attachEntitlementBridge } from './entitlementBridge';
 import { getPremiumManager } from './premiumManager';
 import { getSubscriptionNotifier } from './subscriptionNotifier';
 import { getMetricsCollector } from './metrics/metricsCollector';
@@ -59,8 +63,9 @@ export type MaintenanceMode = 'running' | 'maintenance' | 'login-refused' | 'out
 export type LoginProbe = () => Promise<'accepted' | 'refused' | 'unreachable' | 'none'>;
 export type SaveAnswer =
   | { saved: true }
-  | { saved: null; unansweredGuilds: number; unconfirmedFiles: number; unansweredFiles?: number }
-  | ({ saved: false } & HeldCounts);
+  // running: the work that still runs and may save changes, in words; its answer could not count (ruling G8-14).
+  | { saved: null; unansweredGuilds: number; unconfirmedFiles: number; unansweredFiles?: number; running?: string }
+  | ({ saved: false; running?: string } & HeldCounts);
 export type DatabaseAnswer = 'answers' | 'refused' | 'unreachable';
 type Held = { unsavedGuilds: number; unsavedFiles: number; unansweredGuilds: number; resaveGuilds?: number; unansweredFiles?: number };
 
@@ -82,6 +87,25 @@ let watching = false;
 // Bumped by _resetMaintenance, so a leave step a test started stops with it.
 let generation = 0;
 const timers = new Set<NodeJS.Timeout>();
+
+/** NX5 decision 8: where a serving process with a claims store reads the save order and writes its answer. */
+export interface SaveOrderSource {
+  me: { processId: string; nodeId: string; nodeName: string };
+  read(): Promise<SaveOrderRow | null>;
+  writeAck(ack: SaveAck): Promise<boolean>;
+}
+type HeldBy = 'order' | 'login' | 'file';
+let orderSource: SaveOrderSource | null = null;
+// The kept order read; 'unknown' after a failed renewal or a 28000, which keeps heldWhileUnknown, the predicate's answer before it.
+let orderRead: SaveOrderRow | null | 'unknown' = null;
+let heldWhileUnknown: HeldBy | null = null;
+// The login as the last read that reached the database found it; null before any.
+let loginState: 'accepted' | 'refused' | null = null;
+// The order this process last answered saved true for.
+let answeredOrder: string | null = null;
+let orderSaving = false;
+// The hook's leave could not read: no path leaves until a later read answers (decision 11).
+let leaveReadOwed = false;
 
 type Sender = (message: object) => void;
 const processSender: Sender = message => {
@@ -114,6 +138,14 @@ export function _resetMaintenance(): void {
   databaseAnswer = null;
   watchedBackend = null;
   watching = false;
+  orderSource = null;
+  orderRead = null;
+  heldWhileUnknown = null;
+  loginState = null;
+  answeredOrder = null;
+  orderSaving = false;
+  leaveReadOwed = false;
+  setOrderRefusal(false);
   generation += 1;
   for (const timer of timers) clearInterval(timer);
   timers.clear();
@@ -212,15 +244,28 @@ function installRefusalGuard(): void {
 
 let filePoll: NodeJS.Timeout | null = null;
 
-/** The backstop for a lost maintenance:leave: while the hook holds the gate, maintenance.json saying running starts the leave step. */
+/**
+ * The backstop for a lost maintenance:leave: while the hook (or an order that followed it) holds the gate,
+ * maintenance.json saying running starts the leave step once nothing else holds the process.
+ */
 function startFilePoll(): void {
-  if (filePoll || leaving) return;
+  // A maintenance boot's own poll reads the file (startBootPoll).
+  if (filePoll || leaving || isMaintenanceBoot()) return;
   filePoll = every(timing.filePollMs, () => {
-    if (maintenanceCause() !== 'hook') return;
-    const saved = readMaintenanceFile();
+    const cause = maintenanceCause();
+    if (cause !== 'hook' && cause !== 'order') return;
     // A missing file also reads as running; only a record the hook wrote ends maintenance.
-    if (saved.state === 'running' && saved.since !== null) startLeave('maintenance.json says running');
+    if (readMaintenanceFile().since !== null && !maintenanceStillDue()) startLeave('maintenance.json says running');
   });
+}
+
+const modeOf = (cause: MaintenanceCause): MaintenanceMode => (cause === 'login-refused' ? 'login-refused' : 'maintenance');
+
+/** The mode the leave step reports once nothing is held: the outage's while it lasts, else the gate's cause's. */
+function ownMode(): MaintenanceMode {
+  if (outageDisconnected) return 'outage';
+  const cause = maintenanceCause();
+  return cause === null ? 'running' : modeOf(cause);
 }
 
 /** Closes the gate: interactions get the message, module code stops, guild writes are refused, the status shows it. */
@@ -231,8 +276,258 @@ export function closeMaintenanceGate(cause: MaintenanceCause, message: string): 
   applyPresence();
   // A leave step held by changes it cannot save stays reported as held.
   if (leaving && heldReport) reportMode('held', heldReport);
-  else reportMode(cause === 'hook' ? 'maintenance' : 'login-refused');
+  else reportMode(modeOf(cause));
   if (cause === 'hook') startFilePoll();
+}
+
+// ============================================================================
+// NX5: THE SAVE ORDER AND THE ONE LEAVE RULE (decisions 8 to 11)
+// ============================================================================
+
+const orderHolds = (read: SaveOrderRow | null | 'unknown'): read is SaveOrderRow =>
+  read !== null && read !== 'unknown' && read.current && read.state === 'maintenance';
+
+/** The first source that holds the process in maintenance, in the order order, login, file; null when none does. */
+function heldByNow(): HeldBy | null {
+  const unknown = orderRead === 'unknown';
+  if (orderHolds(orderRead) || (unknown && heldWhileUnknown === 'order')) return 'order';
+  if (loginState === 'refused') return 'login';
+  if (readMaintenanceFile().state === 'maintenance') return 'file';
+  return unknown ? heldWhileUnknown : null;
+}
+
+/** Decision 11: the maintenance file says maintenance, the database refuses the login, or the kept order read is a current maintenance order. */
+export function maintenanceStillDue(): boolean {
+  return heldByNow() !== null || leaveReadOwed;
+}
+
+/** Only a process that reads the order keeps a read: a serving process with an order source, or a maintenance boot. */
+const readsOrder = (): boolean => orderSource !== null || isMaintenanceBoot();
+
+function turnOrderUnknown(): void {
+  if (!readsOrder()) return;
+  heldWhileUnknown = heldByNow();
+  orderRead = 'unknown';
+}
+
+/** A process with no claims store never attaches one (decision 8): it is never expected and never answers. */
+export function attachSaveOrderSource(source: SaveOrderSource | null): void {
+  orderSource = source;
+  if (source) return;
+  orderRead = null;
+  heldWhileUnknown = null;
+  answeredOrder = null;
+  setOrderRefusal(false);
+}
+
+/** onDatabaseChanged: the old database's read no longer holds the process, nor refuses its writes, until the next read. */
+export function dropSaveOrderRead(): void {
+  orderRead = null;
+  heldWhileUnknown = null;
+  setOrderRefusal(false);
+}
+
+const shownMessage = (message: string) => message || DEFAULT_MAINTENANCE_MESSAGE;
+
+/**
+ * Every order read: the serving read after a renewal, and the maintenance boot's poll. A current maintenance order
+ * refuses shared ops, sets the gate's message and starts enterForOrder when this process has no true answer for it or
+ * holds something again; with the gate's cause 'order', an order that ended starts the leave once nothing holds.
+ */
+export function noteSaveOrder(read: SaveOrderRow | null | 'unknown'): void {
+  if (!readsOrder()) return;
+  if (read === 'unknown') {
+    turnOrderUnknown();
+    return;
+  }
+  orderRead = read;
+  heldWhileUnknown = null;
+  // A read that answered is a login the database accepted.
+  loginState = 'accepted';
+  leaveReadOwed = false;
+  const holds = orderHolds(read);
+  setOrderRefusal(holds);
+  if (holds) {
+    const cause = maintenanceCause();
+    if (cause !== null && maintenanceText() !== shownMessage(read.message)) setMaintenanceGate({ cause, message: read.message });
+    if (isMaintenanceBoot()) return;
+    if (answeredOrder !== read.orderId || hasHeldWrites()) void enterForOrder(read);
+    return;
+  }
+  if (!isMaintenanceBoot() && maintenanceCause() === 'order' && !leaving && heldByNow() === null) {
+    startLeave('The main database\'s maintenance order ended');
+  }
+}
+
+/**
+ * Decision 9: enterMaintenance's steps with the gate's cause 'order' (the gate close and the metrics flush only when it
+ * is open), then the answer from this run's own save, written while the order stands.
+ */
+async function enterForOrder(order: SaveOrderRow): Promise<void> {
+  const source = orderSource;
+  if (!source || orderSaving) return;
+  orderSaving = true;
+  const own = generation;
+  setOrderRefusal(true);
+  try {
+    if (!isMaintenanceGateClosed()) {
+      getMetricsCollector().flushTotals();
+      closeMaintenanceGate('order', order.message);
+      console.log('[Maintenance] The main database holds a maintenance order; entered maintenance and saving what this process holds');
+    } else {
+      const was = maintenanceCause();
+      if (was !== 'order') {
+        setMaintenanceGate({ cause: 'order', message: order.message });
+        if (was === 'login-refused' && !(leaving && heldReport)) reportMode('maintenance');
+      }
+      console.log('[Maintenance] The main database holds a maintenance order; saving what this process holds');
+    }
+    const answer = await saveForAnswer(ENTER_BOUNDS.handlerWaitMs, ENTER_BOUNDS.saveBoundMs);
+    if (own !== generation) return;
+    const ack: SaveAck = {
+      orderId: order.orderId, processId: source.me.processId, nodeId: source.me.nodeId, nodeName: source.me.nodeName,
+      saved: answer.saved, ...ackCounts(answer),
+    };
+    let written = false;
+    try {
+      written = await source.writeAck(ack);
+    } catch (error) {
+      console.warn(`[Maintenance] Could not write the answer to the maintenance order (${connectCause(error)}); the next read of the order saves and answers again`);
+    }
+    if (own !== generation) return;
+    answeredOrder = written && answer.saved === true ? order.orderId : null;
+    if (written) console.log(`[Maintenance] Answered the maintenance order: ${answer.saved === true ? 'every change this process held is saved' : answer.saved === false ? 'some changes are not saved' : "can't confirm that every change is saved"}`);
+    else console.warn('[Maintenance] The answer to the maintenance order was not written: the order no longer stands at this generation');
+  } finally {
+    if (own === generation) orderSaving = false;
+  }
+}
+
+type LeaveRead = { ok: true } | { ok: false; why: string };
+const LEAVE_READ_MS = 3_000;
+const NO_ANSWER_3S = 'no answer within 3 seconds';
+
+function within<T>(work: Promise<T>, ms: number): Promise<{ value: T } | { error: unknown } | 'late'> {
+  return new Promise(resolve => {
+    const timer = setTimeout(() => resolve('late'), ms);
+    timer.unref?.();
+    work.then(value => { clearTimeout(timer); resolve({ value }); }, error => { clearTimeout(timer); resolve({ error }); });
+  });
+}
+
+/** The hook's leave reads first (ruling J3), bounded at 3 s (ruling L1), from the source this process has. */
+async function readForLeave(): Promise<LeaveRead> {
+  if (isMaintenanceBoot()) return applyPassRead(await readPass(LEAVE_READ_MS, true));
+  if (orderSource) {
+    const got = await within(orderSource.read(), LEAVE_READ_MS);
+    if (got === 'late') return { ok: false, why: NO_ANSWER_3S };
+    if ('value' in got) {
+      noteSaveOrder(got.value);
+      return { ok: true };
+    }
+    if (isLoginRefused(got.error)) {
+      loginState = 'refused';
+      turnOrderUnknown();
+      return { ok: true };
+    }
+    return { ok: false, why: connectCause(got.error) };
+  }
+  if (watchedBackend) {
+    const got = await within(watchedBackend.askDatabase(), LEAVE_READ_MS);
+    if (got === 'late') return { ok: false, why: NO_ANSWER_3S };
+    const answer: DatabaseAnswer = 'value' in got ? got.value : 'unreachable';
+    databaseAnswer = answer;
+    if (answer === 'unreachable') return { ok: false, why: 'the database did not answer' };
+    loginState = answer === 'refused' ? 'refused' : 'accepted';
+    return { ok: true };
+  }
+  return { ok: true };
+}
+
+/** maintenance:leave (ruling J3): read, then decide, then answer. */
+async function hookLeave(): Promise<object> {
+  if (leaving) return { leaving: true };
+  leaveReadOwed = true;
+  const read = await readForLeave();
+  if (read.ok) leaveReadOwed = false;
+  if (leaving) return { leaving: true };
+  if (!read.ok) {
+    console.warn(`[Maintenance] The hook says running, but the bot could not read the main database (${read.why}); it stays in maintenance until a read shows nothing holds it`);
+    return { leaving: null, why: read.why };
+  }
+  const heldBy = heldByNow();
+  if (heldBy) {
+    console.log(`[Maintenance] The hook says running, but ${HELD_WORDS[heldBy]}; the bot stays in maintenance`);
+    return { leaving: false, heldBy };
+  }
+  startLeave('The hook says running');
+  return { leaving: true };
+}
+
+const HELD_WORDS: Record<HeldBy, string> = {
+  order: 'the main database holds a maintenance order',
+  login: 'the main database refuses the login',
+  file: 'maintenance.json still says maintenance',
+};
+
+type PassRead =
+  | { kind: 'no-database' }
+  | { kind: 'entry'; order: SaveOrderRow | null | 'unknown'; why: string | null }
+  | { kind: 'none'; login: 'accepted' | 'refused' | 'unreachable'; bound: boolean; why: string | null };
+
+/** One probe pass on short-lived sessions; the order and the login come from contract 3's entry (ruling H1). */
+async function readPass(boundMs: number, untilWritable: boolean): Promise<PassRead> {
+  if (!postgresBot()) return { kind: 'no-database' };
+  const list = addressListInUse();
+  if (!list) return { kind: 'no-database' };
+  const pass = await probePass(parseAddressList(list), { session: config => shortLivedClient(config) }, boundMs, { untilWritable });
+  return passRead(pass);
+}
+
+function passRead(pass: ProbeAnswer[]): PassRead {
+  const entry = pass.filter(writableAnswer).sort((a, b) => b.generation - a.generation)[0];
+  if (entry) {
+    const order = entry.saveOrder ?? null;
+    return { kind: 'entry', order, why: order === 'unknown' ? (entry.atBound ? null : entry.saveOrderCause ?? null) : null };
+  }
+  const failed = pass.find(p => p.kind === 'failed' && !p.atBound);
+  return { kind: 'none', login: loginOfPass(pass), bound: pass.some(p => p.atBound), why: failed && failed.kind === 'failed' ? failed.cause : null };
+}
+
+/**
+ * Applies a pass to the kept state. Not ok when the pass keeps the state: an order read 'unknown', no entry that
+ * answered while the gate's cause is not 'hook', or, for a process held by an order or a refused login (whatever the
+ * gate's cause now is), a pass in which no writable entry answered (decision 8).
+ */
+function applyPassRead(read: PassRead): LeaveRead {
+  if (read.kind === 'no-database') return { ok: true };
+  if (read.kind === 'entry') {
+    if (read.order === 'unknown') {
+      loginState = 'accepted';
+      noteSaveOrder('unknown');
+      return { ok: false, why: read.why ?? NO_ANSWER_3S };
+    }
+    noteSaveOrder(read.order);
+    return { ok: true };
+  }
+  if (read.login === 'refused') {
+    loginState = 'refused';
+    return { ok: true };
+  }
+  const held = heldByNow();
+  const unreachable = read.login === 'unreachable';
+  if (held === 'order' || held === 'login' || orderRefusesSharedOps() || (unreachable && maintenanceCause() !== 'hook')) {
+    return { ok: false, why: read.bound ? NO_ANSWER_3S : read.why ?? 'no database that accepts writes answered' };
+  }
+  if (unreachable) {
+    // Ruling G8-13: for cause 'hook' such a pass counts as the file poll's would, so the file decides.
+    orderRead = null;
+    heldWhileUnknown = null;
+    return { ok: true };
+  }
+  loginState = 'accepted';
+  noteSaveOrder(null);
+  return { ok: true };
 }
 
 /** The one answer an interaction gets while the gate is closed: the message, ephemeral; an autocomplete an empty list. */
@@ -285,23 +580,68 @@ export async function enterMaintenance(message: string, opts: { handlerWaitMs?: 
   if (!updating && !isMaintenanceBoot()) getMetricsCollector().flushTotals();
   closeMaintenanceGate('hook', message || DEFAULT_MAINTENANCE_MESSAGE);
   console.log(updating ? '[Maintenance] The maintenance message was updated; saving what this process holds' : '[Maintenance] Entered maintenance through the hook; saving what this process holds');
-  if (isMaintenanceBoot()) return { saved: true };
-  const waitUntil = Date.now() + (opts.handlerWaitMs ?? ENTER_BOUNDS.handlerWaitMs);
-  while (handlersInFlight() > 0 && Date.now() < waitUntil) await new Promise<void>(resolve => { setTimeout(resolve, 20); });
+  return saveForAnswer(opts.handlerWaitMs ?? ENTER_BOUNDS.handlerWaitMs, opts.saveBoundMs ?? ENTER_BOUNDS.saveBoundMs);
+}
+
+/** In-flight handlers settle, then what the process holds is saved; the answer is that save's. */
+type AckCounts = Pick<SaveAck, 'unsavedGuilds' | 'unsavedFiles' | 'unansweredGuilds' | 'unconfirmedFiles' | 'unansweredFiles' | 'resaveGuilds'>;
+
+// saveHeldWrites counts every field; saveForAnswer and saveHeldWrites leave a count out only when it is 0.
+function ackCounts(answer: SaveAnswer): AckCounts {
+  if (answer.saved === true) return { unsavedGuilds: 0, unsavedFiles: 0, unansweredGuilds: 0, unconfirmedFiles: 0, unansweredFiles: 0, resaveGuilds: 0 };
+  if (answer.saved === null) {
+    // Ruling G8-5: an answer that could not count, because work still runs, says so with NULL.
+    if (answer.running) {
+      return { unsavedGuilds: null, unsavedFiles: null, unansweredGuilds: null, unconfirmedFiles: null, unansweredFiles: null, resaveGuilds: 0 };
+    }
+    return {
+      unsavedGuilds: 0, unsavedFiles: 0, unansweredGuilds: answer.unansweredGuilds, unconfirmedFiles: answer.unconfirmedFiles,
+      unansweredFiles: answer.unansweredFiles ?? 0, resaveGuilds: 0,
+    };
+  }
+  return {
+    unsavedGuilds: answer.unsavedGuilds, unsavedFiles: answer.unsavedFiles, unansweredGuilds: answer.unansweredGuilds,
+    unconfirmedFiles: answer.unconfirmedFiles, unansweredFiles: answer.unansweredFiles ?? 0, resaveGuilds: answer.resaveGuilds ?? 0,
+  };
+}
+
+/**
+ * Rulings G8-12 and G8-14: the operations this process accepted and the subsystems' open work that still run and can
+ * write, in words ("1 operation(s) this process accepted; premium: 2 member notice(s) ..."); null when none runs.
+ */
+function runningWork(): string | null {
+  const ops = acceptedOpsRunning();
+  const parts = [...(ops > 0 ? [`${ops} operation(s) this process accepted`] : []), ...openWorkElsewhere()];
+  return parts.length > 0 ? parts.join('; ') : null;
+}
+
+async function saveForAnswer(handlerWaitMs: number, saveBoundMs: number): Promise<SaveAnswer> {
+  const waitUntil = Date.now() + handlerWaitMs;
+  while ((handlersInFlight() > 0 || runningWork() !== null) && Date.now() < waitUntil) await new Promise<void>(resolve => { setTimeout(resolve, 20); });
   if (handlersInFlight() > 0) console.warn(`[Maintenance] ${handlersInFlight()} handler(s) still run; any write they make from now on is refused`);
-  const left = await saveHeldWrites(opts.saveBoundMs ?? ENTER_BOUNDS.saveBoundMs);
+  // A maintenance boot holds no writes to save, but it runs accepted work (shared:op, premium's held saver).
+  const left: HeldCounts = isMaintenanceBoot()
+    ? { unsavedGuilds: 0, unsavedFiles: 0, unansweredGuilds: 0, unconfirmedFiles: 0 }
+    : await saveHeldWrites(saveBoundMs);
   const resave = left.resaveGuilds ?? 0;
   const unansweredFiles = left.unansweredFiles ?? 0;
-  if (left.unsavedGuilds === 0 && left.unsavedFiles === 0 && left.unansweredGuilds === 0 && unansweredFiles === 0 && left.unconfirmedFiles === 0 && resave === 0) {
+  // Work accepted before the refusal that still runs can write after this answer.
+  const running = runningWork();
+  const clauses = [heldClauses(left), running !== null ? `still running and may save changes: ${running}` : '']
+    .filter(Boolean).join('; ');
+  if (left.unsavedGuilds === 0 && left.unsavedFiles === 0 && left.unansweredGuilds === 0 && unansweredFiles === 0 && left.unconfirmedFiles === 0 && resave === 0 && running === null) {
     console.log('[Maintenance] Every change this process held is saved');
     return { saved: true };
   }
   if (left.unsavedGuilds === 0 && left.unsavedFiles === 0 && resave === 0) {
-    console.warn(`[Maintenance] ${heldClauses(left)}; can't confirm whether every change this process held is saved`);
-    return { saved: null, unansweredGuilds: left.unansweredGuilds, unconfirmedFiles: left.unconfirmedFiles, ...(unansweredFiles > 0 ? { unansweredFiles } : {}) };
+    console.warn(`[Maintenance] ${clauses}; can't confirm whether every change this process held is saved`);
+    return {
+      saved: null, unansweredGuilds: left.unansweredGuilds, unconfirmedFiles: left.unconfirmedFiles,
+      ...(unansweredFiles > 0 ? { unansweredFiles } : {}), ...(running !== null ? { running } : {}),
+    };
   }
-  console.warn(`[Maintenance] ${heldClauses(left)}`);
-  return { saved: false, ...left };
+  console.warn(`[Maintenance] ${clauses}`);
+  return { saved: false, ...left, ...(running !== null ? { running } : {}) };
 }
 
 /**
@@ -328,10 +668,7 @@ export async function handleMaintenanceIpc(message: unknown): Promise<{ requestI
   if (type === 'maintenance:enter') {
     return { requestId, data: await enterMaintenance(typeof data?.message === 'string' ? data.message : DEFAULT_MAINTENANCE_MESSAGE) };
   }
-  if (type === 'maintenance:leave') {
-    startLeave('The hook says running');
-    return { requestId, data: { leaving: true } };
-  }
+  if (type === 'maintenance:leave') return { requestId, data: await hookLeave() };
   if (!isMaintenanceBoot()) return null;
   // The shared handler answers these itself, in maintenance too.
   if (type === 'shared:op' || type === 'data:global-read') return null;
@@ -452,7 +789,7 @@ export function maintenanceUnfit(): string | null {
 function heldNames(unansweredOnly: string[]): string {
   const guilds = (getWorkingSet()?.heldGuilds() ?? []).filter(g => !unansweredOnly.includes(g.guildId))
     .map(g => `guild ${g.guildId} (${g.reason ?? 'no save tried yet'})`);
-  const files = [...unsavedFilePaths(), ...unsavedRowPaths()].map(file => `file ${file}`);
+  const files = [...unsavedFilePaths(), ...unsavedRowPaths(), ...heldElsewhere()].map(file => `file ${file}`);
   return [...guilds, ...files].join('; ');
 }
 
@@ -506,10 +843,19 @@ export function startLeave(reason: string, handOver?: { attempt: string | null }
     if (end === 'hand-over') retireForReshard(handOver!.attempt, reason);
     else requestRestart(reason);
   };
+  const untilEnds = `does not ${end === 'hand-over' ? 'stop for the hand-over' : restarts ? 'restart' : 'stop'} until it ends, or the operator ${restarts ? 'restarts' : 'stops'} it, which cuts that work and drops any change it has not saved`;
+  // Ruling G8-14: work that still runs can still write; each piece ends within its own provider's bound.
+  const waitWhileRunning = async (): Promise<void> => {
+    const until = Date.now() + timing.leaveRetryMs;
+    while (runningWork() !== null && Date.now() < until) await new Promise<void>(resolve => { setTimeout(resolve, 20).unref(); });
+  };
   void (async () => {
     let answeredPasses = 0;
     let refusedPasses = 0;
     let heldKey = '';
+    let runningLogged: string | null = null;
+    let refusedRunningLogged: string | null = null;
+    let refusedReported: string | null = null;
     for (;;) {
       const left = isMaintenanceBoot() ? { unsavedGuilds: 0, unsavedFiles: 0, unansweredGuilds: 0, unconfirmedFiles: 0 } : await saveHeldWrites(timing.leaveSaveBoundMs);
       if (own !== generation) return;
@@ -517,9 +863,27 @@ export function startLeave(reason: string, handOver?: { attempt: string | null }
       const resave = left.resaveGuilds ?? 0;
       const unansweredFiles = left.unansweredFiles ?? 0;
       if (left.unsavedGuilds === 0 && left.unsavedFiles === 0 && left.unansweredGuilds === 0 && unansweredFiles === 0 && resave === 0) {
-        restart();
-        return;
+        refusedRunningLogged = null;
+        refusedReported = null;
+        const running = runningWork();
+        if (running === null) {
+          restart();
+          return;
+        }
+        if (heldReport !== null) {
+          heldReport = null;
+          heldKey = '';
+          reportMode(ownMode());
+        }
+        if (running !== runningLogged) {
+          runningLogged = running;
+          console.warn(`[Maintenance] Nothing is held, but work this process accepted still runs and may save changes (${running}); ${standing()} and ${untilEnds}`);
+        }
+        await waitWhileRunning();
+        if (own !== generation) return;
+        continue;
       }
+      runningLogged = null;
       // Decision 11: a backend that holds the saves back by its own state counts as answering.
       const answers = !watching || databaseAnswer === 'answers' || watchedBackend?.refusesByOwnState?.() === true;
       answeredPasses = answers ? answeredPasses + 1 : 0;
@@ -532,11 +896,26 @@ export function startLeave(reason: string, handOver?: { attempt: string | null }
           ...(resave > 0 ? { resaveGuilds: resave } : {}), ...(unansweredFiles > 0 ? { unansweredFiles } : {}),
         };
         if (refusedPasses >= timing.heldAfterPasses && resave === 0) {
-          console.error(`[Maintenance] ${refusedPasses} saves in a row left changes the database refuses for their content: ${names}; ${end === 'hand-over'
+          const dropsRefused = end === 'hand-over'
             ? 'the bot process stops for the hand-over, which drops these changes'
             : restarts
               ? 'the bot process asks for its restart, which drops these changes'
-              : 'the bot process stops, which drops these changes'}`);
+              : 'the bot process stops, which drops these changes';
+          const running = runningWork();
+          if (running !== null) {
+            const reportKey = `${names}/${JSON.stringify(held)}`;
+            if (reportKey !== refusedReported || running !== refusedRunningLogged) {
+              refusedReported = reportKey;
+              heldReport = held;
+              reportMode('held', held);
+              refusedRunningLogged = running;
+              console.warn(`[Maintenance] ${refusedPasses} saves in a row left changes the database refuses for their content: ${names}; work this process accepted still runs and may save changes (${running}); ${standing()} and ${untilEnds}; once it ends, ${dropsRefused}`);
+            }
+            await waitWhileRunning();
+            if (own !== generation) return;
+            continue;
+          }
+          console.error(`[Maintenance] ${refusedPasses} saves in a row left changes the database refuses for their content: ${names}; ${dropsRefused}`);
           heldReport = held;
           reportMode('held', held);
           restart();
@@ -572,6 +951,8 @@ export function startLeave(reason: string, handOver?: { attempt: string | null }
           reportMode('held', held);
         }
       }
+      refusedRunningLogged = null;
+      refusedReported = null;
       console.warn(`[Maintenance] ${heldClauses({ ...left, unconfirmedFiles: 0 })}; the bot process keeps them and tries again in ${Math.round(timing.leaveRetryMs / 1000)} s`);
       await new Promise<void>(resolve => { setTimeout(resolve, timing.leaveRetryMs).unref(); });
       if (own !== generation) return;
@@ -601,30 +982,53 @@ export function loginOfPass(pass: Array<{ kind: 'answered' | 'refused' | 'failed
 
 export type BootDecision = { mode: 'normal' } | { mode: 'maintenance'; cause: MaintenanceCause; message: string };
 
-/** Read before the data backend opens: the saved state, then on Postgres whether the database refuses the login. */
-export async function decideBoot(probe: LoginProbe = probeLoginAtBoot): Promise<BootDecision> {
+/**
+ * Read before the data backend opens: the saved state, then on Postgres one probe pass. Contract 3's entry (answered,
+ * writable, of the highest generation) holding a current maintenance order boots in maintenance with cause 'order'
+ * (NX5 decision 8); with no writable entry the login is loginOfPass's and there is no order. A given probe reads the
+ * login alone.
+ */
+export async function decideBoot(probe?: LoginProbe): Promise<BootDecision> {
   const saved = readMaintenanceFile();
   if (saved.state === 'maintenance') return { mode: 'maintenance', cause: 'hook', message: saved.message };
-  if ((await probe()) === 'refused') {
+  let login: 'accepted' | 'refused' | 'unreachable' | 'none';
+  if (probe) {
+    login = await probe();
+  } else {
+    const read = await readPass(PASS_BOUND_MS, false);
+    if (read.kind === 'entry' && orderHolds(read.order)) {
+      console.warn('[Maintenance] The main database holds a maintenance order; booting in maintenance mode');
+      return { mode: 'maintenance', cause: 'order', message: read.order.message };
+    }
+    login = read.kind === 'none' ? read.login : 'accepted';
+  }
+  if (login === 'refused') {
     console.warn('[Maintenance] The database refused the login (SQLSTATE 28000); booting in maintenance mode');
     return { mode: 'maintenance', cause: 'login-refused', message: saved.message };
   }
   return { mode: 'normal' };
 }
 
-/** Tries the login every retryMs; once accepted while the file says running, starts the leave step. */
-function watchLogin(probe: LoginProbe, retryMs: number): void {
+/**
+ * The maintenance boot's one poll for every cause (ruling G4): every retryMs, one probe pass reads the login and the
+ * order from contract 3's entry, and with the file the predicate decides. A JSON bot reads the file alone.
+ */
+function startBootPoll(cause: MaintenanceCause, retryMs: number): void {
   let busy = false;
-  const timer = every(retryMs, () => {
-    if (busy) return;
+  every(retryMs, () => {
+    if (busy || leaving) return;
     busy = true;
-    void probe().then(answer => {
-      if (answer !== 'accepted') return;
-      stopTimer(timer);
-      if (readMaintenanceFile().state === 'running') startLeave('The database accepted the login again');
-      else console.log('[Maintenance] The database accepted the login again; the bot stays in maintenance until the hook says running');
-    }, () => undefined).finally(() => { busy = false; });
+    void pollOnce(cause).catch(error => console.error('[Maintenance] The maintenance poll failed:', error)).finally(() => { busy = false; });
   });
+}
+
+async function pollOnce(cause: MaintenanceCause): Promise<void> {
+  if (!applyPassRead(await readPass(PASS_BOUND_MS, false)).ok) return;
+  leaveReadOwed = false;
+  if (leaving) return;
+  // A missing file also reads as running; for the hook only a record the hook wrote ends maintenance.
+  if (cause === 'hook' && readMaintenanceFile().since === null) return;
+  if (!maintenanceStillDue()) startLeave(cause === 'hook' ? 'maintenance.json says running' : cause === 'order' ? 'The main database\'s maintenance order ended' : 'The database accepted the login again');
 }
 
 /** Marks that this boot reached its Discord login: a refused login from now on is handled at run time. */
@@ -662,6 +1066,10 @@ export function watchDataBackend(
   // starts the leave.
   const loginRefused = (): void => {
     if (isMaintenanceBoot()) return;
+    loginState = 'refused';
+    leaveReadOwed = false;
+    // NX5 decision 8: the kept order read is from before the refusal; only a fresh read lets the process leave.
+    turnOrderUnknown();
     if (!isMaintenanceGateClosed()) {
       withdrawRestart();
       const earlier = restartAskedEarlier ? '; a restart this process asked for earlier may still stop it, which drops them' : '';
@@ -676,15 +1084,31 @@ export function watchDataBackend(
   const answered = (): void => {
     if (leaving) return;
     if (outageDisconnected) {
-      startLeave(`The shard claims lapsed (no renewal for ${lapsedSeconds} s) and the database answers`);
+      const heldBy = orderRefusesSharedOps() ? 'order' : heldByNow();
+      const cause = maintenanceCause();
+      if (cause === null || (heldBy !== 'order' && heldBy !== 'login')) {
+        startLeave(`The shard claims lapsed (no renewal for ${lapsedSeconds} s) and the database answers`);
+        return;
+      }
+      // Decision 11: the order or the refused login still holds; the leave path of the gate's cause ends maintenance.
+      // The login was just accepted: a 'login' hold is a refusal kept until a fresh order read, so the mode is maintenance.
+      outageDisconnected = false;
+      if (heldBy === 'login') toldAnswers = true;
+      console.log(`[Maintenance] The database answers again after the shard claims lapsed${heldBy === 'login'
+        ? '; the bot process stays off Discord in maintenance until it reads the main database\'s maintenance order again'
+        : `, but ${HELD_WORDS[heldBy]}; the bot process stays off Discord in maintenance`}`);
+      reportMode('maintenance');
       return;
     }
     if (maintenanceCause() !== 'login-refused') return;
-    if (readMaintenanceFile().state === 'running') {
+    const heldBy = heldByNow();
+    if (heldBy === null) {
       startLeave('The database accepted the login again');
     } else if (!toldAnswers) {
       toldAnswers = true;
-      console.log('[Maintenance] The database accepted the login again; the bot stays in maintenance until the hook says running');
+      console.log(`[Maintenance] The database accepted the login again; the bot stays in maintenance ${heldBy === 'file'
+        ? 'until the hook says running'
+        : heldBy === 'order' ? 'while the main database holds a maintenance order' : 'until it reads the main database\'s maintenance order again'}`);
     }
   };
 
@@ -700,8 +1124,13 @@ export function watchDataBackend(
       ]);
       databaseAnswer = answer;
       if (answer === 'unreachable') return;
-      if (answer === 'refused') loginRefused();
-      else answered();
+      if (answer === 'refused') {
+        loginRefused();
+      } else {
+        loginState = 'accepted';
+        leaveReadOwed = false;
+        answered();
+      }
     } finally {
       clearTimeout(timer);
       busy = false;
@@ -716,8 +1145,7 @@ function attachPaymentBridge(client: Client): void {
   try {
     getPremiumManager();
     getSubscriptionNotifier().setClient(client);
-    const discord = getPaymentRegistry().get('discord') as { attachGatewayBridge?: (attach: (event: string, handler: (payload: any) => void) => void) => void } | undefined;
-    discord?.attachGatewayBridge?.((eventName, handler) => { client.on(eventName as any, handler); });
+    attachEntitlementBridge(client);
   } catch (error) {
     console.error('[Maintenance] Could not attach the payment gateway bridge:', error);
   }
@@ -732,7 +1160,6 @@ export async function runMaintenanceBoot(
   deps: {
     login?: (client: Client) => Promise<unknown>;
     shards?: () => Promise<number>;
-    loginProbe?: LoginProbe;
     retryMs?: number;
     sleep?: (ms: number) => Promise<void>;
     shardRecord?: () => ShardRecord | null;
@@ -740,6 +1167,13 @@ export async function runMaintenanceBoot(
 ): Promise<Client | null> {
   markMaintenanceBoot();
   setMaintenanceGate({ cause: decision.cause, message: decision.message });
+  // The boot pass read a current maintenance order or a refused login; each holds until a poll reads otherwise.
+  if (decision.cause === 'order') {
+    orderRead = 'unknown';
+    heldWhileUnknown = 'order';
+    setOrderRefusal(true);
+  }
+  if (decision.cause === 'login-refused') loginState = 'refused';
   installRefusalGuard();
   // NB4 decision 16: this boot's step of the one stop (dataManager.ts, which drains and exits) is added before anything
   // that can start a leave; it destroys only a Client that exists by then.
@@ -749,14 +1183,15 @@ export async function runMaintenanceBoot(
   });
   console.log(decision.cause === 'hook'
     ? '[Maintenance] Booting in maintenance mode: the saved state says maintenance'
-    : '[Maintenance] Booting in maintenance mode: the database refused the login');
+    : decision.cause === 'order'
+      ? '[Maintenance] Booting in maintenance mode: the main database holds a maintenance order'
+      : '[Maintenance] Booting in maintenance mode: the database refused the login');
   setupMaintenanceIPC();
   setupSharedOpsIPC();
   reportWriterStage('shared');
   reportWriterStage('guild');
-  reportMode(decision.cause === 'hook' ? 'maintenance' : 'login-refused', undefined, true);
-  if (decision.cause === 'hook') startFilePoll();
-  if (decision.cause === 'login-refused') watchLogin(deps.loginProbe ?? probeLoginAtBoot, deps.retryMs ?? LOGIN_RETRY_MS);
+  reportMode(modeOf(decision.cause), undefined, true);
+  startBootPoll(decision.cause, deps.retryMs ?? timing.filePollMs);
   const retry = discordRetry(deps.sleep ?? (ms => new Promise<void>(resolve => { setTimeout(resolve, ms); })));
 
   let shardCount: number;

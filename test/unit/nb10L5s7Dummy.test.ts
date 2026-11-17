@@ -47,7 +47,7 @@ vi.mock('../../src/bot/internalSetup/utils/payment/paymentRegistry', () => ({
     emitWalkBatch: (b: any) => { h.events.push(...b.events); },
   }),
 }));
-vi.mock('../../src/bot/internalSetup/utils/maintenanceGate', () => ({ isMaintenanceGateClosed: () => false }));
+vi.mock('../../src/bot/internalSetup/utils/maintenanceGate', () => ({ isMaintenanceGateClosed: () => false, runHeldResave: (fn: () => unknown) => fn(), orderRefusesGlobalWrite: () => false, runAcceptedOp: async (fn: () => unknown) => fn(), MaintenanceRefusal: class extends Error {} }));
 vi.mock('../../src/bot/internalSetup/utils/writerLock', () => ({ writerLockDepth: () => 0 }));
 
 import { DummyProvider, invalidateDummyCaches } from '../../src/bot/internalSetup/utils/payment/dummyProvider';

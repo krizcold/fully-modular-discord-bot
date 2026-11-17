@@ -9,7 +9,7 @@ import { ROOT_CONFIG_PATH } from './configManager';
 import { isInternalGlobalRel } from './configDiscovery';
 import { applyOperatorGlobalRead, shaOfRaw, CHANGED_SINCE_OPEN_TEXT, CHANGED_TEXT, type GlobalDataReadRequest } from './ipcDataHandler';
 import { maintenanceIpcRefusal } from './maintenance';
-import { isMaintenanceBoot, maintenanceText } from './maintenanceGate';
+import { isMaintenanceBoot, maintenanceText, orderRefusesSharedOps, runAcceptedOp } from './maintenanceGate';
 import { carryWrites, landed, markPaymentLedger, NO_WRITES, runSealed, writesOf, type OpWrites, type WriteLedger } from './dataBackends/writeLedger';
 import { truthText, verdictOf, type TruthAnswer } from './dataBackends/replyGate';
 import { checkWriterLock, deposedText } from './writerLock';
@@ -394,8 +394,10 @@ export function setupSharedOpsIPC(): void {
       const starting = startingReply(type);
       if (starting) {
         reply = starting;
+      } else if (type === 'shared:op' && orderRefusesSharedOps()) {
+        reply = { ok: false, code: 'maintenance', error: maintenanceText() };
       } else if (type === 'shared:op') {
-        reply = await applySharedOp((data || {}) as SharedOpRequest);
+        reply = await runAcceptedOp(() => applySharedOp((data || {}) as SharedOpRequest));
       } else {
         reply = maintenanceIpcRefusal(type) ?? applyOperatorGlobalRead((data || {}) as GlobalDataReadRequest);
       }

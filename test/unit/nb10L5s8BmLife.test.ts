@@ -219,8 +219,9 @@ describe('the maintenance hook notes', () => {
 
   it('a leave while the child is still starting logs its note', async () => {
     const { m } = await startWith([]);
-    expect(await m.leaveMaintenance()).toEqual({ restarting: false, note: 'The bot process is still starting; it reads maintenance.json as it opens the data files and runs normally.' });
-    expect(logs).toContain('[BotManager] The bot process is still starting; it reads maintenance.json as it opens the data files and runs normally.');
+    const note = 'The bot process is still starting; it reads maintenance.json as it opens the data files, and it runs normally unless the main database refuses its login or holds a maintenance order.';
+    expect(await m.leaveMaintenance()).toEqual({ restarting: false, starting: true, note });
+    expect(logs).toContain(`[BotManager] ${note}`);
   });
 
   it('an enter that waited for the files leaves no 20 s timer behind', async () => {
