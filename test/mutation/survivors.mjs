@@ -10,6 +10,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { disableTypeChecks, Instrumenter } from '@stryker-mutator/instrumenter';
 import { canonicalName, keyOf } from './keys.mjs';
+import { onePerKey } from './resume.mjs';
 import { gatesIn, mutatePatterns, planFromGit } from './ranges.mjs';
 
 /**
@@ -414,7 +415,7 @@ export async function survivors({ report, sandbox, sandboxName, out, tree, base,
     if ('why' in proof) { unproven.push({ file, why: proof.why }); continue; }
     const lines = content.split('\n');
     /** @type {Listed[]} */
-    const here = proof.mutants.map(m => {
+    const made = proof.mutants.map(m => {
       const location = { start: fromOne(m.location.start), end: fromOne(m.location.end) };
       const replacement = m.replacement ?? '';
       return {
@@ -422,20 +423,21 @@ export async function survivors({ report, sandbox, sandboxName, out, tree, base,
         original: originalOf(file, location, lines), gating: gatesIn(targets, file, location), ...stateOf(report, m.id, present, relatedOnce, sandboxes),
       };
     });
-    const clash = here.find(m => owner.has(m.id));
+    const clash = made.find(m => owner.has(m.id));
     if (clash) {
       const other = /** @type {string} */ (owner.get(clash.id));
       unproven.push({ file, why: `its id ${clash.id} is also ${other}'s` });
       if (byFile.has(other)) { byFile.delete(other); unproven.push({ file: other, why: `its id ${clash.id} is also ${file}'s` }); }
       continue;
     }
-    for (const m of here) owner.set(m.id, file);
-    byFile.set(file, here);
+    for (const m of made) owner.set(m.id, file);
+    byFile.set(file, onePerKey(made));
   }
   refuseSandbox(sandboxes, expectedSandbox, byFile.size > 0);
   for (const here of byFile.values()) listed.push(...here);
   listed.sort((a, b) => Number(a.id) - Number(b.id));
-  const mapped = new Set(listed.map(m => m.id));
+  // A later id of a key Stryker made twice is mapped too, though only the key's first id is listed.
+  const mapped = new Set([...owner].filter(([, file]) => byFile.has(file)).map(([id]) => id));
   const strays = [...present].filter(id => !mapped.has(id));
   const summary = summaryOf(listed, unproven, strays.length, byFile);
   fs.mkdirSync(out, { recursive: true });

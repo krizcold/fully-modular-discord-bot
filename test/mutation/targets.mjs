@@ -19,7 +19,7 @@ import { fileURLToPath } from 'url';
 import { declareClassPlugin, PluginKind, tokens } from '@stryker-mutator/api/plugin';
 import { fileOf, keyOf } from './keys.mjs';
 import { RUN_KEYS_FILE } from './reach.mjs';
-import { PLAN_FILE, RESULTS_FILE } from './resume.mjs';
+import { onePerKey, PLAN_FILE, RESULTS_FILE } from './resume.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -37,15 +37,19 @@ class TargetsReporter {
   /** @type {Set<string> | null} in a pass on some of the mutants, the keys of those it is for */
   forKeys = null;
 
+  /** @type {Map<string, string> | null} each planned key's id: Stryker reports a later mutant with a planned key too, and its result is dropped */
+  ids = null;
+
   /** @param {{ mutantPlans: readonly { mutant: Mutant }[] }} event */
   onMutationTestingPlanReady({ mutantPlans }) {
     const out = process.env.SMDB_MUTATION_OUT;
-    const planned = mutantPlans.map(plan => plan.mutant).map(m => {
+    const planned = onePerKey(mutantPlans.map(plan => plan.mutant).map(m => {
       const file = fileOf(root, m.fileName);
       const location = { start: fromOne(m.location.start), end: fromOne(m.location.end) };
       const replacement = m.replacement ?? '';
       return { id: m.id, key: keyOf(file, m.mutatorName, replacement, location), file, location, mutator: m.mutatorName, replacement };
-    });
+    }));
+    this.ids = new Map(planned.map(m => [m.key, m.id]));
     const targets = process.env.SMDB_MUTATION_TARGETS;
     const run = process.env.SMDB_MUTATION_RUN;
     if (targets && run) {
@@ -71,6 +75,7 @@ class TargetsReporter {
     if (!out) return;
     const key = keyOf(fileOf(root, result.fileName), result.mutatorName, result.replacement ?? '', result.location);
     if (this.forKeys && !this.forKeys.has(key)) return;
+    if (this.ids?.has(key) && this.ids.get(key) !== result.id) return;
     const line = { key, id: result.id, status: result.status, ...(result.statusReason !== undefined ? { statusReason: result.statusReason } : {}) };
     fs.appendFileSync(path.join(out, RESULTS_FILE), `${JSON.stringify(line)}\n`);
   }

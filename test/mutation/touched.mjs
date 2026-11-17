@@ -508,7 +508,7 @@ function savedMutantDir(dir) {
   if (problem) return { problem: `${dir}/${RESULTS_FILE}: ${problem}` };
   if (text[DONE_FILE] !== null && !isDone(/** @type {string} */ (text[DONE_FILE]))) return { problem: `${dir}/${DONE_FILE} cannot be read` };
   const d = mutantDir({ dir, targets: keys, plan, results: lines, done: text[DONE_FILE] !== null });
-  return 'problem' in d ? d : { ...d, plan, subset: keys !== null };
+  return 'problem' in d ? d : { ...d, subset: keys !== null };
 }
 
 /**

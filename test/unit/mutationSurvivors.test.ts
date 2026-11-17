@@ -249,6 +249,32 @@ describe('the id of each mutant, proven against the sandbox', () => {
     expect(clean.summary).toMatch(/Ids in the report dir that match no mapped mutant: 0\n/);
   });
 
+  it('lists and counts once a key Stryker made twice, its first id, and counts the later id as no stray', async () => {
+    const tree = tempDir('smdb-survivors-tree-');
+    const git = (...args: string[]) => execFileSync('git', ['-C', tree, '-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { encoding: 'utf8' });
+    fs.mkdirSync(path.join(tree, 'src'));
+    fs.writeFileSync(path.join(tree, 'src', 'r.ts'), 'export const r = /x/;\n');
+    git('init', '-q');
+    git('config', 'core.safecrlf', 'false');
+    git('add', '.');
+    git('commit', '-q', '-m', 'base');
+    fs.writeFileSync(path.join(tree, 'src', 'r.ts'), 'export const r = /(?:^|^)x/;\n');
+    const { patterns } = planOf({ tree, base: 'HEAD', mutate: [] });
+    const { sandbox, keys } = await strykerSandbox(tree, [...describeMutate(patterns)]);
+    const distinct = [...new Set(keys.values())];
+    expect(distinct.length).toBeLessThan(keys.size);
+    const runs = reportDir(Object.fromEntries([...keys.keys()].map(id => [id, { reach: [] }])), undefined, report({ 'unit/a.test.ts': ['passed'] }));
+    const out = path.join(tempDir('smdb-survivors-out-'), 'out');
+    const { summary } = await survivors({ report: runs, sandbox, out, tree, base: 'HEAD', mutate: [] });
+    const listed = JSON.parse(fs.readFileSync(path.join(out, 'mutants.json'), 'utf8')) as { id: string; key: string }[];
+    expect(listed.map(m => m.key).sort()).toEqual([...distinct].sort());
+    for (const m of listed) expect(m.id).toBe([...keys].find(([, key]) => key === m.key)?.[0]);
+    const survivorsOut = JSON.parse(fs.readFileSync(path.join(out, 'survivors.json'), 'utf8')) as string[];
+    expect(survivorsOut.length).toBe(new Set(survivorsOut).size);
+    expect(summary).toMatch(/Ids in the report dir that match no mapped mutant: 0\n/);
+    expect(summary).toContain(`${distinct.length} mapped mutant(s)`);
+  });
+
   it('starts every git command with GIT_OPTIONAL_LOCKS=0 beside the process env', () => {
     expect(gitEnv()).toEqual({ ...process.env, GIT_OPTIONAL_LOCKS: '0' });
     const source = fs.readFileSync(tool, 'utf8');

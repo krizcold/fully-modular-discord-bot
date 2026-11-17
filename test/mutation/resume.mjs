@@ -167,6 +167,19 @@ export function planOf(text) {
 }
 
 /**
+ * A plan with each key once, at its first entry: Stryker can make one mutant
+ * twice at a place (a regex whose two alternatives are alike), and the gate
+ * plans, judges and counts it once.
+ * @template {{ key: string }} M
+ * @param {M[]} plan
+ * @returns {M[]}
+ */
+export function onePerKey(plan) {
+  const seen = new Set();
+  return plan.filter(m => !seen.has(m.key) && seen.add(m.key));
+}
+
+/**
  * The keys a targets.json or checks.json holds, or null when it cannot be read.
  * @param {string} text
  * @returns {string[] | null}
@@ -273,24 +286,28 @@ export const a2Dir = dir => /^a2(?:-r\d+)?$/.test(dir);
  * targets.json, or for a pass on every mutant the keys of its plan), its
  * results, and the keys it ran for that its plan does not hold (Stryker made
  * no mutant there, so the stage records it missing and nothing runs it again).
- * A dir with results but no plan, a plan with a key twice, or a result whose
- * id is not the one its plan gives its key, is a problem.
+ * A key the plan holds twice is its first entry's (the plan it returns holds
+ * it once), and a result for a later entry's id is dropped. A dir with results but no plan, or a result whose id
+ * is not one its plan gives its key, is a problem.
  * @param {{ dir: string, targets: string[] | null, plan: PlannedMutant[] | null, results: SavedResult[], done: boolean }} saved
- * @returns {StageDir | { problem: string }}
+ * @returns {(StageDir & { plan: PlannedMutant[] | null }) | { problem: string }}
  */
 export function mutantDir({ dir, targets, plan, results, done }) {
   if (!plan && results.length > 0) return { problem: `${dir}/ holds results but no ${PLAN_FILE}, so what their ids name is not known` };
   /** @type {Map<string, string>} */
   const ids = new Map();
+  /** @type {Set<string>} */
+  const repeats = new Set();
   for (const m of plan ?? []) {
-    if (ids.has(m.key)) return { problem: `${dir}/${PLAN_FILE} holds the mutant ${m.key} twice` };
-    ids.set(m.key, m.id);
+    if (ids.has(m.key)) repeats.add(`${m.key}\n${m.id}`);
+    else ids.set(m.key, m.id);
   }
-  for (const r of results) {
+  const lines = results.filter(r => !repeats.has(`${r.key}\n${r.id}`));
+  for (const r of lines) {
     if (ids.has(r.key) && ids.get(r.key) !== r.id) return { problem: `${dir}/${RESULTS_FILE} gives ${r.key} the id ${r.id}, but its plan gives it ${ids.get(r.key)}` };
   }
   const forKeys = targets ?? (plan ? [...ids.keys()] : null);
-  return { dir, forKeys, lines: results, missing: plan && forKeys ? forKeys.filter(key => !ids.has(key)) : [], done };
+  return { dir, forKeys, lines, missing: plan && forKeys ? forKeys.filter(key => !ids.has(key)) : [], done, plan: plan && onePerKey(plan) };
 }
 
 /**
