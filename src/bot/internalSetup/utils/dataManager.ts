@@ -910,6 +910,14 @@ export interface DataOptions {
   check?: Record<string, string | null>;
 }
 
+/** Why a call's scope is refused: it is neither 'guild' (or absent) nor 'global'; null when it is one of those. */
+function scopeRefusal(options: DataOptions): string | null {
+  const scope: unknown = options.scope;
+  if (scope === undefined || scope === 'guild' || scope === 'global') return null;
+  const named = typeof scope === 'string' ? JSON.stringify(scope) : typeof scope === 'object' && scope !== null ? 'an object' : String(scope);
+  return `the data scope ${named} is neither 'guild' nor 'global'`;
+}
+
 /**
  * Get the directory path for data storage
  */
@@ -1296,6 +1304,11 @@ export function loadData<T = any>(
   defaultValue: T
 ): T {
   try {
+    const refusal = scopeRefusal(options);
+    if (refusal) {
+      console.error(`[Data] Refused a read of ${filename}: ${refusal}; serving the default`);
+      return defaultValue;
+    }
     const wsGuild = wsRouted(options);
     if (wsGuild !== null) {
       getMetricsCollector().recordIO('read', options.guildId ?? null, options.category ?? null);
@@ -1352,6 +1365,12 @@ export type SaveTracked = { outcome: 'saved'; ticket: WriteTicket } | { outcome:
 export type AppendTracked = { outcome: 'appended'; ticket: WriteTicket } | { outcome: 'frozen' } | Refused;
 /** An absent delete carries a ticket while an earlier delete of the same document has not landed. */
 export type DeleteTracked = { outcome: 'deleted'; ticket: WriteTicket } | { outcome: 'absent'; ticket?: WriteTicket } | { outcome: 'frozen' } | Refused;
+
+/** A write whose scope is neither 'guild' nor 'global', refused before anything is read, queued or written. */
+function scopeRefused(filename: string, options: DataOptions): Refused | null {
+  const refusal = scopeRefusal(options);
+  return refusal ? unstorable(filename, options, refusal) : null;
+}
 
 /** A write neither store can keep: logged without its content, and answered with the reason. */
 function unstorable(filename: string, options: DataOptions, reason: string): Refused {
@@ -1465,7 +1484,7 @@ export function saveDataOutcome<T = any>(filename: string, options: DataOptions,
 
 /** saveDataOutcome with the ticket of an accepted write, or the cause of a refusal. */
 export function saveDataTracked<T = any>(filename: string, options: DataOptions, data: T): SaveTracked {
-  return recorded(docOf(filename, options), scopeOf(options), true, () => acceptSave(filename, options, data));
+  return recorded(docOf(filename, options), scopeOf(options), true, () => scopeRefused(filename, options) ?? acceptSave(filename, options, data));
 }
 
 function acceptSave<T>(filename: string, options: DataOptions, data: T, update?: RowUpdate): SaveTracked {
@@ -1707,7 +1726,7 @@ export function rerunUpdate(what: string, fn: (current: any) => unknown, stored:
  */
 export function updateData<T = any>(filename: string, options: DataOptions, defaultValue: T, fn: (current: T) => T): SaveTracked {
   try {
-    return recorded(docOf(filename, options), scopeOf(options), true, () => acceptUpdate(filename, options, defaultValue, fn));
+    return recorded(docOf(filename, options), scopeOf(options), true, () => scopeRefused(filename, options) ?? acceptUpdate(filename, options, defaultValue, fn));
   } catch (error) {
     if (error instanceof UpdateFnError) throw error.error;
     throw error;
@@ -1724,7 +1743,7 @@ export function appendData(filename: string, options: DataOptions, line: string)
 
 /** appendData with the ticket of an accepted append, or the cause of a refusal. */
 export function appendDataTracked(filename: string, options: DataOptions, line: string): AppendTracked {
-  return recorded(docOf(filename, options), scopeOf(options), false, () => acceptAppend(filename, options, line));
+  return recorded(docOf(filename, options), scopeOf(options), false, () => scopeRefused(filename, options) ?? acceptAppend(filename, options, line));
 }
 
 function acceptAppend(filename: string, options: DataOptions, line: string): AppendTracked {
@@ -1802,6 +1821,11 @@ function acceptAppend(filename: string, options: DataOptions, line: string): App
  * Check if data file exists
  */
 export function dataExists(filename: string, options: DataOptions): boolean {
+  const refusal = scopeRefusal(options);
+  if (refusal) {
+    console.error(`[Data] Refused an existence check of ${filename}: ${refusal}`);
+    return false;
+  }
   let key: GuildKey | null = null;
   try {
     if ((options.scope || 'guild') === 'guild') key = guildKeyOf(filename, options);
@@ -1838,7 +1862,7 @@ export function deleteDataOutcome(filename: string, options: DataOptions): 'dele
 
 /** deleteDataOutcome with the ticket of an accepted delete, or the cause of a refusal. */
 export function deleteDataTracked(filename: string, options: DataOptions): DeleteTracked {
-  return recorded(docOf(filename, options), scopeOf(options), true, () => acceptDelete(filename, options));
+  return recorded(docOf(filename, options), scopeOf(options), true, () => scopeRefused(filename, options) ?? acceptDelete(filename, options));
 }
 
 function acceptDelete(filename: string, options: DataOptions): DeleteTracked {
