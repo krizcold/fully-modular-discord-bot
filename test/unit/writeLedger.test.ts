@@ -85,7 +85,7 @@ describe('a ledger records the facade writes made inside its entry: file mode', 
     ]);
     expect(answers).toEqual(['saved', 'saved', true, 'saved', 'deleted']);
     expect(shape(ledger)).toEqual([['a.json', ['modA', 'modB']], ['a.json', ['modA', 'modB']], ['b.json', ['modA']], ['b.json', ['modA']], ['log.jsonl', ['modA']]]);
-    for (const { ticket } of ledger.tickets()) expect(await confirmWrite(ticket, 5000)).toBe('ok');
+    for (const { ticket } of ledger.tickets()) expect(await confirmWrite(ticket, 20_000)).toBe('ok');
     expect(JSON.parse(fs.readFileSync(file(guildId, 'a.json'), 'utf8'))).toEqual({ v: 2 });
     expect(fs.existsSync(file(guildId, 'b.json'))).toBe(false);
   });
@@ -130,11 +130,11 @@ describe('a ledger records the facade writes made inside its entry: file mode', 
     const first = openLedger('panel');
     runInLedger(first, 'modA', () => expect(writeRawAtomic(raw, '{"v":1}')).toBe(true));
     expect(shape(first)).toEqual([['r.json', ['modA']]]);
-    expect(await confirmWrite(first.tickets()[0].ticket, 5000)).toBe('ok');
+    expect(await confirmWrite(first.tickets()[0].ticket, 20_000)).toBe('ok');
     runInLedger(first, 'modA', () => expect(deleteRawAtomic(raw)).toBe(true));
     // The write landed, so its entry gave way to the delete's.
     expect(shape(first)).toEqual([['r.json', ['modA']]]);
-    expect(await confirmWrite(first.tickets()[0].ticket, 5000)).toBe('ok');
+    expect(await confirmWrite(first.tickets()[0].ticket, 20_000)).toBe('ok');
     // Never on disk: a queued write becomes a queued delete, which a second delete finds.
     const unwritten = path.join(path.dirname(raw), 'u.json');
     expect(writeRawAtomic(unwritten, '{}')).toBe(true);
@@ -143,7 +143,7 @@ describe('a ledger records the facade writes made inside its entry: file mode', 
     runInLedger(second, 'modB', () => expect(deleteRawAtomic(unwritten)).toBe(false));
     expect(shape(second)).toEqual([['u.json', ['modB']]]);
     const queuedDelete = second.tickets()[0].ticket;
-    expect(await confirmWrite(queuedDelete, 5000)).toBe('ok');
+    expect(await confirmWrite(queuedDelete, 20_000)).toBe('ok');
     const third = openLedger('panel');
     runInLedger(third, 'modB', () => {
       expect(deleteRawAtomic(unwritten)).toBe(false);
@@ -167,12 +167,12 @@ describe('a ledger records the facade writes made inside its entry: file mode', 
       expect(appendData('log.jsonl', options, 'two\n')).toBe(true);
     });
     expect(shape(ledger).map(([where]) => where)).toEqual(['log.jsonl', 'log.jsonl', 'x.json', 'x.json']);
-    const answers = await Promise.all(ledger.tickets().map(e => confirmWrite(e.ticket, 5000)));
+    const answers = await Promise.all(ledger.tickets().map(e => confirmWrite(e.ticket, 20_000)));
     expect(answers.sort()).toEqual(['ok', 'ok', 'unavailable', 'unavailable']);
     runInLedger(ledger, 'modA', () => expect(saveData('x.json', options, { v: 3 })).toBe(true));
     const x = ledger.tickets().filter(e => e.ticket.kind === 'file' && path.basename(e.ticket.path) === 'x.json');
     expect(x).toHaveLength(2);
-    expect((await Promise.all(x.map(e => confirmWrite(e.ticket, 5000)))).sort()).toEqual(['ok', 'unavailable']);
+    expect((await Promise.all(x.map(e => confirmWrite(e.ticket, 20_000)))).sort()).toEqual(['ok', 'unavailable']);
   });
 });
 

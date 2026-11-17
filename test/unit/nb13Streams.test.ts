@@ -1,5 +1,6 @@
 import fs from 'fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => (await import('../helpers/longConfirm')).longConfirm(await orig<any>()));
 
 import { appendData, deleteData, saveData } from '../../src/bot/internalSetup/utils/dataManager';
 import { flushAll } from '../../src/bot/internalSetup/utils/dataBackends/fileBackend';

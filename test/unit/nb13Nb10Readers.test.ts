@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => (await import('../helpers/longConfirm')).longConfirm(await orig<any>()));
 
 const hooks = vi.hoisted(() => ({
   confirm: null as null | ((ticket: unknown, ms: number) => Promise<string>),

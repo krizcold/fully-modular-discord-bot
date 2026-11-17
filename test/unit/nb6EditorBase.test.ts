@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => (await import('../helpers/longConfirm')).longConfirm(await orig<any>()));
 import { dataPath } from '../../src/utils/dataRoot';
 
 // NB6 test 51, the config editor's rows (wip-redesign/sheets/NB6.md decision 50, rows 174 and 175, T14 and T22; part

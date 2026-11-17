@@ -14,7 +14,7 @@ vi.mock('child_process', async orig => {
 });
 vi.mock('../../src/utils/updateSafety', () => ({ getSafetyManager: () => safety }));
 vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => {
-  const real = await orig<any>();
+  const real = (await import('../helpers/longConfirm')).longConfirm(await orig<any>());
   return {
     ...real,
     readGuildDocRaw: (...args: any[]) => {

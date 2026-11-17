@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => (await import('../helpers/longConfirm')).longConfirm(await orig<any>()));
 
 vi.mock('../../src/bot/internalSetup/utils/dataBackends/boot', async importOriginal => ({
   ...(await importOriginal<any>()),

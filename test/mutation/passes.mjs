@@ -21,17 +21,58 @@ export const COMMON = {
 
 const BUILD = { buildCommand: 'node test/helpers/build.cjs', checkers: [] };
 
+// Node's limit on a timer: a longer one fires at once.
+export const TIMER_LIMIT_MS = 2 ** 31 - 1;
+// Stryker hands its bound's minutes * 60,000 to a timer.
+export const MAX_BOUND_MINUTES = Math.floor(TIMER_LIMIT_MS / 60_000);
+
+/**
+ * The factor runner.mjs gives the config's time limits (SMDB_TEST_TIME_SCALE,
+ * helpers/time.mjs) in a rerun alone and in every run with no mutant; a
+ * mutant's run in pass A or B gets 1.
+ */
+export const ALONE_TIME_SCALE = 4;
+
+/**
+ * The bound, in ms, on one vitest run with no mutant of `files` fast test
+ * files, in the runs that check what a pass counted (touched.mjs aloneCheck
+ * and setCheck): per file, the config's hook limit for a beforeAll and an
+ * afterAll and its test limit (vitest.config.ts) at ALONE_TIME_SCALE, plus a
+ * minute to start. A run past it ends, with every process it started, and
+ * counts as failed. It is capped at TIMER_LIMIT_MS, since runner.mjs gives it to a timer.
+ * @param {number} files
+ */
+export const setBoundMs = files => Math.min(TIMER_LIMIT_MS, Math.max(1, files) * ALONE_TIME_SCALE * (2 * 180_000 + 30_000) + 60_000);
+
+/**
+ * The bound, in ms, on the rerun alone of one test file of `project` that
+ * failed beside other files in a run with no mutant (runner.mjs dryTier): a
+ * fast or integration file's is setBoundMs(1), and a child file's takes the
+ * child tier's test limit, fifteen steps' bounds (vitest.config.ts), in place
+ * of the config's.
+ * @param {string} project
+ */
+export const aloneBoundMs = project => (project === 'child'
+  ? Math.min(TIMER_LIMIT_MS, ALONE_TIME_SCALE * (2 * 180_000 + 15 * 20_000) + 60_000)
+  : setBoundMs(1));
+
+// Room in a run with no mutant for one rerun alone at its whole bound, in minutes.
+const AGAIN_FAST = Math.ceil(aloneBoundMs('fast') / 60_000);
+const AGAIN_B = Math.ceil(Math.max(aloneBoundMs('integration'), aloneBoundMs('child')) / 60_000);
+
 export const PASSES = {
   // Their run with no mutant runs every fast test importing a mutated file, one worker: one took 27.9 minutes on a
   // busy machine, and a run past this bound ends the gate NO RESULT before any mutant runs.
-  a: { checkers: ['typescript'], timeoutMS: 10_000, timeoutFactor: 2, dryRunTimeoutMinutes: 60 },
-  a2: { checkers: [], concurrency: 1, timeoutMS: 60_000, timeoutFactor: 4, dryRunTimeoutMinutes: 60 },
+  a: { checkers: ['typescript'], timeoutMS: 10_000, timeoutFactor: 2, dryRunTimeoutMinutes: 60 + AGAIN_FAST },
+  a2: { checkers: [], concurrency: 1, timeoutMS: 60_000, timeoutFactor: 4, dryRunTimeoutMinutes: 60 + AGAIN_FAST },
   // One at a time, as its run with no mutant is made: Stryker builds each run's
   // budget from that run, and a hang in pass B stands with no rerun to clear it.
   // Its run with no mutant takes every related integration file and the whole
   // child tier on one worker, more than an hour for a change to widely imported
   // files, and one past this bound ends the gate NO RESULT before any survivor runs.
-  b: { ...BUILD, concurrency: 1, timeoutMS: 60_000, timeoutFactor: 2, dryRunTimeoutMinutes: 120 },
+  // The bound leaves room for a child test and its hooks to hang at four times
+  // their limits, so vitest's report names the file before Stryker ends the run.
+  b: { ...BUILD, concurrency: 1, timeoutMS: 60_000, timeoutFactor: 2, dryRunTimeoutMinutes: 180 + AGAIN_B },
   // A pass B failure rerun with one file: an hour is above anything vitest's own
   // limits let that file take after its first failure (the rest of a child
   // test, then its hooks), so a rerun that fails always leaves its report.
@@ -66,29 +107,18 @@ export const A2_BOUND = { factor: PASSES.a2.timeoutFactor, startMs: PASSES.a2.ti
  * timeoutMS) and five minutes for Stryker's overhead, so the budget, not the
  * bound, judges that run's time. That run takes every file `files` reruns
  * took, one each (control-b2: every file that failed in pass B), so the bound
- * is that budget times their number.
+ * is that budget times their number, capped at MAX_BOUND_MINUTES.
  * @param {{ timeoutFactor: number, timeoutMS: number, dryRunTimeoutMinutes: number }} rerun
  * @param {number} [files]
  */
 export const controlBoundMinutes = ({ timeoutFactor, timeoutMS, dryRunTimeoutMinutes }, files = 1) =>
-  Math.ceil(Math.max(1, files) * (timeoutFactor * dryRunTimeoutMinutes + timeoutMS / 60_000)) + 5;
-
-/**
- * The bound, in ms, on one vitest run with no mutant of `files` fast test
- * files at time scale `scale`, in the runs that check what a pass counted
- * (touched.mjs aloneCheck and setCheck): per file, the config's hook limit for
- * a beforeAll and an afterAll and its test limit (vitest.config.ts), plus a
- * minute to start. A run past it ends, with every process it started, and
- * counts as failed.
- * @param {number} files
- * @param {number} scale
- */
-export const setBoundMs = (files, scale) => Math.max(1, files) * scale * (2 * 180_000 + 30_000) + 60_000;
+  Math.min(MAX_BOUND_MINUTES, Math.ceil(Math.max(1, files) * (timeoutFactor * dryRunTimeoutMinutes + timeoutMS / 60_000)) + 5);
 
 /**
  * Stryker's bound, in minutes, on a run with no mutant that runs each of
  * `sets` in a vitest run of its own: the sum of their bounds and five minutes
  * for Stryker's overhead, so a set's own bound, not Stryker's, ends a hang.
+ * It is capped at MAX_BOUND_MINUTES, which loses nothing for that reason.
  * @param {{ ms: number }[]} sets
  */
-export const setsBoundMinutes = sets => Math.ceil(sets.reduce((sum, set) => sum + set.ms, 0) / 60_000) + 5;
+export const setsBoundMinutes = sets => Math.min(MAX_BOUND_MINUTES, Math.ceil(sets.reduce((sum, set) => sum + set.ms, 0) / 60_000) + 5);

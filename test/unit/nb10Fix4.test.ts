@@ -34,7 +34,7 @@ vi.mock('fs', async orig => {
 });
 
 vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => {
-  const real = await orig<typeof import('../../src/bot/internalSetup/utils/dataManager')>();
+  const real = (await import('../helpers/longConfirm')).longConfirm(await orig<typeof import('../../src/bot/internalSetup/utils/dataManager')>());
   return { ...real, isStopping: () => h.stopping || real.isStopping() };
 });
 

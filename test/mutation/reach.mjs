@@ -10,7 +10,9 @@
 import { createHash } from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import { RUN_BOUND } from './passes.mjs';
+import { RUN_BOUND, TIMER_LIMIT_MS } from './passes.mjs';
+
+export { TIMER_LIMIT_MS };
 
 /**
  * @typedef {{ files: string[], unsure: number[], reached: Record<string, number[]>, costs?: number[] }} Reach files: the
@@ -36,8 +38,121 @@ export const TAKEN_FILE = 'taken.json';
 export const RUN_KEYS_FILE = 'run-keys.json';
 // In a2's dir: what each file cost in a2's run with no mutant (writeCosts).
 export const COSTS_FILE = 'dry-costs.json';
-// Node's limit on a timer: a longer one fires at once.
-export const TIMER_LIMIT_MS = 2 ** 31 - 1;
+// In a run's dir: the reruns alone of the test files its run with no mutant failed in beside other files (runner.mjs dryTier).
+export const AGAIN_FILE = 'dry-again.json';
+// Beside it: why it could not be written, which failed that run (runner.mjs end).
+export const AGAIN_UNWRITTEN_FILE = 'dry-again-unwritten.txt';
+
+/**
+ * @typedef {{ tier: string, file: string, name: string, code: number | null, ms: number, bound: number, end?: number, ended?: boolean, why?: string }} Again
+ *   one rerun alone: the file (relative to test/) and its tier, the name of its report and log in the run's dir, its
+ *   exit (null when it did not run, and `why`), its time by the monotonic clock from before vitest started, its bound,
+ *   the time (Date.now) after its vitest exited, and whether the runner ended it at its bound
+ */
+
+/** @param {unknown} r */
+const isRerun = r => {
+  const one = /** @type {{ file?: unknown, name?: unknown, code?: unknown }} */ (r);
+  return r !== null && typeof r === 'object' && typeof one.file === 'string' && typeof one.name === 'string' && (one.code === null || Number.isInteger(one.code));
+};
+
+/**
+ * The record of the reruns alone in a run's dir `out` (runner.mjs writeAgain):
+ * null when there is none, and the problem when it is there but cannot be read.
+ * @param {string} out
+ * @returns {{ record: { passed: boolean | null, reruns: Again[] } | null, problem: string }}
+ */
+export function readAgain(out) {
+  /** @type {string} */
+  let text;
+  try {
+    text = fs.readFileSync(path.join(out, AGAIN_FILE), 'utf8');
+  } catch (error) {
+    const code = /** @type {NodeJS.ErrnoException} */ (error).code;
+    return code === 'ENOENT' ? { record: null, problem: '' } : { record: null, problem: `${AGAIN_FILE} cannot be read (${code ?? String(error)})` };
+  }
+  try {
+    const record = JSON.parse(text);
+    const reruns = record?.reruns;
+    if (Array.isArray(reruns) && reruns.every(isRerun) && (record.passed === null || typeof record.passed === 'boolean')) return { record: { passed: record.passed, reruns }, problem: '' };
+  } catch {}
+  return { record: null, problem: `${AGAIN_FILE} does not read as a record of reruns alone` };
+}
+
+/**
+ * Each test file the runs with no mutant of `dirs` (under `reportDir`) failed
+ * in beside other files and then saw pass alone, with the first dir that holds
+ * it, whatever its record says of the run: one of a dir that ran mutants
+ * passed. `problem` names a dir whose record cannot be read, so which files
+ * those are is not known.
+ * @param {string} reportDir
+ * @param {string[]} dirs
+ * @returns {{ flaky: Map<string, string>, problem: string }}
+ */
+export function flakyFiles(reportDir, dirs) {
+  /** @type {Map<string, string>} */
+  const flaky = new Map();
+  for (const dir of dirs) {
+    const { record, problem } = readAgain(path.join(reportDir, dir));
+    if (problem) return { flaky, problem: `${dir}/${problem}` };
+    for (const r of record?.reruns ?? []) if (r.code === 0 && !flaky.has(r.file)) flaky.set(r.file, dir);
+  }
+  return { flaky, problem: '' };
+}
+
+/**
+ * The first line of what failed in each file of a vitest JSON report that failed.
+ * @param {{ testResults?: { name: string, status: string, message?: string, assertionResults?: { status: string, failureMessages?: string[] }[] }[] }} report
+ */
+export const failuresIn = report => (report.testResults ?? []).filter(file => file.status === 'failed').map(file => {
+  const failed = (file.assertionResults ?? []).filter(t => t.status === 'failed');
+  return { name: file.name, first: (failed[0]?.failureMessages?.[0] ?? file.message ?? '').split('\n')[0] };
+});
+
+/**
+ * What a run's dir `out` holds of its run with no mutant beyond the failed
+ * files of its tiers' reports, a line each: each unhandled error vitest caught
+ * (dry-<tier>.unhandled.json), with its file or "no file"; why the record of
+ * the reruns alone could not be written or cannot be read; and each rerun alone
+ * and how it ended. `shown` is how the report names `out`.
+ * @param {string} out
+ * @param {string} shown
+ * @returns {string[]}
+ */
+export function dryNotes(out, shown) {
+  /** @type {string[]} */
+  const lines = [];
+  for (const tier of ['fast', 'integration', 'child']) {
+    const name = `dry-${tier}.unhandled.json`;
+    /** @type {unknown} */
+    let errors;
+    try {
+      errors = JSON.parse(fs.readFileSync(path.join(out, name), 'utf8'));
+    } catch (error) {
+      if (/** @type {NodeJS.ErrnoException} */ (error).code !== 'ENOENT') lines.push(`${shown}/${name}, the run's unhandled errors, cannot be read`);
+      continue;
+    }
+    for (const e of Array.isArray(errors) ? errors : []) {
+      lines.push(`the run with no mutant had an unhandled error in ${typeof e?.file === 'string' ? e.file : 'no file'}: ${String(e?.message ?? '').split('\n')[0]}`);
+    }
+  }
+  try { lines.push(`${fs.readFileSync(path.join(out, AGAIN_UNWRITTEN_FILE), 'utf8').trim()}, so the run with no mutant failed`); } catch {}
+  const { record, problem } = readAgain(out);
+  if (problem) lines.push(`${shown}/${problem}`);
+  for (const r of record?.reruns ?? []) {
+    const log = `${shown}/${r.name}.log`;
+    if (r.code === 0) lines.push(`${r.file} failed in it beside other files and passed alone (${log})`);
+    else if (r.code === null) lines.push(`${r.file} failed in it beside other files and was not rerun alone: ${r.why ?? 'it did not run'}`);
+    else {
+      /** @type {{ first: string }[]} */
+      let failed = [];
+      try { failed = failuresIn(JSON.parse(fs.readFileSync(path.join(out, `${r.name}.json`), 'utf8'))); } catch { failed = []; }
+      const why = r.ended ? `ran past its bound of ${r.bound} ms` : failed[0]?.first ?? 'it failed with no test failed';
+      lines.push(`${r.file} failed in it beside other files and failed alone too, so the run with no mutant failed: ${why} (${log})`);
+    }
+  }
+  return lines;
+}
 
 /**
  * @param {string} testDir
@@ -192,18 +307,44 @@ function dryReport(out) {
 }
 
 /**
+ * `costs` with the cost of each file a rerun alone in `again` passed in taken
+ * from that rerun's own report (costsOf, to its end, against its time), since
+ * its cost in the run where it failed may be cut short or stretched; null when
+ * one cannot be made.
+ * @param {string} out
+ * @param {string} testDir
+ * @param {Record<string, number> | null} costs
+ * @param {Again[]} again
+ * @returns {Record<string, number> | null}
+ */
+function withAgain(out, testDir, costs, again) {
+  if (!costs) return null;
+  for (const rerun of again) {
+    if (rerun.code !== 0 || !Object.hasOwn(costs, rerun.file)) continue;
+    /** @type {TimedReport | null} */
+    let report = null;
+    try { report = JSON.parse(fs.readFileSync(path.join(out, `${rerun.name}.json`), 'utf8')); } catch { report = null; }
+    const alone = rerun.end === undefined ? null : costsOf(testDir, report, rerun.end, rerun.ms);
+    if (!alone || !Object.hasOwn(alone, rerun.file)) return null;
+    costs[rerun.file] = alone[rerun.file];
+  }
+  return costs;
+}
+
+/**
  * Writes what each file cost in a2's run with no mutant (costsOf, from its fast
- * report in `out`, to `end`, against `took`) to `out`, or removes what is there
- * when the costs cannot be made.
+ * report in `out`, to `end`, against `took`, and a file rerun alone from that
+ * rerun, withAgain) to `out`, or removes what is there when the costs cannot be made.
  * @param {string} out a2's report dir
  * @param {string} testDir
  * @param {number} end the time (Date.now) after that run's vitest exited
  * @param {number} took that run's time so far, by the monotonic clock
+ * @param {Again[]} [again] the reruns alone after that run
  */
-export function writeCosts(out, testDir, end, took) {
+export function writeCosts(out, testDir, end, took, again = []) {
   const file = path.join(out, COSTS_FILE);
   fs.rmSync(file, { force: true });
-  const costs = costsOf(testDir, dryReport(out), end, took);
+  const costs = withAgain(out, testDir, costsOf(testDir, dryReport(out), end, took), again);
   if (costs) fs.writeFileSync(file, JSON.stringify({ files: Object.keys(costs), costs: Object.values(costs) }));
 }
 
@@ -292,6 +433,26 @@ export function readRecordDir(dir) {
 }
 
 /**
+ * Removes the record dirs `file` (relative to test/) left in `coverage`, before
+ * it reruns alone into it. One that cannot be removed (a process of the failed
+ * run still holds it) stays, and the reach merges it with the rerun's record
+ * (reachOf): the ids of both, or unsure.
+ * @param {string} coverage
+ * @param {string} testDir
+ * @param {string} file
+ */
+export function dropRecords(coverage, testDir, file) {
+  const key = fileKey(path.resolve(testDir, file));
+  /** @type {string[]} */
+  let names = [];
+  try { names = fs.readdirSync(coverage); } catch { names = []; }
+  for (const name of names) {
+    if (name.slice(0, name.lastIndexOf('-')) !== key) continue;
+    try { fs.rmSync(path.join(coverage, name), { recursive: true, force: true }); } catch {}
+  }
+}
+
+/**
  * The records the run with no mutant left in `coverage`, one per test file process, each read by readRecordDir. A
  * dir whose own record is missing names its file by its key only, and is matched to the file in `ran` it belongs to.
  * @param {string} coverage
@@ -327,7 +488,9 @@ export function readRecords(coverage, testDir, ran) {
  * Builds the reach from what the run with no mutant left in `out` (the report
  * of each of its `tiers`, in the order they ran, and its coverage records) and
  * writes it there, with what each file cost when `end` and `took` are given
- * and the fast report gives that (costsOf, to `end`, against `took`). A tier
+ * and the fast report gives that (costsOf, to `end`, against `took`, and a
+ * file rerun alone from that rerun, withAgain). A file rerun alone has the
+ * records of that rerun (dropRecords). A tier
  * with no report, or no list of files in it, or reports that list no file in
  * all, leave no reach, so every mutant run takes every related file (in pass
  * B, and the whole child tier).
@@ -336,8 +499,9 @@ export function readRecords(coverage, testDir, ran) {
  * @param {string[]} [tiers] pass A's fast tier, or pass B's integration and child tiers
  * @param {number} [end] the time (Date.now) after that run's vitest exited
  * @param {number} [took] that run's time so far, by the monotonic clock
+ * @param {Again[]} [again] the reruns alone after that run
  */
-export function writeReach(out, testDir, tiers = ['fast'], end, took) {
+export function writeReach(out, testDir, tiers = ['fast'], end, took, again = []) {
   /** @type {string[]} */
   const ran = [];
   /** @type {TimedReport | null} */
@@ -353,7 +517,7 @@ export function writeReach(out, testDir, tiers = ['fast'], end, took) {
   if (ran.length === 0) return;
   const records = readRecords(path.join(out, COVERAGE_DIR), testDir, ran);
   const reach = reachOf(testDir, ran, records);
-  const costs = end === undefined || took === undefined ? null : costsOf(testDir, fast, end, took);
+  const costs = end === undefined || took === undefined ? null : withAgain(out, testDir, costsOf(testDir, fast, end, took), again);
   if (costs && reach.files.every(name => Object.hasOwn(costs, name))) reach.costs = reach.files.map(name => costs[name]);
   fs.writeFileSync(path.join(out, REACH_FILE), JSON.stringify(reach));
 }

@@ -24,7 +24,7 @@ vi.mock('../../src/bot/internalSetup/utils/configDiscovery', async orig => ({
   getConfigFileMetadata: (id: string) => h.files.find(f => f.id === id) ?? null,
 }));
 vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => {
-  const real = await orig<any>();
+  const real = (await import('../helpers/longConfirm')).longConfirm(await orig<any>());
   return { ...real, deleteRawAtomic: (...args: unknown[]) => (h.refuseDelete ? false : real.deleteRawAtomic(...args)) };
 });
 

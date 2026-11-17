@@ -5,7 +5,7 @@ import path from 'path';
 import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { endTree } from '../helpers/endTree.mjs';
 import { pastBudget, strykerClock } from '../mutation/control.mjs';
-import { readCosts } from '../mutation/reach.mjs';
+import { dryNotes, readCosts, readReach } from '../mutation/reach.mjs';
 import { lockOf, setLines } from '../mutation/resume.mjs';
 import { confirmed, endedByBound, type MutantRecord } from '../mutation/verdict.mjs';
 
@@ -83,6 +83,27 @@ describe('a mutant run', () => {
     expect(calls.map(call => call.project)).toEqual(['integration']);
     expect(calls[0]).toMatchObject({ scale: '1', mutant: '7' });
     expect(calls[0].args).toEqual(expect.arrayContaining(['related', '../src/a.ts', '--bail=1', '--no-cache']));
+  });
+
+  it('gives every run with no mutant four times the time, as a rerun alone, and a mutant run of pass A or B the config\'s', () => {
+    const dry = { __STRYKER_ACTIVE_MUTANT__: 'none', SMDB_MUTATION_FILES: '["test/mutation/control.mjs"]' };
+    const sets = { ...dry, SMDB_MUTATION_SETS: JSON.stringify([{ files: ['unit/a.test.ts'], ms: 60_000 }]) };
+    const runs: [string, string, string[], NodeJS.ProcessEnv, string[]][] = [
+      ['pass A with no mutant', 'a', [], dry, ['fast']],
+      ['pass B with no mutant', 'b', [], dry, ['integration', 'child']],
+      ['alone-a', 'a', [], sets, ['fast']],
+      ['named files with no mutant', 'b', ['child/c.test.ts'], dry, ['child']],
+    ];
+    for (const [what, pass, only, env, tiers] of runs) {
+      const fake = fakeVitest([]);
+      expect(runner(fake, pass, '', only, env).status, what).toBe(0);
+      expect(fake.read().map(call => [call.project, call.scale]), what).toEqual(tiers.map(project => [project, '4']));
+    }
+    for (const pass of ['a', 'b']) {
+      const fake = fakeVitest([]);
+      expect(runner(fake, pass, '').status, pass).toBe(0);
+      expect(fake.read().map(call => [call.mutant, call.scale]), pass).toEqual((pass === 'a' ? ['fast'] : ['integration', 'child']).map(() => ['7', '1']));
+    }
   });
 
   it('refuses, before any mutant, a file that holds a way to /data as the pass copied it', () => {
@@ -396,6 +417,213 @@ describe('a mutant run', () => {
     const took = fs.readFileSync(path.join(fake.out, 'dry-ms.txt'), 'utf8');
     expect(took).toMatch(/^\d+$/);
     expect(Number(took)).toBeLessThan(300_000);
+  });
+});
+
+describe('a run with no mutant that fails beside other files', () => {
+  interface DryCall { project: string; args: string[]; scale: string | null; mutant: string | null; include: string[] | null; coverage: string | null }
+  interface Rerun { tier: string; file: string; name: string; code: number | null; ms: number; bound: number; end?: number; why?: string }
+  const FLAKY = 'unit/flaky.test.ts';
+  const BROKEN = 'unit/broken.test.ts';
+
+  // A stand-in for vitest: a run of every related file (or of the whole child tier) lists `tiers[project]`, a run of
+  // named files lists those. Each listed file fails when it is in `broken`, or in `flaky` and the run lists another
+  // file; every failed file has a failed test. It writes its JSON report (each file 10 ms with 10 ms gaps, a flaky
+  // file 300 ms when it runs alone), the unhandled errors runner.mjs asks for (`unhandled`, as unhandled.mjs writes
+  // them, in a run of more than one file, which then exits 1 as vitest does; none at all with `writeUnhandled` false),
+  // and, given a coverage dir, a record dir per file: a flaky file that failed leaves one with id 1 and a Node
+  // start with no record (unsure), one that passed ids 1 and 2.
+  function fakeDry({ tiers = { fast: ['unit/a.test.ts', FLAKY, 'unit/b.test.ts'] } as Record<string, string[]>, flaky = [FLAKY], broken = [] as string[], unhandled = [] as { file: string | null; message: string }[], writeUnhandled = true } = {}) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-dryagain-'));
+    onTestFinished(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const calls = path.join(dir, 'calls.jsonl');
+    const script = path.join(dir, 'vitest.cjs');
+    fs.writeFileSync(script, [
+      "const fs = require('fs');",
+      "const path = require('path');",
+      "const { createHash } = require('crypto');",
+      'const args = process.argv.slice(2);',
+      "const project = args[args.indexOf('--project') + 1];",
+      "const include = process.env.SMDB_MUTATION_INCLUDE ? JSON.parse(fs.readFileSync(process.env.SMDB_MUTATION_INCLUDE, 'utf8')) : null;",
+      'const coverage = process.env.SMDB_MUTATION_COVERAGE || null;',
+      `fs.appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ project, args, scale: process.env.SMDB_TEST_TIME_SCALE ?? null, mutant: process.env.__STRYKER_ACTIVE_MUTANT__ ?? null, include, coverage }) + '\\n');`,
+      `const listed = include ?? (${JSON.stringify(tiers)}[project] || []);`,
+      `const fails = file => ${JSON.stringify(broken)}.includes(file) || (${JSON.stringify(flaky)}.includes(file) && listed.length > 1);`,
+      "const outputFile = (args.find(arg => arg.startsWith('--outputFile=')) ?? '').slice('--outputFile='.length);",
+      'const start = Date.now();',
+      'let at = start;',
+      'const testResults = listed.map(file => {',
+      `  const span = ${JSON.stringify(flaky)}.includes(file) && listed.length === 1 ? 300 : 10;`,
+      '  const from = at + 10;',
+      '  at = from + span;',
+      "  const status = fails(file) ? 'failed' : 'passed';",
+      "  return { name: path.join(process.cwd(), file), status, message: '', startTime: from, endTime: at, assertionResults: [{ status, duration: span, failureMessages: status === 'failed' ? [`AssertionError: ${file} timed out`] : [] }] };",
+      '});',
+      'Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, at - start + 10);',
+      'if (outputFile) fs.writeFileSync(outputFile, JSON.stringify({ startTime: start, testResults }));',
+      `const errors = listed.length > 1 ? ${JSON.stringify(unhandled)} : [];`,
+      `if (process.env.SMDB_MUTATION_UNHANDLED && ${JSON.stringify(writeUnhandled)}) fs.writeFileSync(process.env.SMDB_MUTATION_UNHANDLED, JSON.stringify(errors.map(e => ({ ...e, file: e.file && path.join(process.cwd(), e.file) }))));`,
+      'if (coverage) listed.forEach(file => {',
+      '  const abs = path.join(process.cwd(), file);',
+      "  const key = createHash('sha256').update(path.resolve(abs)).digest('hex').slice(0, 32);",
+      '  const dir = path.join(coverage, `${key}-${process.pid}`);',
+      '  fs.mkdirSync(dir, { recursive: true });',
+      `  const cut = ${JSON.stringify(flaky)}.includes(file) && fails(file);`,
+      "  const lines = [{ role: 'file', file: abs, ranOther: false, late: false, pid: process.pid }, { id: '1' }, ...(cut ? [{ start: 't1', kind: 'node' }] : [{ id: '2' }])];",
+      "  fs.writeFileSync(path.join(dir, `${process.pid}-a.jsonl`), lines.map(line => JSON.stringify(line) + '\\n').join(''));",
+      '});',
+      'process.exit(listed.some(fails) || errors.length > 0 ? 1 : 0);',
+      '',
+    ].join('\n'));
+    const out = path.join(dir, 'out');
+    fs.mkdirSync(out);
+    const read = (): DryCall[] => (fs.existsSync(calls) ? fs.readFileSync(calls, 'utf8').trim().split('\n').map(line => JSON.parse(line) as DryCall) : []);
+    const again = () => JSON.parse(fs.readFileSync(path.join(out, 'dry-again.json'), 'utf8')) as { passed: boolean | null; reruns: Rerun[] };
+    return { script, out, read, again };
+  }
+  const dry = { __STRYKER_ACTIVE_MUTANT__: 'none', SMDB_MUTATION_FILES: '["test/mutation/control.mjs"]' };
+  const whole = (call: DryCall) => !call.args.includes('--bail=1') && call.args.some(arg => /^--reporter=.*unhandled\.mjs$/.test(arg));
+
+  it("passes when each file it failed in beside other files passes alone, names them, and takes each one's reach and cost from its run alone", () => {
+    for (const confirm of ['', '1']) {
+      const fake = fakeDry();
+      const run = runner(fake, 'a', confirm, [], dry);
+      expect(run.status, confirm).toBe(0);
+      const calls = fake.read();
+      const coverage = confirm ? null : path.join(fake.out, 'dry-coverage');
+      // The whole run to its end, then the flaky file alone, both at scale 4; only pass A's own run records reach.
+      expect(calls.map(call => [call.project, call.args[0], call.include, call.coverage, call.scale]), confirm).toEqual([['fast', 'related', null, coverage, '4'], ['fast', 'run', [FLAKY], coverage, '4']]);
+      expect(whole(calls[0]), confirm).toBe(true);
+      expect(calls[1].args, confirm).toContain(`--outputFile=${path.join(fake.out, 'dry-again-0')}.json`);
+      const { passed, reruns } = fake.again();
+      expect(passed, confirm).toBe(true);
+      expect(reruns.map(({ tier, file, name, code }) => ({ tier, file, name, code })), confirm).toEqual([{ tier: 'fast', file: FLAKY, name: 'dry-again-0', code: 0 }]);
+      expect(reruns[0].bound, confirm).toBe(4 * 390_000 + 60_000);
+      // Its cost is its 300 ms alone, not the 10 ms it took where it failed.
+      const costs = confirm ? readCosts(fake.out) : readReach(fake.out);
+      expect(costs?.files, confirm).toEqual(['unit/a.test.ts', FLAKY, 'unit/b.test.ts']);
+      expect(costs?.costs?.[1], confirm).toBeGreaterThanOrEqual(300);
+      expect(costs?.costs?.[0], confirm).toBeLessThan(300);
+      if (!confirm) {
+        // Its reach is its run alone's, sure, with both ids, not the failed run's record, which was unsure.
+        expect(readReach(fake.out), confirm).toMatchObject({ unsure: [], reached: { 1: [0, 1, 2], 2: [0, 1, 2] } });
+      }
+    }
+    // Pass B: a flaky integration file reruns alone, and the child tier then runs; the run after b2 likewise.
+    const tiers = { integration: ['integration/a.test.ts', 'integration/flaky.test.ts'], child: ['child/c.test.ts'] };
+    const b = fakeDry({ tiers, flaky: ['integration/flaky.test.ts'] });
+    expect(runner(b, 'b', '', [], dry).status).toBe(0);
+    const coverage = path.join(b.out, 'dry-coverage');
+    expect(b.read().map(call => [call.project, call.args[0], call.include, call.coverage])).toEqual([
+      ['integration', 'related', null, coverage], ['integration', 'run', ['integration/flaky.test.ts'], coverage], ['child', 'run', null, coverage],
+    ]);
+    expect(readReach(b.out)).toMatchObject({ files: [...tiers.integration, ...tiers.child], unsure: [] });
+    const control = fakeDry({ tiers, flaky: ['integration/flaky.test.ts'] });
+    expect(runner(control, 'b', '1', tiers.integration, dry).status).toBe(0);
+    expect(control.read().map(call => [call.project, call.include])).toEqual([['integration', tiers.integration], ['integration', ['integration/flaky.test.ts']]]);
+    expect(control.again().passed).toBe(true);
+  });
+
+  it('fails as before when a file fails alone too, at the first, and when the failure is not only in files run beside others', () => {
+    const fake = fakeDry({ tiers: { fast: [BROKEN, 'unit/a.test.ts', FLAKY] }, broken: [BROKEN] });
+    expect(runner(fake, 'a', '', [], dry).status).toBe(1);
+    // The broken file alone fails, so the flaky one is not rerun.
+    expect(fake.read().map(call => call.include)).toEqual([null, [BROKEN]]);
+    expect(fake.again()).toMatchObject({ passed: false, reruns: [{ file: BROKEN, code: 1 }] });
+    // No time left in Stryker's bound: nothing reruns, and the record says why.
+    const late = fakeDry();
+    expect(runner(late, 'a', '', [], { ...dry, SMDB_MUTATION_DRY_MS: '60000' }).status).toBe(1);
+    expect(late.read()).toHaveLength(1);
+    expect(late.again()).toMatchObject({ passed: false, reruns: [{ file: FLAKY, code: null, why: expect.stringMatching(/^no time was left/) }] });
+    // An unhandled error that names no file or a file outside the report, a report with no record of unhandled errors
+    // beside it, a run of one file (b2's), and a failure with no report: no rerun.
+    const cases: [string, ReturnType<typeof fakeDry>, string, string[]][] = [
+      ['an unhandled error of no file', fakeDry({ unhandled: [{ file: null, message: 'late' }] }), '', []],
+      ['an unhandled error of a file outside the report', fakeDry({ unhandled: [{ file: 'unit/other.test.ts', message: 'late' }] }), '', []],
+      ['no record of unhandled errors', fakeDry({ writeUnhandled: false }), '', []],
+      ['one file', fakeDry({ tiers: { child: ['child/c.test.ts'] }, broken: ['child/c.test.ts'] }), '1', ['child/c.test.ts']],
+    ];
+    for (const [what, stand, confirm, only] of cases) {
+      expect(runner(stand, only.length > 0 ? 'b' : 'a', confirm, only, dry).status, what).toBe(1);
+      expect(stand.read(), what).toHaveLength(1);
+      expect(fs.existsSync(path.join(stand.out, 'dry-again.json')), what).toBe(false);
+    }
+    // The gate's lines then say what failed, the unhandled error and its file or "no file" included.
+    const notes = (stand: ReturnType<typeof fakeDry>) => dryNotes(stand.out, 'r/a');
+    expect(notes(cases[0][1])).toEqual(['the run with no mutant had an unhandled error in no file: late']);
+    expect(notes(cases[1][1])).toEqual([`the run with no mutant had an unhandled error in ${path.join(root, 'test', 'unit', 'other.test.ts')}: late`]);
+    expect(notes(fake)).toEqual([expect.stringMatching(/^unit\/broken\.test\.ts failed in it beside other files and failed alone too, so the run with no mutant failed: AssertionError: unit\/broken\.test\.ts timed out \(r\/a\/dry-again-0\.log\)$/)]);
+    const quiet = fakeVitest(['fast']);
+    expect(runner(quiet, 'a', '', [], dry).status).toBe(1);
+    expect(quiet.read()).toHaveLength(1);
+    // An unhandled error in a file whose tests passed reruns that file alone.
+    const late2 = fakeDry({ flaky: [], unhandled: [{ file: 'unit/b.test.ts', message: 'late' }] });
+    expect(runner(late2, 'a', '', [], dry).status).toBe(0);
+    expect(late2.read().map(call => call.include)).toEqual([null, ['unit/b.test.ts']]);
+  });
+
+  it('fails a run with no mutant whose reruns passed when their record cannot be written, and says why', () => {
+    const fake = fakeDry();
+    // A dir in the record's place: the rename onto it fails on every platform.
+    fs.mkdirSync(path.join(fake.out, 'dry-again.json'));
+    expect(runner(fake, 'a', '', [], dry).status).toBe(1);
+    expect(fake.read().map(call => call.include)).toEqual([null, [FLAKY]]);
+    expect(fs.readFileSync(path.join(fake.out, 'dry-again-unwritten.txt'), 'utf8')).toMatch(/^dry-again\.json could not be written \(\w+\)\n$/);
+    expect(fs.existsSync(path.join(fake.out, 'dry-again.json.tmp'))).toBe(false);
+    expect(dryNotes(fake.out, 'r/a')).toEqual([
+      expect.stringMatching(/^dry-again\.json could not be written \(\w+\), so the run with no mutant failed$/),
+      expect.stringMatching(/^r\/a\/dry-again\.json cannot be read \(\w+\)$/),
+    ]);
+  });
+
+  it('reruns no mutant run that fails, only a run with no mutant', () => {
+    const fake = fakeDry();
+    expect(runner(fake, 'a', '', [], dry).status).toBe(0);
+    expect(fake.read()).toHaveLength(2);
+    for (const [what, pass, confirm] of [['pass A', 'a', ''], ['a2', 'a', '1'], ['pass B', 'b', '']]) {
+      const stand = fakeDry({ tiers: { fast: ['unit/a.test.ts', FLAKY], integration: ['integration/a.test.ts', 'integration/flaky.test.ts'] }, flaky: [FLAKY, 'integration/flaky.test.ts'] });
+      expect(runner(stand, pass, confirm).status, what).toBe(1);
+      const calls = stand.read();
+      expect(calls.map(call => call.mutant), what).toEqual(['7']);
+      expect(calls[0].args, what).toContain('--bail=1');
+      expect(fs.existsSync(path.join(stand.out, 'dry-again.json')), what).toBe(false);
+    }
+  });
+
+  it('bounds a rerun alone by its tier\'s limits at scale 4, and leaves room for one in each pass\'s run with no mutant', async () => {
+    vi.stubEnv('SMDB_TEST_TIME_SCALE', '4');
+    vi.resetModules();
+    onTestFinished(() => { vi.unstubAllEnvs(); vi.resetModules(); });
+    const config = (await import('../vitest.config')).default as { test: { hookTimeout: number; projects: { test: { name: string; testTimeout?: number } }[] } };
+    const { aloneBoundMs, PASSES, setBoundMs } = await import('../mutation/passes.mjs');
+    const child = config.test.projects.find(project => project.test.name === 'child')!.test.testTimeout!;
+    expect(aloneBoundMs('fast')).toBe(setBoundMs(1));
+    expect(aloneBoundMs('integration')).toBe(setBoundMs(1));
+    expect(aloneBoundMs('child')).toBe(2 * config.test.hookTimeout + child + 60_000);
+    expect(PASSES.a.dryRunTimeoutMinutes - 60).toBe(Math.ceil(setBoundMs(1) / 60_000));
+    expect(PASSES.b.dryRunTimeoutMinutes - 180).toBe(Math.ceil(aloneBoundMs('child') / 60_000));
+  });
+
+  // vitest 5's own run, as runner.mjs starts a tier with no mutant: the JSON report beside unhandled.mjs.
+  it("learns from unhandled.mjs the file of each unhandled error, which vitest's JSON report leaves out, and finds a nested hook's failure on its file", { timeout: 180_000 }, () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-unhandled-'));
+    onTestFinished(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const fixtures: Record<string, string> = {
+      'nested.test.mjs': "describe('store', () => {\n  beforeAll(() => { throw new Error('nested hook'); });\n  it('reads', () => {});\n});",
+      'unhandled.test.mjs': "it('passes', () => { Promise.reject(new Error('late')); });",
+      'ok.test.mjs': "it('ok', () => {});",
+    };
+    for (const [name, body] of Object.entries(fixtures)) fs.writeFileSync(path.join(dir, name), `${body}\n`);
+    const [errors, report] = [path.join(dir, 'errors.json'), path.join(dir, 'report.json')];
+    const vitest = path.join(root, 'test', 'node_modules', 'vitest', 'vitest.mjs');
+    const run = spawnSync(process.execPath, [
+      vitest, 'run', '--root', dir, '--globals', '--maxWorkers=1', '--reporter=json', `--reporter=${path.join(root, 'test', 'mutation', 'unhandled.mjs')}`, `--outputFile=${report}`,
+    ], { cwd: dir, encoding: 'utf8', timeout: 150_000, env: { ...process.env, SMDB_MUTATION_UNHANDLED: errors } });
+    expect(run.status, `${run.stdout}\n${run.stderr}`).toBe(1);
+    const lines = JSON.parse(fs.readFileSync(errors, 'utf8')) as { file: string | null; message: string }[];
+    expect(lines.map(line => [path.basename(line.file ?? ''), line.message])).toEqual([['unhandled.test.mjs', 'late']]);
+    const { testResults } = JSON.parse(fs.readFileSync(report, 'utf8')) as { testResults: { name: string; status: string }[] };
+    expect(Object.fromEntries(testResults.map(file => [path.basename(file.name), file.status]))).toEqual({ 'nested.test.mjs': 'failed', 'ok.test.mjs': 'passed', 'unhandled.test.mjs': 'passed' });
   });
 });
 
@@ -820,17 +1048,28 @@ describe('the time limits', () => {
     expect((config.test.hookTimeout - PASSES.b.timeoutMS) / PASSES.b.timeoutFactor).toBe(60_000);
   });
 
-  it('bound a run of a set with no mutant above a beforeAll, an afterAll and a test of each file at their limits, and Stryker above every set', async () => {
-    for (const scale of [1, 4]) {
-      vi.stubEnv('SMDB_TEST_TIME_SCALE', String(scale));
-      vi.resetModules();
-      const config = (await import('../vitest.config')).default as { test: { testTimeout: number; hookTimeout: number } };
-      const { setBoundMs } = await import('../mutation/passes.mjs');
-      expect(setBoundMs(1, scale), String(scale)).toBe(2 * config.test.hookTimeout + config.test.testTimeout + 60_000);
-      expect(setBoundMs(3, scale) - 60_000, String(scale)).toBe(3 * (setBoundMs(1, scale) - 60_000));
-    }
-    const { setsBoundMinutes } = await import('../mutation/passes.mjs');
+  it('bound a run of a set with no mutant above a beforeAll, an afterAll and a test of each file at their limits with no mutant, and Stryker above every set', async () => {
+    vi.stubEnv('SMDB_TEST_TIME_SCALE', '4');
+    vi.resetModules();
+    const config = (await import('../vitest.config')).default as { test: { testTimeout: number; hookTimeout: number } };
+    const { ALONE_TIME_SCALE, setBoundMs, setsBoundMinutes } = await import('../mutation/passes.mjs');
+    expect(ALONE_TIME_SCALE).toBe(4);
+    expect(setBoundMs(1)).toBe(2 * config.test.hookTimeout + config.test.testTimeout + 60_000);
+    expect(setBoundMs(3) - 60_000).toBe(3 * (setBoundMs(1) - 60_000));
     expect(setsBoundMinutes([{ ms: 90_000 }, { ms: 60_000 }])).toBe(8);
+  });
+
+  it('cap the bound on many sets at the largest whole minutes setTimeout can hold', async () => {
+    const { MAX_BOUND_MINUTES, setsBoundMinutes } = await import('../mutation/passes.mjs');
+    expect(MAX_BOUND_MINUTES).toBe(35_791);
+    expect(MAX_BOUND_MINUTES * 60_000).toBeLessThanOrEqual(2_147_483_647);
+    expect(setsBoundMinutes([{ ms: 1_388_310_000 }, { ms: 1_388_310_000 }])).toBe(MAX_BOUND_MINUTES);
+  });
+
+  it('cap one set\'s bound at the longest timer Node can hold', async () => {
+    const { setBoundMs, TIMER_LIMIT_MS } = await import('../mutation/passes.mjs');
+    expect(setBoundMs(1_377)).toBe(TIMER_LIMIT_MS);
+    expect(setBoundMs(1_376)).toBe(1_376 * 4 * 390_000 + 60_000);
   });
 });
 
@@ -843,21 +1082,24 @@ describe('the Stryker options', () => {
       const largest = rerun.timeoutFactor * rerun.dryRunTimeoutMinutes * 60_000 + rerun.timeoutMS;
       expect(controlBoundMinutes(rerun) * 60_000 - largest, name).toBeGreaterThanOrEqual(5 * 60_000);
     }
-    expect(controlBoundMinutes(PASSES.a2)).toBe(246);
+    expect(controlBoundMinutes(PASSES.a2)).toBe(354);
     expect(controlBoundMinutes(PASSES.b2)).toBe(125);
     // control-b2 runs every file that failed in pass B, each of which could take a whole b2 budget.
     expect(controlBoundMinutes(PASSES.b2, 3)).toBe(365);
-    expect(controlBoundMinutes(PASSES.a2, 0)).toBe(246);
-    // A run with no mutant of every related fast file took 27.9 minutes on a busy machine.
-    for (const name of ['a', 'a2'] as const) expect(PASSES[name].dryRunTimeoutMinutes, name).toBe(60);
+    expect(controlBoundMinutes(PASSES.a2, 0)).toBe(354);
+    const { MAX_BOUND_MINUTES } = await import('../mutation/passes.mjs');
+    expect(controlBoundMinutes(PASSES.a2, 1_000)).toBe(MAX_BOUND_MINUTES);
+    // A run with no mutant of every related fast file took 27.9 minutes on a busy machine; 27 more hold one fast
+    // file rerun alone at its whole bound.
+    for (const name of ['a', 'a2'] as const) expect(PASSES[name].dryRunTimeoutMinutes, name).toBe(87);
   });
 
-  it("bound pass B's own run with no mutant at two hours, and b2's, which the bound after the reruns is built from, at fifteen minutes", async () => {
+  it("bound pass B's own run with no mutant at three hours and a child file's rerun alone, and b2's, which the bound after the reruns is built from, at fifteen minutes", async () => {
     const { controlBoundMinutes, PASSES } = await import('../mutation/passes.mjs');
-    expect(PASSES.b.dryRunTimeoutMinutes).toBe(120);
+    expect(PASSES.b.dryRunTimeoutMinutes).toBe(225);
     expect(PASSES.b2.dryRunTimeoutMinutes).toBe(15);
-    expect(PASSES.a.dryRunTimeoutMinutes).toBe(60);
-    expect(PASSES.a2.dryRunTimeoutMinutes).toBe(60);
+    expect(PASSES.a.dryRunTimeoutMinutes).toBe(87);
+    expect(PASSES.a2.dryRunTimeoutMinutes).toBe(87);
     // The run with no mutant after b2 runs every file that failed in pass B, bound per file as a b2 rerun is.
     expect(controlBoundMinutes(PASSES.b2, 2)).toBe(245);
     const gate = fs.readFileSync(path.join(root, 'test', 'mutation', 'touched.mjs'), 'utf8');

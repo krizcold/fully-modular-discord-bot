@@ -294,6 +294,8 @@ describe('two cancels of one path, one ending first', () => {
     syncP.release();
     expect(await onlyP).toEqual([{ path: p, outcome: 'landed' }]);
     stub.shortWrite(p, () => 1);
+    // q's real fsync after its release can outlast the 1 s retry of P2: every retry takes no byte, so P2 never lands first.
+    stub.shortWrite(p, () => 0, Infinity);
     const t2 = append(p, 'P2\n');
     await until(() => stub.writes.some(w => w.path === p && w.accepted === 1) && fileTicketState(t2) === 'written');
     expect(getPending(p)).toBeDefined();

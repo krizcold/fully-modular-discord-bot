@@ -1,5 +1,6 @@
 import fs from 'fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => (await import('../helpers/longConfirm')).longConfirm(await orig<any>()));
 
 // NB10 test 32, and the route case of test 5: the data editor's save carries the sha it loaded, and a write built on
 // a read never replaces a module write made after that read.

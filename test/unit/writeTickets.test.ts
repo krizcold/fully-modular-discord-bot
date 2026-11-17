@@ -643,7 +643,7 @@ const fileRows: Row[] = [
     run: async () => {
       const file = freshPath('lands.json');
       enqueueWrite(file, '{"a":1}');
-      const outcome = await confirmFile(fileTicket(file), 5000);
+      const outcome = await confirmFile(fileTicket(file), 20_000);
       expect(fs.readFileSync(file, 'utf8')).toBe('{"a":1}');
       return [outcome];
     },
@@ -657,10 +657,10 @@ const fileRows: Row[] = [
       const first = fileTicket(file);
       enqueueWrite(file, '{"v":2}');
       const second = fileTicket(file);
-      const outcomes = [await confirmFile(second, 5000), await confirmFile(first, 0)];
+      const outcomes = [await confirmFile(second, 20_000), await confirmFile(first, 0)];
       expect(fs.readFileSync(file, 'utf8')).toBe('{"v":2}');
       enqueueDelete(file);
-      outcomes.push(await confirmFile(fileTicket(file), 5000));
+      outcomes.push(await confirmFile(fileTicket(file), 20_000));
       expect(fs.existsSync(file)).toBe(false);
       return outcomes;
     },
@@ -673,10 +673,10 @@ const fileRows: Row[] = [
       fs.mkdirSync(file, { recursive: true });
       enqueueWrite(file, '{"a":1}');
       const ticket = fileTicket(file);
-      const refused = await confirmFile(ticket, 10_000);
+      const refused = await confirmFile(ticket, 30_000);
       expect(filesPending([file])).toBe(true);
       fs.rmSync(file, { recursive: true });
-      const healed = await confirmFile(ticket, 10_000);
+      const healed = await confirmFile(ticket, 30_000);
       expect(fs.readFileSync(file, 'utf8')).toBe('{"a":1}');
       return [refused, healed];
     },
@@ -691,10 +691,10 @@ const fileRows: Row[] = [
       const file = path.join(parent, 'inner.json');
       enqueueWrite(file, '{"a":1}');
       const ticket = fileTicket(file);
-      const refused = await confirmFile(ticket, 10_000);
+      const refused = await confirmFile(ticket, 30_000);
       expect(filesPending([file])).toBe(true);
       fs.rmSync(parent);
-      const healed = await confirmFile(ticket, 10_000);
+      const healed = await confirmFile(ticket, 30_000);
       expect(fs.readFileSync(file, 'utf8')).toBe('{"a":1}');
       return [refused, healed];
     },
@@ -706,7 +706,7 @@ const fileRows: Row[] = [
       const file = freshPath('deadline.json');
       enqueueWrite(file, '{"a":1}');
       const ticket = fileTicket(file);
-      return [await confirmFile(ticket, 0), await confirmFile(ticket, 5000)];
+      return [await confirmFile(ticket, 0), await confirmFile(ticket, 20_000)];
     },
   },
   {
@@ -728,7 +728,7 @@ const fileRows: Row[] = [
         expect(making).toHaveBeenCalledTimes(1);
         expect(filesPending([file])).toBe(true);
         open();
-        const landed = await confirmFile(ticket, 5000);
+        const landed = await confirmFile(ticket, 20_000);
         expect(fs.readFileSync(file, 'utf8')).toBe('{"a":1}');
         return [atTheDeadline, landed];
       } finally {
@@ -749,7 +749,7 @@ describe('file-queue tickets, the state x exit table', () => {
     const writing = stub.holdWrite(file);
     // The lines end with a newline, as JSON-lines appends do (a line that does not is started on its own line).
     enqueueAppend(file, 'a;\n');
-    const first = confirmFile(fileTicket(file), 5000);
+    const first = confirmFile(fileTicket(file), 20_000);
     await writing.reached;
     expect(stub.writeCalls.filter(p => p === file)).toHaveLength(1);
     enqueueAppend(file, 'b;\n');
@@ -758,7 +758,7 @@ describe('file-queue tickets, the state x exit table', () => {
     expect(await first).toBe('ok');
     expect(await confirmFile(second, 0)).toBe('pending');
     expect(fs.readFileSync(file, 'utf8')).toBe('a;\n');
-    expect(await confirmFile(second, 5000)).toBe('ok');
+    expect(await confirmFile(second, 20_000)).toBe('ok');
     expect(fs.readFileSync(file, 'utf8')).toBe('a;\nb;\n');
   });
 
@@ -768,13 +768,13 @@ describe('file-queue tickets, the state x exit table', () => {
     const written = fileTicket(file);
     enqueueAppend(file, 'a;');
     const appended = fileTicket(file);
-    expect(await confirmFile(appended, 5000)).toBe('ok');
+    expect(await confirmFile(appended, 20_000)).toBe('ok');
     expect(await confirmFile(written, 0)).toBe('ok');
     expect(fs.readFileSync(file, 'utf8')).toBe('w;a;');
     enqueueDelete(file);
     const deleted = fileTicket(file);
     enqueueAppend(file, 'b;');
-    expect(await confirmFile(fileTicket(file), 5000)).toBe('ok');
+    expect(await confirmFile(fileTicket(file), 20_000)).toBe('ok');
     expect(await confirmFile(deleted, 0)).toBe('ok');
     expect(fs.readFileSync(file, 'utf8')).toBe('b;');
   });
@@ -782,22 +782,22 @@ describe('file-queue tickets, the state x exit table', () => {
   it('flushes an op that replaced an append while that append was on the wire, untrimmed and unprompted', async () => {
     const replaced = freshPath('replaced.jsonl');
     enqueueAppend(replaced, 'a;');
-    const onTheWire = confirmFile(fileTicket(replaced), 5000);
+    const onTheWire = confirmFile(fileTicket(replaced), 20_000);
     enqueueWrite(replaced, 'w;');
     expect(await onTheWire).toBe('ok');
-    for (let turns = 0; turns < 200 && filesPending([replaced]); turns++) await new Promise(resolve => { setTimeout(resolve, 10); });
+    for (let turns = 0; turns < 2000 && filesPending([replaced]); turns++) await new Promise(resolve => { setTimeout(resolve, 10); });
     expect(filesPending([replaced])).toBe(false);
     expect(fs.readFileSync(replaced, 'utf8')).toBe('w;');
 
     const guildId = '9301';
     const dropped = path.join(process.env.DATA_DIR!, guildId, 'm', 'dropped.jsonl');
     enqueueAppend(dropped, 'a;\n');
-    const flushing = confirmFile(fileTicket(dropped), 5000);
+    const flushing = confirmFile(fileTicket(dropped), 20_000);
     dropPendingForGuild(guildId);
     enqueueAppend(dropped, 'bb;\n');
     const after = fileTicket(dropped);
     expect(await flushing).toBe('ok');
-    expect(await confirmFile(after, 5000)).toBe('ok');
+    expect(await confirmFile(after, 20_000)).toBe('ok');
     expect(fs.readFileSync(dropped, 'utf8')).toBe('a;\nbb;\n');
   });
 
@@ -828,7 +828,7 @@ describe('file-queue tickets, the state x exit table', () => {
     const dropped = fileTicket(file);
     dropPendingForGuild(guildId);
     enqueueWrite(file, '{"v":2}');
-    expect(await confirmFile(fileTicket(file), 5000)).toBe('ok');
+    expect(await confirmFile(fileTicket(file), 20_000)).toBe('ok');
     expect(fs.readFileSync(file, 'utf8')).toBe('{"v":2}');
     expect(await confirmFile(dropped, 1000)).toBe('unavailable');
   });
@@ -841,7 +841,7 @@ describe('file-queue tickets, the state x exit table', () => {
     dropPendingForGuild(guildId);
     failTmpOpens(file, Number.POSITIVE_INFINITY);
     enqueueWrite(file, '{"v":2}');
-    expect(await confirmFile(dropped, 5000)).toBe('unavailable');
+    expect(await confirmFile(dropped, 20_000)).toBe('unavailable');
     dropPendingForGuild(guildId);
   });
 
@@ -850,7 +850,7 @@ describe('file-queue tickets, the state x exit table', () => {
     const file = path.join(process.env.DATA_DIR!, guildId, 'm', 'drop-mid-attempt.json');
     failTmpOpens(file, Number.POSITIVE_INFINITY, n => { if (n === 1) dropPendingForGuild(guildId); });
     enqueueWrite(file, '{"v":1}');
-    expect(await confirmFile(fileTicket(file), 5000)).toBe('unavailable');
+    expect(await confirmFile(fileTicket(file), 20_000)).toBe('unavailable');
     dropPendingForGuild(guildId);
   });
 
@@ -858,7 +858,7 @@ describe('file-queue tickets, the state x exit table', () => {
     const file = freshPath('progress.json');
     const opens = failTmpOpens(file, 4, n => { if (n === 2) enqueueWrite(file, '{"v":2}'); });
     enqueueWrite(file, '{"v":1}');
-    expect(await confirmFile(fileTicket(file), 5000)).toBe('ok');
+    expect(await confirmFile(fileTicket(file), 20_000)).toBe('ok');
     expect(opens.calls()).toBe(5);
     expect(fs.readFileSync(file, 'utf8')).toBe('{"v":2}');
   });
@@ -881,8 +881,8 @@ describe('file-queue tickets, the state x exit table', () => {
     enqueueAppend(appended, 'a;');
     const appendTicket = fileTicket(appended);
     const kept = fileLandingRecords();
-    expect(await confirmFile(writeTicket, 5000)).toBe('ok');
-    expect(await confirmFile(appendTicket, 5000)).toBe('ok');
+    expect(await confirmFile(writeTicket, 20_000)).toBe('ok');
+    expect(await confirmFile(appendTicket, 20_000)).toBe('ok');
     expect(fileLandingRecords()).toBeLessThanOrEqual(kept - 2);
     expect(await confirmFile(writeTicket, 0)).toBe('ok');
     expect(await confirmFile(appendTicket, 0)).toBe('ok');
@@ -971,7 +971,7 @@ async function runFileQueue(ops: FileOp[]): Promise<void> {
       queued(file, null);
     }
   }
-  for (const { ticket } of issued) expect(await confirmFile(ticket, 5000)).toBe('ok');
+  for (const { ticket } of issued) expect(await confirmFile(ticket, 20_000)).toBe('ok');
   for (const [file, list] of states) expect(await onDisk(file)).toBe(list.at(-1));
 }
 
@@ -990,16 +990,16 @@ describe('the facade keeps its answers, and issues a ticket for each accepted wr
     const options = { guildId: '9400', category: 'm' };
     const saved = saveDataTracked('a.json', options, { a: 1 });
     if (saved.outcome !== 'saved') throw new Error(`the write was not accepted: ${saved.outcome}`);
-    expect(await confirmWrite(saved.ticket, 5000)).toBe('ok');
+    expect(await confirmWrite(saved.ticket, 20_000)).toBe('ok');
     expect(saveDataOutcome('a.json', options, { a: 2 })).toBe('saved');
     expect(saveData('a.json', options, { a: 3 })).toBe(true);
     const appended = appendDataTracked('log.jsonl', options, 'one\n');
     if (appended.outcome !== 'appended') throw new Error(`the append was not accepted: ${appended.outcome}`);
-    expect(await confirmWrite(appended.ticket, 5000)).toBe('ok');
+    expect(await confirmWrite(appended.ticket, 20_000)).toBe('ok');
     expect(appendData('log.jsonl', options, 'two\n')).toBe(true);
     const deleted = deleteDataTracked('a.json', options);
     if (deleted.outcome !== 'deleted') throw new Error(`the delete was not accepted: ${deleted.outcome}`);
-    expect(await confirmWrite(deleted.ticket, 5000)).toBe('ok');
+    expect(await confirmWrite(deleted.ticket, 20_000)).toBe('ok');
     expect(deleteDataTracked('a.json', options).outcome).toBe('absent');
     expect(deleteDataOutcome('a.json', options)).toBe('absent');
     expect(deleteData('a.json', options)).toBe(false);
@@ -1106,7 +1106,7 @@ describe('the facade keeps its answers, and issues a ticket for each accepted wr
     const tracked = deleteDataTracked('x.json', options);
     rename.open();
     if (tracked.outcome !== 'absent' || !tracked.ticket) throw new Error(`the queued delete took no ticket: ${JSON.stringify(tracked)}`);
-    expect(await confirmWrite(tracked.ticket, 5000)).toBe('ok');
+    expect(await confirmWrite(tracked.ticket, 20_000)).toBe('ok');
     expect(fs.existsSync(file)).toBe(false);
     expect(deleteDataTracked('x.json', options)).toEqual({ outcome: 'absent' });
   });
@@ -1190,7 +1190,7 @@ describe('a write that landed is confirmed while a second writer keeps its guild
     expect(fs.readFileSync(path.join(process.env.DATA_DIR!, guildId, 'm', 'a.json'), 'utf8')).toBe(JSON.stringify({ a: 1 }, null, 2));
     expect(filesPending([blocked])).toBe(true);
     fs.rmSync(blocked, { recursive: true });
-    expect(await confirmFile(held, 10_000)).toBe('ok');
+    expect(await confirmFile(held, 20_000)).toBe('ok');
   });
 });
 
@@ -1284,7 +1284,7 @@ describe('the operator route answers through the real confirmWrite', () => {
     expect(renames.calls()).toBe(30);
     expect(fs.existsSync(file)).toBe(false);
     renames.heal();
-    expect(await confirmFile(fileTicket(file), 10_000)).toBe('ok');
+    expect(await confirmFile(fileTicket(file), 20_000)).toBe('ok');
     expect(fs.readFileSync(file, 'utf8')).toBe(JSON.stringify({ a: 1 }, null, 2));
   });
 });

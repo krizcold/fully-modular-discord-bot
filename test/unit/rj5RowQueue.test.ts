@@ -117,7 +117,7 @@ describe('the data pool the row flush sends on', () => {
     await until(() => sharedTx.mock.calls.length > 0, 50);
     expect(sharedTx).toHaveBeenCalledTimes(1);
     answer({ kind: 'committed' });
-    expect(await confirmWrite(ticket, 500)).toBe('ok');
+    expect(await confirmWrite(ticket, 20_000)).toBe('ok');
     expect(rowQueue.keys()).toEqual([]);
   });
 

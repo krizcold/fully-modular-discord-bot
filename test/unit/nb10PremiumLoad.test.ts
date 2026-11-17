@@ -1,5 +1,6 @@
 import fs from 'fs';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => (await import('../helpers/longConfirm')).longConfirm(await orig<any>()));
 
 // NB10 test 25 (decision 12): a premium-tiers.json or Dummy state.json that cannot be read or parsed answers the
 // defaults, refuses changes and is never overwritten; an absent one is written by the first save; the bot's cache is

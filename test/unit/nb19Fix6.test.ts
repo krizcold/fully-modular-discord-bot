@@ -7,9 +7,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const h = vi.hoisted(() => ({
   chain: null as null | { dir: string; before: () => void; answer: { failed: true; kind: 'open'; dir: string; errno: string; error: null } },
-  holdTemp: null as null | { file: string; until: Promise<void> },
+  holdTemp: null as null | { file: string; until: Promise<void>; reach: () => void },
+  reached: null as null | Promise<void>,
   holder: null as null | { pid: number; role: string; start: null; at: number },
   flag: null as null | string,
+  confirmWrite: null as null | ((ticket: unknown, deadlineMs: number) => Promise<string>),
 }));
 
 vi.mock('../../src/bot/internalSetup/utils/folderChain', async orig => {
@@ -36,7 +38,14 @@ vi.mock('../../src/bot/internalSetup/utils/writerLock', async orig => {
 
 vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => {
   const real = await orig<any>();
-  return { ...real, confirmWrite: (ticket: unknown, deadlineMs: number) => real.confirmWrite(ticket, Math.min(deadlineMs, 400)) };
+  h.confirmWrite = real.confirmWrite;
+  return {
+    ...real,
+    confirmWrite: async (ticket: unknown, deadlineMs: number) => {
+      if (h.reached) await h.reached;
+      return real.confirmWrite(ticket, Math.min(deadlineMs, 400));
+    },
+  };
 });
 
 vi.mock('../../src/utils/autoSnapshot', () => ({ takeAutoSnapshot: () => {} }));
@@ -44,7 +53,7 @@ vi.mock('../../src/utils/autoSnapshot', () => ({ takeAutoSnapshot: () => {} }));
 import { dataPath } from '../../src/utils/dataRoot';
 import { enqueueWrite, flushAll } from '../../src/bot/internalSetup/utils/dataBackends/fileBackend';
 import { pendingFor } from '../../src/bot/internalSetup/utils/dataBackends/scopeRecord';
-import { confirmSaved, confirmWrite, saveDataTracked, saveMark } from '../../src/bot/internalSetup/utils/dataManager';
+import { confirmSaved, saveDataTracked, saveMark } from '../../src/bot/internalSetup/utils/dataManager';
 import { resetFolderSyncFailureForTests, syncWords } from '../../src/bot/internalSetup/utils/folderChain';
 import { applyOperatorDataWrite } from '../../src/bot/internalSetup/utils/ipcDataHandler';
 import { FileSessionStore, sessionSaveOutcome } from '../../src/webui/auth/fileSessionStore';
@@ -63,6 +72,7 @@ beforeEach(() => {
   setBackendKind('file');
   h.chain = null;
   h.holdTemp = null;
+  h.reached = null;
   h.holder = null;
   h.flag = null;
   releases = [];
@@ -74,13 +84,17 @@ beforeEach(() => {
   vi.spyOn(fs.promises, 'open').mockImplementation((async (file: fs.PathLike, flags?: string | number, mode?: fs.Mode) => {
     const p = String(file);
     const hold = h.holdTemp;
-    if (flags === 'w' && hold && p.startsWith(`${hold.file}.`) && p.endsWith('.tmp')) await hold.until;
+    if (flags === 'w' && hold && p.startsWith(`${hold.file}.`) && p.endsWith('.tmp')) {
+      hold.reach();
+      await hold.until;
+    }
     return realOpen(file, flags, mode);
   }) as typeof fs.promises.open);
 });
 afterEach(async () => {
   h.chain = null;
   h.holdTemp = null;
+  h.reached = null;
   h.holder = null;
   h.flag = null;
   for (const release of releases) release();
@@ -90,17 +104,22 @@ afterEach(async () => {
   setBackendKind(null);
 });
 
-/** The write to p made by start answers 'open' from its chain while W2 is enqueued, and W2's temp open waits. */
+/**
+ * The write to p made by start answers 'open' from its chain while W2 is enqueued, and W2's temp open waits. Every
+ * confirmWrite through the mock waits until W2's temp open is reached, so W1's failed range is known at its deadline.
+ */
 function replacedWhileNewerFlushes(p: string): void {
   const dir = path.dirname(p);
   let release!: () => void;
   const until = new Promise<void>(resolve => { release = resolve; });
+  let reach!: () => void;
+  h.reached = new Promise<void>(resolve => { reach = resolve; });
   releases.push(release);
   h.chain = {
     dir: path.resolve(dir),
     before: () => {
       enqueueWrite(p, '{"v":2}');
-      h.holdTemp = { file: p, until };
+      h.holdTemp = { file: p, until, reach };
     },
     answer: { failed: true, kind: 'open', dir: path.resolve(dir), errno: 'EMFILE', error: null },
   };
@@ -111,10 +130,11 @@ describe('O1: failed saves under the folder sync flag keep the scope record boun
     const g = freshGuild();
     const before = saveMark();
     h.flag = dataPath(`x${g}`);
+    const end = performance.now() + 20_000;
     for (let i = 0; i < 200; i += 1) {
       const saved = saveDataTracked('a.json', { guildId: g, category: 'm' }, { i });
       if (saved.outcome !== 'saved') throw new Error(saved.outcome);
-      expect(await confirmWrite(saved.ticket, 3000)).toBe('unavailable');
+      expect(await h.confirmWrite!(saved.ticket, Math.max(0, end - performance.now()))).toBe('unavailable');
     }
     const files = pendingFor(g, 0).files ?? [];
     expect(files).toHaveLength(1);

@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vites
 
 const inject = vi.hoisted(() => ({ unstorable: new Set<string>() }));
 vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => {
-  const real = await orig<typeof import('../../src/bot/internalSetup/utils/dataManager')>();
+  const real = (await import('../helpers/longConfirm')).longConfirm(await orig<typeof import('../../src/bot/internalSetup/utils/dataManager')>());
   const ledger = await import('../../src/bot/internalSetup/utils/dataBackends/writeLedger');
   return {
     ...real,

@@ -1205,6 +1205,63 @@ describe('a pass B mutant run', () => {
   });
 });
 
+describe('the record of the reruns alone of a run with no mutant', () => {
+  // A report dir of pass A's dirs, each with the dry-again.json given (a string as written, null for none).
+  function reportDir(records: Record<string, unknown>) {
+    const dir = tempDir('smdb-again-');
+    for (const [name, record] of Object.entries(records)) {
+      fs.mkdirSync(path.join(dir, name));
+      if (record !== null) fs.writeFileSync(path.join(dir, name, 'dry-again.json'), typeof record === 'string' ? record : JSON.stringify(record));
+    }
+    return dir;
+  }
+  const rerun = (file: string, code: number | null, n = 0) => ({ tier: 'fast', file, name: `dry-again-${n}`, code, ms: 300, bound: 1_620_000 });
+  const killed = (line: number, file: string, dir: string): MutantRecord => ({
+    file: 'src/a.ts', location: { start: { line, column: 3 }, end: { line, column: 9 } }, mutator: 'EqualityOperator', original: 'a > 0', replacement: 'a >= 0', gating: true,
+    passes: { a: { id: String(line), dir, status: 'Killed', killedBy: `${file} > t` } },
+  });
+
+  it('gives every rerun that passed in a dir pass A ran mutants in, whatever the record says of its run, and the kills of those files go to a2', async () => {
+    const { flakyFiles } = await import('../mutation/reach.mjs');
+    const { toConfirm, uncreditFlaky } = await import('../mutation/verdict.mjs');
+    const dir = reportDir({
+      a: { passed: true, reruns: [rerun('unit/flaky.test.ts', 0)] },
+      // Its last write never came: a run that ran mutants passed, so its reruns that passed count.
+      'a-r1': { passed: null, reruns: [rerun('unit/other.test.ts', 0), rerun('unit/flaky.test.ts', 0, 1), rerun('unit/broken.test.ts', 1, 2)] },
+      'a-unchecked': null,
+    });
+    const { flaky, problem } = flakyFiles(dir, ['a', 'a-r1', 'a-unchecked']);
+    expect(problem).toBe('');
+    expect([...flaky]).toEqual([['unit/flaky.test.ts', 'a'], ['unit/other.test.ts', 'a-r1']]);
+    const mutants = [killed(1, 'unit/flaky.test.ts', 'a'), killed(2, 'unit/other.test.ts', 'a-r1'), killed(3, 'unit/broken.test.ts', 'a-r1'), killed(4, 'unit/a.test.ts', 'a-unchecked')];
+    expect([...uncreditFlaky(mutants, flaky)]).toEqual([['unit/flaky.test.ts', 1], ['unit/other.test.ts', 1]]);
+    expect(toConfirm(mutants, 'a')).toEqual(mutants.slice(0, 2));
+  });
+
+  it('names a record in such a dir that cannot be read, so the gate stops rather than let a kill stand on one run', async () => {
+    const { flakyFiles } = await import('../mutation/reach.mjs');
+    const dir = reportDir({ a: { passed: true, reruns: [rerun('unit/flaky.test.ts', 0)] }, 'a-r1': '{"passed":true,"reru', 'a-r2': { passed: 'yes', reruns: [] } });
+    fs.mkdirSync(path.join(dir, 'a-r3', 'dry-again.json'), { recursive: true });
+    expect(flakyFiles(dir, ['a', 'a-r1']).problem).toBe('a-r1/dry-again.json does not read as a record of reruns alone');
+    expect(flakyFiles(dir, ['a', 'a-r2']).problem).toBe('a-r2/dry-again.json does not read as a record of reruns alone');
+    expect(flakyFiles(dir, ['a-r3']).problem).toMatch(/^a-r3\/dry-again\.json cannot be read \(\w+\)$/);
+    const gate = fs.readFileSync(path.join(root, 'test', 'mutation', 'touched.mjs'), 'utf8');
+    expect(gate).toContain('const { flaky, problem } = flakyFiles(reportDir, dirs);\n  if (problem) throw new PassError(');
+  });
+
+  it("says, of a failed run with no mutant, each unhandled error with its file or no file, and a record of them that cannot be read", async () => {
+    const { dryNotes } = await import('../mutation/reach.mjs');
+    const out = tempDir('smdb-notes-');
+    fs.writeFileSync(path.join(out, 'dry-fast.unhandled.json'), JSON.stringify([{ file: null, message: 'late\n    at x' }, { file: '/s/test/unit/b.test.ts', message: 'boom' }]));
+    fs.mkdirSync(path.join(out, 'dry-child.unhandled.json'));
+    expect(dryNotes(out, 'r/b')).toEqual([
+      'the run with no mutant had an unhandled error in no file: late',
+      'the run with no mutant had an unhandled error in /s/test/unit/b.test.ts: boom',
+      "r/b/dry-child.unhandled.json, the run's unhandled errors, cannot be read",
+    ]);
+  });
+});
+
 describe('the report', () => {
   const mutant = (line: number, passes: MutantRecord['passes']): MutantRecord =>
     ({ file: 'src/a.ts', location: { start: { line, column: 3 }, end: { line, column: 9 } }, mutator: 'EqualityOperator', original: 'a > 0', replacement: 'a >= 0', gating: true, passes });
@@ -1247,5 +1304,16 @@ describe('the report', () => {
     expect(text).not.toMatch(/src\/a\.ts:5:3/);
     const none = judge({ stamp: 't', scope: 's', emptyScope: false, skipped: [], noMutant: [], unmatched: [], report: 'r', mutants: [mutant(3, { a: pass('Survived'), b: pass('Survived') })] });
     expect(none.lines.join('\n')).not.toMatch(/no test of pass B reached/);
+  });
+
+  it('names each file a run with no mutant failed in beside other files and that then passed alone, and none when there is none', () => {
+    const base = { stamp: 't', scope: 's', emptyScope: false, skipped: [], noMutant: [], unmatched: [], report: 'r', mutants: [mutant(1, { a: pass('Killed', { killedBy: 'unit/a.test.ts > a' }) })] };
+    const run = judge({ ...base, passedAlone: ['a/: unit/flaky.test.ts (r/a/dry-again-0.log)', 'b/: integration/x.test.ts (r/b/dry-again-1.log)'] });
+    const at = run.lines.findIndex(line => line.startsWith('Passed alone after failing in the run with no mutant beside other files ('));
+    expect(at).toBeGreaterThan(-1);
+    expect(run.lines[at]).toMatch(/a pass A kill from a file seen so in pass A reruns alone in a2, and every pass B kill reruns alone in b2\):$/);
+    expect(run.lines.slice(at + 1, at + 3)).toEqual(['  a/: unit/flaky.test.ts (r/a/dry-again-0.log)', '  b/: integration/x.test.ts (r/b/dry-again-1.log)']);
+    expect(run.verdict).toBe('PASS');
+    for (const passedAlone of [undefined, []]) expect(judge({ ...base, passedAlone }).lines.join('\n')).not.toMatch(/Passed alone/);
   });
 });

@@ -302,11 +302,46 @@ export function uncreditFailedAlone(killed, codes, dir) {
     if (code === 0) continue;
     const why = code === undefined ? `its run alone with no mutant (${dir}/) left no result` : `it failed alone with no mutant (${dir}/)`;
     taken.set(file, why);
-    for (const m of on) {
-      const a = /** @type {PassResult} */ (m.passes.a);
-      const { killedBy, ...rest } = a;
-      m.passes.a = { ...rest, recheck: killedBy, inconclusive: `killed in pass A by ${killedBy}, but ${file}: ${why}, so the kill proves nothing` };
-    }
+    uncredit(on, file, why);
+  }
+  return taken;
+}
+
+/**
+ * Turns each of `on`'s pass A kills by `file` into a run that failed only on
+ * the machine: a gating one reruns alone in a2 (toConfirm), and one that is
+ * not stays inconclusive.
+ * @param {MutantRecord[]} on
+ * @param {string} file
+ * @param {string} why
+ */
+function uncredit(on, file, why) {
+  for (const m of on) {
+    const { killedBy, ...rest } = /** @type {PassResult} */ (m.passes.a);
+    m.passes.a = { ...rest, recheck: killedBy, inconclusive: `killed in pass A by ${killedBy}, but ${file}: ${why}, so the kill proves nothing` };
+  }
+}
+
+/**
+ * Takes back each pass A kill (with no checker included) whose test file a run
+ * with no mutant of pass A failed in beside other files and then passed alone
+ * (runner.mjs dryTier; `flaky`: each such file, with the dir of that run): the
+ * file is seen failing under load, so one failure of it in a mutant's run proves
+ * nothing, and its run alone with no mutant (alone-a) would pass. A gating one
+ * reruns alone in a2, where it counts only if it repeats. Returns, per such
+ * file, how many kills it took back.
+ * @param {MutantRecord[]} mutants
+ * @param {Map<string, string>} flaky
+ * @returns {Map<string, number>}
+ */
+export function uncreditFlaky(mutants, flaky) {
+  /** @type {Map<string, number>} */
+  const taken = new Map();
+  for (const [file, on] of killedInA(mutants)) {
+    const dir = flaky.get(file);
+    if (dir === undefined) continue;
+    taken.set(file, on.length);
+    uncredit(on, file, `it failed in the run with no mutant of ${dir}/ beside other files and then passed alone, as a file that fails under load does`);
   }
   return taken;
 }
@@ -416,13 +451,16 @@ export const toPassB = mutants => mutants.filter(m => m.gating && ['Survived', '
  * `controls` names the runs with no mutant made to check a pass: each file
  * that killed in pass A run alone, each set of files an a2 result ran on, and
  * the run after the reruns, each entry with what failed there, if anything.
+ * `passedAlone` names each test file a run with no mutant failed in beside
+ * other files and that then passed alone, so that run counted as passed
+ * (runner.mjs dryTier), with the run's dir.
  * `standIn` is set when a test replaced vitest (runner.mjs's
  * SMDB_MUTATION_VITEST): such a run proves nothing about the code.
  * `resumed` says, for a run that resumed a stopped one (touched.mjs
  * --resume), what each stage it found saved kept and what it ran now.
  * @param {{ stamp: string, scope: string, emptyScope: boolean, skipped: { file: string, why: string }[], mutants: MutantRecord[],
  *   noMutant: { file: string, lines: number[] }[], brackets?: { file: string, lines: number[] }[], deleted?: { file: string, lines: number[] }[],
- *   unmatched: string[], report: string, stopped?: string[], treeChanged?: string[], controls?: string[], resumed?: string[], standIn?: string }} run
+ *   unmatched: string[], report: string, stopped?: string[], treeChanged?: string[], controls?: string[], passedAlone?: string[], resumed?: string[], standIn?: string }} run
  *   brackets: the changed lines that can move others (ranges.mjs structureLines): brackets and separators only, a brace
  *   of a block, or an else, case, default, catch or finally; deleted: where lines of code were taken out with fewer or
  *   none put back, each after the line named (0: the top)
@@ -501,6 +539,8 @@ export function judge(run) {
     `Context mutants (in the widened statements, not gating: they touch no changed line that holds code): ${context.length}: ${tally(context)}`,
     ...section('Context survivors:', context.filter(m => outcomeIn(m) === 'Survived')),
     ...(run.controls?.length ? ['Runs with no mutant that checked what a pass counted:',...run.controls.map(line => `  ${line}`)] : []),
+    ...(run.passedAlone?.length ? ['Passed alone after failing in the run with no mutant beside other files (that run then counted as passed; a pass A kill from a file seen so in pass A reruns alone in a2, and every pass B kill reruns alone in b2):',
+      ...run.passedAlone.map(line => `  ${line}`)] : []),
     ...(run.stopped ? ['Stopped:', ...run.stopped.map(line => `  ${line}`)] : []),
     ...(run.treeChanged?.length ? ['Changed during the run (so no one tree was tested):',
       `  ${run.treeChanged.slice(0, 10).join(', ')}${run.treeChanged.length > 10 ? ` and ${run.treeChanged.length - 10} more` : ''}`] : []),

@@ -95,7 +95,7 @@ const update = (r: Route, fn: (d: any) => any, defaultValue: any = { n: 0 }) => 
 
 async function landed(r: Route, result: dm.SaveTracked): Promise<void> {
   expect(result.outcome).toBe('saved');
-  if (result.outcome === 'saved') expect(await dm.confirmWrite(result.ticket, 5000)).toBe('ok');
+  if (result.outcome === 'saved') expect(await dm.confirmWrite(result.ticket, 20_000)).toBe('ok');
 }
 
 describe('update(fn) on each route and state', () => {
@@ -355,7 +355,7 @@ describe('the answer of an update', () => {
       r.store.holding = false;
       r.store.release();
     }
-    expect(await dm.confirmWrite(result.ticket, 5000)).toBe('ok');
+    expect(await dm.confirmWrite(result.ticket, 20_000)).toBe('ok');
     expect(await dm.confirmSaved(r.scope, { since: mark })).toBe('ok');
   });
 

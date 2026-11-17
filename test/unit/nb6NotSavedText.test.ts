@@ -1,5 +1,6 @@
 import fs from 'fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => (await import('../helpers/longConfirm')).longConfirm(await orig<any>()));
 import { dataPath } from '../../src/utils/dataRoot';
 import * as dm from '../../src/bot/internalSetup/utils/dataManager';
 import { truthText, verdictOf } from '../../src/bot/internalSetup/utils/dataBackends/replyGate';

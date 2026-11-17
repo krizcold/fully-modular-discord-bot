@@ -23,6 +23,8 @@ vi.mock('fs', async orig => {
   return { ...wrapped, default: wrapped };
 });
 
+vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => (await import('../helpers/longConfirm')).longConfirm(await orig<any>()));
+
 import { fileFlushOnTheWire, flushAll as flushFiles } from '../../src/bot/internalSetup/utils/dataBackends/fileBackend';
 import { flushAll, saveData } from '../../src/bot/internalSetup/utils/dataManager';
 import { checkWriterLock, configureWriterLock, deposedText, releaseWriterLock, takeWriterLock, writerLockDepth, writerLockPath } from '../../src/bot/internalSetup/utils/writerLock';
