@@ -1,3 +1,4 @@
+import fs from 'fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // L5 run A, chunk rt2: the App Store module detail and module credential routes (with the Postgres store-first
@@ -46,6 +47,7 @@ vi.mock('../../src/bot/internalSetup/utils/premiumManager', async orig => {
 
 import { createAppStoreRoutes } from '../../src/webui/routes/appstore';
 import { StoreWriteError } from '../../src/bot/internalSetup/utils/appStoreManager';
+import { dataPath } from '../../src/utils/dataRoot';
 import { setBackendKind } from '../helpers/backendKind';
 
 function fakeRes() {
@@ -251,9 +253,17 @@ describe('rt2 provider credential status and save', () => {
   it('rt2 a saved value is trimmed, and a value of only spaces keeps the old one', async () => {
     setBackendKind('file');
     h.creds = { RT2_TEXT: 'old-text' };
-    const sent = await run('put', '/premium/providers/:providerId/credentials', { providerId: 'rt2pay' }, {
-      values: { RT2_SECRET: '  made-up-secret  ', RT2_TEXT: '   ' },
-    });
+    const envFile = dataPath('.env');
+    const envBefore = fs.existsSync(envFile) ? fs.readFileSync(envFile) : null;
+    fs.writeFileSync(envFile, 'RT2_TEXT=old-text\n');
+    let sent: Awaited<ReturnType<typeof run>>;
+    try {
+      sent = await run('put', '/premium/providers/:providerId/credentials', { providerId: 'rt2pay' }, {
+        values: { RT2_SECRET: '  made-up-secret  ', RT2_TEXT: '   ' },
+      });
+    } finally {
+      if (envBefore) fs.writeFileSync(envFile, envBefore); else fs.rmSync(envFile, { force: true });
+    }
     expect(sent[0].status).toBe(200);
     expect(h.saved).toEqual([{ RT2_TEXT: 'old-text', RT2_SECRET: 'made-up-secret' }]);
   });

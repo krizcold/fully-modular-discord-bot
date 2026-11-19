@@ -2183,6 +2183,7 @@ function ProviderCredentialsModal({ providerId, providerName, onClose, onSaved }
       for (const f of fields) cleared[f.key] = '';
       setValues(cleared);
       setClearing({});
+      for (const item of (Array.isArray(res.containerSet) ? res.containerSet : [])) showToast(item.message, 'warning', { sticky: true });
       showToast(`${providerName} credentials saved`, 'success');
       if (onSaved) onSaved();
     } catch (err) {

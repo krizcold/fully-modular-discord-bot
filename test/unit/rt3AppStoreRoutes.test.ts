@@ -85,6 +85,7 @@ async function run(bot: any, method: string, routePath: string, params: Record<s
 const APPSTORE_DIR = dataPath('global', 'appstore');
 const CONFIG = path.join(APPSTORE_DIR, 'config.json');
 const COMPONENTS = path.join(APPSTORE_DIR, 'component-config.json');
+const ENV_FILE = dataPath('.env');
 const snapshot: Record<string, string | null> = {};
 
 beforeEach(() => {
@@ -96,12 +97,12 @@ beforeEach(() => {
   h.saveResult = { success: true };
   h.writeConfig = null;
   h.fields = [];
-  for (const f of [CONFIG, COMPONENTS]) snapshot[f] = fs.existsSync(f) ? fs.readFileSync(f, 'utf8') : null;
+  for (const f of [CONFIG, COMPONENTS, ENV_FILE]) snapshot[f] = fs.existsSync(f) ? fs.readFileSync(f, 'utf8') : null;
   for (const level of ['log', 'warn', 'error'] as const) vi.spyOn(console, level).mockImplementation(() => undefined);
 });
 afterEach(() => {
   setBackendKind(null);
-  for (const f of [CONFIG, COMPONENTS]) {
+  for (const f of [CONFIG, COMPONENTS, ENV_FILE]) {
     if (snapshot[f] === null) fs.rmSync(f, { force: true });
     else fs.writeFileSync(f, snapshot[f]!);
   }
@@ -115,6 +116,7 @@ describe('rt3 PUT provider credentials', () => {
     setBackendKind('file');
     h.fields = [{ key: 'KEEP', type: 'secret' }, { key: 'NEW', type: 'text' }];
     h.existing = { KEEP: 'old-made-up' };
+    fs.writeFileSync(ENV_FILE, 'KEEP=old-made-up\n');
     const sent = await run(makeBot(), 'put', CRED, { providerId: 'rt3pay' }, { values: { KEEP: '   ', NEW: ' fresh ' } });
     expect(sent).toHaveLength(1);
     expect(sent[0].status).toBe(200);
