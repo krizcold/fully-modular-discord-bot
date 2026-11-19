@@ -41,6 +41,7 @@ import { childQueuedError, readServedGlobal, withTargetLock } from '../utils/ser
 import { SharedOpAnswered, sharedOpFailure, sharedOpRunner } from './hopFailure';
 import { shaOfRaw } from '../../bot/internalSetup/utils/ipcDataHandler';
 import { rowBackend } from '../../bot/internalSetup/utils/sharedStore';
+import { containerSetChanges, readStoredEnv } from '../utils/storedEnv';
 
 /**
  * A module's Free baseline (its global settings.json) as the process that
@@ -2006,12 +2007,14 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
 
       const RESERVED = new Set(['DISCORD_TOKEN', 'CLIENT_ID', 'GUILD_ID']);
       const allowed = new Set(fields.map(f => f.key));
-      const existing = loadCredentials();
+      loadCredentials();
       const readError = credentialsReadError();
       if (readError) {
         return res.status(500).json({ success: false, error: `Could not read /data/.env, so nothing was saved: ${readError}` });
       }
-      const next: BotCredentials = { ...existing };
+      // The file's own keys with the sent ones applied: the loader's map also holds values only the container env sets.
+      const toFile: BotCredentials = readStoredEnv();
+      const sent: BotCredentials = {};
       // NB6 decision 57: on a Postgres bot a built-in provider's own keys go to the credentials doc; the rest stay here.
       const onDatabase = resolveDataBackend() === 'postgres';
       const providerId = req.params.providerId;
@@ -2035,24 +2038,30 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         if (toDoc) {
           docChanges[f.key] = value ?? null;
         } else {
-          next[f.key] = value;
+          if (value === undefined) delete toFile[f.key]; else toFile[f.key] = value;
+          sent[f.key] = value;
           localKeys.push(f.key);
         }
       }
 
       if (!onDatabase || localKeys.length > 0) {
-        const result = saveCredentials(next);
+        const result = saveCredentials(toFile);
         if (!result.success) {
           return res.status(500).json({ success: false, error: result.error || 'Failed to save credentials' });
         }
       }
       const kept = onDatabase && localKeys.length > 0 ? localKeys.join(', ') : null;
+      // A note for each sent key the loader still reads from the container env. A provider's keys are secrets or
+      // ids, so the note never repeats a value.
+      const loaded = localKeys.length > 0 ? loadCredentials() : {};
+      const containerSet = containerSetChanges(sent, Object.fromEntries(localKeys.map(key => [key, loaded[key]])), () => true);
       if (Object.keys(docChanges).length > 0) {
         // Decision 25: the bot writes the doc while it runs, the local chain while it does not.
         const failure = sharedOpFailure(await botManager.runSharedOp('provider.saveCredentials', { providerId, changes: docChanges }));
         if (failure) {
           const tail = kept ? ` ${kept} were saved on this machine only (in /data/.env); set them on each machine of the bot.` : '';
-          return res.status(failure.status).json({ success: false, error: `${failure.error}${tail}` });
+          const pinned = containerSet.map(c => ` ${c.message}.`).join('');
+          return res.status(failure.status).json({ success: false, error: `${failure.error}${tail}${pinned}` });
         }
       }
       // Return the updated masked status so the modal can refresh in place.
@@ -2068,6 +2077,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         status,
         isConfigured: provider.isConfigured(),
         ...(kept ? { message: `Saved. ${kept} are kept on this machine only (in /data/.env); set them on each machine of the bot.` } : {}),
+        ...(containerSet.length > 0 ? { containerSet } : {}),
       });
     } catch (error) {
       if (error instanceof SharedOpAnswered) return;

@@ -35,6 +35,7 @@ import {
   lastRawRefusal,
   listGuildDataFiles as listGuildDataFilesFs,
   listGlobalDataFiles,
+  globalPathRefusal,
   placeGuildWrite,
   guildWriteCollision,
   noteGuildWrite,
@@ -799,10 +800,12 @@ const worstSave = (answers: SaveOutcome[]): SaveOutcome =>
  * number, or a mark kept from before a restart) answers 'unavailable'. It answers for every writer of the scope, not
  * the caller alone. category narrows file writes and refusals to that module's folder; a guild served from the
  * database answers for its whole working set, so another module's slower write can make it 'pending'. Raw atomic
- * writes are not counted. A scope that is neither 'global' nor a Discord id answers 'refused': every write to it is.
+ * writes are not counted. A scope that is neither 'global' nor a Discord id answers 'refused': every write to it is,
+ * as is every write to a global category that leaves /data/global.
  */
 export async function confirmSaved(scope: string, options: { since?: SaveMark; deadlineMs?: number; category?: string } = {}): Promise<SaveOutcome> {
   if (scope !== 'global' && !isGuildId(scope)) return 'refused';
+  if (scope === 'global' && globalPathRefusal(options.category)) return 'refused';
   const mark = options.since ?? currentSince();
   const since = mark === undefined ? 0 : stampOf(mark);
   if (since === null) return 'unavailable';
@@ -971,6 +974,11 @@ function scopeRefusal(options: DataOptions): string | null {
   if (scope === undefined || scope === 'guild' || scope === 'global') return null;
   const named = typeof scope === 'string' ? JSON.stringify(scope) : typeof scope === 'object' && scope !== null ? 'an object' : String(scope);
   return `the data scope ${named} is neither 'guild' nor 'global'`;
+}
+
+/** Why a call is refused before anything is read, queued or written: its scope, or a global category or file name that leaves /data/global. */
+function callRefusal(filename: string, options: DataOptions): string | null {
+  return scopeRefusal(options) ?? (options.scope === 'global' ? globalPathRefusal(options.category, filename) : null);
 }
 
 /**
@@ -1359,7 +1367,7 @@ export function loadData<T = any>(
   defaultValue: T
 ): T {
   try {
-    const refusal = scopeRefusal(options);
+    const refusal = callRefusal(filename, options);
     if (refusal) {
       console.error(`[Data] Refused a read of ${filename}: ${refusal}; serving the default`);
       return defaultValue;
@@ -1421,9 +1429,9 @@ export type AppendTracked = { outcome: 'appended'; ticket: WriteTicket } | { out
 /** An absent delete carries a ticket while an earlier delete of the same document has not landed. */
 export type DeleteTracked = { outcome: 'deleted'; ticket: WriteTicket } | { outcome: 'absent'; ticket?: WriteTicket } | { outcome: 'frozen' } | Refused;
 
-/** A write whose scope is neither 'guild' nor 'global', refused before anything is read, queued or written. */
+/** A write whose scope is neither 'guild' nor 'global', or whose global category or file name leaves /data/global, refused before anything is read, queued or written. */
 function scopeRefused(filename: string, options: DataOptions): Refused | null {
-  const refusal = scopeRefusal(options);
+  const refusal = callRefusal(filename, options);
   return refusal ? unstorable(filename, options, refusal) : null;
 }
 
@@ -1876,7 +1884,7 @@ function acceptAppend(filename: string, options: DataOptions, line: string): App
  * Check if data file exists
  */
 export function dataExists(filename: string, options: DataOptions): boolean {
-  const refusal = scopeRefusal(options);
+  const refusal = callRefusal(filename, options);
   if (refusal) {
     console.error(`[Data] Refused an existence check of ${filename}: ${refusal}`);
     return false;

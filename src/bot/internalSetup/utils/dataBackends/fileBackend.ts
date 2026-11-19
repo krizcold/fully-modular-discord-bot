@@ -2013,10 +2013,37 @@ export function listGuildDataFiles(guildId: string, category?: string): string[]
 }
 
 /**
- * List all data files in global directory
+ * Why a global-scope call is refused: its category, or its file name joined to that category, is an absolute path or
+ * resolves to a path that is not inside the global data folder, or the file name resolves to that folder itself; null
+ * when both stay inside.
+ */
+export function globalPathRefusal(category: string | null | undefined, filename?: string): string | null {
+  const root = path.resolve(BASE_DATA_DIR, 'global');
+  const inside = (resolved: string, orRoot: boolean) => (orRoot && resolved === root) || resolved.startsWith(root + path.sep);
+  let dir = root;
+  if (category) {
+    if (path.isAbsolute(category)) return `the category ${JSON.stringify(category)} is an absolute path`;
+    dir = path.resolve(root, category);
+    if (!inside(dir, true)) return `the category ${JSON.stringify(category)} leaves the global data folder`;
+  }
+  if (filename === undefined) return null;
+  if (path.isAbsolute(filename)) return `the file name ${JSON.stringify(filename)} is an absolute path`;
+  const file = path.resolve(dir, filename);
+  if (file === root) return `the file name ${JSON.stringify(filename)} names the global data folder itself`;
+  if (!inside(file, false)) return `the file name ${JSON.stringify(filename)} leaves the global data folder`;
+  return null;
+}
+
+/**
+ * List all data files in global directory; a category that leaves it lists nothing.
  */
 export function listGlobalDataFiles(category?: string): string[] {
   try {
+    const refusal = globalPathRefusal(category);
+    if (refusal) {
+      console.error(`[Data] Refused a listing of global data files: ${refusal}`);
+      return [];
+    }
     const dir = category
       ? path.join(BASE_DATA_DIR, 'global', category)
       : path.join(BASE_DATA_DIR, 'global');

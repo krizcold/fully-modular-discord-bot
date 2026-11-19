@@ -38,9 +38,7 @@ function shownSnapshot(entry: SnapshotEntry, state: BackupState): Shown {
   };
 }
 
-// G2: a stray .pre-restore folder's files are counted only here, cached by its name and mtime.
-const counted = new Map<string, { mtimeMs: number; count: number | 'more' | { errno: string } }>();
-
+// G2: a stray .pre-restore folder's files are counted only here, on every read.
 async function countFiles(dir: string): Promise<number | 'more' | { errno: string }> {
   let count = 0;
   const walk = async (at: string): Promise<boolean> => {
@@ -78,19 +76,12 @@ async function strayNotes(): Promise<string[]> {
   const notes: string[] = [];
   for (const name of names) {
     const dir = path.join(snapshotsRoot(), name);
-    let mtimeMs: number;
-    try {
-      mtimeMs = (await fs.promises.stat(dir)).mtimeMs;
-    } catch {
-      continue;
-    }
-    let found = counted.get(name);
-    if (!found || found.mtimeMs !== mtimeMs) {
-      found = { mtimeMs, count: await countFiles(dir) };
-      counted.set(name, found);
+    const count = await countFiles(dir);
+    if (typeof count === 'object' && count.errno === 'ENOENT') {
+      const gone = await fs.promises.stat(dir).then(() => false, error => (error as { code?: unknown } | null)?.code === 'ENOENT');
+      if (gone) continue;
     }
     const words = containerPath(dir);
-    const { count } = found;
     if (count === 0) {
       notes.push(`${words} is a folder a restore left under that name; it holds no file, so it can be deleted.`);
       continue;
@@ -100,7 +91,6 @@ async function strayNotes(): Promise<string[]> {
         : `files that could not be counted (${count.errno})`;
     notes.push(`${words} is a folder a restore left under that name. It holds ${holds}, which may be the data that restore replaced; nothing offers them as a backup, and can't confirm they are complete. Copy what you need from it by hand, then delete it.`);
   }
-  for (const name of [...counted.keys()]) if (!names.includes(name)) counted.delete(name);
   return notes;
 }
 

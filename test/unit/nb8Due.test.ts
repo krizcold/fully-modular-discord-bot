@@ -501,7 +501,7 @@ describe('the tick', () => {
       return readdir(p, o);
     }) as typeof fs.promises.readdir);
     const HOUR = 60 * 60 * 1000;
-    for (const t of [NOW, NOW + HOUR, NOW + 2 * HOUR, NOW + 3 * HOUR, NOW + 3 * HOUR + 60_000]) {
+    for (const t of [NOW, NOW + HOUR, NOW + 2 * HOUR, NOW + 3 * HOUR - 60_000, NOW + 3 * HOUR + 60_000]) {
       setClock(t);
       await runTick(m);
     }
@@ -694,7 +694,7 @@ describe('test 11 at the tick: a restore that does not finish raises the snapsho
     close();
     const m = fresh();
     const HOUR = 60 * 60 * 1000;
-    for (const t of [NOW, NOW + HOUR, NOW + 2 * HOUR, NOW + 3 * HOUR, NOW + 3 * HOUR + 60_000, NOW + 4 * HOUR]) {
+    for (const t of [NOW, NOW + HOUR, NOW + 2 * HOUR, NOW + 3 * HOUR - 60_000, NOW + 3 * HOUR + 60_000, NOW + 4 * HOUR]) {
       setClock(t);
       await runTick(m);
     }
@@ -708,7 +708,7 @@ describe('test 11 at the tick: a restore that does not finish raises the snapsho
     fs.writeFileSync(statePath(), 'not json');
     const m = fresh();
     const HOUR = 60 * 60 * 1000;
-    for (const t of [NOW, NOW + HOUR, NOW + 2 * HOUR, NOW + 3 * HOUR, NOW + 3 * HOUR + 60_000]) {
+    for (const t of [NOW, NOW + HOUR, NOW + 2 * HOUR, NOW + 3 * HOUR - 60_000, NOW + 3 * HOUR + 60_000]) {
       setClock(t);
       await runTick(m);
     }

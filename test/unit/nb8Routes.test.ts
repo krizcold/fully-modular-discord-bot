@@ -312,7 +312,7 @@ describe("a .pre-restore folder no open journal names (F3, F4, G2)", () => {
     expect((await get(url)).notes).toEqual([holds('1 file')]);
   });
 
-  it('stops counting at its limit, and counts again only when the folder changed', async () => {
+  it('stops counting at its limit, and counts again on every read', async () => {
     _setBackupRouteLimitsForTests({ countMax: 3 });
     leave(5);
     const realReaddir = fs.promises.readdir;
@@ -323,12 +323,67 @@ describe("a .pre-restore folder no open journal names (F3, F4, G2)", () => {
     }) as typeof fs.promises.readdir);
     const url = await serve();
     expect((await get(url)).notes).toEqual([holds('more than 3 files')]);
-    expect((await get(url)).notes).toEqual([holds('more than 3 files')]);
     expect(walks).toBe(1);
-    fs.rmSync(dataPath('_snapshots', folder, 'data'), { recursive: true });
-    fs.utimesSync(dataPath('_snapshots', folder), new Date(), new Date(Date.now() + 5000));
-    expect((await get(url)).notes).toEqual([`${words} is a folder a restore left under that name; it holds no file, so it can be deleted.`]);
+    expect((await get(url)).notes).toEqual([holds('more than 3 files')]);
     expect(walks).toBe(2);
+    fs.rmSync(dataPath('_snapshots', folder, 'data'), { recursive: true });
+    expect((await get(url)).notes).toEqual([`${words} is a folder a restore left under that name; it holds no file, so it can be deleted.`]);
+    expect(walks).toBe(3);
+  });
+
+  it('is not named when it is gone by the time its files are counted', async () => {
+    leave(2);
+    const realReaddir = fs.promises.readdir;
+    vi.spyOn(fs.promises, 'readdir').mockImplementation((async (p: fs.PathLike, o?: any) => {
+      if (String(p) === dataPath('_snapshots', folder)) fs.rmSync(String(p), { recursive: true });
+      return realReaddir(p, o);
+    }) as typeof fs.promises.readdir);
+    expect((await get(await serve())).notes).toEqual([]);
+  });
+
+  it.each([
+    ['the folder cannot be read', '', 'EACCES'],
+    ['a subfolder is gone by the time it is read, the folder still there', 'data', 'ENOENT'],
+  ] as const)('says its files could not be counted when %s', async (_label, sub, code) => {
+    leave(2);
+    const realReaddir = fs.promises.readdir;
+    vi.spyOn(fs.promises, 'readdir').mockImplementation((async (p: fs.PathLike, o?: any) => {
+      if (String(p) === path.join(dataPath('_snapshots', folder), sub)) throw err(code);
+      return realReaddir(p, o);
+    }) as typeof fs.promises.readdir);
+    expect((await get(await serve())).notes).toEqual([holds(`files that could not be counted (${code})`)]);
+  });
+
+  describe('counted as it is now, whatever its times say (NB43)', () => {
+    const at = dataPath('_snapshots', folder);
+    const STAMP = new Date(Date.UTC(2026, 10, 13, 5));
+    const flat = (files: number) => {
+      fs.mkdirSync(at, { recursive: true });
+      for (let i = 0; i < files; i++) fs.writeFileSync(path.join(at, `f${i}.json`), '{}');
+      fs.utimesSync(at, STAMP, STAMP);
+    };
+
+    it('a folder removed and made again under the same name with the same mtime', async () => {
+      flat(1);
+      const before = fs.statSync(at).mtimeMs;
+      const url = await serve();
+      expect((await get(url)).notes).toEqual([holds('1 file')]);
+      fs.rmSync(at, { recursive: true });
+      flat(4);
+      expect(fs.statSync(at).mtimeMs).toBe(before);
+      expect((await get(url)).notes).toEqual([holds('4 files')]);
+    });
+
+    it('a file added under a subfolder, the top folder left as it was', async () => {
+      leave(2);
+      const before = fs.statSync(at);
+      const url = await serve();
+      expect((await get(url)).notes).toEqual([holds('2 files')]);
+      writeTree({ [`_snapshots/${folder}/data/123/m/f2.json`]: '{}' });
+      const after = fs.statSync(at);
+      expect([after.ino, after.mtimeMs, after.ctimeMs]).toEqual([before.ino, before.mtimeMs, before.ctimeMs]);
+      expect((await get(url)).notes).toEqual([holds('3 files')]);
+    });
   });
 });
 
