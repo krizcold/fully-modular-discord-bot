@@ -408,6 +408,9 @@ function renderEnv(text: string, spans: EnvSpan[], edits: Map<number, string | n
 
 const listed = (keys: string[]) => keys.join(', ');
 
+/** How many candidate texts envKeysText's second choice of forms may parse before it gives up. */
+const ENV_FORM_PARSES = 4000;
+
 /** Why envKeysText refused: the other keys it would change, the set key that misreads, or the removed keys still set. */
 class EnvKeysError extends Error {
   constructor(message: string, readonly kind: 'others' | 'wrong' | 'still', readonly keys: string[]) {
@@ -468,8 +471,41 @@ export function envKeysText(text: string, changes: Record<string, string | null>
     apply(chosen);
     placed.push(key);
   }
-  const out = renderEnv(text, spans, edits, appended);
-  const after = dotenv.parse(out);
+  let out = renderEnv(text, spans, edits, appended);
+  let after = dotenv.parse(out);
+  // A later line can close an earlier form's opening quote, so the forms are chosen again, going back over earlier keys.
+  if (outsideKept(after).length === 0 && !reads(after, order)) {
+    for (const key of order) {
+      const span = lastOf.get(key);
+      if (span !== undefined) edits.delete(span);
+    }
+    appended.length = 0;
+    let parses = 0;
+    const place = (i: number): boolean => {
+      if (i === order.length) return true;
+      const key = order[i];
+      const value = changes[key] as string;
+      const span = lastOf.get(key);
+      const quoted = [`'${value}'`, `"${value}"`, `\`${value}\``];
+      const forms = /^\s*['"`]/.test(value) ? [...quoted, value] : [value, ...quoted];
+      for (const gap of span === undefined ? [false, true] : [false]) {
+        for (const form of forms) {
+          if (++parses > ENV_FORM_PARSES) return false;
+          if (span === undefined) appended.push({ line: `${key}=${form}`, gap });
+          else edits.set(span, `${key}=${form}`);
+          const a = dotenv.parse(renderEnv(text, spans, edits, appended));
+          if (outsideKept(a).length === 0 && reads(a, order.slice(0, i + 1)) && nullsGone(a) && place(i + 1)) return true;
+          if (span === undefined) appended.pop();
+          else edits.delete(span);
+        }
+      }
+      return false;
+    };
+    if (place(0)) {
+      out = renderEnv(text, spans, edits, appended);
+      after = dotenv.parse(out);
+    }
+  }
   const others = outsideKept(after);
   if (others.length === 1) throw new EnvKeysError(`Writing ${listed(keys)} would change the value of ${others[0]} in ${envPath}; edit that line of ${envPath}, then run the migration again`, 'others', others);
   if (others.length > 1) throw new EnvKeysError(`Writing ${listed(keys)} would change the values of ${listed(others)} in ${envPath}; edit those lines of ${envPath}, then run the migration again`, 'others', others);
@@ -829,7 +865,7 @@ function saveRefusal(error: EnvKeysError): string {
   const envPath = dataPath('.env');
   const keys = listed(error.keys);
   const one = error.keys.length === 1;
-  if (error.kind === 'wrong') return `The value of ${keys} cannot be written to ${envPath} so that it reads back the same; nothing was saved. Change the value, then save again`;
+  if (error.kind === 'wrong') return `The value of ${keys} could not be written to ${envPath} so that it reads back the same; nothing was saved. Change the value, then save again`;
   if (error.kind === 'others') {
     return `Saving would change the ${one ? 'value' : 'values'} of ${keys} in ${envPath}; nothing was saved. Edit ${one ? 'that line' : 'those lines'} of ${envPath}, then save again`;
   }

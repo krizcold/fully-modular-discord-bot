@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { syncBuiltinESMExports } from 'module';
 import fc from 'fast-check';
+import * as dotenv from 'dotenv';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { loadCredentials, saveCredentials } from '../../src/utils/envLoader';
 import { dataPath } from '../../src/utils/dataRoot';
@@ -78,6 +79,67 @@ describe('saveCredentials writes each value so the loader reads it back as given
     expect(saveCredentials({ [K]: value, [NEXT]: 'next-value' })).toEqual({ success: true });
     expect(loaded(K) === value).toBe(true);
     expect(loaded(NEXT)).toBe('next-value');
+  });
+
+  const pairs: Array<[string, Record<string, string>]> = [
+    ["the gate's counterexample: a double quote, then a double quote and U+2028", { [K]: '"', [NEXT]: '"\u2028' }],
+    ["a backtick, then a backtick and a #", { [K]: '`', STRIPE_NB41_P0: '`#' }],
+    ["a single quote, then a single quote and U+2029", { [K]: "'", [NEXT]: "'\u2029x" }],
+    ["an opening quote with text, then that quote before a comment", { [K]: '"open', [NEXT]: 'a" # b' }],
+    ["three keys, the first two open, the third closing both", { [K]: '"', [NEXT]: '`', STRIPE_NB41_P0: '`"#' }],
+    ["five keys of one double quote and a #", { [K]: '"#', [NEXT]: '"#', STRIPE_NB41_P0: '"#', STRIPE_NB41_P1: '"#', STRIPE_NB41_P2: '"#' }],
+    ["a double quote, then a double quote and a space", { [K]: '"', [NEXT]: '" ' }],
+    ["a quoted value that ends in a backslash, then that quote alone", { [K]: " a\\", [NEXT]: "'" }],
+    ['going back over the first key: a quoted value ending in a backslash, then that quote and a #', { [K]: " a\\", [NEXT]: "'#" }],
+  ];
+
+  it.each(pairs)('an opening quote that a later line could close: %s', (_name, map) => {
+    const first = saveCredentials(map);
+    loadCredentials();
+    const read = Object.keys(map).map(key => process.env[key] === map[key]);
+    const second = saveCredentials({});
+    const left = fs.readFileSync(ENV, 'utf8');
+    expect(first).toEqual({ success: true });
+    expect(read).toEqual(Object.keys(map).map(() => true));
+    expect(second).toEqual({ success: true });
+    expect(left).toBe('');
+  });
+
+  it.each(pairs)('the same over a file that already sets the keys: %s', (_name, map) => {
+    fs.writeFileSync(ENV, Object.keys(map).map(key => `${key}=old\n`).join('') + '# tail\n');
+    const first = saveCredentials(map);
+    loadCredentials();
+    const read = Object.keys(map).map(key => process.env[key] === map[key]);
+    const text = fs.readFileSync(ENV, 'utf8');
+    expect(first).toEqual({ success: true });
+    expect(read).toEqual(Object.keys(map).map(() => true));
+    expect(text.endsWith('\n# tail\n')).toBe(true);
+  });
+
+  it('a set the bounded search does not finish: refused by key name, no file made', () => {
+    const between = Object.fromEntries([1, 2, 3, 4, 5].map(n => [`STRIPE_NB41_Q${n}`, `#p${n}`]));
+    const result = saveCredentials({ [K]: " a\\", ...between, [NEXT]: "'#" });
+    expect(result).toEqual({ success: false, error: `The value of ${NEXT} could not be written to ${ENV} so that it reads back the same; nothing was saved. Change the value, then save again` });
+    expect(fs.existsSync(ENV)).toBe(false);
+    expect(tempFiles()).toEqual([]);
+  });
+
+  it('the same set with one key fewer between is found inside the bound', () => {
+    const between = Object.fromEntries([1, 2, 3, 4].map(n => [`STRIPE_NB41_Q${n}`, `#p${n}`]));
+    const map: Record<string, string> = { [K]: " a\\", ...between, [NEXT]: "'#" };
+    const result = saveCredentials(map);
+    const back = dotenv.parse(fs.readFileSync(ENV));
+    expect(result).toEqual({ success: true });
+    expect(back).toEqual(map);
+  });
+
+  it('six plain keys between the pair are no obstacle', () => {
+    const plain = Object.fromEntries([1, 2, 3, 4, 5, 6].map(n => [`STRIPE_NB41_Q${n}`, `plain${n}`]));
+    const map: Record<string, string> = { [K]: " a\\", ...plain, [NEXT]: "'#" };
+    const result = saveCredentials(map);
+    const back = dotenv.parse(fs.readFileSync(ENV));
+    expect(result).toEqual({ success: true });
+    expect(back).toEqual(map);
   });
 
   it('any map of printable values without line breaks reads back equal', () => {
@@ -160,7 +222,7 @@ describe('saveCredentials refuses a value the file cannot carry', () => {
     const bytes = Buffer.from(`${K}=old\n${NEXT}=next-value\n`);
     fs.writeFileSync(ENV, bytes);
     const result = saveCredentials({ [K]: value, [NEXT]: 'next-value' });
-    expect(result).toEqual({ success: false, error: `The value of ${K} cannot be written to ${ENV} so that it reads back the same; nothing was saved. Change the value, then save again` });
+    expect(result).toEqual({ success: false, error: `The value of ${K} could not be written to ${ENV} so that it reads back the same; nothing was saved. Change the value, then save again` });
     expect(fs.readFileSync(ENV).equals(bytes)).toBe(true);
   });
 
