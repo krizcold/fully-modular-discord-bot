@@ -154,7 +154,7 @@ describe('maintenance enter and leave by the child stage (round 4 cases)', () =>
     const started = Date.now();
     const answer = await manager.leaveMaintenance();
     expect(Date.now() - started).toBeLessThan(500);
-    expect(answer).toEqual({ restarting: false, note: expect.stringContaining('reads maintenance.json') });
+    expect(answer).toEqual({ restarting: false, starting: true, note: expect.stringContaining('reads maintenance.json') });
     expect(sentTo(child)).toEqual([]);
   });
 });

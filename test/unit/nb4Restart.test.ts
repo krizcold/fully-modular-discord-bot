@@ -5,6 +5,15 @@ import { MemClaimStore } from '../helpers/fakeClaimStore';
 import { FakeStore, tokenFor } from '../helpers/fakeStore';
 import { claimTimings } from '../../src/bot/internalSetup/fleet/claimRules';
 import { stopSteps } from '../helpers/stopRig';
+import { entry, fakeSession, world } from '../helpers/nx5Rig';
+import { setBackendKind } from '../helpers/backendKind';
+
+// The maintenance boot's poll is the production probe pass, over nx5Rig's fake sessions.
+vi.mock('../../src/bot/internalSetup/utils/pgClient', async orig => ({
+  ...(await orig<any>()),
+  shortLivedClient: (config: any) => (globalThis as any).__nx5Session(config),
+}));
+(globalThis as any).__nx5Session = fakeSession;
 
 // NB4 decisions 15 and 16, ruling N1: a restart for shards is asked only while fit and never while a save fails; a loss
 // goes through NB2's leave; with no web UI process every leave ends in the process's own stop handler, which releases
@@ -318,24 +327,26 @@ describe('the maintenance boot with no web UI process ends through the one stop 
   }
 
   it('a Postgres maintenance boot whose login returns exits once', async () => {
-    const kind = await import('../helpers/backendKind');
+    // The static copy: vi.resetModules keeps setup.ts's envLoader mock, which reads that copy, not a fresh import.
+    const kind = { setBackendKind };
     kind.setBackendKind('postgres');
     const m = await import('../../src/bot/internalSetup/utils/maintenance');
     const dm = await import('../../src/bot/internalSetup/utils/dataManager');
     const before = listeners();
     dm.installStopHandler();
-    let probe: 'refused' | 'accepted' = 'refused';
+    vi.stubEnv('DATA_BACKEND_URL', entry('db-main'));
+    world.set('db-main', { refuse: true });
     let atLogin: number[] = [];
     const login = vi.fn(async () => { const a = added(before); atLogin = [a.term.length, a.int.length]; });
     try {
       const client = await m.runMaintenanceBoot({ cause: 'login-refused', message: 'm' }, {
-        shardRecord: () => ({ shardCount: 2, shardIds: [0, 1], processId: 'p', at: '' }), login, loginProbe: async () => probe, retryMs: 1000,
+        shardRecord: () => ({ shardCount: 2, shardIds: [0, 1], processId: 'p', at: '' }), login, retryMs: 1000,
       });
       expect(client).not.toBeNull();
       expect(login).toHaveBeenCalledTimes(1);
       await vi.advanceTimersByTimeAsync(3000);
       expect(h.exits).toBe(0);
-      probe = 'accepted';
+      world.set('db-main', { generation: 2, order: null });
       await vi.advanceTimersByTimeAsync(1000 + 8000);
       expect(lines).toContain('[Maintenance] The database accepted the login again, but no web UI process runs to restart this bot process, so it stops; start it again by hand');
       expect(h.exits).toBe(1);
@@ -345,6 +356,8 @@ describe('the maintenance boot with no web UI process ends through the one stop 
     } finally {
       removeAdded(before);
       kind.setBackendKind(null);
+      vi.unstubAllEnvs();
+      world.clear();
     }
   });
 

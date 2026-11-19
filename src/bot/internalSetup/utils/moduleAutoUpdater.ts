@@ -15,7 +15,7 @@ import { Client } from 'discord.js';
 import { dataPath } from '../../../utils/dataRoot';
 import { getAppStoreManager } from './appStoreManager';
 import { reloadModules } from './moduleReloader';
-import { isMaintenanceGateClosed } from './maintenanceGate';
+import { isMaintenanceGateClosed, runAcceptedOp } from './maintenanceGate';
 import { stoppedServing } from './servingGate';
 import { getNodeName } from '../fleet/nodeName';
 
@@ -111,7 +111,7 @@ export function startModuleAutoUpdater(client: Client): void {
 
   intervalHandle = setInterval(() => {
     if (isMaintenanceGateClosed() || stoppedServing()) return;
-    runModuleUpdateCheck().catch(err => {
+    runAcceptedOp(runModuleUpdateCheck).catch(err => {
       console.error('[ModuleAutoUpdater] Tick error:', err);
     });
   }, CHECK_INTERVAL_MS);

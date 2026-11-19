@@ -250,10 +250,12 @@ describe('ruling L: a change the database refuses for its content', () => {
     const { store, options, guildId } = await storeGuild();
     store.mode = 'unavailable';
     saveData('wait.json', options, { v: 1 });
-    const { at } = watchedDatabase('unreachable');
+    const { at } = watchedDatabase('answers');
     await at(0);
     closeMaintenanceGate('hook', 'm');
-    await handleMaintenanceIpc({ type: 'maintenance:leave', requestId: 'w1', data: {} });
+    // NX5 decision 11: the hook's leave starts the leave step only on a read that answers.
+    expect(await handleMaintenanceIpc({ type: 'maintenance:leave', requestId: 'w1', data: {} })).toEqual({ requestId: 'w1', data: { leaving: true } });
+    await at(0, 'unreachable');
     await vi.waitFor(() => expect(retryWarnings()).toBeGreaterThanOrEqual(5), { timeout: 10_000 });
     await at(5_000, 'refused');
     const seen = retryWarnings();
@@ -273,10 +275,11 @@ describe('ruling L: a change the database refuses for its content', () => {
     const { store, options, guildId } = await storeGuild();
     store.mode = 'unavailable';
     saveData('late.json', options, { v: 1 });
-    const { at } = watchedDatabase('unreachable');
+    const { at } = watchedDatabase('answers');
     await at(0);
     closeMaintenanceGate('hook', 'm');
-    await handleMaintenanceIpc({ type: 'maintenance:leave', requestId: 'w2', data: {} });
+    expect(await handleMaintenanceIpc({ type: 'maintenance:leave', requestId: 'w2', data: {} })).toEqual({ requestId: 'w2', data: { leaving: true } });
+    await at(0, 'unreachable');
     await vi.waitFor(() => expect(retryWarnings()).toBeGreaterThanOrEqual(2), { timeout: 10_000 });
     store.mode = 'commit';
     await at(5_000, 'answers');

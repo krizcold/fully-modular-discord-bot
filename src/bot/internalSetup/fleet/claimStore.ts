@@ -6,6 +6,7 @@ import { Pool } from 'pg';
 import type { PoolClient, QueryConfig } from 'pg';
 import { commitMayHaveLanded, isLoginRefused } from '../utils/dataBackends/postgresBackend';
 import { pgConfig } from '../../../utils/databaseAddress';
+import { CURRENT_GENERATION_SQL, SAVE_ORDER_READ_SQL, saveOrderOf, type SaveOrderRow } from './saveOrderSql';
 import { guardPoolClients } from '../utils/pgClient';
 import {
   CLOCK_GAP_CAP_MS,
@@ -428,8 +429,46 @@ export interface RetakeAnswer {
   refused?: { kind: 'count'; read: GateRead } | { kind: 'held'; read: GateRead; rows: HeldRow[] };
 }
 
+export type { SaveOrderRow };
+
+/** NX5 decision 9: one process's answer to the order, from a save run for it (contract 1's counts). */
+export interface SaveAck {
+  orderId: string;
+  processId: string;
+  nodeId: string;
+  nodeName: string;
+  saved: boolean | null;
+  /** null: the answer could not count, because work still ran (ruling G8-5). */
+  unsavedGuilds: number | null;
+  unsavedFiles: number | null;
+  unansweredGuilds: number | null;
+  unconfirmedFiles: number | null;
+  unansweredFiles: number | null;
+  resaveGuilds: number;
+}
+
+export const SAVE_ACK_SQL = `
+INSERT INTO smdb_manager.save_acks AS a (process_id, order_id, node_id, node_name, saved, unsaved_guilds, unsaved_files,
+  unanswered_guilds, unconfirmed_files, unanswered_files, resave_guilds, acked_at)
+SELECT $2::text, $1::text, $3::text, $4::text, $5::boolean, $6::int, $7::int, $8::int, $9::int, $10::int, $11::int, now()
+ WHERE EXISTS (SELECT 1 FROM smdb_manager.save_order o WHERE o.order_id = $1 AND o.state = 'maintenance' AND o.generation = ${CURRENT_GENERATION_SQL})
+ON CONFLICT (process_id) DO UPDATE SET order_id = EXCLUDED.order_id, node_id = EXCLUDED.node_id, node_name = EXCLUDED.node_name,
+  saved = EXCLUDED.saved, unsaved_guilds = EXCLUDED.unsaved_guilds, unsaved_files = EXCLUDED.unsaved_files,
+  unanswered_guilds = EXCLUDED.unanswered_guilds, unconfirmed_files = EXCLUDED.unconfirmed_files,
+  unanswered_files = EXCLUDED.unanswered_files, resave_guilds = EXCLUDED.resave_guilds, acked_at = now()`;
+
+/** 42P01 (no table) and 3F000 (no schema): a manager that writes no order. */
+const noOrderTable = (error: unknown): boolean => {
+  const code = error && typeof error === 'object' ? (error as { code?: unknown }).code : undefined;
+  return code === '42P01' || code === '3F000';
+};
+
 /** The whole claims surface the shard layer uses; tests swap in a fake. */
 export interface ClaimStoreApi {
+  /** NX5 decision 8: one read of the save order; null for no row or no table; rejects on any other failure. */
+  readSaveOrder?(): Promise<SaveOrderRow | null>;
+  /** NX5 decision 9: the answer, written only while its order is current at 'maintenance'; false when nothing was written. */
+  writeSaveAck?(ack: SaveAck): Promise<boolean>;
   /** `move`: the move's own renewal, which passes the pause (NB5 D1). */
   renew(request: RenewRequest, opts?: { move?: boolean }): Promise<RenewAnswer>;
   /** NB9 C14: the standby's renewal on the renewal lane. */
@@ -493,7 +532,7 @@ export function toNodeRow(r: any): NodeRow {
   };
 }
 
-type Lane = 'renewal' | 'work' | 'release' | 'identify';
+type Lane = 'renewal' | 'work' | 'release' | 'identify' | 'order';
 
 export class ClaimStore implements ClaimStoreApi {
   private pool: Pool;
@@ -1065,6 +1104,37 @@ export class ClaimStore implements ClaimStoreApi {
       const wait = (await this.q(client, IDENTIFY_WAIT_SQL, [bucket])).rows[0];
       return { granted: false as const, waitMs: wait ? Number(wait.wait_ms) : 0 };
     });
+  }
+
+  async readSaveOrder(): Promise<SaveOrderRow | null> {
+    try {
+      return await this.withClient('order', this.timings.renewMs, this.timings.renewMs, 'the save order read', async client => {
+        let res;
+        try {
+          res = await this.q(client, SAVE_ORDER_READ_SQL);
+        } catch (error) {
+          if (noOrderTable(error)) return null;
+          throw error;
+        }
+        return saveOrderOf(res.rows);
+      });
+    } catch (error) {
+      throw error instanceof ClaimFailure && error.cause !== undefined ? error.cause : error;
+    }
+  }
+
+  async writeSaveAck(ack: SaveAck): Promise<boolean> {
+    try {
+      return await this.withClient('order', this.timings.renewMs, this.timings.renewMs, 'the save answer', async client => {
+        const res = await this.q(client, SAVE_ACK_SQL, [
+          ack.orderId, ack.processId, ack.nodeId, ack.nodeName, ack.saved, ack.unsavedGuilds, ack.unsavedFiles,
+          ack.unansweredGuilds, ack.unconfirmedFiles, ack.unansweredFiles, ack.resaveGuilds,
+        ]);
+        return (res.rowCount ?? 0) > 0;
+      });
+    } catch (error) {
+      throw error instanceof ClaimFailure && error.cause !== undefined ? error.cause : error;
+    }
   }
 
   async end(): Promise<void> {

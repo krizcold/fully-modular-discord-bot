@@ -21,6 +21,7 @@ import { PanelOptions, PanelContext, PanelResponse } from '../../types/panelType
 import { discoverConfigFiles, ConfigFileMetadata } from '../utils/configDiscovery';
 import { loadGlobalConfig, saveGlobalConfig, getMergedConfig } from '../utils/configManager';
 import { deleteRawAtomic } from '../utils/dataManager';
+import { runAcceptedOp } from '../utils/maintenanceGate';
 import { mirrorPathOf, ROOT_CONFIG_KEY } from '../utils/sharedStore';
 import { EDITOR_BASE_GONE_TEXT, editorSaveOptions, noteEditorBase } from '../utils/panel/editorBase';
 import * as fs from 'fs';
@@ -190,46 +191,48 @@ const configEditorGlobalPanel: PanelOptions = {
       }
 
       try {
-        const response = await fetch(attachment.url);
-        if (!response.ok) {
-          return showError('Failed to download the uploaded file.');
-        }
-
-        const jsonText = await response.text();
-        const result = validateAndSanitizeJson(jsonText, { requiredType: 'object' });
-        if (!result.valid) {
-          return showError(result.error);
-        }
-        const parsedConfig = result.data;
-
-        // Filter to overrides only (like edit modal)
-        const configFiles = discoverConfigFiles().filter(f => f.category === 'config');
-        const metadata = configFiles.find(f => f.id === fileId);
-        let overridesOnly: Record<string, any> = {};
-
-        if (metadata?.schema) {
-          for (const [key, value] of Object.entries(parsedConfig)) {
-            const schemaField = metadata.schema.properties[key];
-            const defaultValue = schemaField?.default;
-            if (JSON.stringify(value) !== JSON.stringify(defaultValue)) {
-              overridesOnly[key] = value;
-            }
+        // NX5 ruling G8-12: the download can outlast maintenance's handler wait, and the write after it is not refused.
+        return await runAcceptedOp(async () => {
+          const response = await fetch(attachment.url);
+          if (!response.ok) {
+            return showError('Failed to download the uploaded file.');
           }
-        } else {
-          overridesOnly = parsedConfig;
-        }
 
-        const options = saveOptions(context, fileId, metadata);
-        if (!options) return showError(EDITOR_BASE_GONE_TEXT);
-        if (Object.keys(overridesOnly).length === 0 && metadata?.path) {
-          resetGlobalFile(metadata.path, options);
-        } else {
-          saveGlobalConfig(fileId, overridesOnly, options);
-        }
+          const jsonText = await response.text();
+          const result = validateAndSanitizeJson(jsonText, { requiredType: 'object' });
+          if (!result.valid) {
+            return showError(result.error);
+          }
+          const parsedConfig = result.data;
 
-        const updatedConfig = loadGlobalConfig(fileId);
-        return await showConfigView(context, fileId, updatedConfig, metadata);
+          // Filter to overrides only (like edit modal)
+          const configFiles = discoverConfigFiles().filter(f => f.category === 'config');
+          const metadata = configFiles.find(f => f.id === fileId);
+          let overridesOnly: Record<string, any> = {};
 
+          if (metadata?.schema) {
+            for (const [key, value] of Object.entries(parsedConfig)) {
+              const schemaField = metadata.schema.properties[key];
+              const defaultValue = schemaField?.default;
+              if (JSON.stringify(value) !== JSON.stringify(defaultValue)) {
+                overridesOnly[key] = value;
+              }
+            }
+          } else {
+            overridesOnly = parsedConfig;
+          }
+
+          const options = saveOptions(context, fileId, metadata);
+          if (!options) return showError(EDITOR_BASE_GONE_TEXT);
+          if (Object.keys(overridesOnly).length === 0 && metadata?.path) {
+            resetGlobalFile(metadata.path, options);
+          } else {
+            saveGlobalConfig(fileId, overridesOnly, options);
+          }
+
+          const updatedConfig = loadGlobalConfig(fileId);
+          return await showConfigView(context, fileId, updatedConfig, metadata);
+        });
       } catch (error) {
         console.error('[ConfigEditor] Upload error:', error);
         return showError(`Upload failed: ${error instanceof Error ? error.message : 'Unknown error'}`);

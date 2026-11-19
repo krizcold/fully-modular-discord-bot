@@ -17,6 +17,11 @@ vi.mock('../../src/bot/internalSetup/utils/payment/paymentRegistry', async orig 
   } };
   return { ...real, getPaymentRegistry: () => ({ get: (id: string) => (id === 'discord' ? discord : undefined), on: () => undefined, off: () => undefined }) };
 });
+// The maintenance boot's poll is the production probe pass, over nx5Rig's fake sessions.
+vi.mock('../../src/bot/internalSetup/utils/pgClient', async orig => ({
+  ...(await orig<any>()),
+  shortLivedClient: (config: any) => (globalThis as any).__nx5Session(config),
+}));
 
 import { ModuleLoader } from '../../src/bot/internalSetup/utils/moduleLoader';
 import { getWorkingSet } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
@@ -28,6 +33,10 @@ import { _resetMaintenance, _setMaintenanceSender, _setMaintenanceTiming, handle
 import { isMaintenanceBoot, maintenanceText } from '../../src/bot/internalSetup/utils/maintenanceGate';
 import { writeMaintenanceFile } from '../../src/utils/maintenanceFile';
 import { rawCommand, textOf, tick, type WireCall } from '../helpers/gateRig';
+import { setBackendKind } from '../helpers/backendKind';
+import { entry, fakeSession, world } from '../helpers/nx5Rig';
+
+(globalThis as any).__nx5Session = fakeSession;
 
 const sent: any[] = [];
 const role = process.env.BOT_PROCESS_ROLE;
@@ -142,16 +151,27 @@ describe('ruling 6: booting in maintenance mode', () => {
   it('ruling 7 at boot: a refused login boots in maintenance mode and asks for the restart once the login is accepted while the file says running', async () => {
     writeMaintenanceFile('running', 'Owner text.');
     sent.length = 0;
-    const answers: Array<'refused' | 'accepted'> = ['refused', 'accepted'];
-    await runMaintenanceBoot({ cause: 'login-refused', message: 'Owner text.' }, {
-      shards: async () => 1,
-      login: async () => undefined,
-      loginProbe: async () => answers.shift() ?? 'accepted',
-      retryMs: 20,
-    });
-    expect(sent).toContainEqual({ type: 'maintenance:mode', data: { mode: 'login-refused', boot: true } });
-    await tick(150);
-    expect(sent.filter(m => m.type === 'control:restart-bot')).toHaveLength(1);
+    setBackendKind('postgres');
+    vi.stubEnv('DATA_BACKEND_URL', entry('db-main'));
+    world.set('db-main', { refuse: true });
+    try {
+      await runMaintenanceBoot({ cause: 'login-refused', message: 'Owner text.' }, {
+        shardRecord: () => null,
+        login: async () => undefined,
+        retryMs: 20,
+      });
+      expect(sent).toContainEqual({ type: 'maintenance:mode', data: { mode: 'login-refused', boot: true } });
+      await tick(60);
+      expect(sent.filter(m => m.type === 'control:restart-bot')).toHaveLength(0);
+      world.set('db-main', { generation: 2, order: null });
+      await tick(150);
+      expect(sent.filter(m => m.type === 'control:restart-bot')).toHaveLength(1);
+    } finally {
+      _resetMaintenance();
+      world.clear();
+      vi.unstubAllEnvs();
+      setBackendKind(null);
+    }
   });
 
   it('ruling B backstop: a hook boot whose maintenance:leave was lost leaves once maintenance.json says running', async () => {
@@ -172,6 +192,8 @@ describe('ruling 6: booting in maintenance mode', () => {
     writeMaintenanceFile('maintenance', 'm');
     sent.length = 0;
     await runMaintenanceBoot({ cause: 'hook', message: 'm' }, { shards: async () => 1, login: async () => undefined });
+    // The hook route saves the running state before it sends maintenance:leave.
+    writeMaintenanceFile('running', 'm');
     expect(await handleMaintenanceIpc({ type: 'maintenance:leave', requestId: 'l', data: {} })).toEqual({ requestId: 'l', data: { leaving: true } });
     expect(await handleMaintenanceIpc({ type: 'maintenance:leave', requestId: 'm', data: {} })).toEqual({ requestId: 'm', data: { leaving: true } });
     await tick(50);

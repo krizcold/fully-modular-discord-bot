@@ -8,10 +8,20 @@ vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => ({
   ...(await orig<object>()),
   stopProcess: () => undefined,
 }));
+// The maintenance boot's poll is the production probe pass, over nx5Rig's fake sessions; each session is one probe.
+const probes = vi.hoisted(() => ({ sessions: 0 }));
+vi.mock('../../src/bot/internalSetup/utils/pgClient', async orig => ({
+  ...(await orig<any>()),
+  shortLivedClient: (config: any) => {
+    probes.sessions += 1;
+    return (globalThis as any).__nx5Session(config);
+  },
+}));
 
 import fs from 'fs';
 import { GatewayIntentBits, IntentsBitField, type Client } from 'discord.js';
 import { setBackendKind } from '../helpers/backendKind';
+import { entry, fakeSession, world } from '../helpers/nx5Rig';
 import { maintenanceFilePath, writeMaintenanceFile } from '../../src/utils/maintenanceFile';
 import {
   _resetMaintenance,
@@ -23,6 +33,7 @@ import {
   runMaintenanceBoot,
 } from '../../src/bot/internalSetup/utils/maintenance';
 
+(globalThis as any).__nx5Session = fakeSession;
 const sent: any[] = [];
 let logs: string[] = [];
 const realSend = process.send;
@@ -54,11 +65,13 @@ afterEach(async () => {
   _resetMaintenance();
   _setMaintenanceSender(null);
   setBackendKind(null);
+  vi.unstubAllEnvs();
+  world.clear();
   fs.rmSync(maintenanceFilePath(), { force: true });
   vi.restoreAllMocks();
 });
 
-const noShard = { shardRecord: () => ({ shardCount: 4, shardIds: [], processId: 'p', at: '' }), loginProbe: async () => 'refused' as const, retryMs: 600_000 };
+const noShard = { shardRecord: () => ({ shardCount: 4, shardIds: [], processId: 'p', at: '' }), retryMs: 600_000 };
 
 async function bootNoShard(cause: 'hook' | 'login-refused') {
   setBackendKind('postgres');
@@ -122,19 +135,24 @@ describe('IPC answers in a maintenance boot', () => {
   });
 });
 
-describe('the maintenance.json poll of a boot for a refused login', () => {
-  it('starts only when the hook closes the gate, counted from that entry', async () => {
+describe('a boot for a refused login after a hook enter (NX5 ruling G4: the one poll asks the predicate)', () => {
+  it('maintenance.json saying running does not end it while the login stays refused', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
     setBackendKind('postgres');
+    vi.stubEnv('DATA_BACKEND_URL', entry('db-main'));
+    world.set('db-main', { refuse: true });
+    probes.sessions = 0;
     _setMaintenanceTiming({ filePollMs: 1000 });
-    expect(await runMaintenanceBoot({ cause: 'login-refused', message: 'm' }, noShard)).toBeNull();
+    expect(await runMaintenanceBoot({ cause: 'login-refused', message: 'm' }, { shardRecord: noShard.shardRecord })).toBeNull();
     await vi.advanceTimersByTimeAsync(600);
     expect(await handleMaintenanceIpc({ type: 'maintenance:enter', requestId: 'e', data: { message: 'm' } })).toStrictEqual({ requestId: 'e', data: { saved: true } });
     writeMaintenanceFile('running', 'm');
     await vi.advanceTimersByTimeAsync(500);
     expect(logs.some(line => line.includes(POLL_LEAVE_LINE))).toBe(false);
-    await vi.advanceTimersByTimeAsync(600);
-    expect(logs.some(line => line.includes(POLL_LEAVE_LINE))).toBe(true);
+    await vi.advanceTimersByTimeAsync(1_600);
+    expect(logs.some(line => line.includes(POLL_LEAVE_LINE))).toBe(false);
+    expect(sent.filter(m => m.type === 'control:restart-bot')).toEqual([]);
+    expect(probes.sessions).toBeGreaterThanOrEqual(2);
   });
 });
 

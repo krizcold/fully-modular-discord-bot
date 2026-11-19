@@ -4,6 +4,9 @@ import { parseAddressList, type ListEntry } from '../../../../utils/databaseAddr
 import type { DatabaseChooser, LatchCause, PostgresBackend, Standing } from './postgresBackend';
 import type { RetireOutcome } from './backend';
 import { machineList, sortedMachines, type NoticeRead } from '../../../../utils/ownerMessages';
+import { SAVE_ORDER_READ_SQL, saveOrderOf, type SaveOrderRow } from '../../fleet/saveOrderSql';
+
+export type { SaveOrderRow };
 
 export type { NoticeRead };
 
@@ -26,6 +29,10 @@ export interface AnsweredProbe {
   sysid: string | null;
   started: string;
   storeId: string | null;
+  /** NX5 decision 8: the save order on this database; 'unknown' when its read failed or the pass bound came first. */
+  saveOrder?: SaveOrderRow | null | 'unknown';
+  /** Why the save order read 'unknown', in connectCause's words. */
+  saveOrderCause?: string;
 }
 
 export interface RefusedProbe {
@@ -324,14 +331,14 @@ export function ownerChannelFromFile(file: string): OwnerChannelValue {
   return { kind: 'unreadable', cause: 'the stored value is not a channel ID of 17 to 20 digits' };
 }
 
-export type ProbeAnswer = Probe & { ownerChannel?: OwnerChannelValue; error?: unknown; atLogin?: true; loggedIn?: true };
+export type ProbeAnswer = Probe & { ownerChannel?: OwnerChannelValue; error?: unknown; atLogin?: true; loggedIn?: true; atBound?: true };
 
 const sinceText = (value: unknown): string | null => {
   if (value instanceof Date) return value.toISOString();
   return value === null || value === undefined ? null : String(value);
 };
 
-async function askOne(session: ProbeSession, entry: string, address: string, login: { taken: boolean }): Promise<ProbeAnswer> {
+async function askOne(session: ProbeSession, entry: string, address: string, login: { taken: boolean; answer?: ProbeAnswer }): Promise<ProbeAnswer> {
   const failed = (cause: string, error?: unknown): ProbeAnswer => ({ kind: 'failed', address, entry, cause, error, ...(login.taken ? { loggedIn: true as const } : {}) });
   try {
     await session.connect();
@@ -383,17 +390,35 @@ async function askOne(session: ProbeSession, entry: string, address: string, log
   } catch (error) {
     if (!missingTable(error)) return failed(`an unreadable store id (${connectCause(error)})`, error);
   }
-  return {
+  const answer: AnsweredProbe & { ownerChannel: OwnerChannelValue } = {
     kind: 'answered', address, entry, inRecovery: identity.rec === true, readOnly: String(identity.ro ?? 'off') === 'on',
     generation, machine, since, sysid: identity.sysid == null ? null : String(identity.sysid), started: String(identity.started),
     storeId, ownerChannel,
   };
+  // NX5 decision 8: a failed order read never makes the entry 'failed'; a pass bound from here on settles it with 'unknown'.
+  login.answer = answer;
+  try {
+    return { ...answer, saveOrder: saveOrderOf((await session.query(SAVE_ORDER_READ_SQL)).rows) };
+  } catch (error) {
+    return missingTable(error) ? { ...answer, saveOrder: null } : { ...answer, saveOrder: 'unknown', saveOrderCause: connectCause(error) };
+  }
 }
 
-/** One probe pass over a list (decision 4): one session per entry in parallel, every entry settled within 10 s. */
-export async function probePass(entries: ListEntry[], deps: ProbeDeps, boundMs = PASS_BOUND_MS): Promise<ProbeAnswer[]> {
-  return Promise.all(entries.map(async (entry): Promise<ProbeAnswer> => {
-    if (!entry.usable) return { kind: 'failed', address: entry.shown, entry: entry.raw, cause: entry.cause };
+/** The entry contract 3 chooses (BUILD.md:57-58): answered, not in recovery, not read-only. */
+export const writableAnswer = (answer: ProbeAnswer): answer is AnsweredProbe & ProbeAnswer =>
+  answer.kind === 'answered' && !answer.inRecovery && !answer.readOnly;
+
+/**
+ * One probe pass over a list (decision 4): one session per entry in parallel, every entry settled within 10 s.
+ * `untilWritable` (NX5 decision 11, the hook's leave in a maintenance boot): the pass ends at the first writable entry's
+ * answer, and the entries still asking settle as failed without waiting.
+ */
+export async function probePass(entries: ListEntry[], deps: ProbeDeps, boundMs = PASS_BOUND_MS, opts: { untilWritable?: boolean } = {}): Promise<ProbeAnswer[]> {
+  let endEarly = (): void => undefined;
+  const ended = new Promise<void>(resolve => { endEarly = resolve; });
+  const settled: Array<ProbeAnswer | undefined> = entries.map(() => undefined);
+  const all = Promise.all(entries.map(async (entry, index): Promise<ProbeAnswer> => {
+    if (!entry.usable) return (settled[index] = { kind: 'failed', address: entry.shown, entry: entry.raw, cause: entry.cause });
     const session = deps.session({
       application_name: 'smdb-probe',
       connectionTimeoutMillis: PROBE_CONNECT_MS,
@@ -402,21 +427,28 @@ export async function probePass(entries: ListEntry[], deps: ProbeDeps, boundMs =
       ...entry.config,
     });
     let timer: NodeJS.Timeout | undefined;
-    const login = { taken: false };
+    const login: { taken: boolean; answer?: ProbeAnswer } = { taken: false };
     const bound = new Promise<ProbeAnswer>(resolve => {
-      timer = setTimeout(() => resolve({
-        kind: 'failed', address: entry.shown, entry: entry.raw, cause: 'a timeout', error: new Error('the probe pass bound'),
+      timer = setTimeout(() => resolve(login.answer ? { ...login.answer, saveOrder: 'unknown', saveOrderCause: 'a timeout', atBound: true } as ProbeAnswer : {
+        kind: 'failed', address: entry.shown, entry: entry.raw, cause: 'a timeout', error: new Error('the probe pass bound'), atBound: true,
         ...(login.taken ? { loggedIn: true as const } : {}),
       }), boundMs);
     });
     const asked = askOne(session, entry.raw, entry.shown, login);
     try {
-      return await Promise.race([asked, bound]);
+      const answer = await Promise.race([asked, bound]);
+      settled[index] = answer;
+      if (opts.untilWritable && writableAnswer(answer)) endEarly();
+      return answer;
     } finally {
       clearTimeout(timer);
       void asked.finally(() => session.end().catch(() => undefined));
     }
   }));
+  if (!opts.untilWritable) return all;
+  return Promise.race([all, ended.then(() => entries.map((entry, index): ProbeAnswer => settled[index] ?? {
+    kind: 'failed', address: entry.shown, entry: entry.raw, cause: 'not awaited (a writable entry answered first)',
+  }))]);
 }
 
 // ============================================================================

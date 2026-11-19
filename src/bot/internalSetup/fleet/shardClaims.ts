@@ -24,6 +24,7 @@ import {
   type RenewAnswer,
   type RetakeAnswer,
   type HeldRow,
+  type SaveOrderRow,
   type StandbyTakeAnswer,
   type TakeAnswer,
 } from './claimStore';
@@ -94,6 +95,8 @@ export interface ShardClaimsDeps {
   standbyPairs?: Pair[];
   /** NB9 6 to 12 and 25: each page read of a granted process outside a stop goes to the reshard driver. */
   onPage?: (page: PageRead) => Promise<void> | void;
+  /** NX5 decision 8: each order read after a serving renewal that succeeded; 'unknown' after a renewal that failed. */
+  onSaveOrder?: (read: SaveOrderRow | null | 'unknown') => void;
 }
 
 /** NB9 7, 27, 30 and 45: a standby's lanes, before it serves. */
@@ -183,6 +186,8 @@ export class ShardClaims {
   /** NB9 52: true until this process's first heartbeat statement completed. */
   private targetEdge = true;
   private lastCopyLog = -Infinity;
+  private orderReading = false;
+  private renewFailures = 0;
   private firstRenewalAt: number | null = null;
   private page: PageRead | null = null;
   private pageReadAt: number | null = null;
@@ -457,7 +462,11 @@ export class ShardClaims {
         ? await this.renewStandby(pairs)
         : await this.deps.store.renew({ me: this.deps.me, pairs, ttlMs: this.deps.timings.ttlMs, heartbeat: this.heartbeat() });
     } catch (error) {
-      if (!(error instanceof ClaimPausedError)) this.latestFailure = classifyFailure(error);
+      if (!(error instanceof ClaimPausedError)) {
+        this.latestFailure = classifyFailure(error);
+        this.renewFailures += 1;
+        if (!this.deps.standby) this.deps.onSaveOrder?.('unknown');
+      }
       return;
     }
     this.latestFailure = null;
@@ -471,7 +480,21 @@ export class ShardClaims {
     this.noteHeartbeat(answer);
     this.firstRenewalAt ??= answer.at;
     this.applyRenewal(answer, sent, new Set(pairs.map(pairKey)));
+    this.readSaveOrder();
     if (this.granted) void this.work();
+  }
+
+  /** NX5 decision 8: one order read on the claims pool; a read answered after a later renewal failed is dropped. */
+  private readSaveOrder(): void {
+    const { onSaveOrder } = this.deps;
+    const store = this.deps.store;
+    if (!onSaveOrder || !store.readSaveOrder || this.orderReading) return;
+    this.orderReading = true;
+    const failures = this.renewFailures;
+    void store.readSaveOrder().then(
+      read => { if (failures === this.renewFailures) onSaveOrder(read); },
+      () => undefined,
+    ).finally(() => { this.orderReading = false; });
   }
 
   /** C14: the standby's renewal carries each pair's readiness and no heartbeat. */

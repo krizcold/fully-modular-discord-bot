@@ -27,7 +27,8 @@ import { errnoOf, isBotProcess, registerCacheStop, stopCause, stopWords, unregis
 import { failItems, landItems, makeItem, newCarry, runItems, type Carry, type Item, type ItemSink, type SaveOp, type SaveOutcome } from '../premiumItems';
 import { rowOutcome, shaOf, type RowTicket } from '../sharedStore';
 import { getPaymentRegistry } from './paymentRegistry';
-import { isMaintenanceGateClosed } from '../maintenanceGate';
+import { isMaintenanceGateClosed, MaintenanceRefusal, orderRefusesGlobalWrite, runHeldResave } from '../maintenanceGate';
+import { OpenWork } from '../openWork';
 import { writerLockDepth } from '../writerLock';
 import type {
   PaymentProvider,
@@ -125,6 +126,9 @@ const RETRY_FIRST_MS = 1_000;
 const RETRY_MAX_MS = 60_000;
 /** How long a method waits for its op's outcome (CONFIRM_MS, replyGate.ts). */
 const CONFIRM_MS = 8_000;
+/** The kinds of the Dummy provider's open work (NX5 ruling G8-14), as a maintenance answer names them. */
+const PURCHASE_WORK = 'purchase(s) not saved yet';
+const SAVE_WORK = 'save(s) of state.json waiting for the database';
 /** T26's words for a field's value: a null endDate is "no end date", a null resumesAt "none". */
 const fieldWords = (field: string, value: unknown): string =>
   value === null && field === 'endDate' ? 'no end date' : value === null && field === 'resumesAt' ? 'none' : String(value);
@@ -249,6 +253,8 @@ export class DummyProvider implements PaymentProvider {
   /** Decision 94's seen: per record, its updatedAt and premium's answer at the last run that found a difference. */
   private seen = new Map<string, { updatedAt: string; answer: string }>();
   private offApplied: (() => void) | null = null;
+  /** NX5 ruling G8-14: every piece of the Dummy provider's asynchronous work, open until it wrote or gave up. */
+  private readonly work = new OpenWork('the Dummy provider');
 
   constructor() {
     liveProviders.add(this);
@@ -351,7 +357,8 @@ export class DummyProvider implements PaymentProvider {
   /** A mutating method's entry check: true when it must refuse, recorded in the current ledger, before it changes the state. */
   private refusedAtEntry(): boolean {
     this.ensureLoaded();
-    const cause: LedgerCause | null = this.stopped ? stopCause(this.stopped) : this.unreadable !== null ? 'io' : null;
+    const cause: LedgerCause | null = this.stopped ? stopCause(this.stopped) : this.unreadable !== null ? 'io'
+      : orderRefusesGlobalWrite() ? 'maintenance' : null;
     if (!cause) return false;
     recordRefusal(cause, STATE_DOC);
     return true;
@@ -360,9 +367,9 @@ export class DummyProvider implements PaymentProvider {
   /** A provider call the PremiumManager makes: it fails, with nothing changed, while the state cannot be written. */
   private refuseCall(): void {
     if (!this.refusedAtEntry()) return;
-    throw new Error(this.stopped
-      ? `The Dummy provider changed nothing: ${stopWords(this.stopped)}.`
-      : `The Dummy provider changed nothing: ${STATE_FILE} cannot be read (${this.unreadable}).`);
+    if (this.stopped) throw new Error(`The Dummy provider changed nothing: ${stopWords(this.stopped)}.`);
+    if (this.unreadable !== null) throw new Error(`The Dummy provider changed nothing: ${STATE_FILE} cannot be read (${this.unreadable}).`);
+    throw new MaintenanceRefusal('The Dummy provider changed nothing: the bot is in maintenance.');
   }
 
   private sharedBackend(): boolean {
@@ -459,21 +466,21 @@ export class DummyProvider implements PaymentProvider {
   /** Settles a save's items with its op (decision 64); an op refused or 'unconfirmed' drops the cache (decision 71). */
   private watchOp(ticket: RowTicket, items: Item[]): Promise<SaveOutcome> {
     this.openSaves += 1;
-    return rowOutcome(ticket).then(outcome => {
+    return this.work.track(SAVE_WORK, rowOutcome(ticket).then((outcome): SaveOutcome => {
       this.openSaves -= 1;
       if (outcome === 'landed') {
         landItems(items, ticket);
-        return 'landed' as const;
+        return 'landed';
       }
       this.invalidate();
       if (outcome === 'unconfirmed') {
         failItems(items, 'unconfirmed', this.itemSink);
-        return 'unconfirmed' as const;
+        return 'unconfirmed';
       }
       const cause = outcome.refused.cause;
       failItems(items, { refused: cause, words: causeWords(cause) }, this.itemSink);
       return { refused: cause };
-    });
+    }));
   }
 
   private refuseItems(items: Item[], cause: LedgerCause): void {
@@ -507,12 +514,32 @@ export class DummyProvider implements PaymentProvider {
     throw notSavedError(outcome.refused);
   }
 
+  /** A held save sent again outside any ledger; the change was accepted, so a save order's refusal does not refuse it (NX5 ruling G8-9). */
+  private resend(): void {
+    outsideLedgers(() => runHeldResave(() => this.writeState()));
+  }
+
+  /** The save run behind a maintenance answer: the held save once now; the retry timer keeps its turn if it stays held. */
+  resaveHeld(): void {
+    if (this.stopped || this.disposed || !this.saveHeld) return;
+    this.resend();
+  }
+
+  heldFiles(): string[] {
+    return this.saveHeld && !this.disposed ? [STATE_PATH] : [];
+  }
+
+  /** NX5 ruling G8-14: the Dummy provider's open asynchronous work in words; null when none is open. */
+  openWork(): string | null {
+    return this.disposed ? null : this.work.words();
+  }
+
   private armRetry(): void {
     if (this.retryTimer || this.stopped || this.disposed) return;
     this.retryTimer = outsideLedgers(() => setTimeout(() => {
       this.retryTimer = null;
       if (this.stopped || !this.saveHeld) return;
-      outsideLedgers(() => this.writeState());
+      this.resend();
       if (this.saveHeld) {
         this.retryDelay = Math.min(this.retryDelay * 2, RETRY_MAX_MS);
         this.armRetry();
@@ -542,7 +569,7 @@ export class DummyProvider implements PaymentProvider {
     if (this.tickTimer) clearInterval(this.tickTimer);
     this.tickTimer = null;
     if (!this.stopped) {
-      if (this.saveHeld) outsideLedgers(() => this.writeState());
+      if (this.saveHeld) this.resend();
       this.clearRetry();
       this.stopped = 'stopping';
     }
@@ -627,7 +654,11 @@ export class DummyProvider implements PaymentProvider {
   // PURCHASE FLOW
   // ============================================================================
 
-  async initiatePurchase(opts: InitiateOpts): Promise<InitiateResult> {
+  initiatePurchase(opts: InitiateOpts): Promise<InitiateResult> {
+    return this.work.run(PURCHASE_WORK, () => this.initiatePurchaseRun(opts));
+  }
+
+  private async initiatePurchaseRun(opts: InitiateOpts): Promise<InitiateResult> {
     this.refuseCall();
     const variant = this.state.variants[opts.variantId];
     if (!variant || !variant.active) {

@@ -8,10 +8,20 @@ vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => ({
   ...(await orig<object>()),
   stopProcess: () => { stops.calls += 1; },
 }));
+// The maintenance boot's poll is the production probe pass, over nx5Rig's fake sessions; each session is one probe.
+const probes = vi.hoisted(() => ({ sessions: 0 }));
+vi.mock('../../src/bot/internalSetup/utils/pgClient', async orig => ({
+  ...(await orig<any>()),
+  shortLivedClient: (config: any) => {
+    probes.sessions += 1;
+    return (globalThis as any).__nx5Session(config);
+  },
+}));
 
 import fs from 'fs';
 import path from 'path';
 import { setBackendKind } from '../helpers/backendKind';
+import { entry, fakeSession, world } from '../helpers/nx5Rig';
 import { shardRecordPath } from '../../src/bot/internalSetup/fleet/shardRecord';
 import { maintenanceFilePath, writeMaintenanceFile } from '../../src/utils/maintenanceFile';
 import {
@@ -21,6 +31,7 @@ import {
   runMaintenanceBoot,
 } from '../../src/bot/internalSetup/utils/maintenance';
 
+(globalThis as any).__nx5Session = fakeSession;
 const sent: any[] = [];
 let logs: string[] = [];
 const realSend = process.send;
@@ -53,7 +64,6 @@ describe('the Postgres maintenance boot', () => {
     const client = await runMaintenanceBoot({ cause, message: 'm' }, {
       shardRecord: () => ({ shardCount: 4, shardIds: [3, 1], processId: 'p', at: '' }),
       login: async c => { loggedIn = c; },
-      loginProbe: async () => 'refused',
       retryMs: 600_000,
     });
     expect(loggedIn).toBe(client);
@@ -84,17 +94,20 @@ describe('the Postgres maintenance boot', () => {
     fs.mkdirSync(path.dirname(shardRecordPath()), { recursive: true });
     plant();
     setBackendKind('postgres');
+    vi.stubEnv('DATA_BACKEND_URL', entry('db-main'));
+    world.set('db-main', { refuse: true });
+    probes.sessions = 0;
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
     try {
       _setMaintenanceTiming({ filePollMs: 1000 });
       const login = vi.fn(async () => undefined);
-      const probe = vi.fn(async () => 'refused' as const);
-      expect(await runMaintenanceBoot({ cause: 'login-refused', message: 'm' }, { login, loginProbe: probe, retryMs: 1000 })).toBeNull();
+      expect(await runMaintenanceBoot({ cause: 'login-refused', message: 'm' }, { login, retryMs: 1000 })).toBeNull();
       expect(login).not.toHaveBeenCalled();
       expect(logs).toContain('[Maintenance] Booting in maintenance mode with no shard: this machine has no record of the shards it served');
       await vi.advanceTimersByTimeAsync(3000);
-      expect(probe.mock.calls.length).toBeGreaterThanOrEqual(2);
+      expect(probes.sessions).toBeGreaterThanOrEqual(2);
       _resetMaintenance();
+      world.set('db-main', { generation: 2, order: null });
       _setMaintenanceTiming({ filePollMs: 1000 });
       writeMaintenanceFile('maintenance', 'm');
       expect(await runMaintenanceBoot({ cause: 'hook', message: 'm' }, { login })).toBeNull();
@@ -107,6 +120,8 @@ describe('the Postgres maintenance boot', () => {
       expect(stops.calls).toBe(1);
     } finally {
       vi.useRealTimers();
+      vi.unstubAllEnvs();
+      world.clear();
       fs.rmSync(shardRecordPath(), { recursive: true, force: true });
       fs.rmSync(maintenanceFilePath(), { force: true });
     }

@@ -99,7 +99,7 @@ import { resolveDataBackend, useSharedDocReader } from '../../../utils/envLoader
 import { currentLedger, currentSince, recordRefusal, recordTicket } from './dataBackends/writeLedger';
 import { markBarrier, noteScopeRefusal, noteScopeTicket, pendingFor, saveMark, stampOf, type SaveMark } from './dataBackends/scopeRecord';
 import { assertGuildId, canonicalGuildKey, GuildKeyError, isGuildId, type GuildKey } from './dataKeys';
-import { isMaintenanceGateClosed } from './maintenanceGate';
+import { acceptedOpsRunning, isMaintenanceGateClosed, orderRefusesGlobalWrite, runHeldResave } from './maintenanceGate';
 import { stoppedServing } from './servingGate';
 import type { HeldCounts } from './heldWords';
 import { noteExitDrain } from './dataBackends/mainDatabase';
@@ -372,23 +372,74 @@ export function isExitDraining(): boolean {
 }
 
 /**
- * Maintenance's save: flushes the working set, the row ops and the queued file writes until nothing is held, nothing
- * lands for the drain's give-up window, or boundMs passes. Unlike the exit drain it closes nothing. Answers what is
- * still held.
+ * Maintenance's save: asks each core subsystem to save the change it holds, then flushes the working set, the row ops
+ * and the queued file writes until nothing is held, nothing lands for the drain's give-up window, or boundMs passes.
+ * Unlike the exit drain it closes nothing. Answers what is still held, the subsystems' held files counted as unsaved.
  */
 export async function saveHeldWrites(boundMs: number): Promise<HeldCounts> {
+  resaveHeldChanges();
   await drainUntilSettled(Date.now() + boundMs, { at: Date.now(), landed: landedFlushes() });
   const ws = getWorkingSet();
   const unanswered = ws?.unansweredGuilds() ?? { all: [], only: [] };
   const rows = rowOpsHeld();
   return {
     unsavedGuilds: (ws?.dirtyGuildIds() ?? []).filter(guildId => !unanswered.only.includes(guildId)).length,
-    unsavedFiles: unsavedFileWrites() + rows.unsaved.length,
+    unsavedFiles: unsavedFileWrites() + rows.unsaved.length + heldElsewhere().length,
     unansweredGuilds: unanswered.all.length,
     unconfirmedFiles: unconfirmedFiles(),
     ...((ws?.resaveGuilds().length ?? 0) > 0 ? { resaveGuilds: ws!.resaveGuilds().length } : {}),
     ...(rows.unanswered.length > 0 ? { unansweredFiles: rows.unanswered.length } : {}),
   };
+}
+
+/**
+ * NX5 decision 9: something is held again after a save answered true (a queued write, a row op, a set pending re-save,
+ * a change a core subsystem holds), or an operation it accepted or a subsystem's open work still runs toward a write
+ * (rulings G8-12 and G8-14).
+ */
+export function hasHeldWrites(): boolean {
+  return !writesSettled() || (getWorkingSet()?.resaveGuilds().length ?? 0) > 0 || heldElsewhere().length > 0 || acceptedOpsRunning() > 0
+    || openWorkElsewhere().length > 0;
+}
+
+/** A core subsystem that holds a change it accepted outside the facade's queues and saves it again itself (premium, the Dummy provider). */
+export interface HeldSaver {
+  resaveHeld(): void;
+  /** The files whose accepted change it holds unsaved. */
+  heldFiles(): string[];
+  /** Its open asynchronous work in words, null when none is open (ruling G8-14): it is busy while this is not null. */
+  openWork?(): string | null;
+}
+
+const heldSavers = new Set<HeldSaver>();
+
+export function addHeldSaver(saver: HeldSaver): void {
+  heldSavers.add(saver);
+}
+
+export function removeHeldSaver(saver: HeldSaver): void {
+  heldSavers.delete(saver);
+}
+
+/** NX5 ruling G8-9 (b): the save run asks each subsystem to save what it holds, with the order's refusal passed. */
+function resaveHeldChanges(): void {
+  for (const saver of heldSavers) {
+    try {
+      runHeldResave(() => saver.resaveHeld());
+    } catch (error) {
+      console.error('[Data] A held change could not be saved again:', error);
+    }
+  }
+}
+
+/** The files whose accepted change a core subsystem still holds unsaved, beside the queues' unsaved paths. */
+export function heldElsewhere(): string[] {
+  return [...heldSavers].flatMap(saver => saver.heldFiles());
+}
+
+/** Each busy subsystem's open work in words; empty when none is busy. */
+export function openWorkElsewhere(): string[] {
+  return [...heldSavers].flatMap(saver => saver.openWork?.() ?? []);
 }
 
 let guildWritesClosed = false;
@@ -410,9 +461,13 @@ export function noteGuildDataServing(): void {
   guildDataServing = true;
 }
 
-/** A guild write while the maintenance gate is closed: the data may be moving, so nothing is accepted. */
+/**
+ * A guild write while the maintenance gate is closed: the data may be moving, so nothing is accepted. While a save
+ * order holds, a global write is refused the same way, except an entitlement event's (NX5 ruling G8-8).
+ */
 function refuseInMaintenance(options: DataOptions): void {
   if ((options.scope || 'guild') === 'guild') refuseGuildChangeInMaintenance();
+  else if (orderRefusesGlobalWrite()) throw new DataBackendUnavailableError('maintenance');
 }
 
 /** A guild change (a write, a move to or from the graveyard) while the gate is closed would land after the confirmed save. */

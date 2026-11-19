@@ -51,7 +51,7 @@ const CHILD_STOP_WAIT_MS = 40_000;
 const CHILD_KILL_WAIT_MS = 5_000;
 // The manager's hook call gives up after 30 s; the child bounds its own step to 18 s.
 const MAINTENANCE_IPC_TIMEOUT_MS = 20_000;
-// The child answers maintenance:leave at once and saves behind its closed gate.
+// The child answers maintenance:leave within its 3 s read bound and saves behind its closed gate.
 const LEAVE_IPC_TIMEOUT_MS = 5_000;
 const RESTART_QUEUE_POLL_MS = 100;
 /** A shared op sent to the child: its provider calls (30 s each) and its 8 s confirm fit inside. */
@@ -381,7 +381,16 @@ const countOf = (value: unknown): number => Number(value) || 0;
 export interface MaintenanceLeaveResult {
   restarting: boolean | null;
   note: string;
+  stays?: 'order' | 'login' | 'file';
+  unread?: string;
+  starting?: true;
 }
+
+const STAYS_NOTES: Record<'order' | 'login' | 'file', string> = {
+  order: 'The bot stays in maintenance: the main database holds a maintenance order. It leaves when that order ends.',
+  login: 'The bot stays in maintenance: the main database refuses its login. It leaves once the login is accepted and no maintenance order holds it.',
+  file: 'The bot stays in maintenance: its saved maintenance state still says maintenance. It leaves once that state says running.',
+};
 
 export interface BotStartResult {
   success: boolean;
@@ -1851,14 +1860,20 @@ export class BotManager {
         ...(counts.unconfirmedFiles > 0 ? { unconfirmedFiles: counts.unconfirmedFiles } : {}),
         ...(counts.unansweredFiles > 0 ? { unansweredFiles: counts.unansweredFiles } : {}),
       };
+      // NX5 ruling G8-14: work that still runs is named after what is held; the note has no empty clause.
+      const running = typeof reply?.running === 'string' && reply.running ? `still running and may save changes: ${reply.running}` : '';
       if (reply?.saved === false) {
-        return answered({ saved: false, unsavedGuilds: counts.unsavedGuilds, unsavedFiles: counts.unsavedFiles, ...apart, note: heldClauses(counts) });
+        return answered({
+          saved: false, unsavedGuilds: counts.unsavedGuilds, unsavedFiles: counts.unsavedFiles, ...apart,
+          note: [heldClauses(counts), running].filter(Boolean).join('; '),
+        });
       }
       if (reply?.saved === null && (typeof reply.unansweredGuilds === 'number' || typeof reply.unconfirmedFiles === 'number' || typeof reply.unansweredFiles === 'number')) {
+        const held = heldClauses(counts);
         return answered({
           saved: null, unansweredGuilds: counts.unansweredGuilds, unconfirmedFiles: counts.unconfirmedFiles,
           ...(counts.unansweredFiles > 0 ? { unansweredFiles: counts.unansweredFiles } : {}),
-          note: `${heldClauses(counts)}; can't confirm whether the held changes were saved`,
+          note: [held, running, held ? "can't confirm whether the held changes were saved" : "can't confirm that every change is saved"].filter(Boolean).join('; '),
         });
       }
       console.warn('[BotManager] The bot process answered the maintenance request without a save result');
@@ -1869,9 +1884,10 @@ export class BotManager {
   }
 
   /**
-   * The hook 'running' in the bot process: it answers at once, saves what it holds behind its closed gate and asks for
-   * its restart once nothing is held, or once the database answers and refuses guilds for their content. With no bot
-   * process nothing is started.
+   * The hook 'running' in the bot process: it reads the main database within 3 s and answers whether it leaves, what
+   * holds it, or which read failed; once leaving, it saves what it holds behind its closed gate and asks for its restart
+   * once nothing is held, or once the database answers and refuses guilds for their content. With no bot process
+   * nothing is started.
    */
   async leaveMaintenance(): Promise<MaintenanceLeaveResult> {
     if (!this.isRunning() || !this.botProcess) {
@@ -1883,13 +1899,20 @@ export class BotManager {
       return { restarting: null, note };
     }
     if (!this.stageReached('shared')) {
-      const note = 'The bot process is still starting; it reads maintenance.json as it opens the data files and runs normally.';
+      const note = 'The bot process is still starting; it reads maintenance.json as it opens the data files, and it runs normally unless the main database refuses its login or holds a maintenance order.';
       console.log(`[BotManager] ${note}`);
-      return { restarting: false, note };
+      return { restarting: false, starting: true, note };
     }
     try {
       const reply = await this.sendIPCMessage('maintenance:leave', {}, LEAVE_IPC_TIMEOUT_MS);
       if (reply?.leaving === true) return { restarting: true, note: 'The bot restarts once it has saved what it holds; a change the database refuses for its content is dropped at that restart.' };
+      if (reply?.leaving === false && (reply.heldBy === 'order' || reply.heldBy === 'login' || reply.heldBy === 'file')) {
+        const stays = reply.heldBy as 'order' | 'login' | 'file';
+        return { restarting: false, stays, note: STAYS_NOTES[stays] };
+      }
+      if (reply?.leaving === null && typeof reply.why === 'string') {
+        return { restarting: null, unread: reply.why, note: `Can't confirm whether the bot restarts: it could not read the main database (${reply.why}). It leaves maintenance once a read shows nothing holds it.` };
+      }
       console.warn('[BotManager] The bot process answered the request to leave maintenance without accepting it');
     } catch (error) {
       console.warn(`[BotManager] The request to leave maintenance got no answer from the bot: ${error instanceof Error ? error.message : String(error)}`);

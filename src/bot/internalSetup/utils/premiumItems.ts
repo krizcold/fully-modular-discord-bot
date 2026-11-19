@@ -36,6 +36,8 @@ export interface Item {
   run(): unknown;
   /** Logs that the item did not go out, and answers whoever waits for it. */
   drop(how: DropHow): void;
+  /** Answers whoever waits for it, with no log, when it is forgotten. */
+  forget?(): void;
   /** The audit item's line landed, or its marked copy was queued; for an install line, its entry follows. */
   settledLine?(state: 'landed' | 'gone', ticket?: LedgerTicket): void;
   open: boolean;
@@ -167,6 +169,7 @@ export function dropItems(items: readonly Item[], how: DropHow): void {
 export function forgetItems(items: readonly Item[]): void {
   for (const item of items) {
     item.settledLine?.('gone');
+    item.forget?.();
     close(item);
   }
 }
