@@ -408,6 +408,13 @@ function renderEnv(text: string, spans: EnvSpan[], edits: Map<number, string | n
 
 const listed = (keys: string[]) => keys.join(', ');
 
+/** Why envKeysText refused: the other keys it would change, the set key that misreads, or the removed keys still set. */
+class EnvKeysError extends Error {
+  constructor(message: string, readonly kind: 'others' | 'wrong' | 'still', readonly keys: string[]) {
+    super(message);
+  }
+}
+
 /**
  * /data/.env's text with each changed key written (a string) or removed (null), every other byte kept: the spans
  * dotenv's own parse reads are edited (NB6F V1). `unread` names the provider of a key removed because its entry in the
@@ -464,19 +471,19 @@ export function envKeysText(text: string, changes: Record<string, string | null>
   const out = renderEnv(text, spans, edits, appended);
   const after = dotenv.parse(out);
   const others = outsideKept(after);
-  if (others.length === 1) throw new Error(`Writing ${listed(keys)} would change the value of ${others[0]} in ${envPath}; edit that line of ${envPath}, then run the migration again`);
-  if (others.length > 1) throw new Error(`Writing ${listed(keys)} would change the values of ${listed(others)} in ${envPath}; edit those lines of ${envPath}, then run the migration again`);
+  if (others.length === 1) throw new EnvKeysError(`Writing ${listed(keys)} would change the value of ${others[0]} in ${envPath}; edit that line of ${envPath}, then run the migration again`, 'others', others);
+  if (others.length > 1) throw new EnvKeysError(`Writing ${listed(keys)} would change the values of ${listed(others)} in ${envPath}; edit those lines of ${envPath}, then run the migration again`, 'others', others);
   const wrong = order.find(k => after[k] !== changes[k]);
   if (wrong !== undefined) {
     const tail = wrong === 'DATA_BACKEND'
       ? `edit the DATA_BACKEND lines of ${envPath}, then run the migration again`
       : `change ${wrong} in the premium tab, then run the migration again`;
-    throw new Error(`The value of ${wrong} cannot be written to ${envPath} so that it reads back the same; ${tail}`);
+    throw new EnvKeysError(`The value of ${wrong} cannot be written to ${envPath} so that it reads back the same; ${tail}`, 'wrong', [wrong]);
   }
   const still = keys.filter(k => changes[k] === null && hasOwn(after, k));
   const cleared = still.filter(k => !hasOwn(unread, k));
-  if (cleared.length === 1) throw new Error(`${cleared[0]} was cleared in the database, but a line of ${envPath} still sets it; remove that line, then run the migration again`);
-  if (cleared.length > 1) throw new Error(`${listed(cleared)} were cleared in the database, but lines of ${envPath} still set them; remove those lines, then run the migration again`);
+  if (cleared.length === 1) throw new EnvKeysError(`${cleared[0]} was cleared in the database, but a line of ${envPath} still sets it; remove that line, then run the migration again`, 'still', cleared);
+  if (cleared.length > 1) throw new EnvKeysError(`${listed(cleared)} were cleared in the database, but lines of ${envPath} still set them; remove those lines, then run the migration again`, 'still', cleared);
   if (still.length > 0) {
     const id = unread[still[0]];
     const ofId = still.filter(k => unread[k] === id);
@@ -487,8 +494,13 @@ export function envKeysText(text: string, changes: Record<string, string | null>
   return out;
 }
 
-/** envKeysText over /data/.env as it is (temp file, fsync, rename, fsync of /data), keeping its mode, uid and gid. */
-function writeEnvLines(changes: Record<string, string | null>, unread: Record<string, string>, notUtf8Text: string): void {
+type EnvChanges = Record<string, string | null>;
+
+/**
+ * envKeysText over /data/.env as it is (temp file, fsync, rename, fsync of /data), keeping its mode, uid and gid.
+ * `changes` may be worked out from the file's text.
+ */
+function writeEnvLines(changes: EnvChanges | ((text: string) => EnvChanges), unread: Record<string, string>, notUtf8Text: string): void {
   const envPath = dataPath('.env');
   let raw: Buffer | null = null;
   let keep: { mode: number; uid: number; gid: number } | undefined;
@@ -501,7 +513,7 @@ function writeEnvLines(changes: Record<string, string | null>, unread: Record<st
   }
   const text = raw === null ? '' : envTextOf(raw);
   if (text === null) throw new Error(notUtf8Text);
-  atomicWriteFileSync(envPath, envKeysText(text, changes, unread), keep);
+  atomicWriteFileSync(envPath, envKeysText(text, typeof changes === 'function' ? changes(text) : changes, unread), keep);
 }
 
 /**
@@ -794,33 +806,63 @@ export function validateCredentials(credentials: BotCredentials): CredentialVali
   return { isValid: true, missing: [] };
 }
 
+/** What a save of `credentials` changes in /data/.env's text: each value that differs, and null for each key no longer held. */
+function credentialChanges(text: string, credentials: BotCredentials): EnvChanges {
+  const file = dotenv.parse(text);
+  const changes: EnvChanges = {};
+  for (const [key, value] of Object.entries(credentials)) {
+    if (typeof value !== 'string' || (hasOwn(file, key) && file[key] === value)) continue;
+    if (!/^[\w.-]+$/.test(key)) throw new Error(`${JSON.stringify(key)} is not a key name ${dataPath('.env')} can hold (letters, digits, _, . and - only); nothing was saved`);
+    if (/[\r\n]/.test(value)) throw new Error(`The value of ${key} holds a line break, and a save does not write one; nothing was saved`);
+    // process.env cuts a value at a NUL, and the bot's fork refuses one
+    if (value.includes('\0')) throw new Error(`The value of ${key} holds a NUL character, and a save does not write one; nothing was saved`);
+    if (/\p{Cs}/u.test(value)) throw new Error(`The value of ${key} is not well-formed Unicode text, and a save does not write it; nothing was saved`);
+    changes[key] = value;
+  }
+  for (const key of Object.keys(file)) {
+    if (typeof credentials[key] !== 'string') changes[key] = null;
+  }
+  return changes;
+}
+
+function saveRefusal(error: EnvKeysError): string {
+  const envPath = dataPath('.env');
+  const keys = listed(error.keys);
+  const one = error.keys.length === 1;
+  if (error.kind === 'wrong') return `The value of ${keys} cannot be written to ${envPath} so that it reads back the same; nothing was saved. Change the value, then save again`;
+  if (error.kind === 'others') {
+    return `Saving would change the ${one ? 'value' : 'values'} of ${keys} in ${envPath}; nothing was saved. Edit ${one ? 'that line' : 'those lines'} of ${envPath}, then save again`;
+  }
+  return `${envPath} would still set ${keys} after the save; nothing was saved. Remove ${one ? 'that line' : 'those lines'} from ${envPath}, then save again`;
+}
+
 /**
- * Saves credentials to /data/.env
- * @param credentials Credentials to save
- * @returns Success status
+ * Makes /data/.env hold these credentials and no other key, through envKeysText's writer: a value that differs is
+ * written in the first form that reads back equal, a key no longer held is removed, every other byte stays. Answers
+ * success only when the file reads back each key as given.
  */
 export function saveCredentials(credentials: BotCredentials): { success: boolean; error?: string } {
-  const dataEnvPath = dataPath('.env');
+  const envPath = dataPath('.env');
+  const held = Object.entries(credentials).filter((entry): entry is [string, string] => typeof entry[1] === 'string');
 
   try {
-    // Ensure /data directory exists
-    const dataDir = path.dirname(dataEnvPath);
-    if (!fs.existsSync(dataDir)) {
-      fs.mkdirSync(dataDir, { recursive: true });
+    writeEnvLines(text => credentialChanges(text, credentials), {}, `${envPath} is not valid UTF-8, so it cannot be changed without changing other bytes; nothing was saved. Save the file as UTF-8, then save again`);
+    let back: Record<string, string>;
+    try {
+      back = dotenv.parse(fs.readFileSync(envPath));
+    } catch (error) {
+      throw new Error(`${envPath} was written, but it could not be read back (${causeOf(error)}), so the save can't be confirmed; save again`);
     }
-
-    // Format as env file
-    const envContent = Object.entries(credentials)
-      .filter(([_, value]) => value !== undefined)
-      .map(([key, value]) => `${key}=${value}`)
-      .join('\n');
-
-    fs.writeFileSync(dataEnvPath, envContent + '\n', { encoding: 'utf-8' });
+    const wrong = [
+      ...held.filter(([key, value]) => back[key] !== value).map(([key]) => key),
+      ...Object.keys(back).filter(key => !held.some(([k]) => k === key)),
+    ];
+    if (wrong.length > 0) throw new Error(`${envPath} was written but does not read back ${listed(wrong)} as given; save again`);
     console.log('[EnvLoader] Credentials saved to /data/.env');
 
     return { success: true };
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    const errorMessage = error instanceof EnvKeysError ? saveRefusal(error) : error instanceof Error ? error.message : 'Unknown error';
     console.error('[EnvLoader] Error saving credentials:', errorMessage);
     return { success: false, error: errorMessage };
   }
