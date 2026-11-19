@@ -23,6 +23,8 @@ export function hopFailure(code: unknown, detail?: string): HopFailure | null {
       return { status: 503, error: detail || 'the bot is in maintenance, so nothing was changed' };
     case 'starting':
       return { status: 503, error: detail || 'The bot is starting and has not opened its data files yet; nothing was saved. Try again in a moment.' };
+    case 'refused':
+      return { status: 503, error: detail || "The data layer refused the database; nothing was saved. The bot's log says how to fix it." };
     case 'stopping':
       return { status: 503, error: detail || 'The bot is stopping; nothing was saved. Save again once it has stopped.' };
     case 'held-elsewhere':
