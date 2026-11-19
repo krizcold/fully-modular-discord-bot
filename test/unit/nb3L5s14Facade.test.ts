@@ -85,9 +85,10 @@ describe('dataExists', () => {
     expect(() => dataExists(123 as unknown as string, { guildId: G })).toThrow(TypeError);
   });
 
-  it('does not apply the guild key rules to a global file', () => {
+  it('answers false for a global file name that is an absolute path', () => {
     put(['global', 'x.json'], '{}');
-    expect(dataExists('/x.json', { scope: 'global' })).toBe(true);
+    expect(dataExists('x.json', { scope: 'global' })).toBe(true);
+    expect(dataExists('/x.json', { scope: 'global' })).toBe(false);
   });
 
   it('answers false for a postgres bot with no working set, whatever the files hold', () => {
