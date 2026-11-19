@@ -4,7 +4,7 @@
 
 import * as fs from 'fs';
 import { dataPath } from '../../../utils/dataRoot';
-import { ProcessLock, parseHolder, realSeams, type LockHolder, type LockSeams, type TakeResult } from './processLock';
+import { ProcessLock, parseHolder, realSeams, type LockHolder, type LockSeams, type Staleness, type TakeResult } from './processLock';
 import { answerEndedTries, cancelQueued, queuedFilePaths, queuedFileWrites, fileFlushOnTheWire, pathOnTheWire, type CancelOutcome } from './dataBackends/fileBackend';
 import { closeSharedWritesLost, forgetSharedFileKnowledge, isSharedPath, reopenSharedWrites, useDeposedWrites, useWriterLockCheck } from './dataManager';
 import { deposeRows, reopenRows } from './sharedStore';
@@ -28,6 +28,7 @@ let checkTimer: NodeJS.Timeout | null = null;
 let readErrorLogged: string | null = null;
 let releaseRetry: { timer: NodeJS.Timeout; text: string; logged: string } | null = null;
 let deposedBy: LockHolder | null = null;
+let recreates = 0;
 const deposedListeners: Array<(holder: LockHolder) => void> = [];
 // The paths a deposition cancelled and has not named yet, each with the words of the process that took the lock.
 const unnamedLost = new Map<string, string>();
@@ -97,6 +98,26 @@ export function deposedText(holder: { role?: string; pid: number }): string {
 
 export function writerLockDepth(): number {
   return lock?.depth ?? 0;
+}
+
+/** The exact text this process wrote at its take, while it holds the lock; null otherwise. */
+export function heldText(): string | null {
+  return lock?.heldText ?? null;
+}
+
+/** The logged re-creates of an absent lock file since this process started. */
+export function recreateCount(): number {
+  return recreates;
+}
+
+/** The lock file's text as it stands; throws as the read does. */
+export function readLockText(): string {
+  return fs.readFileSync(writerLockPath(), 'utf-8');
+}
+
+/** The lock file read as a taker reads it (absent, stale, held or unreadable), with no take, create or write. */
+export function probeWriterLock(): Staleness {
+  return theLock().staleness();
 }
 
 /** The holder another process deposed this one with, once it happened. */
@@ -225,6 +246,7 @@ export function checkWriterLock(): CheckResult {
         try {
           const fd = fs.openSync(path, 'wx');
           try { fs.writeSync(fd, written); } finally { fs.closeSync(fd); }
+          recreates += 1;
           console.error(`[Data] ${path} was removed while this process held it; re-created it. Never delete it while a bot, web UI or import of this data runs.`);
           return { kind: 'held' };
         } catch (createError: any) {

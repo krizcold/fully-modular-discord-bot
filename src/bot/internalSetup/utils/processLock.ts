@@ -85,7 +85,7 @@ export function parseHolder(raw: string): LockHolder | null {
   return { pid, start: typeof holder.start === 'string' ? holder.start : null, role: typeof holder.role === 'string' ? holder.role : undefined, at: typeof holder.at === 'number' ? holder.at : undefined };
 }
 
-type Staleness =
+export type Staleness =
   | { state: 'missing' }
   | { state: 'stale'; raw: string }
   | { state: 'held'; holder: LockHolder | null }

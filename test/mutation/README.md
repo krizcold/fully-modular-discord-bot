@@ -911,6 +911,12 @@ whose stage has items with no result; and a dir of a stage the walk does not rea
 did not finish, or one this run makes no use of). Only the last piece of a `.jsonl`, after its last line break, is
 dropped: that is the line the stop cut short.
 
+Stryker can make one mutant twice at a place, under two ids: its Regex mutator does so for a pattern with two like
+alternatives, such as `(?:^|^)`. The gate keeps the key's first mutant: plan.json names it once, a pass on some of
+the mutants lists only its id, and the result of the later one is dropped, so the key is judged once and counts once
+(in a pass on every mutant Stryker still runs the later one's tests, and only its results.jsonl line is dropped). A saved plan.json that holds a key
+twice reads the same way: its first entry stands, and a saved result under the later entry's id is dropped.
+
 A runner.mjs that runs sets writes `runner-<pid>.json` (its process id and start time) in its dir before its first
 set and removes it when it exits. It watches the gate that started it (SMDB_MUTATION_GATE_PID): once that process is
 gone, it ends the set in flight with every process it started, adds no line for it, and exits. A resume, after it
@@ -1031,8 +1037,9 @@ files in `a/`:
   which vitest writes as success true with that test pending); no run when it left no file (the type checker ended
   it, or the pass has not reached it).
 - `--out` gets survivors.json (the gating survivors' keys, keys.mjs, as `b/targets.json` holds them),
-  survivors-context.json (the context ones), mutants.json (every mapped id with its key, place, mutator, replacement,
-  original text, gating, state and `unreached`) and summary.txt, which it also prints. It refuses an `--out` inside
+  survivors-context.json (the context ones), mutants.json (each key once, at its first id, with its place, mutator,
+  replacement, original text, gating, state and `unreached`; a later id Stryker made with the same key counts as
+  mapped, not as a stray) and summary.txt, which it also prints. It refuses an `--out` inside
   the tree, inside its own checkout, or inside the sandbox or the report dir or their checkouts, and writes nowhere
   else: a new file in a tree ends a gate run there NO RESULT. Exit 0 when every mutated file was proven and every id
   in the report dir matched a mapped mutant; 1 when a file was not proven, or when some id matched none, since then

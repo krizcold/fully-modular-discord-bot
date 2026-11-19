@@ -42,7 +42,7 @@ const PROBE_BOUND_MS = 2_000;
 const DRAIN_BOUND_MS = 10_000;
 const INSERT_BATCH = 500;
 const CLIENT_KEEPALIVE_MS = 30_000;
-const COMMIT_BOUND_MS = 120_000;
+export const COMMIT_BOUND_MS = 120_000;
 const ANSWER_BOUND_MS = 120_000;
 const CLOSE_BOUND_MS = 5_000;
 const SECOND_LOOK_MS = 1_000;
@@ -113,12 +113,12 @@ const keysWord = (n: number) => `${n} owner message ${n === 1 ? 'key' : 'keys'}`
 const sameChannel = (a: OwnerChannelValue, b: OwnerChannelValue) =>
   a.kind === b.kind && (a.kind !== 'id' || a.id === (b as { id: string }).id);
 /** Decision 16's refusal of a list; an empty entry is named by decision 18's check, not counted as a live copy. */
-function addressListText(url: string): string {
+export function addressListText(url: string, needs = 'a migration'): string {
   if (parseAddressList(url).some(entry => entry.raw === '')) {
     const named = checkAddressList(url);
     if (named !== null) return named;
   }
-  return `DATA_BACKEND_URL lists ${url.trim().split(/\s*,\s*|\s+/).length} database addresses (live copies on other machines); a migration needs one database address, so remove the live copies first`;
+  return `DATA_BACKEND_URL lists ${url.trim().split(/\s*,\s*|\s+/).length} database addresses (live copies on other machines); ${needs} needs one database address, so remove the live copies first`;
 }
 
 export const JOB_ID = /^[A-Za-z0-9-]{8,40}$/;
@@ -138,6 +138,8 @@ export interface MigrationHost {
   ownerChannelWriteSettled(): boolean;
   /** NB6 decision 39: no shared write of this process waits to be stored and no web UI session's mark is set. */
   sharedWritesSettled(): boolean;
+  /** NB8 C15: a backup restore or take refuses the migration; read in the turn that takes the lock. */
+  backupRefusal?(): string | null;
 }
 
 export interface PgSession {
@@ -338,6 +340,22 @@ export function deriveStatus(facts: DataFacts, opts: { running: { jobId: string 
     ? journal.error ?? 'The job stopped before it finished; run the migration again to finish it'
     : note ?? journal.error ?? 'The job stopped before it finished; the old store still serves';
   return { status: 200, body: { success: true, job: jobView(journal, 'interrupted', journal.stage, error) } };
+}
+
+export type MigrationState =
+  | { kind: 'none' }
+  | { kind: 'running'; jobId: string }
+  | { kind: 'unfinished'; jobId: string; stage: string }
+  | { kind: 'unknown'; cause: string };
+
+/** NB8 C14: whether a data migration runs (`running` is the web UI's lock) or did not finish, for the backups' gates. */
+export function migrationState(running: RunningMigration | null): MigrationState {
+  if (running) return { kind: 'running', jobId: running.jobId };
+  const { status, body } = deriveStatus(readDataFacts(), { running: null, managed: isManaged() });
+  if (status !== 200 || body.success === false) return { kind: 'unknown', cause: String(body.error) };
+  const job = body.job as { jobId: string; state: string; stage: string } | null;
+  if (job && job.state === 'interrupted') return { kind: 'unfinished', jobId: job.jobId, stage: job.stage };
+  return { kind: 'none' };
 }
 
 // ============================================================================
@@ -784,7 +802,7 @@ async function readMetaStoreId(session: PgSession, schema: string): Promise<stri
 }
 
 /** Waits at most boundMs for work; undefined when the bound passed first. */
-async function within<T>(work: Promise<T>, boundMs: number): Promise<{ value: T } | undefined> {
+export async function within<T>(work: Promise<T>, boundMs: number): Promise<{ value: T } | undefined> {
   work.catch(() => undefined);
   let timer: NodeJS.Timeout | undefined;
   try {
@@ -798,7 +816,7 @@ async function within<T>(work: Promise<T>, boundMs: number): Promise<{ value: T 
 }
 
 /** Destroys a session's socket, so the server ends the session and releases its locks. */
-function destroySession(session: PgSession): void {
+export function destroySession(session: PgSession): void {
   try {
     (session as { connection?: { stream?: { destroy?: () => void } } }).connection?.stream?.destroy?.();
   } catch { /* already gone */ }
@@ -2081,6 +2099,8 @@ export class MigrationService {
       if (run.to === to) return { status: 200, body: { success: true, jobId: run.jobId, to: run.to, state: 'running' } };
       return { status: 409, body: { success: false, error: `Migration ${run.jobId} (--to ${run.to}) is running`, jobId: run.jobId, to: run.to } };
     }
+    const backup = this.host.backupRefusal?.() ?? null;
+    if (backup) return { status: 409, body: { success: false, error: backup } };
     if (!this.host.takeMigrationLock({ jobId, to })) {
       const held = this.host.migrationRunning();
       return { status: 409, body: { success: false, error: held ? `Migration ${held.jobId} (--to ${held.to}) is running` : 'A data migration is running', ...(held ?? {}) } };

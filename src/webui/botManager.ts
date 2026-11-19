@@ -6,8 +6,14 @@ import { loadCredentials, validateCredentials, BotCredentials, resolveDataBacken
 import { cancelQueued, droppedByDeposition, fileTicketFailure, fileTicketState, filesPending, queuedFilePaths } from '../bot/internalSetup/utils/dataBackends/fileBackend';
 import { carriedWrites, landed, type LedgerTicket } from '../bot/internalSetup/utils/dataBackends/writeLedger';
 import { EXIT_DEPOSED, isSharedPath, sharedWritesSettled as rowWritesSettled } from '../bot/internalSetup/utils/dataManager';
-import { holderWords, onDeposed, readWriterHolder, releaseWriterLock, takeWriterLock, unconfirmedWords, writerLockPath } from '../bot/internalSetup/utils/writerLock';
-import { syncWords, type SyncKind } from '../bot/internalSetup/utils/folderChain';
+import { holderWords, onDeposed, probeWriterLock, readWriterHolder, releaseWriterLock, takeWriterLock, unconfirmedWords, writerLockPath } from '../bot/internalSetup/utils/writerLock';
+import { containerPath, noteReportedFolderSyncFailure, syncWords, type SyncKind } from '../bot/internalSetup/utils/folderChain';
+import type { TakeAnswer, TakeKind } from '../bot/internalSetup/utils/backups/snapshotTake';
+import {
+  backupWorkRunning, gateRestartText, gateStartText, gateTakeWords, gateWriteText, migrationRefusal, restoreGate, restoreOp,
+  RESTART_DURING_RESTORE_TEXT, stoppedDuringRestoreLine, type ClosedRestoreGate, type RestoreOp,
+} from './backups/restoreState';
+import { readState } from './backups/state';
 import type { CancelOutcome, FileTicket } from '../bot/internalSetup/utils/dataBackends/fileBackend';
 import type { LockHolder } from '../bot/internalSetup/utils/processLock';
 import { applySharedOp, callsProvider, invalidateSharedCaches, partialEnding, partialEndingIn, PROVIDER_SENTENCE } from '../bot/internalSetup/utils/sharedOps';
@@ -110,14 +116,14 @@ const childGone = (child: ChildProcess): boolean => child.exitCode !== null || c
 
 /** The stage a child must have reported before a message type can be sent to it (its handler is registered by then). */
 export function ipcStageOf(type: string): 'shared' | 'guild' {
-  if (type === 'shared:op' || type === 'data:global-read' || type === 'maintenance:enter' || type === 'maintenance:leave') return 'shared';
+  if (type === 'shared:op' || type === 'data:global-read' || type === 'maintenance:enter' || type === 'maintenance:leave' || type === 'backup:take') return 'shared';
   if (type.startsWith('fleet:') || type.startsWith('metrics:')) return 'shared';
   return 'guild';
 }
 
 type ChildStage = 'none' | 'waiting' | 'shared' | 'guild' | 'deposed';
 
-export type RouteCode = 'stopping' | 'starting' | 'held-elsewhere' | 'disk' | 'bot-down';
+export type RouteCode = 'stopping' | 'starting' | 'held-elsewhere' | 'disk' | 'bot-down' | 'restoring';
 export interface RouteRefusal {
   route?: undefined;
   ok: false;
@@ -128,6 +134,23 @@ export interface RouteRefusal {
   lockTake?: { kind: 'unwritable' | 'unreadable' | 'contended' | 'unparsable'; errno?: string };
 }
 export type WriterRoute = { route: 'child' } | { route: 'local' } | RouteRefusal;
+/** routeProbe's answer: a refusal carries decision 31's words for a take's `lastRefusal`. */
+export type ProbeRoute = { route: 'child' } | { route: 'local' } | (RouteRefusal & { words: string });
+type Worded = { route: 'child' } | { route: 'local' } | (RouteRefusal & { words: string });
+
+/** Decision 19: the bot answers `backup:take` within its 10-minute cap; the web UI waits 12 minutes. */
+const TAKE_IPC_MS = 12 * 60_000;
+const lockWords = (): string => containerPath(writerLockPath());
+const FINAL_PASS_CHILD_WORDS = "the bot was started during the backup's final pass.";
+const GATE_CAUSE = 'a backup restore is running or did not finish';
+
+/** What awaitNoChildren() found: every child gone, one not exited, or every one exited with a channel still open. */
+export type ChildrenAnswer = 'gone' | 'running' | 'channel';
+export type RestoreOpAnswer<T> =
+  | { taken: true; value: T }
+  | { taken: false; take: { kind: 'held'; holder: { pid: number; start: string | null; role?: string; at?: number } | null } | { kind: 'previous'; pid: number } | { kind: 'contended' } | { kind: 'unreadable' | 'unwritable'; errno: string } }
+  | { taken: false; exiting: true };
+export type TakeViaAnswer = TakeAnswer | { ok: false; unknown: true; error: string } | { ok: false; notSent: true; error: string };
 
 const refuse = (code: RouteCode, error: string, status = 503): RouteRefusal => ({ ok: false, status, code, error });
 const refuseTake = (code: RouteCode, error: string, lockTake: NonNullable<RouteRefusal['lockTake']>): RouteRefusal => ({ ...refuse(code, error), lockTake });
@@ -292,6 +315,8 @@ const storeDocsLocalText = (cause: string): string =>
 interface LocalEntry {
   label: string;
   provider: boolean;
+  /** A web UI op of its own (a take's final pass, a restore): no reconcile, no land-or-cancel; run answers itself. */
+  raw?: true;
   run: () => Promise<any>;
   /** Routes the request again: the answer of an op taken out of the chain before it started. */
   again: () => Promise<any>;
@@ -384,6 +409,8 @@ export interface BotStatus {
   migration: RunningMigration | null;
   // What the bot process waits for before it opens the data files, or null.
   dataFiles?: { waitingFor: { role: string | null; pid: number } } | { cannotLock: string } | { cannotRead: string } | null;
+  // NB8: the standing backup alert from state.json, and whether a restore is running or did not finish.
+  backups: { alert: { case: 'snapshot-failed' | 'test-failed'; text: string } | null; restoring: boolean | 'unknown' };
 }
 
 export interface LogsResponse {
@@ -396,6 +423,23 @@ export interface LogsResponse {
  * Manages the Discord bot as a child process
  * Handles lifecycle (start, restart, shutdown) and log collection
  */
+/** NB8: getStatus().backups, read in the caller's turn; no alert while state.json cannot be read. */
+function backupsStatus(): BotStatus['backups'] {
+  const gate = restoreGate();
+  const { state, cause } = readState();
+  let alert: BotStatus['backups']['alert'] = null;
+  if (cause === null) {
+    for (const key of ['snapshot-failed', 'test-failed'] as const) {
+      const standing = state.alerts?.[key];
+      if (standing && typeof standing.text === 'string') {
+        alert = { case: key, text: standing.text };
+        break;
+      }
+    }
+  }
+  return { alert, restoring: gate.state === 'clear' ? false : gate.state === 'unknown' ? 'unknown' : true };
+}
+
 /** The bot's entry: dist in production, the TypeScript source under ts-node in development. */
 function botEntry(): { entry: string; isProd: boolean } {
   const isProd = process.env.NODE_ENV !== 'development';
@@ -510,6 +554,8 @@ export class BotManager {
   private stopKind: 'stop' | 'restart' | null = null;
   // Every child this web UI forked whose exit it has not seen.
   private unexitedChildren = new Map<number, ChildProcess>();
+  // NB8 G1 and F2: every child this web UI forked until its exit and its channel's close; the value is its exit seen.
+  private openChildren = new Map<ChildProcess, boolean>();
   // The local chain: the web UI's own changes while no child runs, one at a time under the writer lock.
   private chainQueue: LocalEntry[] = [];
   private chainCurrent: { entry: LocalEntry; done: Promise<void> } | null = null;
@@ -656,10 +702,21 @@ export class BotManager {
   /**
    * Start the bot process
    */
-  async start(): Promise<BotStartResult> {
+  async start(opts: { restoreOp?: RestoreOp; after?: 'crash' | 'restart' } = {}): Promise<BotStartResult> {
     // The process is exiting: a child started now would outlive it.
     if (this.exiting) {
       return { success: false, reason: 'exiting', error: 'The process is exiting' };
+    }
+
+    // NB8 decisions 47, 56 and 65: the restore gate; an automatic start refused during a POST's op marks it stopped.
+    const gate = restoreGate(opts.restoreOp);
+    if (gate.state !== 'clear') {
+      const op = restoreOp();
+      if (opts.after && op?.kind === 'restore' && !op.stopped) {
+        op.stopped = true;
+        console.warn(stoppedDuringRestoreLine(op.name ?? 'the backup'));
+      }
+      return { success: false, reason: 'restoring', error: gateStartText(gate) };
     }
 
     if (this.migrationBlocksStart()) {
@@ -797,6 +854,11 @@ export class BotManager {
 
   /** NB9 26 and 40: one wiring per child; each event is decided by what the child is when it arrives. */
   private attachChild(child: ChildProcess): void {
+    this.openChildren.set(child, false);
+    const closeIfDone = () => {
+      if (this.openChildren.get(child) === true && child.connected !== true) this.openChildren.delete(child);
+    };
+    child.on('disconnect', closeIfDone);
     child.stdout?.on('data', (data: Buffer) => {
       const text = data.toString();
       const logLine = this.standby?.child === child ? `[Standby] ${text}` : text;
@@ -815,6 +877,8 @@ export class BotManager {
     });
 
     child.on('exit', (code, signal) => {
+      if (this.openChildren.has(child)) this.openChildren.set(child, true);
+      closeIfDone();
       if (this.lastChild === child) this.lastChildExited = true;
       if (typeof child.pid === 'number' && this.unexitedChildren.get(child.pid) === child) this.unexitedChildren.delete(child.pid);
       this.failStageWaiters(child);
@@ -842,10 +906,22 @@ export class BotManager {
     child.on('error', (error) => {
       console.error('[BotManager] Bot process error:', error);
       this.addLog(`[BotManager] Process error: ${error.message}`);
+      // A spawn that failed emits 'error' with no 'exit' after it.
+      if (childGone(child) && this.openChildren.has(child)) {
+        this.openChildren.set(child, true);
+        closeIfDone();
+      }
     });
 
     child.on('message', (message: any) => {
       if (!message || typeof message !== 'object') return;
+      if (message.type === 'disk:folder-sync-failed') {
+        const data = message.data;
+        if (this.openChildren.has(child) && typeof data?.dir === 'string' && typeof data.errno === 'string' && typeof data.at === 'number' && Number.isFinite(data.at)) {
+          noteReportedFolderSyncFailure({ dir: data.dir, errno: data.errno, at: data.at });
+        }
+        return;
+      }
       // A draining previous child still reports; only the current one and the standby may move the manager's state.
       if (this.botProcess === child) this.botProcessMessage(child, message);
       else if (this.standby?.child === child) this.standbyMessage(child, message);
@@ -1051,13 +1127,14 @@ export class BotManager {
     if (attempt === null || !Number.isSafeInteger(to) || to < 1) return;
     const living = this.standby !== null && this.standby.attempt === attempt && !childGone(this.standby.child);
     const restarting = child.killed || this.stoppingRestart !== null || this.queuedRestart !== null;
+    const restoring = restoreGate().state !== 'clear';
     const answer = standbyAskVerdict({
       attempt,
       exiting: this.exiting,
       overlapEnded: this.overlapEnded,
       standbyOfAttempt: living,
-      busy: restarting || this.operationInProgress,
-      busyReason: restarting ? 'the bot is being stopped or restarted' : 'another operation is in progress',
+      busy: restarting || this.operationInProgress || restoring,
+      busyReason: restarting ? 'the bot is being stopped or restarted' : this.operationInProgress ? 'another operation is in progress' : GATE_CAUSE,
       forkedFor: this.forkedFor,
       memoryReason: this.memoryReason(),
     });
@@ -1206,7 +1283,9 @@ export class BotManager {
     if (child.killed || this.retiring || this.exiting) return;
     const cause = this.operationInProgress
       ? 'another operation is in progress'
-      : this.stoppingRestart || this.queuedRestart ? 'a restart is under way' : null;
+      : this.stoppingRestart || this.queuedRestart
+        ? 'a restart is under way'
+        : restoreGate().state !== 'clear' ? GATE_CAUSE : null;
     if (cause) {
       if (!this.retireHeldLogged.has(cause)) {
         this.retireHeldLogged.add(cause);
@@ -1246,7 +1325,7 @@ export class BotManager {
         if (standby && standby.attempt !== retiring.attempt) this.stopStandby('the second bot process is not the one for this reshard');
         console.warn(B7_LINE);
       }
-      void this.start();
+      void this.start({ after: 'restart' });
       return;
     }
     this.standby = null;
@@ -1298,7 +1377,7 @@ export class BotManager {
       return;
     }
     this.startingAfterCrash = true;
-    void this.start().then(result => {
+    void this.start({ after: 'crash' }).then(result => {
       if (!result.success && result.reason !== 'already_running') {
         console.error(`[BotManager] The bot did not start again after its crash: ${result.error ?? result.reason ?? 'unknown'}`);
       }
@@ -1328,7 +1407,7 @@ export class BotManager {
         console.log('[BotManager] The start a restart left for after the migration was called off: a stop was requested meanwhile');
         return;
       }
-      void this.start().then(result => {
+      void this.start({ after: 'restart' }).then(result => {
         if (!result.success && result.reason !== 'already_running') {
           console.error(`[BotManager] The bot did not start after the migration: ${result.error ?? result.reason ?? 'unknown'}`);
         }
@@ -1346,10 +1425,16 @@ export class BotManager {
   }
 
   /**
-   * NB5 decisions 16 and 23: in one synchronous step, refuses while a migration holds its lock, else marks an owner
-   * channel setting write in flight. The caller ends the mark once no statement of the write can still run.
+   * NB5 decisions 16 and 23 with NB8 C16: in one synchronous step, refuses while the restore gate is closed or a
+   * migration holds its lock, else marks an owner channel setting write in flight. The caller ends the mark once no
+   * statement of the write can still run.
    */
-  ownerChannelWriteStart(): { ok: true; end: (afterMs?: number) => void } | { ok: false; running: RunningMigration } {
+  ownerChannelWriteStart():
+    | { ok: true; end: (afterMs?: number) => void }
+    | { ok: false; running: RunningMigration }
+    | { ok: false; restore: ClosedRestoreGate } {
+    const restore = restoreGate();
+    if (restore.state !== 'clear') return { ok: false, restore };
     const running = this.migrationRunning();
     if (running) return { ok: false, running };
     this.ownerChannelWrites += 1;
@@ -1485,6 +1570,9 @@ export class BotManager {
     const inFlight = this.stoppingRestart;
     if (inFlight?.stopping()) return inFlight.result;
 
+    const gate = restoreGate();
+    if (gate.state !== 'clear') return { success: false, reason: 'restoring', error: this.isRunning() ? gateRestartText(gate) : gateStartText(gate) };
+
     if (this.migrationBlocksStart()) {
       return { success: false, reason: 'migration_running', error: MIGRATION_RUNNING };
     }
@@ -1520,7 +1608,11 @@ export class BotManager {
         console.log('[BotManager] The restart was called off by a stop requested while the bot drained');
         return { success: false, reason: 'stopped', error: 'A stop was requested while the restart waited for the bot to exit' };
       }
-      const started = await this.start();
+      const started = await this.start(stopped ? { after: 'restart' } : {});
+      const op = restoreOp();
+      if (stopped && !started.success && started.reason === 'restoring' && op?.kind === 'restore' && op.stopped) {
+        return { success: false, reason: 'restoring', error: RESTART_DURING_RESTORE_TEXT };
+      }
       if (stopped && !started.success && started.reason === 'migration_running') {
         this.restartStartDeferred = { stops: this.stopsRequested };
         if (!this.migrationLock) this.releaseMigrationLock();
@@ -1549,6 +1641,10 @@ export class BotManager {
     if (this.migrationBlocksStart()) {
       console.warn('[BotManager] The restart the bot process asked for was refused: a data migration is running');
       return Promise.resolve({ success: false, reason: 'migration_running', error: MIGRATION_RUNNING });
+    }
+    const gate = restoreGate();
+    if (gate.state !== 'clear') {
+      return Promise.resolve({ success: false, reason: 'restoring', error: this.isRunning() ? gateRestartText(gate) : gateStartText(gate) });
     }
     const child = this.botProcess;
     if (this.queuedRestart && this.queuedRestartChild === child) return this.queuedRestart;
@@ -1581,11 +1677,11 @@ export class BotManager {
    * @param emergency If true, use SIGKILL, otherwise SIGTERM
    * @param kind A restart's stop, or a stop; a stop sent while a restart drains makes it a stop
    */
-  async shutdown(emergency: boolean = false, kind: 'stop' | 'restart' = 'stop'): Promise<void> {
+  async shutdown(emergency: boolean = false, kind: 'stop' | 'restart' = 'stop'): Promise<{ killed: boolean }> {
     // Check if another operation is in progress (unless emergency)
     if (!emergency && this.operationInProgress) {
       console.warn('[BotManager] Another operation is in progress, shutdown blocked');
-      return;
+      return { killed: false };
     }
 
     this.cancelCrashRestart();
@@ -1594,7 +1690,7 @@ export class BotManager {
     if (!this.retiring || this.retiring.child !== this.botProcess) this.stopStandby(kind === 'restart' ? 'the bot is restarting' : 'the bot process stopped');
     if (!this.botProcess) {
       console.log('[BotManager] Bot is not running');
-      return;
+      return { killed: false };
     }
 
     // Lock operations for emergency shutdowns
@@ -1606,6 +1702,7 @@ export class BotManager {
     // only ever acts on the one it signalled.
     const child = this.botProcess;
     this.stopKind = kind;
+    let killed = emergency;
     try {
       const signal = emergency ? 'SIGKILL' : 'SIGTERM';
       console.log(`[BotManager] Shutting down bot with ${signal}...`);
@@ -1621,6 +1718,7 @@ export class BotManager {
       if (!gone && !emergency) {
         console.log('[BotManager] Bot did not exit gracefully, forcing shutdown');
         child.kill('SIGKILL');
+        killed = true;
         gone = await this.within(exited, CHILD_KILL_WAIT_MS);
       }
 
@@ -1636,12 +1734,57 @@ export class BotManager {
         // nothing, so requests still waiting on it fail here.
         this.failPendingIpc('bot process was stopped before replying');
       }
+      return { killed };
     } finally {
       // Release lock if emergency
       if (emergency) {
         this.operationInProgress = false;
       }
     }
+  }
+
+  /**
+   * NB8 decisions 27, F1 and F2: waits until every child this web UI forked has exited and closed its channel, after
+   * stopping a standby; answers `running` or `channel` for what still stood at the deadline.
+   */
+  async awaitNoChildren(deadline: number): Promise<ChildrenAnswer> {
+    this.stopStandby('a backup restore is starting');
+    for (;;) {
+      if (this.openChildren.size === 0) return 'gone';
+      if (Date.now() >= deadline) return [...this.openChildren.values()].some(exited => !exited) ? 'running' : 'channel';
+      await this.sleep(Math.max(1, Math.min(50, deadline - Date.now())));
+    }
+  }
+
+  /** NB8 C19: a child this web UI forked (a bot process, a standby) has not exited yet. */
+  hasUnexitedChildren(): boolean {
+    return this.unexitedChildren.size > 0;
+  }
+
+  /** NB8 C15: a data migration's refusal while a restore runs or did not finish, or a take runs; null otherwise. */
+  backupRefusal(): string | null {
+    return migrationRefusal(restoreGate(), backupWorkRunning());
+  }
+
+  /**
+   * NB8 decision 19: a take in the bot process. The child's answer passes through; one that never came, or came with no
+   * result, is can't confirm; a message never sent answers notSent.
+   */
+  async takeSnapshotVia(req: { name: string; kind: TakeKind }): Promise<TakeViaAnswer> {
+    const lead = "can't confirm whether the backup was taken:";
+    let answer: any;
+    try {
+      answer = await this.sendIPCMessage('backup:take', req, TAKE_IPC_MS);
+    } catch (error) {
+      const cause = noAnswerOf(error);
+      if (cause === 'timeout') return { ok: false, unknown: true, error: `${lead} the bot did not answer within 12 minutes.` };
+      if (cause === 'stopped') return { ok: false, unknown: true, error: `${lead} the bot stopped before answering.` };
+      return { ok: false, notSent: true, error: error instanceof Error ? error.message : String(error) };
+    }
+    if (!answer || typeof answer !== 'object' || typeof answer.ok !== 'boolean') {
+      return { ok: false, unknown: true, error: `${lead} the bot answered without a result.` };
+    }
+    return answer as TakeAnswer;
   }
 
   /**
@@ -1777,6 +1920,7 @@ export class BotManager {
             ? { cannotRead: this.childWaitReadCause }
             : this.childWaitHolder ? { waitingFor: { ...this.childWaitHolder } } : null)
         : null,
+      backups: backupsStatus(),
     };
   }
 
@@ -2039,29 +2183,78 @@ export class BotManager {
 
   /** Where a write of a shared file goes now: the child, the local chain, or a refusal (decision 5 of NB10). */
   writerRoute(kind: 'shared' | 'guild', options: { postgresGuild?: boolean } = {}): WriterRoute {
-    if (this.exiting) return refuse('stopping', ROUTE_TEXT.exiting);
+    const route = this.routeWithWords(kind, options, 'take');
+    if (route.route !== undefined) return route;
+    const { words: _words, ...refusal } = route;
+    return refusal;
+  }
+
+  /** NB8 decision 41: writerRoute's rules with the writer lock only read, never taken; a refusal carries its words. */
+  routeProbe(kind: 'shared' | 'guild'): ProbeRoute {
+    return this.routeWithWords(kind, {}, 'probe');
+  }
+
+  /** The route's rules; 'take' takes the writer lock for a local route, 'probe' reads it. Words are decision 31's. */
+  private routeWithWords(kind: 'shared' | 'guild', options: { postgresGuild?: boolean }, mode: 'take' | 'probe'): Worded {
+    const say = (refusal: RouteRefusal, words: string): Worded => ({ ...refusal, words });
+    if (this.exiting) return say(refuse('stopping', ROUTE_TEXT.exiting), 'the web panel was shutting down.');
+    const gate = restoreGate();
+    if (gate.state !== 'clear') return say(refuse('restoring', gateWriteText(gate)), gateTakeWords(gate));
     const child = this.isRunning() ? this.botProcess : null;
-    if (child && this.stopKind) return refuse('stopping', this.stopKind === 'restart' ? ROUTE_TEXT.restarting : ROUTE_TEXT.stopping);
-    if (child && this.childStage === 'deposed' && this.childDeposedHolder) return refuse('held-elsewhere', deposedRouteText(this.childDeposedHolder));
-    if (this.chainDeposed) return refuse('held-elsewhere', deposedRouteText({ role: this.chainDeposed.role ?? null, pid: this.chainDeposed.pid }));
+    if (child && this.stopKind) {
+      return this.stopKind === 'restart'
+        ? say(refuse('stopping', ROUTE_TEXT.restarting), 'the bot was restarting.')
+        : say(refuse('stopping', ROUTE_TEXT.stopping), 'the bot was stopping.');
+    }
+    const heldWords = (holder: { role?: string | null; pid: number }) => `another process held the data files (${routeHolderWords(holder)}, pid ${holder.pid}).`;
+    if (child && this.childStage === 'deposed' && this.childDeposedHolder) {
+      return say(refuse('held-elsewhere', deposedRouteText(this.childDeposedHolder)), heldWords(this.childDeposedHolder));
+    }
+    if (this.chainDeposed) {
+      const holder = { role: this.chainDeposed.role ?? null, pid: this.chainDeposed.pid };
+      return say(refuse('held-elsewhere', deposedRouteText(holder)), heldWords(holder));
+    }
     if (child) {
       if (this.childStage === 'guild' || (this.childStage === 'shared' && kind === 'shared')) return { route: 'child' };
       if (this.childStage === 'waiting') {
-        if (this.childWaitCause) return refuse('disk', waitingDiskText(this.childWaitCause));
-        if (this.childWaitReadCause) return refuse('held-elsewhere', waitingReadText(this.childWaitReadCause));
-        return refuse('starting', waitingText(this.childWaitHolder));
+        if (this.childWaitCause) return say(refuse('disk', waitingDiskText(this.childWaitCause)), `the bot was waiting for the data disk to take writes (${lockWords()}: ${this.childWaitCause}).`);
+        if (this.childWaitReadCause) return say(refuse('held-elsewhere', waitingReadText(this.childWaitReadCause)), `can't confirm which process holds the data files (${lockWords()}: ${this.childWaitReadCause}).`);
+        const holder = this.childWaitHolder;
+        return say(refuse('starting', waitingText(holder)), `the bot was waiting for ${holder ? `${holderWords({ role: holder.role ?? undefined })} (pid ${holder.pid})` : 'another process'} to release the data files.`);
       }
-      return refuse('starting', ROUTE_TEXT.starting);
+      return say(refuse('starting', ROUTE_TEXT.starting), 'the bot was starting and had not opened its data files yet.');
     }
-    if (kind === 'guild' && options.postgresGuild) return refuse('bot-down', 'the bot process is not running');
+    if (kind === 'guild' && options.postgresGuild) return say(refuse('bot-down', 'the bot process is not running'), 'the bot was not running.');
     if (this.chainHolds) return { route: 'local' };
+    const previousWords = (pid: number) => `a previous bot process this web panel started (pid ${pid}) had not exited yet.`;
     const previousText = (pid: number) => `A previous bot process this web UI started (pid ${pid}) has not exited yet and still holds the data files; nothing was saved. Try again once it has exited.`;
+    const contendedWords = 'another process was taking the data files.';
+    const unreadable = (errno: string): Worded => say(
+      refuseTake('held-elsewhere', `Can't confirm which process holds the data files (${writerLockPath()}: ${errno}); nothing was saved. Check that the web UI can read that file.`, { kind: 'unreadable', errno }),
+      `can't confirm which process holds the data files (${lockWords()}: ${errno}).`,
+    );
+    const held = (holder: LockHolder | null): Worded => {
+      if (!holder) return say(refuseTake('held-elsewhere', ROUTE_TEXT.unparsable, { kind: 'unparsable' }), contendedWords);
+      if (this.unexitedChildren.has(holder.pid)) return say(refuse('held-elsewhere', previousText(holder.pid)), previousWords(holder.pid));
+      return say(refuse('held-elsewhere', `Another process holds the data files (${routeHolderWords(holder)}, pid ${holder.pid}); nothing was saved. Stop that process or wait until it ends, then try again.`), heldWords(holder));
+    };
+    const free = (): Worded | null => {
+      const previous = [...this.unexitedChildren.keys()][0];
+      if (previous === undefined) return null;
+      return say(refuse('held-elsewhere', `A previous bot process this web UI started (pid ${previous}) has not exited yet and may still open the data files; nothing was saved. Try again once it has exited.`), previousWords(previous));
+    };
+    if (mode === 'probe') {
+      const lock = probeWriterLock();
+      if (lock.state === 'missing' || lock.state === 'stale') return free() ?? { route: 'local' };
+      if (lock.state === 'unreadable') return unreadable(lock.errno);
+      return held(lock.holder);
+    }
     const taken = takeWriterLock();
     if (taken.kind === 'taken') {
-      const previous = [...this.unexitedChildren.keys()][0];
-      if (previous !== undefined) {
+      const previous = free();
+      if (previous) {
         releaseWriterLock();
-        return refuse('held-elsewhere', `A previous bot process this web UI started (pid ${previous}) has not exited yet and may still open the data files; nothing was saved. Try again once it has exited.`);
+        return previous;
       }
       this.chainHolds = true;
       this.chainReconciled = false;
@@ -2069,19 +2262,85 @@ export class BotManager {
     }
     switch (taken.kind) {
       case 'held':
-        if (!taken.holder) return refuseTake('held-elsewhere', ROUTE_TEXT.unparsable, { kind: 'unparsable' });
-        if (this.unexitedChildren.has(taken.holder.pid)) return refuse('held-elsewhere', previousText(taken.holder.pid));
-        return refuse('held-elsewhere', `Another process holds the data files (${routeHolderWords(taken.holder)}, pid ${taken.holder.pid}); nothing was saved. Stop that process or wait until it ends, then try again.`);
+        return held(taken.holder);
       case 'contended':
-        return refuseTake('held-elsewhere', ROUTE_TEXT.contended, { kind: 'contended' });
+        return say(refuseTake('held-elsewhere', ROUTE_TEXT.contended, { kind: 'contended' }), contendedWords);
       case 'unreadable':
-        return refuseTake('held-elsewhere', `Can't confirm which process holds the data files (${writerLockPath()}: ${taken.errno}); nothing was saved. Check that the web UI can read that file.`, { kind: 'unreadable', errno: taken.errno });
+        return unreadable(taken.errno);
       case 'unwritable':
       default: {
         const errno = (taken as { errno: string }).errno;
-        return refuseTake('disk', `The data disk does not take writes (${writerLockPath()}: ${errno}); nothing was saved. Check the disk, then try again.`, { kind: 'unwritable', errno });
+        return say(
+          refuseTake('disk', `The data disk does not take writes (${writerLockPath()}: ${errno}); nothing was saved. Check the disk, then try again.`, { kind: 'unwritable', errno }),
+          `the data disk did not take writes (${lockWords()}: ${errno}).`,
+        );
       }
     }
+  }
+
+  isExiting(): boolean {
+    return this.exiting;
+  }
+
+  /**
+   * NB8 decisions 18 and 38: the local take's final op, routed as a shared write. On `local` it runs as a raw entry of
+   * the chain in the same turn; a child or a refusal answers the words the take records.
+   */
+  async queueFinalOp<T>(fn: () => Promise<T>): Promise<{ ran: true; value: T } | { ran: true; error: unknown } | { ran: false; words: string }> {
+    const route = this.routeWithWords('shared', {}, 'take');
+    if (route.route === 'child') return { ran: false, words: FINAL_PASS_CHILD_WORDS };
+    if (route.route === undefined) return { ran: false, words: route.words };
+    return this.enqueueLocal({
+      label: "the backup's final pass",
+      provider: false,
+      raw: true,
+      run: async () => {
+        try {
+          return { ran: true, value: await fn() };
+        } catch (error) {
+          return { ran: true, error };
+        }
+      },
+      again: () => this.queueFinalOp(fn),
+    });
+  }
+
+  /**
+   * NB8 decisions 27 and 29, C19: a restore's or recovery's op in the local chain. It skips the route (the gate refuses
+   * every other write), takes the writer lock in the caller's turn, and runs nothing while a child this web UI forked
+   * has not exited.
+   */
+  async runRestoreOp<T>(fn: () => Promise<T>): Promise<RestoreOpAnswer<T>> {
+    if (this.exiting) return { taken: false, exiting: true };
+    if (!this.chainHolds) {
+      const taken = takeWriterLock();
+      if (taken.kind === 'held') return { taken: false, take: { kind: 'held', holder: taken.holder } };
+      if (taken.kind === 'contended') return { taken: false, take: { kind: 'contended' } };
+      if (taken.kind !== 'taken') return { taken: false, take: { kind: taken.kind, errno: taken.errno } };
+      const previous = [...this.unexitedChildren.keys()][0];
+      if (previous !== undefined) {
+        releaseWriterLock();
+        return { taken: false, take: { kind: 'previous', pid: previous } };
+      }
+      this.chainHolds = true;
+      this.chainReconciled = false;
+    }
+    const ran: { value: T } | { error: unknown } | { refused: RestoreOpAnswer<T> } = await this.enqueueLocal({
+      label: 'the backup restore',
+      provider: false,
+      raw: true,
+      run: async () => {
+        try {
+          return { value: await fn() };
+        } catch (error) {
+          return { error };
+        }
+      },
+      again: async () => ({ refused: await this.runRestoreOp(fn) }),
+    });
+    if ('refused' in ran) return ran.refused;
+    if ('error' in ran) throw ran.error;
+    return { taken: true, value: ran.value };
   }
 
   /** Queues a local op; the chain takes it in order and answers after its land-or-cancel step. */
@@ -2101,9 +2360,15 @@ export class BotManager {
       let opStarted = false;
       try {
         const reconcile = { end: Promise.resolve() };
-        const unreconciled = await this.reconcileAfterTake(end => { reconcile.end = end; });
+        const unreconciled = entry.raw ? null : await this.reconcileAfterTake(end => { reconcile.end = end; });
         opStarted = !unreconciled;
-        if (unreconciled) {
+        if (entry.raw) {
+          try {
+            entry.resolve(await entry.run());
+          } finally {
+            invalidateSharedCaches();
+          }
+        } else if (unreconciled) {
           entry.resolve(unreconciled);
           // A mirror moved aside before the reconcile's bound is still written: the lock stays held until its pass ends.
           await reconcile.end;

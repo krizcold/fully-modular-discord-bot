@@ -16,6 +16,9 @@ function resolveDataRoot(): string {
 
 export const DATA_ROOT = resolveDataRoot();
 
+/** The data root as the container mounts it, for texts that name a data path. */
+export const CONTAINER_DATA_ROOT = '/data';
+
 export function dataPath(...segments: string[]): string {
   return path.join(DATA_ROOT, ...segments);
 }

@@ -254,7 +254,7 @@ describe('the delete through config.ts', () => {
   });
 
   it.each([
-    [{ ok: true, moveUnconfirmed: 'EIO' }, { success: true, warning: "The disk did not confirm the move of this server's folder (EIO), so a power cut can undo the delete. Check the disk." }],
+    [{ ok: true, moveUnconfirmed: 'EIO' }, { success: true, warning: "The disk did not confirm the move of this server's folder (EIO), so a power cut can undo the delete. Check the disk, then restart the machine." }],
     [{ ok: true }, { success: true }],
   ] as const)('D2: an ok reply %j answers 200 with %j', async (reply, body) => {
     const app = await deleteApp(reply);

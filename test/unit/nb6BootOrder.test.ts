@@ -136,9 +136,9 @@ describe('cell 440\'s registration (D4) and decision 14\'s order', () => {
     await boot();
     await vi.waitFor(() => expect(h.order).toContain('startSharedPass'));
     const { stopSharedPass } = await import('../../src/bot/internalSetup/utils/sharedMirror');
-    expect(h.stopSteps).toHaveLength(2);
-    expect(h.stopSteps[1]).toBe(stopSharedPass);
-    expect(nb6()).toEqual(['addStopStep', 'bootShards', 'addStopStep', 'bootShared', 'populate', 'loadModules', 'startSharedPass']);
+    expect(h.stopSteps).toHaveLength(3);
+    expect(h.stopSteps[2]).toBe(stopSharedPass);
+    expect(nb6()).toEqual(['addStopStep', 'addStopStep', 'bootShards', 'addStopStep', 'bootShared', 'populate', 'loadModules', 'startSharedPass']);
   });
 
   it('a stop ends bootShared: nothing after it runs', async () => {
@@ -146,7 +146,7 @@ describe('cell 440\'s registration (D4) and decision 14\'s order', () => {
     await boot();
     await vi.waitFor(() => expect(h.order).toContain('bootShared'));
     await new Promise(resolve => setTimeout(resolve, 20));
-    expect(nb6()).toEqual(['addStopStep', 'bootShards', 'addStopStep', 'bootShared']);
+    expect(nb6()).toEqual(['addStopStep', 'addStopStep', 'bootShards', 'addStopStep', 'bootShared']);
   });
 });
 
@@ -173,7 +173,7 @@ describe('cell 462: a JSON bot (guard)', () => {
     await boot();
     await vi.waitFor(() => expect(h.order).toContain('loadModules'));
     await new Promise(resolve => setTimeout(resolve, 20));
-    expect(h.stopSteps).toHaveLength(1);
+    expect(h.stopSteps).toHaveLength(2);
     expect(h.order).not.toContain('startSharedPass');
   });
 });

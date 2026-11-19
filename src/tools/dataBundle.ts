@@ -7,11 +7,11 @@
 
 import { Client, resolveTarget } from '../cli/client';
 import { bundleRefusal, importBundle, readBundle, writeBundle } from '../bot/internalSetup/utils/dataInterchange';
-import { FolderSyncError } from '../bot/internalSetup/utils/folderChain';
+import { FolderSyncError, setDiskRole } from '../bot/internalSetup/utils/folderChain';
 
 async function refuseIfUnsafe(guildId: string): Promise<void> {
   const panel = await new Client(resolveTarget({})).panelAnswers();
-  const refusal = bundleRefusal(guildId, panel.bot, panel.migration);
+  const refusal = bundleRefusal(guildId, panel.bot, panel.migration, panel.restoring);
   if (refusal) {
     console.error(`Refused: ${refusal}`);
     process.exit(1);
@@ -47,6 +47,7 @@ async function main(): Promise<void> {
       return;
     }
     await refuseIfUnsafe(first.value.guildId);
+    setDiskRole('a data bundle import');
     let result: Awaited<ReturnType<typeof importBundle>>;
     try {
       result = await importBundle(a);

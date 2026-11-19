@@ -24,6 +24,7 @@ import { createManagedRoutes } from './routes/managed';
 import { createMigrateRoutes } from './routes/migrate';
 import { MigrationService } from '../bot/internalSetup/utils/dataMigration';
 import { createGraveyardRoutes } from './routes/graveyard';
+import { createBackupRoutes } from './routes/backups';
 import { requireAuth } from './middleware/auth';
 import { adminPageFallback, pathGuard, pathMiss } from './middleware/pathGuard';
 import { configureOAuth, isGuildWebUIEnabled } from './auth/oauthConfig';
@@ -212,6 +213,7 @@ export async function createServer(botManager: BotManager): Promise<Express> {
   app.use('/api/fleet', requireAuth, createFleetRoutes(botManager));
   app.use('/api/data/graveyard', requireAuth, createGraveyardRoutes(botManager));
   app.use('/api/data/migrate', requireAuth, createMigrateRoutes(botManager, migration));
+  app.use('/api/backups', requireAuth, createBackupRoutes(botManager));
 
   // Manager-facing surface. NOT requireAuth:
   // this one carries its own per-instance token check, because it is reached

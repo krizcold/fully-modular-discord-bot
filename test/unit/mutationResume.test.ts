@@ -4,7 +4,7 @@ import os from 'os';
 import path from 'path';
 import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import {
-  a2Dir, boundedDir, chainOf, controlLines, keysOf, lockOf, mutantDir, nextDir, planOf, resultLines, resumeNumber, savedRun, setKey, setLines, setupChanges, someOf,
+  a2Dir, boundedDir, chainOf, controlLines, keysOf, lockOf, mutantDir, nextDir, onePerKey, planOf, resultLines, resumeNumber, savedRun, setKey, setLines, setupChanges, someOf,
   STAGE_DIR, stageOf,
   type PlannedMutant, type SavedResult, type StageDir,
 } from '../mutation/resume.mjs';
@@ -143,16 +143,27 @@ describe('a dir of a Stryker stage', () => {
   it('ran for its targets, or with none for every mutant its plan holds, and settles with no result a target its plan lacks', () => {
     const plan = [planned('k1', '1'), planned('k2', '2')];
     expect(mutantDir({ dir: 'a', targets: null, plan, results: [result('k1', '1')], done: false }))
-      .toEqual({ dir: 'a', forKeys: ['k1', 'k2'], lines: [result('k1', '1')], missing: [], done: false });
-    expect(mutantDir({ dir: 'a2', targets: ['k2', 'k9'], plan, results: [], done: true })).toEqual({ dir: 'a2', forKeys: ['k2', 'k9'], lines: [], missing: ['k9'], done: true });
+      .toEqual({ dir: 'a', forKeys: ['k1', 'k2'], lines: [result('k1', '1')], missing: [], done: false, plan });
+    expect(mutantDir({ dir: 'a2', targets: ['k2', 'k9'], plan, results: [], done: true })).toEqual({ dir: 'a2', forKeys: ['k2', 'k9'], lines: [], missing: ['k9'], done: true, plan });
     // Stopped before its plan: it knows its targets, and none is settled.
-    expect(mutantDir({ dir: 'b', targets: ['k1'], plan: null, results: [], done: false })).toEqual({ dir: 'b', forKeys: ['k1'], lines: [], missing: [], done: false });
-    expect(mutantDir({ dir: 'a', targets: null, plan: null, results: [], done: false })).toEqual({ dir: 'a', forKeys: null, lines: [], missing: [], done: false });
+    expect(mutantDir({ dir: 'b', targets: ['k1'], plan: null, results: [], done: false })).toEqual({ dir: 'b', forKeys: ['k1'], lines: [], missing: [], done: false, plan: null });
+    expect(mutantDir({ dir: 'a', targets: null, plan: null, results: [], done: false })).toEqual({ dir: 'a', forKeys: null, lines: [], missing: [], done: false, plan: null });
   });
 
-  it('cannot be read with results but no plan, a plan with a mutant twice, or a result whose id is not its key\'s in the plan', () => {
+  it('reads a plan that holds a key twice as its first entry, and drops a result for the later entry\'s id', () => {
+    const plan = [planned('k1', '1'), planned('k2', '2'), planned('k1', '3')];
+    const read = mutantDir({ dir: 'a', targets: null, plan, results: [result('k1', '3', 'Killed'), result('k1', '1'), result('k2', '2')], done: true });
+    expect(read).toEqual({ dir: 'a', forKeys: ['k1', 'k2'], lines: [result('k1', '1'), result('k2', '2')], missing: [], done: true, plan: [planned('k1', '1'), planned('k2', '2')] });
+    const stage = stageOf([read as StageDir], null);
+    expect('problem' in stage ? stage : [stage.targets, stage.settled.size, stage.missing, stage.done]).toEqual([['k1', 'k2'], 2, [], true]);
+    // Stopped with only the later entry's result: the key runs again.
+    expect(mutantDir({ dir: 'a', targets: null, plan, results: [result('k1', '3')], done: false })).toEqual({ dir: 'a', forKeys: ['k1', 'k2'], lines: [], missing: [], done: false, plan: [planned('k1', '1'), planned('k2', '2')] });
+    const text = JSON.stringify(plan);
+    expect(onePerKey(planOf(text) ?? [])).toEqual([planned('k1', '1'), planned('k2', '2')]);
+  });
+
+  it('cannot be read with results but no plan, or a result whose id is not its key\'s in the plan', () => {
     expect(mutantDir({ dir: 'a', targets: null, plan: null, results: [result('k1', '1')], done: false })).toEqual({ problem: 'a/ holds results but no plan.json, so what their ids name is not known' });
-    expect(mutantDir({ dir: 'a', targets: null, plan: [planned('k1', '1'), planned('k1', '2')], results: [], done: false })).toEqual({ problem: 'a/plan.json holds the mutant k1 twice' });
     expect(mutantDir({ dir: 'a2', targets: ['k1'], plan: [planned('k1', '1')], results: [result('k1', '4')], done: false })).toEqual({ problem: 'a2/results.jsonl gives k1 the id 4, but its plan gives it 1' });
   });
 });
@@ -201,6 +212,8 @@ describe('a stage on a resume', () => {
 });
 
 describe('the reporter', () => {
+  // Stryker's plan counts from 0, its results from 1: the place a result at place(line) has in the plan.
+  const fromZero = (line: number) => ({ start: { line: line - 1, column: 1 }, end: { line: line - 1, column: 7 } });
   afterEach(() => vi.unstubAllEnvs());
 
   const reporter = async () => {
@@ -257,6 +270,34 @@ describe('the reporter', () => {
     r.onMutantTested(tested('1', 'Killed', 4));
     r.onMutantTested(tested('2', 'Survived', 5));
     expect(resultLines(fs.readFileSync(path.join(dir, 'results.jsonl'), 'utf8')).lines).toEqual([{ key: 'src/a.ts|BlockStatement|{}|4:2-4:8', id: '1', status: 'Killed' }]);
+  });
+
+  it('plans a key Stryker made twice once, at its first mutant, and writes no line for the later one', async () => {
+    const dir = outDir();
+    const r = await reporter();
+    const planned = (id: string, line: number) => ({ plan: 'Run', mutant: { id, fileName: path.join(root, 'src', 'a.ts'), mutatorName: 'BlockStatement', replacement: '{}', location: fromZero(line) } });
+    r.onMutationTestingPlanReady({ mutantPlans: [planned('1', 4), planned('2', 5), planned('3', 4)] });
+    expect(JSON.parse(fs.readFileSync(path.join(dir, 'plan.json'), 'utf8')).map((m: PlannedMutant) => [m.id, m.key])).toEqual([
+      ['1', 'src/a.ts|BlockStatement|{}|4:2-4:8'], ['2', 'src/a.ts|BlockStatement|{}|5:2-5:8'],
+    ]);
+    r.onMutantTested(tested('3', 'Killed', 4));
+    r.onMutantTested(tested('1', 'Survived', 4));
+    r.onMutantTested(tested('2', 'Killed', 5));
+    expect(resultLines(fs.readFileSync(path.join(dir, 'results.jsonl'), 'utf8')).lines.map(l => [l.id, l.status])).toEqual([['1', 'Survived'], ['2', 'Killed']]);
+  });
+
+  it('in a pass on some of the mutants, lists the id of a key Stryker made twice once', async () => {
+    const dir = outDir();
+    const targets = path.join(dir, 'targets.json');
+    fs.writeFileSync(targets, JSON.stringify(['src/a.ts|BlockStatement|{}|4:2-4:8']));
+    vi.stubEnv('SMDB_MUTATION_TARGETS', targets);
+    vi.stubEnv('SMDB_MUTATION_RUN', path.join(dir, 'run-ids.json'));
+    const r = await reporter();
+    const planned = (id: string) => ({ plan: 'Run', mutant: { id, fileName: path.join(root, 'src', 'a.ts'), mutatorName: 'BlockStatement', replacement: '{}', location: fromZero(4) } });
+    r.onMutationTestingPlanReady({ mutantPlans: [planned('1'), planned('2')] });
+    expect(JSON.parse(fs.readFileSync(path.join(dir, 'run-ids.json'), 'utf8'))).toEqual(['1']);
+    r.onMutantTested(tested('2', 'Killed', 4));
+    expect(fs.existsSync(path.join(dir, 'results.jsonl'))).toBe(false);
   });
 
   it('writes nothing where no pass dir is named', async () => {

@@ -23,6 +23,11 @@ export interface CliResponse {
 
 export class LoopbackError extends Error {}
 
+export class RequestTimeoutError extends Error {}
+
+/** The shortest wait for an answer any verb gives a request. */
+export const MIN_REQUEST_MS = 3000;
+
 export function resolveTarget(opts: { url?: string; port?: string; defaultPort?: number }): Target {
   if (opts.url) {
     let parsed: URL;
@@ -49,13 +54,16 @@ export class Client {
   }
 
   /** Whether the bot child runs, from the panel's /api/bot/status: running true is yes, running false is no, anything else (no answer, an error status, a timeout, an unreadable body) is unknown. */
-  async botAnswers(timeoutMs = 3000): Promise<'yes' | 'no' | 'unknown'> {
+  async botAnswers(timeoutMs = MIN_REQUEST_MS): Promise<'yes' | 'no' | 'unknown'> {
     return (await this.panelAnswers(timeoutMs)).bot;
   }
 
-  /** botAnswers, and whether the panel runs a data migration: its status's migration (null is no, a job is yes, anything else unknown). */
-  panelAnswers(timeoutMs = 3000): Promise<{ bot: 'yes' | 'no' | 'unknown'; migration: 'yes' | 'no' | 'unknown' }> {
-    const unknown = { bot: 'unknown' as const, migration: 'unknown' as const };
+  /**
+   * botAnswers, whether the panel runs a data migration (its status's migration: null is no, a job is yes, anything else
+   * unknown) and whether a backup restore stands (backups.restoring: true is yes, false is no, anything else unknown).
+   */
+  panelAnswers(timeoutMs = MIN_REQUEST_MS): Promise<{ bot: 'yes' | 'no' | 'unknown'; migration: 'yes' | 'no' | 'unknown'; restoring: 'yes' | 'no' | 'unknown' }> {
+    const unknown = { bot: 'unknown' as const, migration: 'unknown' as const, restoring: 'unknown' as const };
     return new Promise((resolve) => {
       const req = http.request(
         { host: this.target.host, port: this.target.port, method: 'GET', path: '/api/bot/status', headers: { Accept: 'application/json' } },
@@ -66,12 +74,14 @@ export class Client {
           res.on('end', () => {
             if (res.statusCode !== 200) return resolve(unknown);
             try {
-              const status = (JSON.parse(Buffer.concat(chunks).toString('utf8')) as { status?: { running?: unknown; migration?: unknown } })?.status;
+              const status = (JSON.parse(Buffer.concat(chunks).toString('utf8')) as { status?: { running?: unknown; migration?: unknown; backups?: { restoring?: unknown } } })?.status;
               const running = status?.running;
               const migration = status?.migration;
+              const restoring = status?.backups?.restoring;
               resolve({
                 bot: running === true ? 'yes' : running === false ? 'no' : 'unknown',
                 migration: migration === null ? 'no' : migration && typeof migration === 'object' ? 'yes' : 'unknown',
+                restoring: restoring === true ? 'yes' : restoring === false ? 'no' : 'unknown',
               });
             } catch {
               resolve(unknown);
@@ -130,7 +140,7 @@ export class Client {
         },
       );
       req.on('error', reject);
-      if (opts.timeoutMs) req.setTimeout(opts.timeoutMs, () => req.destroy(new Error(`no answer within ${Math.round(opts.timeoutMs! / 1000)}s`)));
+      if (opts.timeoutMs) req.setTimeout(opts.timeoutMs, () => req.destroy(new RequestTimeoutError(`no answer within ${Math.round(opts.timeoutMs! / 1000)}s`)));
       if (payload) req.write(payload);
       req.end();
     });

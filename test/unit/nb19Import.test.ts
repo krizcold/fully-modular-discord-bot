@@ -12,7 +12,7 @@ vi.mock('../../src/cli/client', async orig => {
 import { importBundle, writeBundle } from '../../src/bot/internalSetup/utils/dataInterchange';
 import { dispatch } from '../../src/cli/commands';
 import { EXIT_ERR } from '../../src/cli/output';
-import { FolderSyncError, syncWords } from '../../src/bot/internalSetup/utils/folderChain';
+import { FolderSyncError, resetFolderSyncFailureForTests, syncWords } from '../../src/bot/internalSetup/utils/folderChain';
 import { DATA_ROOT, dataPath } from '../../src/utils/dataRoot';
 import { setBackendKind } from '../helpers/backendKind';
 import { stubAppendHandles, type AppendStub } from '../helpers/fileHandleStub';
@@ -77,6 +77,8 @@ afterEach(() => {
   stub.restore();
   vi.restoreAllMocks();
   setBackendKind(null);
+  fs.rmSync(dataPath('_snapshots'), { recursive: true, force: true });
+  resetFolderSyncFailureForTests();
 });
 
 describe.skipIf(!POSIX)('rows 45 to 47: the bundle import', () => {

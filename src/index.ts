@@ -33,6 +33,18 @@ import { exitProcess, setSharedWriteGate } from './bot/internalSetup/utils/dataM
 import { carryWrites, runSealed, writesOf } from './bot/internalSetup/utils/dataBackends/writeLedger';
 import { truthText, verdictOf } from './bot/internalSetup/utils/dataBackends/replyGate';
 import { holderWords, readWriterHolder } from './bot/internalSetup/utils/writerLock';
+import { removeOtherBootRecords, setDiskRole } from './bot/internalSetup/utils/folderChain';
+import { restoreGate, restoreLatch, restoreOp, setRestoreOp } from './webui/backups/restoreState';
+import { beginRecovery, MAIN_SKIP_LINE, safeModeLine, type RecoveryEnd } from './webui/backups/restore';
+import { startScheduler } from './webui/backups/scheduler';
+
+/** NB8 decisions 44 and 62: the populate refused while a restore runs, did not finish or cannot be confirmed. */
+function populateRestoreLine(): string {
+  const gate = restoreGate();
+  return gate.state === 'unknown'
+    ? `[Main] Skipped populating config.json: can't confirm whether a backup restore is running (/data/_snapshots/restore.json: ${gate.cause}); the bot populates it at its start`
+    : '[Main] Skipped populating config.json: a backup restore is running or did not finish; the bot populates it at its start';
+}
 
 /** The populate as a local op: it holds the data files' lock at most 8 s plus a flush, and main() does not wait for it. */
 function populateConfig(botManager: BotManager): void {
@@ -51,6 +63,8 @@ function populateConfig(botManager: BotManager): void {
     const take = answer?.lockTake;
     if (answer?.ok) {
       console.log(unchanged ? '[Main] config.json populate: every key is present; nothing written' : '[Main] config.json populate: saved');
+    } else if (answer?.code === 'restoring') {
+      console.log(populateRestoreLine());
     } else if (take) {
       console.log(`[Main] Skipped populating config.json: ${populateTakeCause(take)}`);
     } else if (answer?.code === 'held-elsewhere' || answer?.code === 'starting') {
@@ -65,6 +79,9 @@ function populateConfig(botManager: BotManager): void {
 }
 
 async function main() {
+  // NB8 N6: a disk error recorded in this boot stands for this process too; earlier boots' records go.
+  setDiskRole('web panel');
+  removeOtherBootRecords();
   // Outside a change the web UI applies itself, this process writes no data file.
   setSharedWriteGate(absPath => inLocalOp(absPath));
   console.log('='.repeat(60));
@@ -89,6 +106,9 @@ async function main() {
   // Create bot manager with safe mode awareness
   const botManager = new BotManager(isSafeMode);
 
+  // NB8 decision 49: an open or unreadable restore journal is recovered before the populate and before any route.
+  const recovery: Promise<RecoveryEnd> | null = beginRecovery(botManager);
+
   // The Config tab can show a full config.json before the bot starts; the bot populates it at its own start too.
   console.log('[Main] Synchronizing config.json with schema...');
   populateConfig(botManager);
@@ -102,14 +122,32 @@ async function main() {
     exitProcess(1);
   }
 
-  // Skip bot start if in safe mode
-  if (isSafeMode) {
+  // NB8 decision 57: the backup schedule runs from here, also while main() waits for recovery.
+  startScheduler(botManager);
+
+  // NB8 decisions 49, 58 and 67: the bot starts after recovery, with recovery's op as its own, unless it latched.
+  const recovered = recovery ? await recovery : null;
+  const op = restoreOp();
+  const clearOp = () => { if (op && restoreOp() === op) setRestoreOp(null); };
+  if (recovered === 'exiting') {
+    clearOp();
+  } else if (recovered && restoreLatch()) {
+    console.log(MAIN_SKIP_LINE);
+    clearOp();
+  } else if (isSafeMode) {
+    if (recovered) console.log(safeModeLine());
+    clearOp();
     console.log('[Main] [Warning] Safe mode active - Bot will NOT auto-start');
     console.log('[Main] [Warning] Use Web-UI to manually start bot or trigger rollback');
   } else {
     // Try to start bot if credentials are configured
     console.log('[Main] Attempting to start bot...');
-    const result = await botManager.start();
+    let result: Awaited<ReturnType<BotManager['start']>>;
+    try {
+      result = await botManager.start(recovered && op ? { restoreOp: op } : {});
+    } finally {
+      clearOp();
+    }
 
     if (result.success) {
       if (result.waiting || result.waitingFor || result.cannotLock || result.cannotRead) {

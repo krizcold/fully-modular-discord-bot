@@ -9,7 +9,7 @@ const PANEL = fileURLToPath(new URL('../../src/webui/public/components/ConfigPan
 const G1 = '111111111111111111';
 const G2 = '222222222222222222';
 const FILES = [{ id: 'x.json', name: 'X', category: 'data', moduleName: 'mod', exists: true }];
-const W = "The disk did not confirm the move of this server's folder (EIO), so a power cut can undo the delete. Check the disk.";
+const W = "The disk did not confirm the move of this server's folder (EIO), so a power cut can undo the delete. Check the disk, then restart the machine.";
 
 async function deleteGuild(answer: unknown) {
   const { calls, api } = heldApi();

@@ -15,7 +15,7 @@ const PANEL = PUBLIC('components/ConfigPanel.jsx');
 const G1 = '111111111111111111';
 const G2 = '222222222222222222';
 const FILES = [{ id: 'x.json', name: 'X', category: 'data', moduleName: 'mod', exists: true }];
-const WARNING = "The disk did not confirm the move of this server's folder (EIO), so a power cut can undo the restore. Check the disk.";
+const WARNING = "The disk did not confirm the move of this server's folder (EIO), so a power cut can undo the restore. Check the disk, then restart the machine.";
 const local = (ms: number) => new Date(ms).toLocaleString();
 
 const graveyardRestore = () => require(PUBLIC('utils/graveyardRestore.js')) as {

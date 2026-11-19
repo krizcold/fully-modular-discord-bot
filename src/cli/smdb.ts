@@ -31,7 +31,10 @@ Usage:     usage global | usage guilds | usage guild <guildId>
 Fleet:     fleet state
 Data:      bundle export <guildId> <file> | bundle import <file>
            data migrate --to postgres|file   (bot stopped; exits 0 only when the migration is done)
+           data provision   (creates an empty store in the database DATA_BACKEND_URL names, without serving it)
            graveyard list | graveyard restore <guildId> [retiredAt | --retired-at MS] [--replace]
+Backups:   backups list | backups restore <name> | backups settings --body '{"enabled":true,"hour":4,"expected":{...}}'
+           (backups restore waits until the restore ends or stops on a disk error, at most 2 hours; exits 0 only when it finished)
 Raw:       api <METHOD> <path> [--body JSON] | events [--filter PREFIX] [--timeout S]
            wait --get <path> --until <expr> [--interval MS] [--timeout S] | health
 

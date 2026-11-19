@@ -3,7 +3,7 @@
  * on async verbs) and poll a GET route until a condition holds (`wait --until`).
  */
 
-import { Client } from './client';
+import { Client, RequestTimeoutError } from './client';
 
 export interface WaitOutcome {
   ok: boolean;
@@ -63,13 +63,27 @@ function evalCondition(expr: string, data: unknown): boolean {
   return Boolean(fn(data));
 }
 
+/**
+ * With `requestMinMs`, each GET waits for its answer until the deadline, or `requestMinMs` when less is left, and a
+ * GET that gets no answer in that time ends the poll unmatched with `timedOut` and the last body read.
+ */
 export async function pollUntil(
   client: Client,
-  opts: { path: string; expr: string; intervalMs: number; timeoutMs: number },
-): Promise<{ ok: boolean; body: unknown }> {
+  opts: { path: string; expr: string; intervalMs: number; timeoutMs: number; requestMinMs?: number },
+): Promise<{ ok: boolean; body: unknown; timedOut?: boolean }> {
   const deadline = Date.now() + opts.timeoutMs;
+  let last: unknown;
   for (;;) {
-    const res = await client.request('GET', opts.path);
+    let res;
+    try {
+      res = opts.requestMinMs
+        ? await client.request('GET', opts.path, { timeoutMs: Math.max(opts.requestMinMs, deadline - Date.now()) })
+        : await client.request('GET', opts.path);
+    } catch (err) {
+      if (err instanceof RequestTimeoutError) return { ok: false, body: last, timedOut: true };
+      throw err;
+    }
+    last = res.body;
     let matched = false;
     try {
       matched = evalCondition(opts.expr, res.body);

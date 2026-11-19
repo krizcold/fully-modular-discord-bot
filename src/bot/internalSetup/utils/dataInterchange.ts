@@ -16,7 +16,8 @@ import { MIGRATION_FILE, readDataFacts } from './dataBackends/recognitionGuard';
 import { resolveDataBackend, type DataBackendKind } from '../../../utils/envLoader';
 import { assertGuildId, canonicalGuildKey, GuildKeyError, isGuildId } from './dataKeys';
 import { decodeStorable, keyRefusal, KeyTree, pathKeyOf } from './storableData';
-import { FolderSyncError, syncFolder, syncFolderChain, syncFoldersUnder, syncWords, writeFileSynced, type ChainAnswer } from './folderChain';
+import { containerPath, FolderSyncError, syncFolder, syncFolderChain, syncFoldersUnder, syncWords, writeFileSynced, type ChainAnswer } from './folderChain';
+import { isOpenStage, readRestoreJournal, restoreJournalPath } from './backups/restoreJournal';
 
 export interface FileRecord {
   guildId: string;
@@ -229,11 +230,17 @@ interface BundleSummary {
  * reads and writes /data/<guild> directly, so it is only true to its word for a
  * file-routed guild with no bot process beside it.
  */
-export function bundleRefusal(guildId: string, botRunning: 'yes' | 'no' | 'unknown', migrating: 'yes' | 'no' | 'unknown' = 'no'): string | null {
+export function bundleRefusal(
+  guildId: string,
+  botRunning: 'yes' | 'no' | 'unknown',
+  migrating: 'yes' | 'no' | 'unknown' = 'no',
+  restoring: 'yes' | 'no' | 'unknown' = 'no',
+): string | null {
   if (!isGuildId(guildId)) return `"${guildId}" is not a guild id`;
   const facts = readDataFacts();
   if (!facts.ok) return facts.reason;
   if (migrating === 'yes') return 'a data migration is running; run the bundle once it ends';
+  if (restoring === 'yes') return 'a backup restore is running or did not finish; run the import or export once it has finished';
   const marker = facts.marker;
   let route: DataBackendKind;
   try {
@@ -247,6 +254,7 @@ export function bundleRefusal(guildId: string, botRunning: 'yes' | 'no' | 'unkno
   if (botRunning === 'yes') return 'the bot is running; stop it first, a bundle beside it would miss its queued writes or be overwritten by them';
   if (botRunning === 'unknown') return 'could not confirm the bot is stopped (the panel did not answer or gave no clear reply); start the panel (/webui start) or stop the bot first';
   if (migrating === 'unknown') return 'could not confirm that no data migration is running (the panel gave no clear reply)';
+  if (restoring === 'unknown') return "can't confirm whether a backup restore is running (the web panel's status did not confirm it); run the import or export once it does";
   return null;
 }
 
@@ -425,6 +433,8 @@ export async function importBundle(filePath: string): Promise<BundleImportResult
   const taken = takeWriterLock();
   if (taken.kind !== 'taken') throw new Error(`[DataInterchange] ${importLockRefusal(taken)}`);
   try {
+    const restore = importRestoreRefusal();
+    if (restore) throw new Error(`[DataInterchange] ${restore}`);
     return await importBundleHeld(filePath);
   } finally {
     releaseWriterLock();
@@ -444,6 +454,18 @@ function importLockRefusal(taken: Exclude<TakeResult, { kind: 'taken' }>): strin
     case 'unwritable':
       return `the data disk does not take writes (${writerLockPath()}: ${taken.errno}); nothing was imported`;
   }
+}
+
+/** Why a backup restore keeps this import out, read from restore.json in the turn of the lock take, or null. */
+function importRestoreRefusal(): string | null {
+  const read = readRestoreJournal();
+  if (read.state === 'unreadable') {
+    return `can't confirm whether a backup restore is running (${containerPath(restoreJournalPath())}: ${read.cause}); run the import once that file can be read`;
+  }
+  if (read.state === 'read' && isOpenStage(read.journal.stage)) {
+    return `a backup restore is running or did not finish (${containerPath(restoreJournalPath())}); run the import once it has finished`;
+  }
+  return null;
 }
 
 /** Throws when another process took the data files from this import: no guild dir is moved after that. */

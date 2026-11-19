@@ -40,7 +40,7 @@ describe('the restore route', () => {
   it('D1: an ok reply naming an unconfirmed move answers 200 with the restore warning', async () => {
     const res = await restore(() => ({ ok: true, retiredAt: 5, reason: 'r', moveUnconfirmed: 'EIO' }), { guildId: G, retiredAt: 5 });
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ success: true, retiredAt: 5, reason: 'r', warning: "The disk did not confirm the move of this server's folder (EIO), so a power cut can undo the restore. Check the disk." });
+    expect(res.body).toEqual({ success: true, retiredAt: 5, reason: 'r', warning: "The disk did not confirm the move of this server's folder (EIO), so a power cut can undo the restore. Check the disk, then restart the machine." });
   });
 
   it('a refused retiredAt answers success false, never success', async () => {

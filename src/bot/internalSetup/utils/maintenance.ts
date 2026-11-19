@@ -21,6 +21,7 @@ import { addressListInUse, parseAddressList, showEntry } from '../../../utils/da
 import { heldClauses, type HeldCounts } from './heldWords';
 import { STOPPED_SERVING_TEXT, stoppedServing } from './servingGate';
 import { setupSharedOpsIPC } from './sharedOps';
+import { setupBackupIPC } from './ipcBackupHandler';
 import { reportWriterStage } from './writerLock';
 import { countCrash } from './moduleCrashes';
 import { getWorkingSet } from './dataBackends/workingSet';
@@ -333,8 +334,8 @@ export async function handleMaintenanceIpc(message: unknown): Promise<{ requestI
     return { requestId, data: { leaving: true } };
   }
   if (!isMaintenanceBoot()) return null;
-  // The shared handler answers these itself, in maintenance too.
-  if (type === 'shared:op' || type === 'data:global-read') return null;
+  // Their own handlers answer these, in maintenance too.
+  if (type === 'shared:op' || type === 'data:global-read' || type === 'backup:take') return null;
   return { requestId, data: maintenanceIpcRefusal(type) ?? { success: false, error: 'the bot is in maintenance' } };
 }
 
@@ -751,6 +752,7 @@ export async function runMaintenanceBoot(
     ? '[Maintenance] Booting in maintenance mode: the saved state says maintenance'
     : '[Maintenance] Booting in maintenance mode: the database refused the login');
   setupMaintenanceIPC();
+  setupBackupIPC();
   setupSharedOpsIPC();
   reportWriterStage('shared');
   reportWriterStage('guild');

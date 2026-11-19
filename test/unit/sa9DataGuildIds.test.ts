@@ -56,13 +56,12 @@ describe('a guild key that leaves the guild folder', () => {
 });
 
 describe('a guild id that is not a Discord id', () => {
-  it('is refused whatever the scope says, so the global folder is not read as a guild', () => {
+  it("a scope other than 'guild' and 'global' is refused by name, so the global folder is not read as a guild", () => {
     plant(dataPath('global', 'sa9-scope.json'), '{"leaked":true}');
     const { value, errors } = errorsOf(() => dm.loadData('sa9-scope.json', { scope: 'module' as any, guildId: 'global' }, { leaked: false }));
     expect(value).toEqual({ leaked: false });
     expect(errors).toHaveLength(1);
-    expect(errors[0][1]).toBeInstanceOf(GuildKeyError);
-    expect((errors[0][1] as Error).message).toBe('[Data] The guild id "global" is not a Discord id; refused');
+    expect(errors[0][0]).toBe(`[Data] Refused a read of sa9-scope.json: the data scope "module" is neither 'guild' nor 'global'; serving the default`);
   });
 
   it("a file queue question for no guild id answers the guild id's refusal", () => {

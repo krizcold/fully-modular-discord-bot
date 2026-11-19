@@ -147,8 +147,8 @@ function resetCalls() {
 }
 
 describe('the stop steps main() adds (tests run in order: during the boot, then after it)', () => {
-  it('during the boot, before the metrics start: one stop step and three release steps (the watch\'s stop, NB7\'s answer writes, then the claims), added with no signal listener of its own', async () => {
-    await vi.waitFor(() => expect(h.stopSteps).toHaveLength(1));
+  it('during the boot, before the metrics start: two stop steps (the drain\'s and the backup abort\'s) and three release steps (the watch\'s stop, NB7\'s answer writes, then the claims), added with no signal listener of its own', async () => {
+    await vi.waitFor(() => expect(h.stopSteps).toHaveLength(2));
     expect(h.ingestStarted).toBe(false);
     expect(h.releaseSteps).toHaveLength(3);
     expect(h.signals.get('SIGTERM') ?? []).toHaveLength(0);
@@ -173,7 +173,7 @@ describe('the stop steps main() adds (tests run in order: during the boot, then 
   it('after the boot: the samplers stop, the totals flush while the maintenance gate is open and not while it is closed', async () => {
     h.releaseBoot();
     await vi.waitFor(() => expect(h.ingestStarted).toBe(true));
-    expect(h.stopSteps).toHaveLength(1);
+    expect(h.stopSteps).toHaveLength(2);
     resetCalls();
     h.gateClosed = false;
     await h.stopSteps[0]();

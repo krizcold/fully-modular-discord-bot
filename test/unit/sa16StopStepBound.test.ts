@@ -104,7 +104,7 @@ afterAll(() => { vi.restoreAllMocks(); });
 
 describe('sa16 the stop step main() adds, with a gateway close that never answers', () => {
   it('sa16 goes on 2 s after it began closing the gateway, not before', async () => {
-    await vi.waitFor(() => expect(h.stopSteps).toHaveLength(1), { timeout: 5000, interval: 5 });
+    await vi.waitFor(() => expect(h.stopSteps).toHaveLength(2), { timeout: 5000, interval: 5 });
     h.close = new Promise<void>(() => undefined);
     h.closes.length = 0;
     vi.useFakeTimers();

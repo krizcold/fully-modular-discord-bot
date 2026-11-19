@@ -22,7 +22,7 @@ const N_READ_BOUND_MS = 5000;
 
 /** The warning of a restore or a delete whose folder move the disk did not confirm. */
 export function moveUnconfirmedText(code: string, what: 'restore' | 'delete'): string {
-  return `The disk did not confirm the move of this server's folder (${code}), so a power cut can undo the ${what}. Check the disk.`;
+  return `The disk did not confirm the move of this server's folder (${code}), so a power cut can undo the ${what}. Check the disk, then restart the machine.`;
 }
 
 /** The web UI's own refusal of a restore or a server's data delete while the bot starts or stops: hopFailure's words are a save's. */

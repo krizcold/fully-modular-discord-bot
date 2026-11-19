@@ -10,6 +10,8 @@ if (!node) {
   console.error(`The test suite needs Node 22.12 or newer (this is ${process.version}); set SMDB_TEST_NODE to a newer node binary.`);
   process.exit(1);
 }
+const sites = spawnSync(process.execPath, [path.join(__dirname, 'checkSyncSites.cjs')], { cwd: __dirname, stdio: 'inherit' });
+if (sites.status !== 0) process.exit(1);
 const vitest = path.join(__dirname, 'node_modules', 'vitest', 'vitest.mjs');
 const run = spawnSync(node, [vitest, 'run', ...process.argv.slice(2)], { cwd: __dirname, stdio: 'inherit' });
 process.exit(run.status === null ? 1 : run.status);

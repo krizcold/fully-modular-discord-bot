@@ -14,6 +14,7 @@ import { OWNER_KEY_PREFIX, OWNER_KEYS_DAYS, OWNER_KEYS_MAX } from '../../bot/int
 import { rowBackend } from '../../bot/internalSetup/utils/sharedStore';
 import type { SharedStatement } from '../../bot/internalSetup/utils/dataBackends/postgresBackend';
 import type { RunningMigration } from '../../bot/internalSetup/utils/dataMigration';
+import { gateOwnerChannelText, restoreGate, type ClosedRestoreGate } from '../backups/restoreState';
 import {
   CHOOSING_REFUSAL, chooseNow, getWebuiDataReader, resolveWebuiDatabase, unreachableReason, webuiChildCase,
   webuiFirstCheck, webuiReportCount, webuiSecondCheck, type WebuiCheckRefusal, type WebuiResolution,
@@ -224,7 +225,10 @@ export function writeOwnerChannelFile(channelId: string | null): void {
 
 export interface OwnerChannelHost {
   migrationRunning(): RunningMigration | null;
-  ownerChannelWriteStart(): { ok: true; end: (afterMs?: number) => void } | { ok: false; running: RunningMigration };
+  ownerChannelWriteStart():
+    | { ok: true; end: (afterMs?: number) => void }
+    | { ok: false; running: RunningMigration }
+    | { ok: false; restore: ClosedRestoreGate };
 }
 
 export interface RouteAnswer {
@@ -237,10 +241,15 @@ const migrationText = (running: RunningMigration) => `A data migration is runnin
 const cantUse = (reason: string) => `The setting is kept in the bot's main database, which the web panel cannot use now (${reason}); nothing was changed`;
 const confirming = (reason: string) => `The setting is kept in the bot's main database, which the bot process is still confirming (${reason}); nothing was changed`;
 
+const markRefused = (mark: { running: RunningMigration } | { restore: ClosedRestoreGate }): RouteAnswer =>
+  refused(409, 'restore' in mark ? gateOwnerChannelText(mark.restore) : migrationText(mark.running));
+
 const checkRefused = (check: WebuiCheckRefusal): RouteAnswer => refused(503, check.held ? confirming(check.refusal) : cantUse(check.refusal));
 
 /** The first check, before the test post, on what is known then. */
 function firstCheck(host: OwnerChannelHost, postgres: boolean): RouteAnswer | null {
+  const restore = restoreGate();
+  if (restore.state !== 'clear') return refused(409, gateOwnerChannelText(restore));
   const running = host.migrationRunning();
   if (running) return refused(409, migrationText(running));
   if (!postgres) return null;
@@ -310,7 +319,7 @@ async function putOnce(host: OwnerChannelHost, value: unknown): Promise<RouteAns
 
   if (!postgres) {
     const mark = host.ownerChannelWriteStart();
-    if (!mark.ok) return withPrefix(refused(409, migrationText(mark.running)));
+    if (!mark.ok) return withPrefix(markRefused(mark));
     try {
       writeOwnerChannelFile(channelId);
     } catch (error) {
@@ -326,7 +335,7 @@ async function putOnce(host: OwnerChannelHost, value: unknown): Promise<RouteAns
   const second = secondCheck(host, resolution, countAtStart);
   if (!('entry' in second)) return withPrefix(second);
   const mark = host.ownerChannelWriteStart();
-  if (!mark.ok) return withPrefix(refused(409, migrationText(mark.running)));
+  if (!mark.ok) return withPrefix(markRefused(mark));
   const entry = second.entry;
   const outcome = await writeOwnerChannelRow(entry, channelId);
   if (outcome.kind === 'unknown') {
