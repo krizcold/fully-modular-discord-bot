@@ -6,95 +6,13 @@
   <title>Discord Bot System Settings</title>
   <link rel="stylesheet" href="/assets/styles.css">
   <link rel="stylesheet" href="/styles/update-panel.css">
-  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-  <!-- Pinned to Babel 7: Babel 8 defaults preset-react to the automatic runtime,
-       which injects `import {jsx} from "react/jsx-runtime"` and breaks these classic
-       (global-scope) text/babel scripts. -->
-  <script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
 </head>
 <body>
   <div id="toast-container"></div>
   <div id="root"></div>
+  <!-- React and ReactDOM, then the page's own script: both built by "npm run build:webui" -->
+  <script src="/assets/vendor.js"></script>
   <script src="/build-info.js"></script>
-  <script src="/utils/api.js"></script>
-  <script src="/utils/graveyardRestore.js"></script>
-  <script src="/utils/websocket.js"></script>
-  <script src="/utils/discordFormatters.js"></script>
-  <script>
-    // Third arg: number (duration ms) or { duration?, sticky? }. Sticky toasts do not auto-dismiss.
-    window.showToast = function(message, type, opts) {
-      type = type || 'info';
-      var sticky = false;
-      var duration;
-      if (typeof opts === 'number') {
-        duration = opts;
-      } else if (opts && typeof opts === 'object') {
-        sticky = !!opts.sticky;
-        duration = opts.duration;
-      }
-      if (duration == null) {
-        if (type === 'error') duration = 10000;
-        else if (type === 'warning') duration = 12000;
-        else duration = 6000;
-      }
-      var container = document.getElementById('toast-container');
-      if (!container) return;
-      var el = document.createElement('div');
-      el.className = 'toast toast-' + type + (sticky ? ' toast-sticky' : '');
-      el.textContent = message;
-      if (sticky) {
-        var close = document.createElement('span');
-        close.textContent = ' \u00D7';
-        close.style.marginLeft = '10px';
-        close.style.cursor = 'pointer';
-        close.style.fontWeight = 'bold';
-        el.appendChild(close);
-      }
-      el.onclick = function() { dismiss(); };
-      container.appendChild(el);
-      var timer = sticky ? null : setTimeout(dismiss, duration);
-      function dismiss() {
-        if (timer) clearTimeout(timer);
-        if (!el.parentNode) return;
-        el.classList.add('toast-out');
-        el.addEventListener('animationend', function() { el.remove(); });
-      }
-    };
-  </script>
-  <!-- Shared UI helpers (loaded before any component that uses them) -->
-  <script type="text/babel" src="/assets/utils/uiHelpers.jsx"></script>
-  <!-- Components -->
-  <script type="text/babel" src="/components/BotControlPanel.jsx"></script>
-  <script type="text/babel" src="/components/DataBackupsPanel.jsx"></script>
-  <!-- Credentials Panel Components -->
-  <script type="text/babel" src="/components/credentials/BotCredentialsSection.jsx"></script>
-  <script type="text/babel" src="/components/credentials/OAuthCredentialsSection.jsx"></script>
-  <script type="text/babel" src="/components/credentials/OwnerMessagesSection.jsx"></script>
-  <script type="text/babel" src="/components/CredentialsPanel.jsx"></script>
-  <script type="text/babel" src="/components/ConfigPanel.jsx"></script>
-  <script type="text/babel" src="/components/LogsPanel.jsx"></script>
-  <!-- Update Panel Components -->
-  <script type="text/babel" src="/components/update/UpdateStatus.jsx"></script>
-  <script type="text/babel" src="/components/update/UpdateBackups.jsx"></script>
-  <script type="text/babel" src="/components/UpdatePanel.jsx"></script>
-  <!-- Panel System Components -->
-  <script type="text/babel" src="/assets/components/panels/PanelComponents.jsx"></script>
-  <script type="text/babel" src="/assets/components/panels/PanelRenderer.jsx"></script>
-  <script type="text/babel" src="/assets/components/panels/PanelViewer.jsx"></script>
-  <script type="text/babel" src="/assets/components/panels/PanelList.jsx"></script>
-  <script type="text/babel" src="/components/PanelsPanel.jsx"></script>
-  <!-- Premium Tier Components (loaded before AppStorePanel) -->
-  <script type="text/babel" src="/components/premium/PremiumComponents.jsx"></script>
-  <!-- App Store Components -->
-  <script type="text/babel" src="/components/AppStorePanel.jsx"></script>
-  <!-- Dev Modules -->
-  <script type="text/babel" src="/components/DevModulesPanel.jsx"></script>
-  <!-- Usage Tab Components -->
-  <script type="text/babel" src="/components/usage/UsageCharts.jsx"></script>
-  <script type="text/babel" src="/components/usage/FleetView.jsx"></script>
-  <script type="text/babel" src="/components/UsagePanel.jsx"></script>
-  <!-- Main App -->
-  <script type="text/babel" src="/app.jsx"></script>
+  <script src="/admin.js"></script>
 </body>
 </html>

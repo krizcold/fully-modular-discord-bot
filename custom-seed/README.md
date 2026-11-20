@@ -29,6 +29,11 @@ applied version. On mismatch (a fresh image, or a code update), it:
 - `bot/internalSetup/` is locked. Anything you put under
   `/app/custom/bot/internalSetup/` is silently ignored to keep the
   system stable.
+- The web panel's scripts are built with the image, from `/app/src`. A
+  `.jsx` or `.js` file under `webui/public/` that is part of a built
+  script does not change the pages, and a page placed here that loads a
+  script inline or from another site has that script blocked by the
+  browser. Stylesheets, images and pages placed here still apply.
 - This directory is never modified by the bot or the bot manager. It is
   yours.
 

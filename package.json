@@ -4,12 +4,14 @@
   "description": "Multi-purpose Discord bot TypeScript base, designed to be modular and easy to work with.",
   "main": "index.js",
   "scripts": {
-    "build": "tsc && npm run copy-assets",
+    "build": "tsc && npm run copy-assets && npm run build:webui",
+    "build:webui": "node scripts/buildFrontend.cjs",
     "build-prod": "tsc",
     "copy-assets": "mkdir -p dist/webui/public && cp -r src/webui/public/* dist/webui/public/ && find src/bot/modules -name 'module.json' -exec sh -c 'mkdir -p dist/bot/modules/$(dirname {} | sed \"s|src/bot/modules/||\") && cp {} dist/bot/modules/$(dirname {} | sed \"s|src/bot/modules/||\")/' \\; && find src/bot/modules -name 'settingsSchema.json' -exec sh -c 'mkdir -p dist/bot/modules/$(dirname {} | sed \"s|src/bot/modules/||\") && cp {} dist/bot/modules/$(dirname {} | sed \"s|src/bot/modules/||\")/' \\;",
     "start": "node dist/index.js",
     "cli": "node dist/cli/smdb.js",
     "start:watch": "tsc --watch & nodemon --watch dist dist/index.js",
+    "predev": "npm run build:webui",
     "dev": "cross-env NODE_ENV=development nodemon --watch src --ext ts,json --ignore src/bot/config.json --exec ts-node -r tsconfig-paths/register src/index.ts",
     "dev:bot": "cross-env NODE_ENV=development nodemon --watch src/bot --ext ts,json --ignore src/bot/config.json --exec ts-node -r tsconfig-paths/register src/bot/index.ts",
     "dockerPublish": "dotenv node scripts/dockerPublish.js",
@@ -57,7 +59,10 @@
     "@types/ws": "^8.5.10",
     "cross-env": "^7.0.3",
     "dotenv-cli": "^8.0.0",
+    "esbuild": "^0.28.2",
     "nodemon": "^3.1.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
     "ts-node": "^10.9.2",
     "typescript": "^5.7.3"
   }

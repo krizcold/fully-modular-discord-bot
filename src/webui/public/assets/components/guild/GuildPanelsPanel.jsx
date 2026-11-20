@@ -1,6 +1,6 @@
 // Guild Panels Panel Component - Panel management for guild context
 
-const { useState, useEffect } = React;
+var { useState, useEffect } = React;
 
 function GuildPanelsPanel({ guild, user, onBack }) {
   const [panels, setPanels] = useState([]);

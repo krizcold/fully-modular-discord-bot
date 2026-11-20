@@ -1,4 +1,4 @@
-const { useState, useEffect } = React;
+var { useState, useEffect } = React;
 
 // Top-level tabs that map 1:1 to a URL path. Order drives the tab strip.
 const APP_TABS = ['dashboard', 'panels', 'credentials', 'config', 'logs', 'usage', 'update', 'appstore', 'devmodules'];

@@ -152,3 +152,6 @@ src/bot/modulesDev/*
 # Authelia secrets + runtime (public self-hosted gateway); never commit
 authelia/secrets/
 /data_coworker
+
+# The web panel's built scripts (npm run build:webui)
+/webui-built/

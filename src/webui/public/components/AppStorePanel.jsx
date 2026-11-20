@@ -1,5 +1,5 @@
 // App Store Panel Component - Browse, install, and manage modules
-const { useState, useEffect, useRef } = React;
+var { useState, useEffect, useRef } = React;
 
 // Subscribe to the emoji shortcode map so previews re-render once it loads.
 function useEmojiMapReady() {

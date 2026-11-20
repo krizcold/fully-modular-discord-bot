@@ -2,7 +2,8 @@
 
 import express, { Express, Request, Response } from 'express';
 import cors from 'cors';
-import helmet from 'helmet';
+import { securityHeaders } from './securityHeaders';
+import { BUILT_DIR, MISSING_BUILD_LOG, missingBuiltFiles, mountFrontendBuild } from './frontendBuild';
 import { mountRateLimits, TRUST_PROXY } from './middleware/tokenLimiter';
 import session from 'express-session';
 import passport from 'passport';
@@ -65,30 +66,7 @@ export async function createServer(botManager: BotManager): Promise<Express> {
   }
 
   // Security headers
-  app.use(helmet({
-    contentSecurityPolicy: {
-      directives: {
-        defaultSrc: ["'self'"],
-        scriptSrc: [
-          "'self'",
-          "'unsafe-inline'", // Required for React with Babel
-          "https://unpkg.com"
-        ],
-        styleSrc: ["'self'", "'unsafe-inline'"],
-        imgSrc: ["'self'", "data:", "https:"],
-        connectSrc: ["'self'", "ws:", "wss:"],
-        fontSrc: ["'self'"],
-        objectSrc: ["'none'"],
-        upgradeInsecureRequests: []
-      }
-    },
-    xFrameOptions: { action: 'deny' },
-    hsts: {
-      maxAge: 31536000,
-      includeSubDomains: true,
-      preload: true
-    }
-  }));
+  app.use(securityHeaders());
 
   // Additional security headers
   app.use((req, res, next) => {
@@ -230,6 +208,10 @@ export async function createServer(botManager: BotManager): Promise<Express> {
       res.setHeader('X-Content-Type-Options', 'nosniff');
     }
   }));
+
+  // The scripts "npm run build:webui" wrote: /admin.js behind the gateway's login, the member page's two under /assets/.
+  if (missingBuiltFiles(BUILT_DIR).length > 0) console.error(MISSING_BUILD_LOG);
+  mountFrontendBuild(app, BUILT_DIR);
 
   // Root route (requireAuth passes; auth enforced at the deployment boundary)
   app.get('/', requireAuth, (req: Request, res: Response) => {

@@ -1,6 +1,6 @@
 // Guild Selector Component - Select which guild to manage
 
-const { useState, useEffect } = React;
+var { useState, useEffect } = React;
 
 function GuildSelector({ user, onGuildSelected, onLogout }) {
   const [guilds, setGuilds] = useState([]);

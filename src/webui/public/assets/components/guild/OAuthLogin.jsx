@@ -1,6 +1,6 @@
 // OAuth Login Component - Discord OAuth login UI
 
-const { useState, useEffect } = React;
+var { useState, useEffect } = React;
 
 function OAuthLogin({ onAuthenticated }) {
   const [loading, setLoading] = useState(true);

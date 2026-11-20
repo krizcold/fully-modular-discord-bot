@@ -51,7 +51,7 @@ export function createGuildSubscriptionRoutes(botManager: BotManager): Router {
       const failure = sharedOpFailure(reply) ?? { status: 500, error: 'Patreon callback failed' };
       return res.status(reply?.code === 'invalid' ? 400 : failure.status).type('html').send(
         `<h2>Patreon link failed</h2><p>${escapeHtml(failure.error)}</p>` +
-        `<p><a href="javascript:history.back()">Go back</a></p>`
+        `<p><a href="/guild">Back to the server page</a></p>`
       );
     }
     const existing: string | undefined = reply.result?.linkedElsewhere;

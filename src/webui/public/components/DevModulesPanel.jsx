@@ -9,7 +9,7 @@
  * - Dev logging (dedicated log stream for dev module compile/load output)
  * - Dependency linking (resolve cross-module deps within modulesDev repos)
  */
-const { useState, useEffect, useRef } = React;
+var { useState, useEffect, useRef } = React;
 
 function DevModulesPanel() {
   const [repos, setRepos] = useState([]);

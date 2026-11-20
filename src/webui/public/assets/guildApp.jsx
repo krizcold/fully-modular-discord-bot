@@ -1,6 +1,6 @@
 // Guild App: Main application for guild Web-UI
 
-const { useState, useEffect } = React;
+var { useState, useEffect } = React;
 
 const GUILD_TABS = ['panels', 'subscription'];
 

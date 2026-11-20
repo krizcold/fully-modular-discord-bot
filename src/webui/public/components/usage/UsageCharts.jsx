@@ -1,5 +1,5 @@
-// Dependency-free SVG charts for the Usage tab. Bare global functions
-// (Babel 7 classic runtime, global-scope text/babel scripts - no import/export).
+// Dependency-free SVG charts for the Usage tab.
+// scripts/buildFrontend.cjs joins this file into the page's built script, where it runs at global scope.
 // Both take data as [{t, v}] and autoscale to min/max.
 
 function usageChartScale(data, width, height, padding) {

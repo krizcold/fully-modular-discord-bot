@@ -1,4 +1,5 @@
 import fs from 'fs';
+import { createRequire } from 'module';
 import { describe, expect, it } from 'vitest';
 import { readSourceText } from '../helpers/sourceText';
 
@@ -9,6 +10,7 @@ const repo = new URL('../../', import.meta.url);
 const read = (rel: string) => readSourceText(__dirname, `../../${rel}`);
 const exists = (rel: string) => fs.existsSync(new URL(rel, repo));
 const PUBLIC = 'src/webui/public/';
+const frontend = createRequire(import.meta.url)('../../scripts/buildFrontend.cjs') as { ADMIN_FILES: string[]; GUILD_FILES: string[] };
 
 const MEMBER_FILES = [
   'styles.css',
@@ -39,8 +41,13 @@ function walk(rel: string, out: string[] = []): string[] {
 describe('the member page loads only files under /assets/', () => {
   const loads = localLoads(read(`${PUBLIC}guild.html`));
 
-  it('names each of its twelve files once, by its /assets/ path, and nothing else', () => {
-    expect([...loads].sort()).toEqual(MEMBER_FILES.map(f => `/assets/${f}`).sort());
+  it('names only /assets/ paths: its stylesheet and its two built scripts', () => {
+    expect(loads.filter(u => !u.startsWith('/assets/'))).toEqual([]);
+    expect([...loads].sort()).toEqual(['/assets/guild.js', '/assets/styles.css', '/assets/vendor.js']);
+  });
+
+  it('builds /assets/guild.js from the member files, each once, and nothing else', () => {
+    expect([...frontend.GUILD_FILES].sort()).toEqual(MEMBER_FILES.filter(f => f !== 'styles.css').map(f => `assets/${f}`).sort());
   });
 
   it('finds every one of them under public/assets/', () => {
@@ -67,17 +74,19 @@ describe('the member page loads only files under /assets/', () => {
 describe('the admin page', () => {
   const loads = localLoads(read(`${PUBLIC}index.html`));
 
-  it('finds every file it loads (build-info.js is written at start)', () => {
-    for (const u of loads) {
-      if (u === '/build-info.js') continue;
-      expect(exists(`${PUBLIC}${u.slice(1)}`), u).toBe(true);
-    }
+  it('finds every source file its script is built from', () => {
+    for (const f of frontend.ADMIN_FILES) expect(exists(`${PUBLIC}${f}`), f).toBe(true);
+    const hrefs = [...read(`${PUBLIC}index.html`).matchAll(/\shref="(\/[^"?#]*)/g)].map(m => m[1]);
+    expect(hrefs).toContain('/assets/styles.css');
+    for (const h of hrefs) expect(exists(`${PUBLIC}${h.slice(1)}`), h).toBe(true);
   });
 
-  it('loads the files it shares with the member page from /assets/', () => {
-    const shared = MEMBER_FILES.filter(f => loads.includes(`/assets/${f}`));
-    expect(shared.sort()).toEqual(['styles.css', 'utils/uiHelpers.jsx', 'components/panels/PanelComponents.jsx',
+  it('shares its stylesheet and five script files with the member page, all from /assets/', () => {
+    expect(loads).toContain('/assets/styles.css');
+    const shared = MEMBER_FILES.filter(f => frontend.ADMIN_FILES.includes(`assets/${f}`));
+    expect(shared.sort()).toEqual(['utils/uiHelpers.jsx', 'components/panels/PanelComponents.jsx',
       'components/panels/PanelRenderer.jsx', 'components/panels/PanelViewer.jsx', 'components/panels/PanelList.jsx'].sort());
+    for (const f of shared) expect(frontend.GUILD_FILES, f).toContain(`assets/${f}`);
   });
 
   it('no file in the web UI names a moved file by its old path', () => {

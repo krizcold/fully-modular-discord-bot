@@ -9,7 +9,7 @@
  *   _disabledCommands: string[]: specific commands disabled for this tier
  *   <settingKey>: value        : setting value overrides
  */
-const { useState, useEffect, useRef, useMemo } = React;
+var { useState, useEffect, useRef, useMemo } = React;
 
 // ============================================================================
 // Effective-overrides helper (used by TierEditorPanel dirty tracking)

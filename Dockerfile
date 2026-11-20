@@ -29,6 +29,10 @@ RUN npm ci
 # Copy source files with correct ownership (avoids slow chown later)
 COPY --chown=node:node src/ /app/src/
 
+# Build the web panel's scripts into /app/webui-built (a failed build fails the image build)
+COPY --chown=node:node scripts/buildFrontend.cjs /app/scripts/buildFrontend.cjs
+RUN node /app/scripts/buildFrontend.cjs
+
 # Select updater module at build time based on BUILD_MODE
 # - undefined/empty (default): updater_local (git-based, for self-hosted)
 # - managed: updater_managed (API-based, for Bot Manager)

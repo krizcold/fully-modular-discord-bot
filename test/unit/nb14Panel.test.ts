@@ -66,11 +66,11 @@ describe('api.js', () => {
   });
 });
 
-describe('index.html', () => {
-  it('loads graveyardRestore.js after api.js', () => {
-    const html = fs.readFileSync(PUBLIC('index.html'), 'utf-8');
-    const api = html.indexOf('<script src="/utils/api.js"></script>');
-    const restore = html.indexOf('<script src="/utils/graveyardRestore.js"></script>');
+describe('the admin page script', () => {
+  it('holds graveyardRestore.js after api.js', () => {
+    const { ADMIN_FILES } = require('../../scripts/buildFrontend.cjs') as { ADMIN_FILES: string[] };
+    const api = ADMIN_FILES.indexOf('utils/api.js');
+    const restore = ADMIN_FILES.indexOf('utils/graveyardRestore.js');
     expect(api).toBeGreaterThanOrEqual(0);
     expect(restore).toBeGreaterThan(api);
   });

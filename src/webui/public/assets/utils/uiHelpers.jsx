@@ -1,7 +1,5 @@
 // Shared UI helpers for consistent loading + disabled states across the
-// React Web-UI. Both the main app (index.html) and the Guild Web-UI
-// (guild.html) include this file via <script type="text/babel">, so all
-// helpers attach to the global `window` and are usable from any component.
+// React Web-UI. scripts/buildFrontend.cjs joins this file into each page's built script, where it runs at global scope.
 //
 // Why these exist:
 //  - `disabled={true}` on a <button> doesn't actually look disabled to the

@@ -473,6 +473,7 @@ npm run dev:bot          # Run bot only (for Web-UI development)
 ```bash
 npm run build            # Compile for development (from src/)
 npm run build-prod       # Compile for production (tsc only, used by container build)
+npm run build:webui      # Build the web panel's scripts into webui-built/ (run again after editing a frontend file)
 ```
 
 **Production:**
