@@ -268,7 +268,7 @@ describe('P1 claim 19, part 3: the subscription routes', () => {
     expect(sent[0].status).toBe(400);
     expect(sent[0].body.success).toBe(false);
     expect(ops).toEqual([]);
-    expect(w.seller.calls).toEqual([]);
+    expect(w.calls()).toEqual([]);
     expect(w.storedText()).toBe(before);
   });
 

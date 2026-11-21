@@ -4,19 +4,23 @@
 // logs when an install threw (a created event lost to an error, with nothing stored). A row that expects such a line
 // calls allowDropLines() first, naming 'install' for the last one.
 //
+// P2 adds DL1, the Dummy provider's line when its load left subscription records out (sheet P2, section 3); a row that
+// expects it names 'DL1'.
+//
 // The guard stands in front of console itself, so it sees a line whether or not the row replaced the method with a
 // spy that swallows it: the global console is a proxy whose log methods read the line, then call what the row put
 // there.
 
-export type DropLine = 'L1' | 'L2' | 'L3' | 'install';
+export type DropLine = 'L1' | 'L2' | 'L3' | 'install' | 'DL1';
 
 const PATTERNS: Record<DropLine, RegExp> = {
   L1: /^\[PremiumManager\] (premium-tiers\.json|The configuration given to setFullConfig) holds entries this version does not read:/,
   L2: /^\[PremiumManager\] A \S+ event from .+ names no holder; it was not applied:/,
   L3: /^\[PremiumManager\] subscription\.created from .+ was not installed:/,
   install: /^\[PremiumManager\] installAsyncSubscription failed:/,
+  DL1: /^\[DummyProvider\] payment-providers\/dummy\/state\.json holds \d+ subscription record\(s\) this version does not read/,
 };
-/** What allowDropLines() with no name lets through: a failed install is opted in to by name only. */
+/** What allowDropLines() with no name lets through: a failed install and DL1 are opted in to by name only. */
 const UNNAMED: DropLine[] = ['L1', 'L2', 'L3'];
 const METHODS = new Set(['log', 'info', 'warn', 'error', 'debug']);
 
@@ -101,7 +105,7 @@ export function installDropLineGuard(beforeEach: (fn: () => void) => void, after
     state.all.length = 0;
     state.allowed.clear();
     if (seen.length > 0) {
-      throw new Error(`This row logged ${seen.length} line(s) that say premium left stored entries out, dropped an event or failed an install (${[...new Set(seen.map(s => s.kind))].join(', ')}); a row that expects them calls allowDropLines() first. First line: ${seen[0].line}`);
+      throw new Error(`This row logged ${seen.length} line(s) that say premium or the Dummy provider left stored entries out, premium dropped an event or failed an install (${[...new Set(seen.map(s => s.kind))].join(', ')}); a row that expects them calls allowDropLines() first. First line: ${seen[0].line}`);
     }
   });
 }

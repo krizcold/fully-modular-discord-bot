@@ -27,7 +27,7 @@ import { errnoOf, isBotProcess, registerCacheStop, stopCause, stopWords, unregis
 import { failItems, landItems, makeItem, newCarry, runItems, type Carry, type Item, type ItemSink, type SaveOp, type SaveOutcome } from '../premiumItems';
 import { rowOutcome, shaOf, type RowTicket } from '../sharedStore';
 import { getPaymentRegistry } from './paymentRegistry';
-import { guildIdFor, holderFromWire, parseHolder, type HolderKey } from '../premiumHolder';
+import { isDiscordId, parseHolder, type HolderKey, type HolderKind } from '../premiumHolder';
 import { isMaintenanceGateClosed, MaintenanceRefusal, orderRefusesGlobalWrite, runHeldResave } from '../maintenanceGate';
 import { OpenWork } from '../openWork';
 import { writerLockDepth } from '../writerLock';
@@ -83,9 +83,9 @@ interface DummyCoupon {
 /** A live or historical simulated subscription. */
 interface DummyRecord {
   providerSubId: string;
-  guildId: string;
-  /** The Discord user who paid, when the purchase named one. */
-  buyerId?: string;
+  holder: HolderKey;
+  /** The Discord user who paid; for a user holder, that user. */
+  buyerId: string;
   tierId: string;
   offeringId: string;
   variantId: string;
@@ -158,19 +158,78 @@ function notSavedError(cause: string): Error {
   return new Error(`The Dummy provider did not save this change (${causeWords(cause)}), so nothing was changed at the provider.`);
 }
 
-/** T23: a change the database did not confirm; `code` and `reason` let premium word its warnings (decision 88). */
-function unconfirmedError(reason: string, purchase: boolean): Error {
-  const tail = purchase
+/** Why a save is held for a retry: its words in TH1 and in the last stop's log. */
+type HeldCause = 'disk' | 'order' | 'database' | 'other';
+
+const HELD_WORDS: Record<HeldCause, { reason: string; changes: string }> = {
+  disk: { reason: 'the disk did not take the write', changes: 'the disk refused' },
+  order: { reason: 'a maintenance save order holds the write', changes: 'a maintenance save order held' },
+  database: { reason: 'the database did not take the write', changes: 'the database did not take' },
+  other: { reason: 'storage refused the write for now', changes: 'the storage refused' },
+};
+
+/** The words a held save's cause is told in; 'maintenance' is a save order's only while one refuses global writes. */
+function heldCauseOf(cause: LedgerCause, threw: boolean): HeldCause {
+  if (threw) return 'other';
+  if (cause === 'storage-failing' || cause === 'io') return 'disk';
+  if (cause === 'database-unreachable' || cause === 'database-backlog') return 'database';
+  if (cause === 'maintenance' && orderRefusesGlobalWrite()) return 'order';
+  return 'other';
+}
+
+/** TH1: T23's reason for a purchase whose save is held and the Dummy provider retries. */
+const heldReason = (cause: HeldCause): string => `${HELD_WORDS[cause].reason} and the Dummy provider is trying again`;
+
+/**
+ * T23: a change the database did not confirm; `code` and `reason` let premium word its warnings (decision 88). A
+ * purchase gives the kind of its holder, whose tail says where the purchase is found (DT1 for a user).
+ */
+function unconfirmedError(reason: string, purchase: HolderKind | null): Error {
+  const tail = purchase === 'guild'
     ? ' If the purchase was saved, it is listed under "Subscriptions needing attention" on this server\'s subscription page, where it can be adopted or cancelled.'
-    : " If the provider saved it, the Dummy provider puts the subscription back to the bot's copy within about 2 minutes.";
+    : purchase === 'user'
+      ? " If the purchase was saved, the Dummy provider holds it for this user and the bot does not. A bot dev can adopt or cancel it under \"Test purchase\" in the Dummy Provider Settings."
+      : " If the provider saved it, the Dummy provider puts the subscription back to the bot's copy within about 2 minutes.";
   return Object.assign(new Error(`Can't confirm that the Dummy provider saved this change (${reason}), so the bot did not apply it. Check the subscription before trying again.${tail}`), {
     code: 'unconfirmed',
     reason,
   });
 }
 
-/** T25: a call on a record that has nothing to change. */
-const notFound = (id: string) => new Error(`Dummy subscription '${id}' not found.`);
+function shownText(text: unknown): string {
+  try {
+    return String(text);
+  } catch {
+    return typeof text;
+  }
+}
+
+/** What is wrong with a record's or a purchase's owner: its holder, its buyer, or a user paid for by someone else. */
+function ownerFault(holder: unknown, buyerId: unknown): 'holder' | 'buyer' | 'other-buyer' | null {
+  const parsed = parseHolder(holder);
+  if (!parsed) return 'holder';
+  if (!isDiscordId(buyerId)) return 'buyer';
+  if (parsed.kind === 'user' && buyerId !== parsed.id) return 'other-buyer';
+  return null;
+}
+
+/** The load keeps a record only when it is one this version writes, under its own id. */
+function recordFits(record: unknown, key: string): boolean {
+  if (!record || typeof record !== 'object' || Array.isArray(record)) return false;
+  const r = record as Record<string, unknown>;
+  return typeof r.providerSubId === 'string' && r.providerSubId === key && ownerFault(r.holder, r.buyerId) === null
+    && (r.status === 'active' || r.status === 'paused' || r.status === 'expired');
+}
+
+/** DX1 to DX3: the Dummy's own refusal of a purchase owner its load would not keep. */
+function ownerFaultError(fault: 'holder' | 'buyer' | 'other-buyer', holder: unknown): Error {
+  if (fault === 'holder') return new Error(`The Dummy provider sold nothing: '${shownText(holder)}' is not a holder (expected guild:<id> or user:<id> with a Discord id).`);
+  if (fault === 'buyer') return new Error('The Dummy provider sold nothing: the purchase names no Discord user who pays.');
+  return new Error("The Dummy provider sold nothing: a user's subscription is paid by that user, and the buyer given is someone else.");
+}
+
+/** T25: a call on a record that has nothing to change; premium ends its own copy on the code (sheet P2, section 4). */
+const notFound = (id: string) => Object.assign(new Error(`Dummy subscription '${id}' not found.`), { code: 'not-found' });
 
 /**
  * Seed state on first run so testing has something to click on out of the box.
@@ -219,7 +278,7 @@ const CAPABILITIES: ProviderCapabilities = {
   mechanism: 'immediate',
   variantIdLabel: 'Dummy Variant ID',
   productIdLabel: 'Dummy Product ID',
-  sells: ['guild'],
+  sells: ['guild', 'user'],
 };
 
 // ============================================================================
@@ -240,11 +299,14 @@ export class DummyProvider implements PaymentProvider {
   private unreadable: string | null = null;
   private loggedCause: string | null = null;
   private loggedRecheck: string | null = null;
+  /** The shas of the texts whose left-out records were logged (DL1), once per content. */
+  private loggedLeftOut = new Set<string>();
   private lastLoadTry = -Infinity;
   private tickTimer: NodeJS.Timeout | null = null;
   /** Set by the final stop step or a deposition: from then on nothing is written. */
   private stopped: StopKind | null = null;
   private saveHeld = false;
+  private heldCause: HeldCause = 'disk';
   private unstorableSave = false;
   private retryTimer: NodeJS.Timeout | null = null;
   private retryDelay = RETRY_FIRST_MS;
@@ -299,12 +361,23 @@ export class DummyProvider implements PaymentProvider {
           variants: loaded.variants && typeof loaded.variants === 'object' ? loaded.variants : buildSeedState().variants,
           products: loaded.products && typeof loaded.products === 'object' ? loaded.products : buildSeedState().products,
           coupons: loaded.coupons && typeof loaded.coupons === 'object' ? loaded.coupons : buildSeedState().coupons,
-          subscriptions: loaded.subscriptions || {},
+          subscriptions: {},
           nextId: loaded.nextId || 1,
         }
       : buildSeedState();
+    let leftOut = 0;
+    if (loaded && loaded.subscriptions && typeof loaded.subscriptions === 'object') {
+      for (const [key, record] of Object.entries(loaded.subscriptions as Record<string, unknown>)) {
+        if (recordFits(record, key)) this.state.subscriptions[key] = record as DummyRecord;
+        else leftOut++;
+      }
+    }
     this.lastRaw = raw;
     this.lastSha = raw === null ? 'absent' : shaOf(Buffer.from(raw, 'utf8'));
+    if (leftOut > 0 && !this.loggedLeftOut.has(this.lastSha)) {
+      this.loggedLeftOut.add(this.lastSha);
+      console.warn(`[DummyProvider] ${STATE_FILE} holds ${leftOut} subscription record(s) this version does not read (its holder, buyer, id or status is not one this version writes). They are not loaded, and the next Dummy save writes the file without them. The bot may still hold a subscription for one of them: "Cancel & remove now" on a server's subscription page or "End now" under "Test purchase" for a user removes an active one from the bot, and "Cancel & remove" removes a queued one.`);
+    }
     this.loaded = true;
     if (this.unreadable) console.log(`[DummyProvider] ${STATE_FILE} can be read again`);
     this.unreadable = null;
@@ -412,6 +485,7 @@ export class DummyProvider implements PaymentProvider {
         }
       : SAVE_OPTIONS;
     let cause: LedgerCause;
+    let threw = false;
     try {
       const tracked = saveDataTracked('state.json', options, this.state);
       if (tracked.outcome === 'saved') {
@@ -436,6 +510,7 @@ export class DummyProvider implements PaymentProvider {
         console.error('[DummyProvider] Failed to save state:', error);
         recordRefusal('io', STATE_DOC);
         cause = 'io';
+        threw = true;
       }
     }
     if (cause === 'unstorable') {
@@ -445,6 +520,7 @@ export class DummyProvider implements PaymentProvider {
     }
     if (tick || cause === 'node-stopping' || cause === 'writer-lost' || !isBotProcess()) return this.refused(items, cause);
     this.saveHeld = true;
+    this.heldCause = heldCauseOf(cause, threw);
     markRetried(STATE_DOC);
     this.armRetry();
     if (shared) return { key: STATE_KEY, outcome: new Promise(resolve => this.heldWaits.push(resolve)) };
@@ -502,7 +578,7 @@ export class DummyProvider implements PaymentProvider {
    * no outcome within 8 s: T23 (the op goes on, and its outcome still drops the cache). A JSON bot's write is judged
    * by NB10's verdict in the op's ledger, so it answers at the accept.
    */
-  private async settled(op: SaveOp | null, purchase: boolean): Promise<void> {
+  private async settled(op: SaveOp | null, purchase: HolderKind | null): Promise<void> {
     if (op === null) throw notSavedError(this.lastRefusal);
     if (op.outcome === null) return;
     let timer: NodeJS.Timeout | undefined;
@@ -579,7 +655,7 @@ export class DummyProvider implements PaymentProvider {
     }
     const lost = this.stopped === 'deposed' ? 'lost: another process took the data files' : 'lost with this stop';
     if (this.saveHeld) {
-      console.error(`[DummyProvider] ${STATE_FILE} holds changes the disk refused; they are ${lost}`);
+      console.error(`[DummyProvider] ${STATE_FILE} holds changes ${HELD_WORDS[this.heldCause].changes}; they are ${lost}`);
     } else if (this.unstorableSave) {
       console.error(`[DummyProvider] ${STATE_FILE} holds changes too large to store (one write holds at most 4 MiB); they are ${lost}`);
     }
@@ -663,8 +739,10 @@ export class DummyProvider implements PaymentProvider {
   }
 
   private async initiatePurchaseRun(opts: InitiateOpts): Promise<InitiateResult> {
-    const guildId = guildIdFor(opts.holder as HolderKey, this.displayName);
     this.refuseCall();
+    const fault = ownerFault(opts.holder, opts.buyerId);
+    if (fault) throw ownerFaultError(fault, opts.holder);
+    const kind = parseHolder(opts.holder)!.kind;
     const variant = this.state.variants[opts.variantId];
     if (!variant || !variant.active) {
       throw new Error(`Dummy variant '${opts.variantId}' does not exist or is inactive.`);
@@ -700,8 +778,8 @@ export class DummyProvider implements PaymentProvider {
     const providerSubId = `dummy_${this.state.nextId++}`;
     const record: DummyRecord = {
       providerSubId,
-      guildId,
-      ...(typeof opts.buyerId === 'string' ? { buyerId: opts.buyerId } : {}),
+      holder: opts.holder as HolderKey,
+      buyerId: opts.buyerId as string,
       tierId: opts.tierId,
       offeringId: opts.offeringId,
       variantId: opts.variantId,
@@ -718,7 +796,10 @@ export class DummyProvider implements PaymentProvider {
       updatedAt: nowIso,
     };
     this.state.subscriptions[providerSubId] = record;
-    await this.settled(this.save(), true);
+    const op = this.save();
+    // A held save on JSON has no outcome to wait for, and premium must not install what only this cache holds.
+    if (op !== null && op.outcome === null && this.saveHeld) throw unconfirmedError(heldReason(this.heldCause), kind);
+    await this.settled(op, kind);
 
     return {
       providerSubId,
@@ -741,7 +822,7 @@ export class DummyProvider implements PaymentProvider {
     }
     r.autoRenew = false;
     r.updatedAt = new Date().toISOString();
-    await this.settled(this.save(), false);
+    await this.settled(this.save(), null);
     return this.stateFrom(r);
   }
 
@@ -755,7 +836,7 @@ export class DummyProvider implements PaymentProvider {
     }
     r.autoRenew = true;
     r.updatedAt = new Date().toISOString();
-    await this.settled(this.save(), false);
+    await this.settled(this.save(), null);
     return this.stateFrom(r);
   }
 
@@ -770,7 +851,7 @@ export class DummyProvider implements PaymentProvider {
     r.resumesAt = resumesAt;
     r.status = 'paused';
     r.updatedAt = r.pausedAt;
-    await this.settled(this.save(), false);
+    await this.settled(this.save(), null);
     return this.stateFrom(r);
   }
 
@@ -787,7 +868,7 @@ export class DummyProvider implements PaymentProvider {
     r.endDate = newEndDate;
     r.status = 'active';
     r.updatedAt = nowIso;
-    await this.settled(this.save(), false);
+    await this.settled(this.save(), null);
     return this.stateFrom(r);
   }
 
@@ -814,7 +895,7 @@ export class DummyProvider implements PaymentProvider {
       r.startDate = new Date().toISOString();
       r.updatedAt = r.startDate;
     }
-    await this.settled(this.save(), false);
+    await this.settled(this.save(), null);
     return this.stateFrom(r);
   }
 
@@ -825,14 +906,12 @@ export class DummyProvider implements PaymentProvider {
   }
 
   async listSubscriptionsFor(holder: HolderKey): Promise<ProviderSubscriptionRef[]> {
-    const parsed = parseHolder(holder);
-    if (!parsed || parsed.kind !== 'guild') return [];
-    const guildId = parsed.id;
+    if (!parseHolder(holder)) return [];
     this.ensureLoaded();
     const liveStatuses = new Set(['active', 'paused']);
     const out: ProviderSubscriptionRef[] = [];
     for (const r of Object.values(this.state.subscriptions)) {
-      if (r.guildId !== guildId) continue;
+      if (r.holder !== holder) continue;
       if (!liveStatuses.has(r.status)) continue;
       const variant = this.state.variants[r.variantId];
       const amountLabel = variant ? `${(variant.amount / 100).toFixed(2)} ${variant.currency}` : '';
@@ -844,7 +923,7 @@ export class DummyProvider implements PaymentProvider {
         state: this.stateFrom(r),
         metadata: {
           holder,
-          ...(r.buyerId === undefined ? {} : { buyerId: r.buyerId }),
+          buyerId: r.buyerId,
           tierId: r.tierId,
           offeringId: r.offeringId,
           variantId: r.variantId,
@@ -964,9 +1043,7 @@ export class DummyProvider implements PaymentProvider {
     const differing = new Set<string>();
     const written: Array<{ id: string; parts: string }> = [];
     for (const r of records) {
-      const holder = holderFromWire(r.guildId);
-      if (!holder) continue;
-      const answer = registry.readSubscription(this.id, holder, r.providerSubId);
+      const answer = registry.readSubscription(this.id, r.holder, r.providerSubId);
       if (!answer) continue;
       const diff = this.differences(r, answer);
       if (diff.length === 0) continue;
@@ -984,8 +1061,6 @@ export class DummyProvider implements PaymentProvider {
 
     const events: WalkEvent[] = [];
     for (const r of records) {
-      const holder = holderFromWire(r.guildId);
-      if (!holder) continue;
       if (differing.has(r.providerSubId)) continue;
       if (r.status !== 'active') continue;
       if (r.paused) continue;
@@ -996,11 +1071,11 @@ export class DummyProvider implements PaymentProvider {
         const base = Date.parse(r.endDate);
         r.endDate = new Date(base + r.durationDays * DAY_MS).toISOString();
         r.updatedAt = nowIso;
-        events.push({ type: 'subscription.renewed', providerId: this.id, providerSubId: r.providerSubId, holder, state: this.stateFrom(r) });
+        events.push({ type: 'subscription.renewed', providerId: this.id, providerSubId: r.providerSubId, holder: r.holder, state: this.stateFrom(r) });
       } else {
         r.status = 'expired';
         r.updatedAt = nowIso;
-        events.push({ type: 'subscription.expired', providerId: this.id, providerSubId: r.providerSubId, holder, state: this.stateFrom(r) });
+        events.push({ type: 'subscription.expired', providerId: this.id, providerSubId: r.providerSubId, holder: r.holder, state: this.stateFrom(r) });
       }
     }
     if (written.length === 0 && events.length === 0) return;

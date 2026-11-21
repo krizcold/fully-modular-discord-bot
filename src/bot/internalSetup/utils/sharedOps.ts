@@ -15,7 +15,7 @@ import { truthText, verdictOf, type TruthAnswer } from './dataBackends/replyGate
 import { checkWriterLock, deposedText } from './writerLock';
 export { deposedText } from './writerLock';
 import { notHolderText, parseHolder } from './premiumHolder';
-import { getPremiumManager, invalidatePremiumCache, MigrationBusy, settlePremiumInstalls } from './premiumManager';
+import { BeforeProviderCall, getPremiumManager, invalidatePremiumCache, MigrationBusy, settlePremiumInstalls } from './premiumManager';
 import { getPaymentRegistry } from './payment/paymentRegistry';
 import { invalidateDummyCaches } from './payment/dummyProvider';
 import { refreshShared, sharedBootCause, sharedBootCauseLocal, sharedBootDone } from './sharedMirror';
@@ -366,6 +366,7 @@ export async function applySharedOp(req: SharedOpRequest): Promise<SharedOpReply
     }
     if (error instanceof WebhookRejected) return carryWrites({ ok: false, code: 'invalid', error: error.message }, writes);
     if (error instanceof MigrationBusy) return carryWrites({ ok: false, code: 'changed', error: error.message }, writes);
+    if (error instanceof BeforeProviderCall) return { ok: false, code: 'failed', error: error.message };
     // A throw of its own leaves the op's writes off its reply: the local chain answers it can't confirm.
     return { ok: false, code: 'failed', error: withProviderSentence(op, error instanceof Error ? error.message : String(error)) };
   }

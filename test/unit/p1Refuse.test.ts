@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 // P1 claims 5 and 22 (parts 3 and 4a): a tier of the wrong kind never reaches the store, and no method stores under
 // a text that is not a holder key. Every call goes through its shared op on the real manager; the stored bytes, the
 // audit log, the seller's call list and the notices are compared with what they were before the call.
+// P2 claim 12 (parts 0 and 2): a purchase of the other kind's tier, and the adoption of a listed subscription whose tier
+// was made again with the other kind, run again through the real Dummy provider, for a server and for a user.
 
 vi.mock('../../src/bot/internalSetup/utils/payment/paymentRegistry', async orig => (await import('../helpers/p1Mocks')).bareRegistry(await orig<any>()));
 vi.mock('../../src/bot/internalSetup/utils/premiumNotifications', async () => (await import('../helpers/p1Mocks')).noticeModule());
@@ -11,25 +13,31 @@ import { getPremiumManager } from '../../src/bot/internalSetup/utils/premiumMana
 import { notices } from '../helpers/p1Mocks';
 import { gh, uh } from '../helpers/p1Holder';
 import { allowDropLines } from '../helpers/p1Guard';
-import { brokenHolders, BUYER, p1World, purchaseOptions, SELLER_ID, SELLER_VARIANT, sellerListCall, sellerOffering, SERVERS, USERS, userTierDef } from '../helpers/p1World';
+import { brokenHolders, BUYER, eachSeller, p1World, type SellerDriver, purchaseOptions, SELLER_ID, SELLER_VARIANT, sellerListCall, sellerOffering, SERVERS, USERS, userTierDef } from '../helpers/p1World';
 
-const w = p1World();
+let w: ReturnType<typeof p1World>;
 const X1 = (text: string) => `'${text}' is not a holder: expected guild:<id> or user:<id> with a Discord id.`;
 const X11 = 'Price changes cannot be scheduled for a user tier: a user has no page to accept or decline one until the "My account" page exists.';
-const state = () => ({ premium: w.storedText(), audit: w.auditText(), calls: JSON.stringify(w.seller.calls), notices: JSON.stringify(notices.sent) });
+const state = () => ({ premium: w.storedText(), audit: w.auditText(), calls: JSON.stringify(w.calls()), notices: JSON.stringify(notices.sent) });
 const schedule = (over: Record<string, unknown> = {}, inMs = 3_600_000) => w.op('scheduleMigration', {
   providerId: SELLER_ID, sourceTierId: 'low', sourceOfferingId: 'o-low', sourceVariantId: SELLER_VARIANT,
   targetTierId: 'mid', targetOfferingId: 'o-mid', targetVariantId: SELLER_VARIANT,
   effectiveDate: new Date(Date.now() + inMs).toISOString(), message: 'the price changes', ...over,
 });
 
-beforeEach(async () => {
-  await w.setup();
-  await w.addUserTiers();
-});
-afterEach(async () => { await w.teardown(); });
+/** The world of the rows that follow, on this driver's seller. */
+function useWorld(driver: SellerDriver): void {
+  const world = p1World('json', driver);
+  beforeEach(async () => {
+    w = world;
+    await w.setup();
+    await w.addUserTiers();
+  });
+  afterEach(async () => { await w.teardown(); });
+}
 
-describe('P1 claim 5: a tier of the wrong kind never reaches the store', () => {
+describe('P1 claim 5: a tier of the wrong kind never reaches the store', () => eachSeller(['p1seller'], make => {
+  useWorld(make());
   it.each([
     ['a manual grant of a user tier to a server', () => w.grant(gh(SERVERS[0]), 'ulow', 30), "'ULOW' is a user tier and cannot be given to a server."],
     ['a manual grant of a server tier to a user', () => w.grant(uh(USERS[0]), 'low', 30), "'LOW' is a server tier and cannot be given to a user."],
@@ -69,13 +77,13 @@ describe('P1 claim 5: a tier of the wrong kind never reaches the store', () => {
     expect(refused.ok).toBe(false);
     expect(refused.error).toContain("'U Sold' is a user tier and cannot be given to a server.");
     expect(state()).toEqual(before);
-    expect(w.seller.calls).toEqual([]);
+    expect(w.calls()).toEqual([]);
 
     const reply = await w.op('initiatePaidSubscription', uh(USERS[0]), 'usold', 'o-usold', purchaseOptions(uh(USERS[0])));
 
     expect(reply).toMatchObject({ ok: true });
     expect(w.recordOf(uh(USERS[0])).active).toMatchObject({ tierId: 'usold', source: 'paid', buyerId: USERS[0] });
-    expect(w.seller.calls.map(c => c.method)).toEqual([sellerListCall(uh(USERS[0])).method, 'initiatePurchase']);
+    expect(w.calls().map(c => c.method)).toEqual([sellerListCall(uh(USERS[0])).method, 'initiatePurchase']);
     expect(brokenHolders(w.stored())).toEqual([]);
   });
 
@@ -96,7 +104,7 @@ describe('P1 claim 5: a tier of the wrong kind never reaches the store', () => {
 
     expect(reply).toMatchObject({ ok: true });
     expect({ premium: w.storedText(), audit: w.auditText(), notices: JSON.stringify(notices.sent) }).toEqual(before);
-    expect(w.seller.calls).toEqual([]);
+    expect(w.calls()).toEqual([]);
     const lines = warned.filter(l => l.includes('was not installed'));
     expect(lines).toHaveLength(1);
     expect(lines[0]).toMatch(new RegExp(`^\\[PremiumManager\\] subscription\\.created from ${SELLER_ID} \\(subscription p1s_\\d+, ${words}\\) was not installed: ${why}$`));
@@ -113,15 +121,15 @@ describe('P1 claim 5: a tier of the wrong kind never reaches the store', () => {
     const listed = await w.orphans(holder);
     expect(listed.map((o: any) => [o.ref.providerSubId, o.plan])).toEqual([[record.providerSubId, { kind: 'refuse', reason, line: `It cannot be adopted: ${reason}.` }]]);
     const before = { premium: w.storedText(), audit: w.auditText(), notices: JSON.stringify(notices.sent) };
-    const callsBefore = w.seller.calls.length;
+    const callsBefore = w.calls().length;
 
     const reply = await w.adopt(holder, record.providerSubId, paused ? { kind: 'resume', days: 12, from: 'recorded', autoRenew: true, call: true } : { kind: 'install' });
 
     expect(reply.ok).toBe(false);
     expect(reply.error).toContain(`Subscription '${record.providerSubId}' was not adopted: ${reason}.`);
     expect({ premium: w.storedText(), audit: w.auditText(), notices: JSON.stringify(notices.sent) }).toEqual(before);
-    expect(w.seller.calls.slice(callsBefore)).toEqual([sellerListCall(holder)]);
-    expect(w.seller.records.get(record.providerSubId)!.status).toBe(paused ? 'paused' : 'active');
+    expect(w.calls().slice(callsBefore)).toEqual([sellerListCall(holder)]);
+    expect(w.view(record.providerSubId)!.status).toBe(paused ? 'paused' : 'active');
   });
 
   it("the adoption's check after its resume: a tier deleted and made again as a user tier while the resume call is open ends with R1 and one pause call", async () => {
@@ -132,11 +140,11 @@ describe('P1 claim 5: a tier of the wrong kind never reaches the store', () => {
     expect(listed[0].plan).toMatchObject({ kind: 'resume', call: true, days });
     let release!: () => void;
     w.seller.holdResume = new Promise<void>(resolve => { release = resolve; });
-    const callsBefore = w.seller.calls.length;
+    const callsBefore = w.calls().length;
     for (const level of ['log', 'warn'] as const) vi.spyOn(console, level).mockImplementation(() => undefined);
 
     const pending = w.adopt(server, record.providerSubId, listed[0].plan);
-    await vi.waitFor(() => expect(w.seller.calls.some(c => c.method === 'resumeSubscription')).toBe(true), { timeout: 5000, interval: 10 });
+    await vi.waitFor(() => expect(w.calls().some(c => c.method === 'resumeSubscription')).toBe(true), { timeout: 5000, interval: 10 });
     // While the seller's resume call is open, as unit/nb25Adopt.test.ts changes premium during one.
     expect(getPremiumManager().deleteTier('low')).toBe(true);
     expect(getPremiumManager().setTier('low', { displayName: 'LOW', priority: 1, overrides: {}, offerings: [sellerOffering('o-low', 'LOW')] as any, kind: 'user' })).toBe(true);
@@ -146,9 +154,9 @@ describe('P1 claim 5: a tier of the wrong kind never reaches the store', () => {
 
     expect(reply.ok).toBe(false);
     expect(reply.error).toContain(`Subscription '${record.providerSubId}' was not adopted: it was resumed at P1 Seller, but not installed: tier 'low' is now a user tier. It was paused again at P1 Seller.`);
-    expect(w.seller.calls.slice(callsBefore).map(c => c.method)).toEqual([sellerListCall(server).method, 'resumeSubscription', 'pauseSubscription']);
-    expect(w.seller.calls[w.seller.calls.length - 1].args).toEqual([record.providerSubId, null, days]);
-    expect(w.seller.records.get(record.providerSubId)).toMatchObject({ status: 'paused', pausedDaysLeft: days });
+    expect(w.calls().slice(callsBefore).map(c => c.method)).toEqual([sellerListCall(server).method, 'resumeSubscription', 'pauseSubscription']);
+    expect(w.calls()[w.calls().length - 1].args).toEqual([record.providerSubId, null, days]);
+    expect(w.view(record.providerSubId)).toMatchObject({ status: 'paused', daysLeft: days });
     expect(w.recordOf(server)).toBeNull();
     expect(w.stored().tiers.low.kind).toBe('user');
     expect(brokenHolders(w.stored())).toEqual([]);
@@ -163,7 +171,7 @@ describe('P1 claim 5: a tier of the wrong kind never reaches the store', () => {
     expect(await w.op('recordMigrationDecision', id, gh(SERVERS[0]), 'accepted')).toMatchObject({ ok: true, result: true });
     expect(await w.deleteTier('mid')).toMatchObject({ ok: true });
     expect((await w.op('setTier', 'mid', { ...userTierDef('umid', 'Mid as user'), priority: 2 })).ok).toBe(true);
-    const callsBefore = w.seller.calls.length;
+    const callsBefore = w.calls().length;
     await new Promise(resolve => setTimeout(resolve, 450));
 
     await getPremiumManager().processDueMigrations();
@@ -173,7 +181,7 @@ describe('P1 claim 5: a tier of the wrong kind never reaches the store', () => {
     expect(stored.status).toBe('applied');
     expect(stored.decisions).toHaveLength(1);
     expect(stored.decisions[0]).toMatchObject({ holder: gh(SERVERS[0]), decision: 'accepted', outcome: 'failed', outcomeNote: 'the target tier is now a user tier' });
-    expect(w.seller.calls.slice(callsBefore)).toEqual([]);
+    expect(w.calls().slice(callsBefore)).toEqual([]);
     expect(w.recordOf(SERVERS[0]).active).toMatchObject({ tierId: 'low', variantId: SELLER_VARIANT });
   });
 
@@ -184,7 +192,7 @@ describe('P1 claim 5: a tier of the wrong kind never reaches the store', () => {
     const id = scheduled.result.id;
     expect(await w.op('recordMigrationDecision', id, gh(SERVERS[0]), 'accepted')).toMatchObject({ ok: true, result: true });
     expect(await w.deleteTier('mid')).toMatchObject({ ok: true });
-    const callsBefore = w.seller.calls.length;
+    const callsBefore = w.calls().length;
     await new Promise(resolve => setTimeout(resolve, 450));
 
     const warned: string[] = [];
@@ -198,7 +206,7 @@ describe('P1 claim 5: a tier of the wrong kind never reaches the store', () => {
     expect(stored.status).toBe('applied');
     expect(stored.decisions).toHaveLength(1);
     expect(stored.decisions[0]).toMatchObject({ holder: gh(SERVERS[0]), decision: 'accepted', outcome: 'failed', outcomeNote: 'the target tier no longer exists' });
-    expect(w.seller.calls.slice(callsBefore)).toEqual([]);
+    expect(w.calls().slice(callsBefore)).toEqual([]);
     expect(w.recordOf(SERVERS[0]).active).toMatchObject({ tierId: 'low', variantId: SELLER_VARIANT });
 
     expect((await w.op('setTier', 'mid', { ...userTierDef('umid', 'Mid as user'), priority: 2 })).ok).toBe(true);
@@ -223,9 +231,10 @@ describe('P1 claim 5: a tier of the wrong kind never reaches the store', () => {
     expect(w.stored().subscriptions['user:1'].active.id).toBe('hand-1');
     expect(notices.sent.filter(n => n.kind === 'migration.scheduled').map(n => n.to)).toEqual([gh(SERVERS[0])]);
   });
-});
+}));
 
-describe('P1 claim 22: no method stores under a text that is not a holder key', () => {
+describe('P1 claim 22: no method stores under a text that is not a holder key', () => eachSeller(['p1seller'], make => {
+  useWorld(make());
   const methods: Array<[string, (holder: unknown) => unknown[]]> = [
     ['grantManual', h => [h, 'low', 30]],
     ['extendManual', h => [h, 5]],
@@ -263,4 +272,84 @@ describe('P1 claim 22: no method stores under a text that is not a holder key', 
     expect([...PREMIUM_METHODS].filter(m => !without.includes(m)).sort()).toEqual(methods.map(([m]) => m).sort());
     expect(PREMIUM_METHODS).toHaveLength(24);
   });
-});
+}));
+
+describe('P2 claim 12: claim 5 for a server, through each seller', () => eachSeller(['p1seller', 'dummy'], make => {
+  useWorld(make());
+  const SERVER = gh(SERVERS[0]);
+  const held = () => ({ premium: w.storedText(), audit: w.auditText(), calls: JSON.stringify(w.calls()), seller: w.bytes(), notices: JSON.stringify(notices.sent) });
+
+  it('a server purchase of a user tier is refused with its text, and nothing is bought or stored', async () => {
+    expect(await w.grant(SERVER, 'mid', 30)).toMatchObject({ ok: true });
+    expect(await w.purchase(SERVER, 'low')).toMatchObject({ ok: true });
+    const before = held();
+
+    const reply = await w.purchase(SERVER, 'ulow');
+
+    expect(reply.ok).toBe(false);
+    expect(reply.error).toContain("'ULOW' is a user tier and cannot be given to a server.");
+    expect(held()).toEqual(before);
+    expect(w.calls().filter(c => c.method === 'initiatePurchase')).toHaveLength(1);
+  });
+
+  it.each([['an active', false], ['a paused', true]])('the adoption of %s listed subscription whose tier was made again as a user tier is refused after its one list call', async (_what, paused) => {
+    const id = await w.unheld(SERVER, 'low', { paused });
+    expect(await w.deleteTier('low')).toMatchObject({ ok: true });
+    expect((await w.op('setTier', 'low', { ...userTierDef('ulow', 'LOW'), priority: 1 })).ok).toBe(true);
+    const reason = "'LOW' is a user tier and cannot be given to a server";
+    const listed = await w.orphans(SERVER);
+    expect(listed.map((o: any) => [o.ref.providerSubId, o.plan])).toEqual([[id, { kind: 'refuse', reason, line: `It cannot be adopted: ${reason}.` }]]);
+    const before = { premium: w.storedText(), audit: w.auditText(), seller: w.bytes(), notices: JSON.stringify(notices.sent) };
+    const callsBefore = w.calls().length;
+
+    const reply = await w.adopt(SERVER, id, paused ? { kind: 'resume', days: 12, from: 'recorded', autoRenew: true, call: true } : { kind: 'install' });
+
+    expect(reply.ok).toBe(false);
+    expect(reply.error).toContain(`Subscription '${id}' was not adopted: ${reason}.`);
+    expect({ premium: w.storedText(), audit: w.auditText(), seller: w.bytes(), notices: JSON.stringify(notices.sent) }).toEqual(before);
+    expect(w.calls().slice(callsBefore)).toEqual([sellerListCall(SERVER)]);
+    expect(w.view(id)!.status).toBe(paused ? 'paused' : 'active');
+    expect(w.recordOf(SERVER)).toBeNull();
+  });
+}));
+
+describe('P2 claim 12: claim 5 for a user, through each seller', () => eachSeller(['p1seller', 'dummy'], make => {
+  useWorld(make());
+  const USER = uh(USERS[0]);
+  const held = () => ({ premium: w.storedText(), audit: w.auditText(), calls: JSON.stringify(w.calls()), seller: w.bytes(), notices: JSON.stringify(notices.sent) });
+
+  it('a user purchase of a server tier is refused with its text, and nothing is bought or stored', async () => {
+    await w.addSoldUserTiers();
+    expect(await w.grant(USER, 'umid', 30)).toMatchObject({ ok: true });
+    expect(await w.purchase(USER, 'vlow')).toMatchObject({ ok: true });
+    const before = held();
+
+    const reply = await w.purchase(USER, 'low');
+
+    expect(reply.ok).toBe(false);
+    expect(reply.error).toContain("'LOW' is a server tier and cannot be given to a user.");
+    expect(held()).toEqual(before);
+    expect(w.calls().filter(c => c.method === 'initiatePurchase')).toHaveLength(1);
+  });
+
+  it.each([['an active', false], ['a paused', true]])('the adoption of %s listed subscription whose tier was made again as a server tier is refused after its one list call', async (_what, paused) => {
+    await w.addSoldUserTiers();
+    const id = await w.unheld(USER, 'vlow', { paused });
+    expect(await w.deleteTier('vlow')).toMatchObject({ ok: true });
+    expect((await w.op('setTier', 'vlow', { displayName: 'VLOW', priority: 1, overrides: {}, offerings: [] })).ok).toBe(true);
+    const reason = "'VLOW' is a server tier and cannot be given to a user";
+    const listed = await w.orphans(USER);
+    expect(listed.map((o: any) => [o.ref.providerSubId, o.plan])).toEqual([[id, { kind: 'refuse', reason, line: `It cannot be adopted: ${reason}.` }]]);
+    const before = { premium: w.storedText(), audit: w.auditText(), seller: w.bytes(), notices: JSON.stringify(notices.sent) };
+    const callsBefore = w.calls().length;
+
+    const reply = await w.adopt(USER, id, paused ? { kind: 'resume', days: 12, from: 'recorded', autoRenew: true, call: true } : { kind: 'install' });
+
+    expect(reply.ok).toBe(false);
+    expect(reply.error).toContain(`Subscription '${id}' was not adopted: ${reason}.`);
+    expect({ premium: w.storedText(), audit: w.auditText(), seller: w.bytes(), notices: JSON.stringify(notices.sent) }).toEqual(before);
+    expect(w.calls().slice(callsBefore)).toEqual([sellerListCall(USER)]);
+    expect(w.view(id)!.status).toBe(paused ? 'paused' : 'active');
+    expect(w.recordOf(USER)).toBeNull();
+  });
+}));

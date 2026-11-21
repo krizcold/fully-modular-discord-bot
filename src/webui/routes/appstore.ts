@@ -14,7 +14,7 @@ import {
   StoreModuleInfo,
   StoreWriteError,
 } from '../../bot/internalSetup/utils/appStoreManager';
-import { getPremiumManager, DEFAULT_MESSAGES, EMPTY_USER_BLOCKED, emptyUserBlocked, PremiumMessages, tierKind } from '../../bot/internalSetup/utils/premiumManager';
+import { getPremiumManager, DEFAULT_MESSAGES, EMPTY_USER_BLOCKED, emptyUserBlocked, PremiumMessages, tierKind, BUYER_IS_NOT_THE_USER } from '../../bot/internalSetup/utils/premiumManager';
 import { guildHolder, isDiscordId, parseHolder, userHolder, type HolderKey } from '../../bot/internalSetup/utils/premiumHolder';
 import {
   globalModuleConfigFrom,
@@ -1622,6 +1622,174 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  /** A user's subscriptions and effective tier; `effective` is null when the user has none. */
+  router.get('/premium/users/:userId', (req: Request, res: Response) => {
+    try {
+      const holder = holderParam(res, 'user', req.params.userId);
+      if (!holder) return;
+      const manager = getPremiumManager();
+      const resolved = manager.resolveActiveUserTier(req.params.userId);
+      res.json({
+        success: true,
+        subscriptions: manager.getSubscriptions(holder),
+        effective: resolved ? { tierId: resolved.tierId, tier: resolved.tier, source: resolved.source } : null,
+      });
+    } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  /** A user's paid purchase; the buyer is the user, and a `buyerId` naming anyone else is refused. */
+  router.post('/premium/users/:userId/paid', async (req: Request, res: Response) => {
+    try {
+      const holder = holderParam(res, 'user', req.params.userId);
+      if (!holder) return;
+      const { tierId, offeringId, providerId, variantId, couponCode, buyerId } = req.body || {};
+      if (!tierId || typeof tierId !== 'string') {
+        return res.status(400).json({ success: false, error: 'tierId is required' });
+      }
+      if (!offeringId || typeof offeringId !== 'string') {
+        return res.status(400).json({ success: false, error: 'offeringId is required' });
+      }
+      if (!providerId || typeof providerId !== 'string') {
+        return res.status(400).json({ success: false, error: 'providerId is required' });
+      }
+      if (!variantId || typeof variantId !== 'string') {
+        return res.status(400).json({ success: false, error: 'variantId is required' });
+      }
+      if (buyerId !== undefined && (typeof buyerId !== 'string' || buyerId === '')) {
+        return res.status(400).json({ success: false, error: "buyerId must be the user's Discord id, or left out" });
+      }
+      if (buyerId !== undefined && buyerId !== req.params.userId) {
+        return res.status(400).json({ success: false, error: BUYER_IS_NOT_THE_USER });
+      }
+      const manager = getPremiumManager();
+      const result = await shared(res, 'premium.initiatePaidSubscription', [holder, tierId, offeringId, { providerId, variantId, couponCode, buyerId: req.params.userId }]);
+      res.json({ success: true, result, subscriptions: manager.getSubscriptions(holder) });
+    } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  router.delete('/premium/users/:userId/paid', async (req: Request, res: Response) => {
+    try {
+      const holder = holderParam(res, 'user', req.params.userId);
+      if (!holder) return;
+      const manager = getPremiumManager();
+      const success = await shared(res, 'premium.cancelPaidSubscription', [holder]);
+      res.json({ success, subscriptions: manager.getSubscriptions(holder) });
+    } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  router.post('/premium/users/:userId/paid/reactivate', async (req: Request, res: Response) => {
+    try {
+      const holder = holderParam(res, 'user', req.params.userId);
+      if (!holder) return;
+      const manager = getPremiumManager();
+      const success = await shared(res, 'premium.reactivatePaidSubscription', [holder]);
+      res.json({ success, subscriptions: manager.getSubscriptions(holder) });
+    } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  router.post('/premium/users/:userId/paid/expire-now', async (req: Request, res: Response) => {
+    try {
+      const holder = holderParam(res, 'user', req.params.userId);
+      if (!holder) return;
+      const manager = getPremiumManager();
+      const success = await shared(res, 'premium.cancelPaidSubscriptionImmediately', [holder]);
+      if (!success) {
+        return res.status(404).json({ success: false, error: 'No active paid subscription to expire' });
+      }
+      res.json({ success, subscriptions: manager.getSubscriptions(holder) });
+    } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  router.delete('/premium/users/:userId/paused/:subscriptionId', async (req: Request, res: Response) => {
+    try {
+      const holder = holderParam(res, 'user', req.params.userId);
+      if (!holder) return;
+      const { subscriptionId } = req.params;
+      if (!subscriptionId || typeof subscriptionId !== 'string') {
+        return res.status(400).json({ success: false, error: 'subscriptionId is required' });
+      }
+      const manager = getPremiumManager();
+      const success = await shared(res, 'premium.cancelAndRemovePausedSubscription', [holder, subscriptionId]);
+      if (!success) {
+        return res.status(404).json({ success: false, error: 'No paused subscription matched that id' });
+      }
+      res.json({ success, subscriptions: manager.getSubscriptions(holder) });
+    } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  /** The subscriptions a provider holds for this user and the bot does not, each with the plan its adoption takes. */
+  router.get('/premium/users/:userId/orphans', async (req: Request, res: Response) => {
+    try {
+      const holder = holderParam(res, 'user', req.params.userId);
+      if (!holder) return;
+      const orphans = await getPremiumManager().findOrphansFor(holder);
+      res.json({ success: true, orphans });
+    } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  router.post('/premium/users/:userId/orphans/:providerId/:providerSubId/adopt', async (req: Request, res: Response) => {
+    try {
+      const holder = holderParam(res, 'user', req.params.userId);
+      if (!holder) return;
+      const { providerId, providerSubId } = req.params;
+      const manager = getPremiumManager();
+      await shared(res, 'premium.adoptOrphan', [holder, providerId, providerSubId, req.body?.plan]);
+      res.json({ success: true, subscriptions: manager.getSubscriptions(holder) });
+    } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(400).json({ success: false, error: errorMessage });
+    }
+  });
+
+  /** Cancels at the provider only a subscription the provider lists for this user. */
+  router.delete('/premium/users/:userId/orphans/:providerId/:providerSubId', async (req: Request, res: Response) => {
+    try {
+      const holder = holderParam(res, 'user', req.params.userId);
+      if (!holder) return;
+      const { providerId, providerSubId } = req.params;
+      const listed = await getPremiumManager().findOrphansFor(holder);
+      if (!listed.some(o => o.providerId === providerId && o.ref.providerSubId === providerSubId)) {
+        const providerName = getPaymentRegistry().get(providerId)?.displayName ?? providerId;
+        return res.status(404).json({ success: false, error: `Subscription '${providerSubId}' is not listed at ${providerName} for this user.` });
+      }
+      await shared(res, 'premium.cancelOrphan', [providerId, providerSubId]);
+      res.json({ success: true });
+    } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(400).json({ success: false, error: errorMessage });
     }
   });
 

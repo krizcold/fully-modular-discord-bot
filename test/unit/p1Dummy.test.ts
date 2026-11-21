@@ -1,14 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getPaymentRegistry } from '../../src/bot/internalSetup/utils/payment/paymentRegistry';
-import { PREMIUM_KEY, premiumRig } from '../helpers/nb6PremiumRig';
-import { DAY_MS, DUMMY_KEY, MONTHLY, dummyRig, dummyTier } from '../helpers/nb6DummyRig';
+import { premiumRig } from '../helpers/nb6PremiumRig';
+import { DAY_MS, MONTHLY, dummyRig, dummyTier } from '../helpers/nb6DummyRig';
 import { gh, uh } from '../helpers/p1Holder';
 
-// P1 claims 13 (the Dummy's block) and 21 (part 4d): the Dummy keeps `guildId` in its record and gains `buyerId`; its
-// list answers by holder with the buyer; its tick reads premium and sends its events by holder, and skips a record
-// whose server id is not a Discord id; it sells servers only, so a user's purchase is refused (X3) and its file is
-// left as it was. The real DummyProvider and PremiumManager in the bot role over the scripted shared tables
-// (nb6DummyProvider.test.ts's rig).
+// P1 claims 13 (the Dummy's block) and 21 (part 4d): the Dummy's record names its holder and its buyer; its list
+// answers by holder with the buyer; its tick reads premium and sends its events by holder. That the Dummy sells users,
+// and the records its load leaves out, are pinned in p2Shape.test.ts.
+// The real DummyProvider and PremiumManager in the bot role over the scripted shared tables (nb6DummyProvider.test.ts's
+// rig).
 
 vi.mock('fs', async orig => (await import('../helpers/forwardingFs')).forwardingFs(await orig<any>()));
 vi.mock('../../src/bot/internalSetup/utils/payment/paymentRegistry', async orig => {
@@ -27,10 +27,7 @@ const S1 = '70000000000000001';
 const S2 = '70000000000000002';
 const BUYER = '80000000000000001';
 const USER = '80000000000000005';
-const X3 = 'Dummy (Development) does not sell user subscriptions.';
-const X10 = "Dummy (Development)'s record does not name the Discord user who paid; cancel it at Dummy (Development) instead";
 const premiumSub = (guild: string) => r.row()?.subscriptions?.[gh(guild)]?.active;
-const storedText = () => r.m.state.rows.docs.get(DUMMY_KEY)?.body.toString('utf8') ?? null;
 
 /** Collects the walk batches the tick sends to premium. */
 function walkBatches(): any[] {
@@ -59,13 +56,13 @@ afterEach(async () => {
 });
 
 describe('P1 claim 21: the Dummy stores and lists the buyer', () => {
-  it("a server purchase stores the buyer in the Dummy's record, beside today's guildId, and in premium's subscription", async () => {
+  it("a server purchase stores the holder and the buyer in the Dummy's record, and the buyer in premium's subscription", async () => {
     const bought = await d.buy(S1);
     expect(bought.providerSubId).toBe('dummy_1');
     const record = d.record('dummy_1');
-    expect(record).toMatchObject({ providerSubId: 'dummy_1', guildId: S1, buyerId: BUYER, tierId: 'gold', offeringId: 'o1', variantId: MONTHLY, status: 'active' });
+    expect(record).toMatchObject({ providerSubId: 'dummy_1', holder: gh(S1), buyerId: BUYER, tierId: 'gold', offeringId: 'o1', variantId: MONTHLY, status: 'active' });
     expect(Object.keys(record)).toEqual([
-      'providerSubId', 'guildId', 'buyerId', 'tierId', 'offeringId', 'variantId', 'durationDays', 'startDate', 'endDate', 'autoRenew', 'status', 'createdAt', 'updatedAt',
+      'providerSubId', 'holder', 'buyerId', 'tierId', 'offeringId', 'variantId', 'durationDays', 'startDate', 'endDate', 'autoRenew', 'status', 'createdAt', 'updatedAt',
     ]);
     expect(premiumSub(S1)).toMatchObject({ providerId: 'dummy', providerSubId: 'dummy_1', buyerId: BUYER });
   });
@@ -79,25 +76,6 @@ describe('P1 claim 21: the Dummy stores and lists the buyer', () => {
     expect(await d.dummy.listSubscriptionsFor!(gh(S2))).toEqual([]);
     expect(await d.dummy.listSubscriptionsFor!(uh(S1))).toEqual([]);
     expect(await d.dummy.listSubscriptionsFor!('guild:g1' as any)).toEqual([]);
-  });
-
-  it('a record without a buyer (as the Dummy wrote every record before P1) is listed with none, and its adoption plan is X10', async () => {
-    const made = await d.dummy.initiatePurchase({ holder: gh(S2), tierId: 'gold', offeringId: 'o1', variantId: MONTHLY } as any);
-    const madeId = made.providerSubId!;
-    await d.settle();
-    expect(d.record(madeId)).not.toHaveProperty('buyerId');
-    const listed = await d.dummy.listSubscriptionsFor!(gh(S2));
-    expect(listed.map(l => l.metadata)).toEqual([{ holder: gh(S2), tierId: 'gold', offeringId: 'o1', variantId: MONTHLY, couponCode: undefined }]);
-
-    const orphans = await r.pm().findOrphansFor(gh(S2));
-    expect(orphans.map(o => [o.providerId, o.ref.providerSubId, o.plan])).toEqual([
-      ['dummy', madeId, { kind: 'refuse', reason: X10, line: `It cannot be adopted: ${X10}.` }],
-    ]);
-    const before = r.row();
-    await expect(r.pm().adoptOrphan(gh(S2), 'dummy', madeId, { kind: 'install' })).rejects.toThrow(`Subscription '${madeId}' was not adopted: ${X10}.`);
-    await d.settle();
-    expect(r.row()).toEqual(before);
-    expect(premiumSub(S2)).toBeUndefined();
   });
 });
 
@@ -124,72 +102,43 @@ describe("P1 claims 13 and 21: the Dummy's tick speaks holders", () => {
     expect(premiumSub(S2)).toBeUndefined();
     expect(r.logged('was not applied')).toEqual([]);
   });
-
-  it("skips a record whose server id is 'g1' (written by another machine) and still handles the record beside it", async () => {
-    await d.buy(S1);
-    const oddId = (await d.dummy.initiatePurchase({ holder: gh(S2), buyerId: BUYER, tierId: 'gold', offeringId: 'o1', variantId: MONTHLY } as any)).providerSubId!;
-    await d.settle();
-    await d.otherDummy(state => { state.subscriptions[oddId].guildId = 'g1'; });
-    const oddBefore = d.record(oddId);
-    const end1 = premiumSub(S1).endDate;
-    const batches = walkBatches();
-    const reads = readerCalls();
-    d.later(31);
-    const errors = vi.spyOn(console, 'error');
-    const warns = vi.spyOn(console, 'warn');
-    await d.tick();
-    await d.tick();
-    reads.restore();
-    const errorCount = errors.mock.calls.length;
-    const warnCount = warns.mock.calls.length;
-    errors.mockRestore();
-    warns.mockRestore();
-
-    expect(reads.calls.every(c => c[1] === gh(S1))).toBe(true);
-    expect(d.record(oddId)).toEqual(oddBefore);
-    expect(batches.flatMap(b => b.events.map((e: any) => e.providerSubId))).toEqual(['dummy_1']);
-    expect(Date.parse(premiumSub(S1).endDate)).toBe(Date.parse(end1) + 30 * DAY_MS);
-    expect(await d.dummy.listSubscriptionsFor!(gh(S2))).toEqual([]);
-    expect([errorCount, warnCount]).toEqual([0, 0]);
-  });
 });
 
-describe('P1 claim 13: the Dummy sells servers only', () => {
-  it("a user purchase made straight at the Dummy throws X3 and the Dummy's stored file is unchanged", async () => {
+describe('P2 claim 3: the Dummy sells servers and users', () => {
+  it("a user purchase made straight at the Dummy stores a record under the user's key, paid by the user", async () => {
     await d.buy(S1);
-    const before = storedText();
-    await expect(d.dummy.initiatePurchase({ holder: uh(USER), buyerId: USER, tierId: 'gold', offeringId: 'o1', variantId: MONTHLY } as any)).rejects.toThrow(X3);
+    const bought = await d.dummy.initiatePurchase({ holder: uh(USER), buyerId: USER, tierId: 'gold', offeringId: 'o1', variantId: MONTHLY } as any);
     await d.settle();
-    expect(storedText()).toBe(before);
-    expect((await d.dummy.initiatePurchase({ holder: gh(S2), buyerId: BUYER, tierId: 'gold', offeringId: 'o1', variantId: MONTHLY } as any)).providerSubId).toBe('dummy_2');
+    expect(bought.providerSubId).toBe('dummy_2');
+    expect(d.record('dummy_2')).toMatchObject({ providerSubId: 'dummy_2', holder: uh(USER), buyerId: USER, status: 'active' });
+    expect((await d.dummy.listSubscriptionsFor!(uh(USER))).map(l => l.providerSubId)).toEqual(['dummy_2']);
+    expect((await d.dummy.listSubscriptionsFor!(gh(USER))).map(l => l.providerSubId)).toEqual([]);
   });
 
-  it("a user purchase through premium is refused with X3 before the Dummy is called; the Dummy's file is unchanged", async () => {
-    getPaymentRegistry().unregister('dummy');
+  it("a user purchase through premium asks the Dummy's list for the user, then buys and installs under the user's key with the user as buyer", async () => {
     const vip = { ...dummyTier('VIP', 3, 'ov'), kind: 'user' };
     r.pm().setTier('vip', vip as any);
     await d.settle();
-    getPaymentRegistry().register(d.dummy);
-    d.dummy.start();
     expect(r.row().tiers.vip.kind).toBe('user');
-    await d.buy(S1);
-    const before = storedText();
-    const premiumBefore = r.m.state.rows.docs.get(PREMIUM_KEY)?.body.toString('utf8');
     const purchase = vi.spyOn(d.dummy, 'initiatePurchase');
     const list = vi.spyOn(d.dummy, 'listSubscriptionsFor' as any);
 
-    await expect(r.pm().initiatePaidSubscription(uh(USER), 'vip', 'ov', { buyerId: USER, providerId: 'dummy', variantId: MONTHLY })).rejects.toThrow(X3);
+    const bought = await r.pm().initiatePaidSubscription(uh(USER), 'vip', 'ov', { buyerId: USER, providerId: 'dummy', variantId: MONTHLY });
     await d.settle();
-
-    expect(purchase).not.toHaveBeenCalled();
-    expect(list).not.toHaveBeenCalled();
+    const listedFor = list.mock.calls.map(c => c[0]);
+    const boughtWith = purchase.mock.calls.map(c => [(c[0] as any).holder, (c[0] as any).buyerId]);
     purchase.mockRestore();
     list.mockRestore();
-    expect(storedText()).toBe(before);
-    expect(r.m.state.rows.docs.get(PREMIUM_KEY)?.body.toString('utf8')).toBe(premiumBefore);
+
+    expect(listedFor).toEqual([uh(USER)]);
+    expect(boughtWith).toEqual([[uh(USER), USER]]);
+    expect(bought.providerSubId).toBe('dummy_1');
+    expect(d.record('dummy_1')).toMatchObject({ holder: uh(USER), buyerId: USER, tierId: 'vip', status: 'active' });
+    expect(r.row().subscriptions[uh(USER)].active).toMatchObject({ providerId: 'dummy', providerSubId: 'dummy_1', tierId: 'vip', buyerId: USER });
+    expect(r.row().subscriptions[gh(USER)]).toBeUndefined();
   });
 
-  it("declares that it sells servers", () => {
-    expect(d.dummy.capabilities.sells).toEqual(['guild']);
+  it('declares that it sells servers and users', () => {
+    expect(d.dummy.capabilities.sells).toEqual(['guild', 'user']);
   });
 });

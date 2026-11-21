@@ -44,7 +44,7 @@ import { DummyProvider } from '../../src/bot/internalSetup/utils/payment/dummyPr
 // The Dummy provider's stop and deposition: what it refuses, what it records, and its rechecks of state.json.
 
 const DOC = 'global:payment-providers/dummy/state.json';
-const PURCHASE = { holder: 'guild:70000000000000001', guildId: '70000000000000001', tierId: 't', offeringId: 'o', variantId: 'dummy_monthly_999' } as any;
+const PURCHASE = { holder: 'guild:70000000000000001', buyerId: '80000000000000001', tierId: 't', offeringId: 'o', variantId: 'dummy_monthly_999' } as any;
 let providers: DummyProvider[];
 
 function make(): DummyProvider {

@@ -74,7 +74,7 @@ describe("expire now with the Dummy provider, whose own event removes the subscr
     dummy.adminListVariants();
     const now = new Date().toISOString();
     (dummy as any).state.subscriptions.dA = {
-      providerSubId: 'dA', guildId: G, tierId: 'low', offeringId: 'o1', variantId: 'v1', durationDays: 30,
+      providerSubId: 'dA', holder: gh(G), buyerId: '80000000000000001', tierId: 'low', offeringId: 'o1', variantId: 'v1', durationDays: 30,
       startDate: now, endDate: new Date(Date.now() + 30 * 86_400_000).toISOString(), autoRenew: true, status: 'active',
       createdAt: now, updatedAt: now,
     };

@@ -6,6 +6,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 // nb10PremiumRefused.test.ts makes one): the op answers not ok, the stored bytes stay, and the bot's retry stores the
 // change with its audit line once. On the mirror rig another machine changes the row the save was built on: the op
 // answers changed-elsewhere and the next read shows the other machine's record.
+// P2 claim 12 (parts 0 and 2): the paid methods for a server and for a user run through the P1 seller and the real Dummy
+// provider, with the refusal on premium-tiers.json only (the Dummy's state.json is another file and stores its
+// change): a purchase or an adoption leaves the seller's record live and listed for the holder.
 
 const inject = vi.hoisted(() => ({ refuse: new Map<string, string>() }));
 vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => {
@@ -26,11 +29,12 @@ vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => {
 vi.mock('../../src/bot/internalSetup/utils/payment/paymentRegistry', async orig => (await import('../helpers/p1Mocks')).bareRegistry(await orig<any>()));
 vi.mock('../../src/bot/internalSetup/utils/premiumNotifications', async () => (await import('../helpers/p1Mocks')).noticeModule());
 
+import { getPaymentRegistry } from '../../src/bot/internalSetup/utils/payment/paymentRegistry';
 import { getPremiumManager } from '../../src/bot/internalSetup/utils/premiumManager';
 import { runSharedPass } from '../../src/bot/internalSetup/utils/sharedMirror';
 import { PREMIUM_KEY } from '../helpers/nb6PremiumRig';
 import { gh, uh } from '../helpers/p1Holder';
-import { SERVERS, USERS, p1World, type OpReply } from '../helpers/p1World';
+import { BUYER, SERVERS, USERS, eachSeller, p1World, type OpReply } from '../helpers/p1World';
 
 type World = ReturnType<typeof p1World>;
 const USER = uh(USERS[0]);
@@ -46,9 +50,11 @@ interface Case {
   action: string;
   stored: (record: any) => unknown;
   expected: unknown;
+  /** The seller's record the call sells or adopts, which stays live at the seller when premium's save is refused. */
+  sold?: (w: World, idsBefore: string[]) => string;
 }
 
-const cases: Case[] = [
+const manualCases: Case[] = [
   {
     name: 'grantManual for a user', holder: USER, action: 'subscription.grant.manual',
     prepare: async () => undefined,
@@ -67,17 +73,20 @@ const cases: Case[] = [
     call: w => w.revoke(USER),
     stored: record => record, expected: null,
   },
-  {
-    name: 'a server purchase', holder: SERVER, action: 'subscription.install.paid',
-    prepare: async () => undefined,
-    call: w => w.purchase(SERVER, 'mid'),
-    stored: record => record?.active?.tierId ?? null, expected: 'mid',
-  },
+];
+
+/** The paid methods for a user, run through each seller. */
+const userPaidCases: Case[] = [
   {
     name: 'a user purchase', holder: USER, action: 'subscription.install.paid',
     prepare: async () => undefined,
     call: w => w.purchase(USER, 'vlow'),
     stored: record => [record?.active?.tierId ?? null, record?.active?.buyerId ?? null], expected: ['vlow', USERS[0]],
+    sold: (w, idsBefore) => {
+      const made = w.ids().filter(id => !idsBefore.includes(id));
+      expect(made).toHaveLength(1);
+      return made[0];
+    },
   },
   {
     name: 'cancelPaidSubscriptionImmediately for a user', holder: USER, action: 'subscription.cancel.paid',
@@ -115,20 +124,80 @@ const cases: Case[] = [
   {
     name: 'adoptOrphan for a user', holder: USER, action: 'subscription.install.paid',
     prepare: async w => {
-      const record = w.orphan(USER, 'vlow');
+      const providerSubId = await w.unheld(USER, 'vlow');
       const listed = await w.orphans(USER);
-      expect(listed.map(o => [o.ref.providerSubId, o.plan.kind])).toEqual([[record.providerSubId, 'install']]);
-      adoption = { providerSubId: record.providerSubId, plan: listed[0].plan };
+      expect(listed.map(o => [o.ref.providerSubId, o.plan.kind])).toEqual([[providerSubId, 'install']]);
+      adoption = { providerSubId, plan: listed[0].plan };
     },
     call: w => w.adopt(USER, adoption.providerSubId, adoption.plan),
     stored: record => [record?.active?.providerSubId === adoption.providerSubId, record?.active?.buyerId ?? null], expected: [true, USERS[0]],
+    sold: () => adoption.providerSubId,
   },
 ];
 
 let adoption: { providerSubId: string; plan: unknown } = { providerSubId: '', plan: null };
 
+/** The paid methods for a server, run through each seller. */
+const serverCases: Case[] = [
+  {
+    name: 'a server purchase', holder: SERVER, action: 'subscription.install.paid',
+    prepare: async () => undefined,
+    call: w => w.purchase(SERVER, 'mid'),
+    stored: record => record?.active?.tierId ?? null, expected: 'mid',
+    sold: (w, idsBefore) => {
+      const made = w.ids().filter(id => !idsBefore.includes(id));
+      expect(made).toHaveLength(1);
+      return made[0];
+    },
+  },
+  {
+    name: 'cancelPaidSubscriptionImmediately for a server', holder: SERVER, action: 'subscription.cancel.paid',
+    prepare: async w => { expect((await w.purchase(SERVER, 'low')).ok).toBe(true); },
+    call: w => w.cancelNow(SERVER),
+    stored: record => record, expected: null,
+  },
+  {
+    name: 'cancelAndRemovePausedSubscription for a server', holder: SERVER, action: 'subscription.cancel.paid',
+    prepare: async w => {
+      expect((await w.purchase(SERVER, 'high')).ok).toBe(true);
+      expect((await w.purchase(SERVER, 'low')).ok).toBe(true);
+    },
+    call: async w => (await w.cancelQueued(SERVER, 0))!,
+    stored: record => [record?.active?.tierId ?? null, record?.paused?.length ?? null], expected: ['high', 0],
+  },
+  {
+    name: 'cancelPaidSubscription for a server', holder: SERVER, action: 'subscription.cancel.paid',
+    prepare: async w => { expect((await w.purchase(SERVER, 'low')).ok).toBe(true); },
+    call: w => w.op('cancelPaidSubscription', SERVER),
+    stored: record => [record?.active?.tierId ?? null, record?.active?.autoRenew ?? null], expected: ['low', false],
+  },
+  {
+    name: 'reactivatePaidSubscription for a server', holder: SERVER, action: 'subscription.reactivate.paid',
+    prepare: async w => {
+      expect((await w.purchase(SERVER, 'low')).ok).toBe(true);
+      expect(await w.op('cancelPaidSubscription', SERVER)).toMatchObject({ ok: true, result: true });
+      expect(w.recordOf(SERVER).active.autoRenew).toBe(false);
+    },
+    call: w => w.op('reactivatePaidSubscription', SERVER),
+    stored: record => [record?.active?.tierId ?? null, record?.active?.autoRenew ?? null], expected: ['low', true],
+  },
+  {
+    name: 'adoptOrphan for a server', holder: SERVER, action: 'subscription.install.paid',
+    prepare: async w => {
+      const providerSubId = await w.unheld(SERVER, 'low');
+      const listed = await w.orphans(SERVER);
+      expect(listed.map(o => [o.ref.providerSubId, o.plan.kind])).toEqual([[providerSubId, 'install']]);
+      adoption = { providerSubId, plan: listed[0].plan };
+    },
+    call: w => w.adopt(SERVER, adoption.providerSubId, adoption.plan),
+    stored: record => [record?.active?.providerSubId === adoption.providerSubId, record?.active?.buyerId ?? null], expected: [true, BUYER],
+    sold: () => adoption.providerSubId,
+  },
+];
+
 describe('P1 claim 10 on the JSON files: a save the disk refuses', () => {
-  const w = p1World();
+  for (const [sellers, table] of [[['p1seller'], manualCases], [['p1seller', 'dummy'], [...userPaidCases, ...serverCases]]] as const) eachSeller([...sellers], make => {
+  const w = p1World('json', make());
   beforeEach(async () => {
     inject.refuse.clear();
     await w.setup();
@@ -142,10 +211,11 @@ describe('P1 claim 10 on the JSON files: a save the disk refuses', () => {
     vi.restoreAllMocks();
   });
 
-  it.each(cases)('$name answers not ok, leaves the stored bytes, and the retry stores it with its audit line once', async c => {
+  it.each(table)('$name answers not ok, leaves the stored bytes, and the retry stores it with its audit line once', async c => {
     await c.prepare(w);
     const before = { premium: w.storedText(), audit: w.auditText() };
     const linesBefore = w.auditLines().filter(l => l.action === c.action).length;
+    const idsBefore = w.ids();
     inject.refuse.set('premium-tiers.json', 'storage-failing');
     inject.refuse.set('premium-tiers.audit.jsonl', 'storage-failing');
 
@@ -154,6 +224,12 @@ describe('P1 claim 10 on the JSON files: a save the disk refuses', () => {
     expect(reply.ok).toBe(false);
     expect((reply as any).answer).toBe('held');
     expect({ premium: w.storedText(), audit: w.auditText() }).toEqual(before);
+    if (c.sold) {
+      const id = c.sold(w, idsBefore);
+      expect(w.view(id)).toMatchObject({ status: 'active' });
+      const listed = await getPaymentRegistry().get(w.driver.id)!.listSubscriptionsFor!(c.holder as any);
+      expect(listed.map(r => r.providerSubId)).toContain(id);
+    }
 
     inject.refuse.clear();
     await vi.waitFor(() => expect(c.stored(w.recordOf(c.holder))).toEqual(c.expected), { timeout: 8000, interval: 50 });
@@ -163,10 +239,12 @@ describe('P1 claim 10 on the JSON files: a save the disk refuses', () => {
     expect(lines).toHaveLength(linesBefore + 1);
     expect(lines[lines.length - 1].holder).toBe(c.holder);
   }, 30_000);
+  });
 });
 
 describe('P1 claim 10 on the mirror rig: a save built on a row another machine changed', () => {
-  const w = p1World('rig');
+  for (const [sellers, table] of [[['p1seller'], manualCases], [['p1seller', 'dummy'], [...userPaidCases, ...serverCases]]] as const) eachSeller([...sellers], make => {
+  const w = p1World('rig', make());
   beforeEach(async () => {
     inject.refuse.clear();
     await w.setup();
@@ -175,7 +253,7 @@ describe('P1 claim 10 on the mirror rig: a save built on a row another machine c
   });
   afterEach(async () => { await w.teardown(); });
 
-  it.each(cases)("$name answers changed-elsewhere, and the next read shows the other machine's record", async c => {
+  it.each(table)("$name answers changed-elsewhere, and the next read shows the other machine's record", async c => {
     await c.prepare(w);
     const rows = w.rig!.m.state.rows;
     // The other machine's version: this one's document with a grant to a third holder, and without this change.
@@ -203,4 +281,5 @@ describe('P1 claim 10 on the mirror rig: a save built on a row another machine c
     expect(read['user:9'].active.id).toBe('theirs-1');
     expect(read[c.holder] ?? null).toEqual(mineBefore);
   }, 30_000);
+  });
 });

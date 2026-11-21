@@ -4,6 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 // P1 claims 2, 17 and 20 (parts 3 and 4a): the store is keyed by holder, a provider account link stores its holder and its
 // buyer, and the audit log names the holder. Every change goes through its shared op on the real manager; claim 2
 // runs on the JSON files and on the mirror rig.
+// P2 claim 12 (parts 0 and 2): the purchases of a server and of a user (claim 2) and their audit lines (claim 20) run
+// again through the real Dummy provider; the created event is absent from its run.
 
 vi.mock('../../src/bot/internalSetup/utils/payment/paymentRegistry', async orig => (await import('../helpers/p1Mocks')).bareRegistry(await orig<any>()));
 vi.mock('../../src/bot/internalSetup/utils/premiumNotifications', async () => (await import('../helpers/p1Mocks')).noticeModule());
@@ -11,12 +13,13 @@ vi.mock('../../src/bot/internalSetup/utils/premiumNotifications', async () => (a
 import { getPaymentRegistry } from '../../src/bot/internalSetup/utils/payment/paymentRegistry';
 import { getPremiumManager } from '../../src/bot/internalSetup/utils/premiumManager';
 import { gh, uh } from '../helpers/p1Holder';
-import { AUDIT, BUYER, defaultBuyer, LINKER, linkProvider, p1World, purchaseOptions, SELLER_ID, SELLER_VARIANT, SERVERS, USERS } from '../helpers/p1World';
+import { AUDIT, BUYER, defaultBuyer, eachSeller, LINKER, linkProvider, p1World, purchaseOptions, SELLER_ID, SELLER_VARIANT, SERVERS, USERS } from '../helpers/p1World';
 
 const X12 = 'A provider account link needs the Discord id of the user who linked it; none was given.';
 
 describe.each([['the JSON files', 'json' as const], ['the mirror rig', 'rig' as const]])('P1 claim 2 on %s: the store is keyed by holder', (_name, backend) => {
-  const w = p1World(backend);
+  eachSeller(['p1seller', 'dummy'], make => {
+  const w = p1World(backend, make());
   beforeEach(async () => { await w.setup(); });
   afterEach(async () => { await w.teardown(); });
 
@@ -33,10 +36,39 @@ describe.each([['the JSON files', 'json' as const], ['the mirror rig', 'rig' as 
     expect(Object.keys(doc.subscriptions).sort()).toEqual([gh(server), gh(other), uh(user)].sort());
     expect(doc.subscriptions[gh(server)].active).toMatchObject({ tierId: 'low', source: 'manual' });
     expect(doc.subscriptions[uh(user)].active).toMatchObject({ tierId: 'ulow', source: 'manual' });
-    expect(doc.subscriptions[gh(other)].active).toMatchObject({ tierId: 'high', source: 'paid', providerId: SELLER_ID, buyerId: BUYER });
+    expect(doc.subscriptions[gh(other)].active).toMatchObject({ tierId: 'high', source: 'paid', providerId: w.driver.id, buyerId: BUYER });
     expect(doc.subscriptions[gh(server)].active.buyerId).toBeUndefined();
     expect(doc.subscriptions[uh(user)].active.buyerId).toBeUndefined();
   });
+
+  it("P2 claim 12: a user purchase and a server purchase are stored under the holders' keys, and guild:5 and user:5 hold different paid records", async () => {
+    await w.addSoldUserTiers();
+    const user = USERS[0];
+
+    expect(await w.purchase(uh(user), 'vlow')).toMatchObject({ ok: true });
+    expect(await w.purchase(gh('5'), 'low')).toMatchObject({ ok: true });
+    expect(await w.purchase(uh('5'), 'vmid')).toMatchObject({ ok: true });
+
+    const doc = w.stored();
+    expect(Object.keys(doc.subscriptions).sort()).toEqual([uh(user), 'guild:5', 'user:5'].sort());
+    expect(doc.subscriptions[uh(user)].active).toMatchObject({ tierId: 'vlow', source: 'paid', providerId: w.driver.id, buyerId: user });
+    expect(doc.subscriptions['guild:5'].active).toMatchObject({ tierId: 'low', source: 'paid', buyerId: BUYER });
+    expect(doc.subscriptions['user:5'].active).toMatchObject({ tierId: 'vmid', source: 'paid', buyerId: '5' });
+    expect(doc.subscriptions['guild:5'].active.providerSubId).not.toBe(doc.subscriptions['user:5'].active.providerSubId);
+
+    const serverBefore = JSON.stringify(doc.subscriptions['guild:5']);
+    expect(await w.cancelNow(uh('5'))).toMatchObject({ ok: true });
+    expect(w.stored().subscriptions['user:5']).toBeUndefined();
+    expect(JSON.stringify(w.stored().subscriptions['guild:5'])).toBe(serverBefore);
+    const installs = w.auditLines().filter(l => l.action === 'subscription.install.paid');
+    expect(installs.map(l => [l.holder, l.metadata.buyerId])).toEqual([[uh(user), user], ['guild:5', BUYER], ['user:5', '5']]);
+  });
+  });
+
+  eachSeller(['p1seller'], make => {
+  const w = p1World(backend, make());
+  beforeEach(async () => { await w.setup(); });
+  afterEach(async () => { await w.teardown(); });
 
   it('a user purchase and an event install of each kind are stored under the holders\' keys, and guild:5 and user:5 hold different paid records', async () => {
     await w.addSoldUserTiers();
@@ -95,6 +127,7 @@ describe.each([['the JSON files', 'json' as const], ['the mirror rig', 'rig' as 
     expect(mgr.getHolderSubscriptions(uh(USERS[0])).active.tierId).toBe('ulow');
     expect(mgr.getHolderSubscriptions(uh(USERS[1]))).toBeNull();
     expect(mgr.getSubscriptions(gh(USERS[0]))).toEqual({ paused: [] });
+  });
   });
 });
 
@@ -319,7 +352,8 @@ describe('P1 claim 17: a provider account link stores its holder and its buyer',
 });
 
 describe('P1 claim 20: the audit log names the holder', () => {
-  const w = p1World();
+  eachSeller(['p1seller', 'dummy'], make => {
+  const w = p1World('json', make());
   beforeEach(async () => { await w.setup(); });
   afterEach(async () => { await w.teardown(); });
 
@@ -333,7 +367,7 @@ describe('P1 claim 20: the audit log names the holder', () => {
     expect(await w.purchase(a, 'high')).toMatchObject({ ok: true });
     expect(await w.cancelNow(a)).toMatchObject({ ok: true });
     expect(await w.revoke(a)).toMatchObject({ ok: true });
-    expect(await w.created(b, 'mid')).toMatchObject({ ok: true });
+    if (w.delivers) expect(await w.created(b, 'mid')).toMatchObject({ ok: true });
     expect(await w.grant(uh(u), 'ulow', 30)).toMatchObject({ ok: true });
     expect(await w.grant(uh(u), 'uhigh', 30)).toMatchObject({ ok: true });
     expect(await w.revoke(uh(u))).toMatchObject({ ok: true });
@@ -347,7 +381,7 @@ describe('P1 claim 20: the audit log names the holder', () => {
       `subscription.cancel.paid ${gh(a)}`,
       `subscription.resume ${gh(a)}`,
       `subscription.revoke.manual ${gh(a)}`,
-      `subscription.install.paid ${gh(b)}`,
+      ...(w.delivers ? [`subscription.install.paid ${gh(b)}`] : []),
       `subscription.grant.manual ${uh(u)}`,
       `subscription.grant.manual ${uh(u)}`,
       `subscription.pause ${uh(u)}`,
@@ -357,6 +391,12 @@ describe('P1 claim 20: the audit log names the holder', () => {
     expect(lines.filter(l => 'guildId' in l)).toEqual([]);
     expect(lines.find(l => l.action === 'subscription.install.paid' && l.holder === gh(a)).metadata.buyerId).toBe(BUYER);
   });
+  });
+
+  eachSeller(['p1seller'], make => {
+  const w = p1World('json', make());
+  beforeEach(async () => { await w.setup(); });
+  afterEach(async () => { await w.teardown(); });
 
   it('readAuditEntries({ holder }) returns the lines of that holder only', async () => {
     await w.addUserTiers();
@@ -395,5 +435,6 @@ describe('P1 claim 20: the audit log names the holder', () => {
     const read = await (getPremiumManager() as any).readAuditEntries({ holder: gh(SERVERS[0]) });
     expect(read.entries.map((e: any) => e.subscriptionId).includes('old-1')).toBe(false);
     expect(read.entries.map((e: any) => e.action).sort()).toEqual(['subscription.grant.manual', 'subscription.revoke.manual']);
+  });
   });
 });

@@ -13,13 +13,15 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 // mirror rig with fewer steps. Nothing runs on the clock.
 // Left out, as the sheet's section 4 says: a state event for a queued subscription (E1), a setTier that changes a
 // priority (E2), price migrations and the expiry tick (E3). A failure prints its seed; SMDB_TEST_SEED replays it.
+// P2 claim 12 (parts 0 and 2): claims 8 and 9 run again through the real Dummy provider, with the steps it can make
+// (no delivery) for the two servers and the three users.
 
 vi.mock('../../src/bot/internalSetup/utils/payment/paymentRegistry', async orig => (await import('../helpers/p1Mocks')).bareRegistry(await orig<any>()));
 vi.mock('../../src/bot/internalSetup/utils/premiumNotifications', async () => (await import('../helpers/p1Mocks')).noticeModule());
 
 import { allowDropLines, droppedLines } from '../helpers/p1Guard';
 import { gh, uh } from '../helpers/p1Holder';
-import { HOLDERS, SELLER_LIST_CALL, SERVERS, TIER_IDS, TWIN_USER, USERS, USER_HOLDERS, USER_SOLD_TIER_IDS, USER_TIER_IDS, brokenHolders, brokenStacking, p1World, type OpReply } from '../helpers/p1World';
+import { HOLDERS, SELLER_LIST_CALL, SERVERS, TIER_IDS, TWIN_USER, USERS, USER_HOLDERS, USER_SOLD_TIER_IDS, USER_TIER_IDS, brokenHolders, brokenStacking, eachSeller, p1World, type OpReply, type SellerDriver } from '../helpers/p1World';
 
 type Step =
   | { t: 'grant'; h: number; tier: string; days: number | null }
@@ -48,6 +50,22 @@ const holderSteps: fc.Arbitrary<Step>[] = [
   fc.record({ t: fc.constant('cancelQueued' as const), h: anyHolder, pick: fc.nat({ max: 5 }) }),
 ];
 const tierSteps: fc.Arbitrary<Step>[] = [fc.record({ t: fc.constantFrom('deleteTier' as const, 'setTier' as const), tier: anyTier })];
+/** The steps of a seller that takes no delivery: the manual and paid steps of the servers and the users (sheet P2, section 5). */
+const sellerSteps: fc.Arbitrary<Step>[] = [
+  fc.record({ t: fc.constant('grant' as const), h: anyHolder, tier: anyTier, days: fc.option(fc.integer({ min: 1, max: 60 }), { nil: null }) }),
+  fc.record({ t: fc.constant('grant' as const), h: user, tier: fc.constantFrom(...USER_TIER_IDS), days: fc.option(fc.integer({ min: 1, max: 60 }), { nil: null }) }),
+  fc.record({ t: fc.constant('extend' as const), h: anyHolder, days: fc.integer({ min: 1, max: 30 }) }),
+  fc.record({ t: fc.constant('revoke' as const), h: anyHolder }),
+  fc.record({ t: fc.constant('cancelNow' as const), h: anyHolder }),
+  fc.record({ t: fc.constant('purchase' as const), h: server, tier: serverTier }),
+  fc.record({ t: fc.constant('purchase' as const), h: user, tier: soldUserTier }),
+  fc.record({ t: fc.constant('purchase' as const), h: anyHolder, tier: anyTier }),
+  fc.record({ t: fc.constant('cancelQueued' as const), h: anyHolder, pick: fc.nat({ max: 5 }) }),
+];
+const sellerTierSteps: fc.Arbitrary<Step>[] = [fc.record({ t: fc.constantFrom('deleteTier' as const, 'setTier' as const), tier: anyTier })];
+/** The steps a driver's seller can make. */
+const stepsOf = (driver: SellerDriver, tiers: boolean): fc.Arbitrary<Step>[] =>
+  driver.delivers ? [...holderSteps, ...(tiers ? tierSteps : [])] : [...sellerSteps, ...(tiers ? sellerTierSteps : [])];
 
 type World = ReturnType<typeof p1World>;
 const files = p1World();
@@ -159,31 +177,41 @@ describe('P1 parts 0, 3 and 4a: two servers and three users', () => {
     expect(new Set(HOLDERS).size).toBe(HOLDERS.length);
   });
 
-  it("claim 8, K5: a step on one holder leaves every other holder's record as it was (and N1, N2, N3 hold)", async () => {
-    vi.spyOn(console, 'log').mockImplementation(() => undefined);
-    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-    vi.spyOn(console, 'error').mockImplementation(() => undefined);
-    allowDropLines('L3', 'install');
-    Object.assign(tally, noTally);
-    await fc.assert(fc.asyncProperty(fc.array(fc.oneof(...holderSteps), { minLength: 1, maxLength: 25 }), async steps => {
-      expect(await broken(steps, { others: true, stacking: false })).toEqual([]);
-    }), { numRuns: 40 });
-    expect({ ...tally, enough: enoughOk() }).toMatchObject({ enough: true });
-    expect(untiedInstallFailures()).toEqual([]);
-  }, 400_000);
+  eachSeller(['p1seller', 'dummy'], make => {
+    const driver = make();
+    const world = driver.delivers ? files : p1World('json', driver);
+    afterEach(() => { w = files; });
 
-  it('claim 9, K1 to K4, N1 to N3: the stored queue stays paused, without doubles, behind a filled slot and in order, under holder keys, tiers of the holder\'s kind and a buyer on every paid subscription', async () => {
-    vi.spyOn(console, 'log').mockImplementation(() => undefined);
-    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-    vi.spyOn(console, 'error').mockImplementation(() => undefined);
-    allowDropLines('L3', 'install');
-    Object.assign(tally, noTally);
-    await fc.assert(fc.asyncProperty(fc.array(fc.oneof(...holderSteps, ...tierSteps), { minLength: 1, maxLength: 25 }), async steps => {
-      expect(await broken(steps, { others: true, stacking: true })).toEqual([]);
-    }), { numRuns: 40 });
-    expect({ ...tally, enough: enoughOk() }).toMatchObject({ enough: true });
-    expect(untiedInstallFailures()).toEqual([]);
-  }, 400_000);
+    it("claim 8, K5: a step on one holder leaves every other holder's record as it was (and N1, N2, N3 hold)", async () => {
+      vi.spyOn(console, 'log').mockImplementation(() => undefined);
+      vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      allowDropLines('L3', 'install');
+      Object.assign(tally, noTally);
+      w = world;
+      await fc.assert(fc.asyncProperty(fc.array(fc.oneof(...stepsOf(driver, false)), { minLength: 1, maxLength: 25 }), async steps => {
+        expect(await broken(steps, { others: true, stacking: false })).toEqual([]);
+      }), { numRuns: 40 });
+      expect({ ...tally, enough: enoughOk() }).toMatchObject({ enough: true });
+      expect(untiedInstallFailures()).toEqual([]);
+      w = files;
+    }, 400_000);
+
+    it('claim 9, K1 to K4, N1 to N3: the stored queue stays paused, without doubles, behind a filled slot and in order, under holder keys, tiers of the holder\'s kind and a buyer on every paid subscription', async () => {
+      vi.spyOn(console, 'log').mockImplementation(() => undefined);
+      vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      allowDropLines('L3', 'install');
+      Object.assign(tally, noTally);
+      w = world;
+      await fc.assert(fc.asyncProperty(fc.array(fc.oneof(...stepsOf(driver, true)), { minLength: 1, maxLength: 25 }), async steps => {
+        expect(await broken(steps, { others: true, stacking: true })).toEqual([]);
+      }), { numRuns: 40 });
+      expect({ ...tally, enough: enoughOk() }).toMatchObject({ enough: true });
+      expect(untiedInstallFailures()).toEqual([]);
+      w = files;
+    }, 400_000);
+  });
 
   it('the steps reach the stacking: a purchase above a grant queues the grant, and an expiry resumes it', async () => {
     await w.setup();
@@ -195,7 +223,7 @@ describe('P1 parts 0, 3 and 4a: two servers and three users', () => {
       expect(await w.grant(b, 'mid', null)).toMatchObject({ ok: true });
       const queued = w.recordOf(a);
       expect([queued.active.tierId, queued.active.source, queued.paused.map((p: any) => `${p.tierId}/${p.source}/${p.status}`)]).toEqual(['high', 'paid', ['mid/paid/paused', 'low/manual/paused']]);
-      expect(w.seller.calls.map(c => c.method)).toEqual([SELLER_LIST_CALL, 'initiatePurchase', 'pauseSubscription']);
+      expect(w.calls().map(c => c.method)).toEqual([SELLER_LIST_CALL, 'initiatePurchase', 'pauseSubscription']);
       expect(await w.expired(a)).toMatchObject({ ok: true });
       const resumed = w.recordOf(a);
       expect([resumed.active.tierId, resumed.active.status, resumed.paused.map((p: any) => p.tierId)]).toEqual(['mid', 'active', ['low']]);
@@ -229,7 +257,7 @@ describe('P1 parts 0, 3 and 4a: two servers and three users', () => {
       expect(await w.cancelQueued(u, 0)).toBeNull();
       expect(Object.keys(w.stored().subscriptions).sort()).toEqual([u, v].sort());
       expect(w.recordOf(v).active).toMatchObject({ tierId: 'umid', endDate: null });
-      expect(w.seller.calls).toEqual([]);
+      expect(w.calls()).toEqual([]);
       expect(brokenStacking(w.stored())).toEqual([]);
       expect(brokenHolders(w.stored())).toEqual([]);
     } finally {

@@ -143,7 +143,7 @@ describe('a Dummy method answers once its op settled (71)', () => {
     const result = await buying;
     await d.settle();
     expect(result.providerSubId).toBe('dummy_1');
-    expect(d.record('dummy_1')).toMatchObject({ guildId: '70000000000000001', status: 'active' });
+    expect(d.record('dummy_1')).toMatchObject({ holder: 'guild:70000000000000001', status: 'active' });
     expect(premiumSub()).toMatchObject({ providerId: 'dummy', providerSubId: 'dummy_1', status: 'active' });
     expect(auditActions()).toContain('subscription.install.paid');
     expect(notices.sent).toEqual(['paid.sub.started:guild:70000000000000001']);
@@ -206,7 +206,7 @@ describe('a Dummy method answers once its op settled (71)', () => {
     const purchase = { holder: gh('70000000000000002'), buyerId: '80000000000000001', tierId: 'gold', offeringId: 'o1', variantId: MONTHLY };
     await expect(other.initiatePurchase(purchase)).rejects.toThrow(T20(ELSEWHERE));
     expect(Object.keys(d.stored().subscriptions)).toEqual(['dummy_1']);
-    expect(d.record('dummy_1').guildId).toBe('70000000000000001');
+    expect(d.record('dummy_1').holder).toBe('guild:70000000000000001');
     expect((await other.initiatePurchase(purchase)).providerSubId).toBe('dummy_2');
   });
 

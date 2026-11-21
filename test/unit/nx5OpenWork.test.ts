@@ -193,10 +193,12 @@ describe('G8-14: the Dummy provider', () => {
     const store = await answerWhileOpen(/^the Dummy provider: 1 purchase\(s\) not saved yet$/);
 
     check.open({ valid: true });
-    const result = await bought;
+    const answer: any = await bought.then(() => null, error => error);
     await answerOnceEnded(store);
     await settleQueue();
-    expect(Object.keys(jsonOf(DUMMY_STATE).subscriptions)).toEqual([result.providerSubId]);
+    // The order holds the purchase's save, so it answers T23 and the retry stores it once the order ends.
+    expect([answer?.code, answer?.reason]).toEqual(['unconfirmed', 'a maintenance save order holds the write and the Dummy provider is trying again']);
+    expect(Object.keys(jsonOf(DUMMY_STATE).subscriptions)).toEqual(['dummy_1']);
   });
 });
 

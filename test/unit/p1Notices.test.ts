@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 // P1 claim 15, part 2: a notice takes a holder from premium to the Discord call. The notifier, the dispatch and the
 // bot's IPC handler are the real ones; Discord is a fake client that records every call in order. The manager is the
 // world's, so a server's notices channel is the one the setNotificationsChannelId op stored.
+// P2 claim 12 (parts 0 and 2): the notice of a server's and of a user's purchase runs through the P1 seller and the
+// real Dummy provider.
 
 vi.mock('../../src/bot/internalSetup/utils/payment/paymentRegistry', async orig => (await import('../helpers/p1Mocks')).bareRegistry(await orig<any>()));
 
@@ -10,9 +12,9 @@ import { SubscriptionNotifier, getSubscriptionNotifier } from '../../src/bot/int
 import { dispatchPremiumNotification, setNotificationIPCDispatcher } from '../../src/bot/internalSetup/utils/premiumNotifications';
 import { setupIPCNotificationHandler } from '../../src/bot/internalSetup/utils/ipcNotificationHandler';
 import { BotManager } from '../../src/webui/botManager';
-import { SERVERS, p1World } from '../helpers/p1World';
+import { SERVERS, eachSeller, p1World, type SellerDriver } from '../helpers/p1World';
 
-const w = p1World();
+let w: ReturnType<typeof p1World>;
 const SERVER = SERVERS[0];
 const USER = '80000000000000007';
 const OWNER = '80000000000000009';
@@ -76,7 +78,7 @@ function discord(how: FakeDiscord = {}) {
   };
   const notifier = new SubscriptionNotifier();
   notifier.setClient(client as any);
-  return { notifier, calls, sent };
+  return { notifier, client, calls, sent };
 }
 
 const FETCH = `guilds.fetch {"guild":"${SERVER}","cache":false}`;
@@ -85,16 +87,22 @@ const warned = (spy: { mock: { calls: unknown[][] } }): string[] => spy.mock.cal
 
 let warn: ReturnType<typeof vi.spyOn>;
 
-beforeEach(async () => {
-  await w.setup();
-  warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-});
-afterEach(async () => {
-  vi.restoreAllMocks();
-  await w.teardown();
-});
+/** The world of the rows that follow, on this driver's seller. */
+function useWorld(driver: SellerDriver): void {
+  const world = p1World('json', driver);
+  beforeEach(async () => {
+    w = world;
+    await w.setup();
+    warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+  });
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await w.teardown();
+  });
+}
 
-describe('P1 claim 15: a server holder is delivered as a server is today', () => {
+describe('P1 claim 15: a server holder is delivered as a server is today', () => eachSeller(['p1seller'], make => {
+  useWorld(make());
   beforeEach(async () => {
     const reply = await w.setNoticesChannel(SERVER, 'chan1');
     expect(reply.ok).toBe(true);
@@ -151,9 +159,10 @@ describe('P1 claim 15: a server holder is delivered as a server is today', () =>
     expect(d.calls).toEqual([FETCH]);
     expect(warned(warn)).toEqual([`[SubscriptionNotifier] guild ${SERVER} not reachable; cannot deliver manual.grant.added: guild not reachable (Unknown Guild)`]);
   });
-});
+}));
 
-describe('P1 claim 15: a user holder gets one direct message', () => {
+describe('P1 claim 15: a user holder gets one direct message', () => eachSeller(['p1seller'], make => {
+  useWorld(make());
   it('sends one direct message to that user, fetches no server, and words the two texts for a user', async () => {
     const d = discord();
     const granted = await d.notifier.notify(userHolder, 'manual.grant.added', { tierName: 'VIP' });
@@ -207,9 +216,10 @@ describe('P1 claim 15: a user holder gets one direct message', () => {
     expect((outcomes[0] as any).cause).toBe(`'${SERVER}' is not a holder: expected guild:<id> or user:<id> with a Discord id.`);
     expect(d.calls).toEqual([]);
   });
-});
+}));
 
-describe('P1 claim 15, part 3: what premium sends a user', () => {
+describe('P1 claim 15, part 3: what premium sends a user', () => eachSeller(['p1seller'], make => {
+  useWorld(make());
   const stricter = (kind: 'user' | 'guild', count: number) => ({ displayName: kind === 'user' ? 'VIP' : 'Gold', priority: 5, overrides: { p1mod: { count } }, offerings: [], ...(kind === 'user' ? { kind } : {}) });
 
   it('a stricter change of a user tier sends its user the details without the panel sentence, a server its sentence', async () => {
@@ -248,9 +258,10 @@ describe('P1 claim 15, part 3: what premium sends a user', () => {
     expect({ premium: w.storedText(), audit: w.auditText() }).toEqual(held);
     expect(w.recordOf(userHolder).notificationsChannelId).toBeUndefined();
   });
-});
+}));
 
-describe('P1 claim 15: the dispatch carries the holder', () => {
+describe('P1 claim 15: the dispatch carries the holder', () => eachSeller(['p1seller'], make => {
+  useWorld(make());
   it('premium names the server of a notice as its holder', async () => {
     const notify = vi.spyOn(getSubscriptionNotifier(), 'notify').mockResolvedValue({ delivered: true, via: 'dm' });
     const reply = await w.grant(SERVER, 'low', 30);
@@ -299,9 +310,10 @@ describe('P1 claim 15: the dispatch carries the holder', () => {
     expect(outcome).toStrictEqual({ delivered: true, via: 'dm' });
     expect(messages).toStrictEqual([['notification:dispatch', { holder: userHolder, kind: 'manual.grant.added', payload: { tierName: 'VIP' } }]]);
   });
-});
+}));
 
-describe("P1 claim 15: the bot's handler of notification:dispatch", () => {
+describe("P1 claim 15: the bot's handler of notification:dispatch", () => eachSeller(['p1seller'], make => {
+  useWorld(make());
   async function handler() {
     const replies: any[] = [];
     const hadSend = Object.prototype.hasOwnProperty.call(process, 'send');
@@ -369,4 +381,41 @@ describe("P1 claim 15: the bot's handler of notification:dispatch", () => {
       { requestId: 'r5', data: { success: false, error: 'holder and kind are required' } },
     ]);
   });
-});
+}));
+
+describe("P2 claim 12: the notice of a purchase", () => eachSeller(['p1seller', 'dummy'], make => {
+  useWorld(make());
+  it('premium names the server as the holder of its purchase notice', async () => {
+    const notify = vi.spyOn(getSubscriptionNotifier(), 'notify').mockResolvedValue({ delivered: true, via: 'dm' });
+    const reply = await w.purchase(SERVER, 'low');
+
+    expect(reply.ok).toBe(true);
+    expect(notify.mock.calls.map(c => [c[0], c[1]])).toEqual([[serverHolder, 'paid.sub.started']]);
+  });
+
+  it("premium names the user as the holder of the notice of a user's purchase", async () => {
+    await w.addSoldUserTiers();
+    const notify = vi.spyOn(getSubscriptionNotifier(), 'notify').mockResolvedValue({ delivered: true, via: 'dm' });
+    const reply = await w.purchase(userHolder, 'vlow');
+
+    expect(reply.ok).toBe(true);
+    expect(notify.mock.calls.map(c => [c[0], c[1]])).toEqual([[userHolder, 'paid.sub.started']]);
+  });
+
+  it("the notice of a user's purchase reaches Discord as one direct message to that user, and no server is fetched", async () => {
+    await w.addSoldUserTiers();
+    const d = discord();
+    getSubscriptionNotifier().setClient(d.client as any);
+    try {
+      const reply = await w.purchase(userHolder, 'vlow');
+      expect(reply.ok).toBe(true);
+      await vi.waitFor(() => expect(d.calls).toHaveLength(1));
+      await w.settle();
+    } finally {
+      getSubscriptionNotifier().setClient(null as any);
+    }
+
+    expect(d.calls).toEqual([`users.send ${USER}`]);
+    expect(d.sent.map(s => s.to)).toEqual([`user ${USER}`]);
+  });
+}));

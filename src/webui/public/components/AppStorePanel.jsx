@@ -2968,6 +2968,197 @@ function MigrationsPanel({ tiers, providers, sectionStyle, showSuccess, setError
   );
 }
 
+function dummyLinkOf(offering) {
+  return (offering.providerLinks || []).find(link => link.providerId === 'dummy' && link.enabled) || null;
+}
+
+function dummyLinkVariants(link) {
+  if (link.cache && Array.isArray(link.cache.variants) && link.cache.variants.length) {
+    return link.cache.variants.map(v => ({ variantId: v.variantId, label: v.label || v.variantId }));
+  }
+  return ((link.priceConfig && link.priceConfig.entries) || []).map(e => ({ variantId: e.variantId, label: e.variantId }));
+}
+
+function dummySoldTiers(tierMap) {
+  const out = [];
+  for (const [tierId, tier] of Object.entries(tierMap || {})) {
+    const offering = (tier.offerings || []).find(o => dummyLinkOf(o));
+    if (offering) out.push({ tierId, displayName: tier.displayName || tierId, offeringId: offering.id, variants: dummyLinkVariants(dummyLinkOf(offering)) });
+  }
+  return out;
+}
+
+function DummyTestPurchase({ activated, showSuccess }) {
+  const [tierLists, setTierLists] = useState({ guild: [], user: [] });
+  const [kind, setKind] = useState('guild');
+  const [holderId, setHolderId] = useState('');
+  const [buyerId, setBuyerId] = useState('');
+  const [tierId, setTierId] = useState('');
+  const [variantId, setVariantId] = useState('');
+  const [coupon, setCoupon] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [failure, setFailure] = useState('');
+  const [lookup, setLookup] = useState(null);
+
+  useEffect(() => {
+    if (!activated) return;
+    (async () => {
+      try {
+        const res = await api.get('/appstore/premium/tiers');
+        if (res.success) setTierLists({ guild: dummySoldTiers(res.tiers), user: dummySoldTiers(res.userTiers) });
+        else setFailure(res.error || 'Could not load the tiers');
+      } catch (err) { setFailure(err.message); }
+    })();
+  }, [activated]);
+
+  if (!activated) return null;
+
+  const tiersShown = tierLists[kind];
+  const tierName = id => (tierLists.user.find(t => t.tierId === id) || { displayName: id }).displayName;
+  const chosen = tiersShown.find(t => t.tierId === tierId) || null;
+  const userBase = `/appstore/premium/users/${encodeURIComponent(holderId.trim())}`;
+
+  async function run(call, doneText, refresh) {
+    setFailure('');
+    setBusy(true);
+    try {
+      const res = await call();
+      if (res && res.success) {
+        showSuccess(doneText);
+        if (refresh) await loadUser();
+      } else {
+        setFailure((res && res.error) || 'Nothing was changed: this user has no active paid subscription that can be cancelled or renewed again.');
+      }
+    } catch (err) {
+      setFailure(err.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function loadUser() {
+    try {
+      const [detail, found] = await Promise.all([api.get(userBase), api.get(`${userBase}/orphans`)]);
+      if (!detail.success) { setLookup(null); setFailure(detail.error || 'Could not read the user'); return; }
+      setLookup({ subscriptions: detail.subscriptions || { paused: [] }, orphans: found.success ? (found.orphans || []).filter(o => o.providerId === 'dummy') : [], orphanError: found.success ? null : (found.error || 'Could not list the Dummy provider\'s records') });
+    } catch (err) {
+      setLookup(null);
+      setFailure(err.message);
+    }
+  }
+
+  function buy() {
+    if (!chosen) { setFailure('Pick a tier first'); return; }
+    const body = { tierId: chosen.tierId, offeringId: chosen.offeringId, providerId: 'dummy', variantId: variantId || (chosen.variants[0] && chosen.variants[0].variantId) };
+    if (coupon.trim()) body.couponCode = coupon.trim();
+    const id = encodeURIComponent(holderId.trim());
+    if (kind === 'guild') {
+      body.buyerId = buyerId.trim();
+      return run(() => api.post(`/appstore/premium/subscriptions/${id}/paid`, body), `Bought ${chosen.displayName} for server ${holderId.trim()}`, false);
+    }
+    return run(() => api.post(`/appstore/premium/users/${id}/paid`, body), `Bought ${chosen.displayName} for user ${holderId.trim()}`, true);
+  }
+
+  const inputStyle = { padding: '6px 8px', background: '#1a1a1a', color: '#ddd', border: '1px solid #333', borderRadius: '4px', fontSize: '0.8rem' };
+  const labelStyle = { display: 'flex', flexDirection: 'column', gap: '4px', fontSize: '0.75rem', color: '#aaa' };
+  const rowStyle = { display: 'flex', gap: '8px', alignItems: 'center', fontSize: '0.75rem', color: '#ccc', marginBottom: '4px' };
+  const subs = lookup ? lookup.subscriptions : null;
+  const active = subs && subs.active && subs.active.source === 'paid' ? subs.active : null;
+
+  return (
+    <div style={{ marginTop: '24px', paddingTop: '14px', borderTop: '1px solid #333' }}>
+      <h4 style={{ margin: '0 0 4px 0', color: '#ddd', fontSize: '0.95rem' }}>Test purchase</h4>
+      <p style={{ color: '#888', margin: '0 0 12px 0', fontSize: '0.75rem' }}>
+        Buys a tier through the Dummy provider at once, with no payment. Buying for a user sends that user the bot's direct message that the subscription is active.
+      </p>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px', alignItems: 'flex-end' }}>
+        <label style={labelStyle}>Buy for
+          <select name="kind" value={kind} style={inputStyle} onChange={e => { setKind(e.target.value); setTierId(''); setVariantId(''); setLookup(null); }}>
+            <option value="guild">Server</option>
+            <option value="user">User</option>
+          </select>
+        </label>
+        <label style={labelStyle}>Discord id
+          <input name="holderId" value={holderId} style={inputStyle} onChange={e => { setHolderId(e.target.value); setLookup(null); }} />
+        </label>
+        {kind === 'guild' && (
+          <label style={labelStyle}>Paid by
+            <input name="buyerId" value={buyerId} placeholder="Discord user id" style={inputStyle} onChange={e => setBuyerId(e.target.value)} />
+          </label>
+        )}
+        <label style={labelStyle}>Tier
+          <select name="tier" value={tierId} style={inputStyle} onChange={e => { setTierId(e.target.value); setVariantId(''); }}>
+            <option value="">Pick a tier</option>
+            {tiersShown.map(t => <option key={t.tierId} value={t.tierId}>{t.displayName}</option>)}
+          </select>
+        </label>
+        <label style={labelStyle}>Plan
+          <select name="variant" value={variantId || (chosen && chosen.variants[0] ? chosen.variants[0].variantId : '')} style={inputStyle} onChange={e => setVariantId(e.target.value)}>
+            {(chosen ? chosen.variants : []).map(v => <option key={v.variantId} value={v.variantId}>{v.label}</option>)}
+          </select>
+        </label>
+        <label style={labelStyle}>Coupon
+          <input name="coupon" value={coupon} style={inputStyle} onChange={e => setCoupon(e.target.value)} />
+        </label>
+        <button className="btn btn-primary" disabled={busy || !holderId.trim() || (kind === 'guild' && !buyerId.trim())} onClick={buy}>Buy</button>
+        {kind === 'user' && (
+          <button className="btn btn-secondary" disabled={busy || !holderId.trim()} onClick={() => { setFailure(''); loadUser(); }}>Look up</button>
+        )}
+      </div>
+      {kind === 'user' && tiersShown.length === 0 && (
+        <p style={{ color: '#999', margin: '8px 0 0 0', fontSize: '0.75rem' }}>
+          No personal tier is sold through the Dummy provider yet. Make one with a request to the dev API: a tier with kind "user" and an enabled Dummy link.
+        </p>
+      )}
+      {failure && (
+        <p style={{ color: '#f87171', margin: '8px 0 0 0', fontSize: '0.8rem' }}>{failure}</p>
+      )}
+      {kind === 'user' && subs && (
+        <div style={{ marginTop: '12px' }}>
+          <div style={{ fontSize: '0.8rem', color: '#ddd', marginBottom: '6px' }}>Subscriptions</div>
+          {!subs.active && (!subs.paused || subs.paused.length === 0) && (
+            <div style={{ fontSize: '0.75rem', color: '#888' }}>This user holds no subscription.</div>
+          )}
+          {subs.active && (
+            <div style={rowStyle}>
+              <span>Active: {tierName(subs.active.tierId)} ({subs.active.source}, {subs.active.status})</span>
+              {active && (
+                <>
+                  <button className="btn btn-secondary btn-sm" disabled={busy} onClick={() => run(() => api.delete(`${userBase}/paid`), 'Subscription cancelled', true)}>Cancel</button>
+                  <button className="btn btn-secondary btn-sm" disabled={busy} onClick={() => run(() => api.post(`${userBase}/paid/reactivate`), 'Subscription renews again', true)}>Renew again</button>
+                  <button className="btn btn-danger btn-sm" disabled={busy} onClick={() => { if (confirm('End this subscription now?')) run(() => api.post(`${userBase}/paid/expire-now`), 'Subscription ended', true); }}>End now</button>
+                </>
+              )}
+            </div>
+          )}
+          {(subs.paused || []).map(entry => (
+            <div key={entry.id} style={rowStyle}>
+              <span>Queued: {tierName(entry.tierId)} ({entry.source})</span>
+              <button className="btn btn-danger btn-sm" disabled={busy} onClick={() => { if (confirm(entry.source === 'paid' ? `End the queued '${tierName(entry.tierId)}' subscription now? It is cancelled at the provider, and its days are lost.` : `Remove the queued '${tierName(entry.tierId)}' grant now? Its days are lost.`)) run(() => api.delete(`${userBase}/paused/${encodeURIComponent(entry.id)}`), 'Queued subscription cancelled', true); }}>Cancel & remove</button>
+            </div>
+          ))}
+          <div style={{ fontSize: '0.8rem', color: '#ddd', margin: '10px 0 6px 0' }}>Found at the Dummy provider, not in the bot</div>
+          {lookup.orphanError && <div style={{ fontSize: '0.75rem', color: '#f87171' }}>{lookup.orphanError}</div>}
+          {!lookup.orphanError && lookup.orphans.length === 0 && (
+            <div style={{ fontSize: '0.75rem', color: '#888' }}>None.</div>
+          )}
+          {lookup.orphans.map(orphan => {
+            const subId = orphan.ref && orphan.ref.providerSubId;
+            const orphanPath = `${userBase}/orphans/${encodeURIComponent(orphan.providerId)}/${encodeURIComponent(subId)}`;
+            return (
+              <div key={`${orphan.providerId}:${subId}`} style={rowStyle}>
+                <span>{subId}{orphan.plan && orphan.plan.line ? `: ${orphan.plan.line}` : ''}</span>
+                <button className="btn btn-secondary btn-sm" disabled={busy} onClick={() => run(() => api.post(`${orphanPath}/adopt`, { plan: orphan.plan }), 'Subscription adopted', true)}>Adopt</button>
+                <button className="btn btn-danger btn-sm" disabled={busy} onClick={() => { if (confirm('Cancel this subscription at the Dummy provider?')) run(() => api.delete(orphanPath), 'Cancelled at the Dummy provider', true); }}>Cancel at the provider</button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function PremiumTiersView({ tiers, subscriptions, messages, messageDefaults, onRefresh, onMessagesChanged, showSuccess, setError }) {
   // Tier CRUD state
   const [showTierForm, setShowTierForm] = useState(false);
@@ -4176,6 +4367,8 @@ function PremiumTiersView({ tiers, subscriptions, messages, messageDefaults, onR
               </div>
             </div>
           </div>
+
+          <DummyTestPurchase activated={!!activatedProviders?.dummy} showSuccess={showSuccess} />
         </div>
       )}
 

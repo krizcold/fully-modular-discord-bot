@@ -2,8 +2,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // P1 claim 14: what a provider sells is honoured. The seller sells both kinds. A provider that sells servers only:
 // premium refuses a user's purchase from it before any call (X3), asks it nothing about a user, and speaks to it
-// for a server by holder and buyer. Each of the seven providers is judged by its own `sells`. setTier refuses an
-// enabled link of a provider that does not sell the tier's kind (X8).
+// for a server by holder and buyer. Each of the seven providers is judged by its own `sells`: six sell servers only,
+// and the Dummy sells both kinds (P2 claim 3). setTier refuses an enabled link of a provider that does not sell the
+// tier's kind (X8).
 
 vi.mock('../../src/bot/internalSetup/utils/payment/paymentRegistry', async orig => (await import('../helpers/p1Mocks')).bareRegistry(await orig<any>()));
 vi.mock('../../src/bot/internalSetup/utils/premiumNotifications', async () => (await import('../helpers/p1Mocks')).noticeModule());
@@ -16,7 +17,7 @@ import { PayPalProvider } from '../../src/bot/internalSetup/utils/payment/paypal
 import { PatreonProvider } from '../../src/bot/internalSetup/utils/payment/patreonProvider';
 import { ServerBoostingProvider } from '../../src/bot/internalSetup/utils/payment/boostProvider';
 import { DiscordProvider } from '../../src/bot/internalSetup/utils/payment/discordProvider';
-import { DummyProvider } from '../../src/bot/internalSetup/utils/payment/dummyProvider';
+import { dummyDriver } from '../helpers/p2DummyDriver';
 import { allowDropLines } from '../helpers/p1Guard';
 import { notices } from '../helpers/p1Mocks';
 import { gh, uh } from '../helpers/p1Holder';
@@ -86,7 +87,7 @@ describe('P1 claim 14: a provider that sells servers only', () => {
     expect(reply.error).toContain('P1 Plain does not sell user subscriptions.');
     expect(state()).toEqual(before);
     expect(plain.calls).toEqual([]);
-    expect(w.seller.calls).toEqual([]);
+    expect(w.calls()).toEqual([]);
   });
 
   it('a server purchase through it lists by the holder, sends the holder and the buyer and stores the buyer', async () => {
@@ -170,11 +171,11 @@ describe('P1 claim 14: a provider that sells servers only', () => {
     getPaymentRegistry().register(plain.provider);
 
     expect(await w.orphans(USER)).toEqual([]);
-    expect(w.seller.calls).toEqual([sellerListCall(USER)]);
+    expect(w.calls()).toEqual([sellerListCall(USER)]);
     expect(plain.calls).toEqual([]);
 
     expect(await w.orphans(SERVER)).toEqual([]);
-    expect(w.seller.calls).toEqual([sellerListCall(USER), sellerListCall(SERVER)]);
+    expect(w.calls()).toEqual([sellerListCall(USER), sellerListCall(SERVER)]);
     expect(plain.calls).toEqual([{ method: 'listSubscriptionsFor', args: [SERVER] }]);
   });
 
@@ -192,17 +193,17 @@ describe('P1 claim 14: a provider that sells servers only', () => {
   });
 });
 
-describe('P1 claim 14: each of the seven providers by its own `sells`', () => {
+describe('P1 claim 14 as P2 leaves it: the six providers that sell servers only, each by its own `sells`', () => {
   it('each sells servers; a user tier linking it is refused (X8), and a user purchase and adoption through it never reach it', async () => {
-    const seven: PaymentProvider[] = [new StripeProvider(), new LemonSqueezyProvider(), new PayPalProvider(), new PatreonProvider(), new ServerBoostingProvider(), new DiscordProvider(), new DummyProvider()];
+    const six: PaymentProvider[] = [new StripeProvider(), new LemonSqueezyProvider(), new PayPalProvider(), new PatreonProvider(), new ServerBoostingProvider(), new DiscordProvider()];
     const offering = (enabled: boolean) => ({
       id: 'o-useven', label: 'Seven monthly',
-      providerLinks: seven.map(p => ({ providerId: p.id, enabled, mode: 'price', priceConfig: { entries: [{ variantId: `${p.id}_v` }] } })),
+      providerLinks: six.map(p => ({ providerId: p.id, enabled, mode: 'price', priceConfig: { entries: [{ variantId: `${p.id}_v` }] } })),
     });
     expect((await w.op('setTier', 'useven', { ...userSoldTierDef('vlow', 'U Seven'), priority: 5, offerings: [offering(true)] })).ok).toBe(true);
     const outcomes: unknown[] = [];
     try {
-      for (const p of seven) {
+      for (const p of six) {
         const configured = vi.spyOn(p, 'isConfigured').mockReturnValue(true);
         const bought = vi.spyOn(p, 'initiatePurchase');
         const listed = vi.spyOn(p as Required<PaymentProvider>, 'listSubscriptionsFor');
@@ -217,7 +218,7 @@ describe('P1 claim 14: each of the seven providers by its own `sells`', () => {
         outcomes.push([p.id, p.capabilities.sells, purchase.ok, purchase.error, askedByPurchase, adopt.ok, adopt.error, tier.ok, tier.error, bought.mock.calls.length, listed.mock.calls.length, state().premium === before.premium]);
       }
     } finally {
-      for (const p of seven) p.stop?.();
+      for (const p of six) p.stop?.();
     }
 
     const x3 = (name: string) => `${name} does not sell user subscriptions.`;
@@ -230,8 +231,48 @@ describe('P1 claim 14: each of the seven providers by its own `sells`', () => {
       row('patreon', 'Patreon'),
       row('boost', 'Server Boosting'),
       row('discord', 'Discord App Monetization'),
-      row('dummy', 'Dummy (Development)'),
     ]);
+  });
+});
+
+describe('P2 claim 3: the Dummy provider sells servers and users', () => {
+  const dummyOffering = (offeringId: string, label: string) => ({
+    id: offeringId, label,
+    providerLinks: [{ providerId: 'dummy', enabled: true, mode: 'price', priceConfig: { entries: [{ variantId: 'dummy_monthly_999' }] } }],
+  });
+
+  it('declares both kinds; a user tier and a server tier with an enabled Dummy link are saved; a user purchase installs under the user with the user as buyer', async () => {
+    const driver = dummyDriver();
+    await driver.attach(null);
+    try {
+      const dummy = driver.provider();
+      expect(dummy.capabilities.sells).toEqual(['guild', 'user']);
+      expect(await w.op('setTier', 'udummy', { ...userSoldTierDef('vlow', 'U Dummy'), priority: 5, offerings: [dummyOffering('o-udummy', 'Dummy monthly')] })).toMatchObject({ ok: true });
+      expect(await w.op('setTier', 'gdummy', { displayName: 'G Dummy', priority: 6, overrides: {}, offerings: [dummyOffering('o-gdummy', 'Dummy monthly')] })).toMatchObject({ ok: true });
+      expect(w.stored().tiers.udummy).toMatchObject({ kind: 'user', offerings: [{ providerLinks: [{ providerId: 'dummy', enabled: true }] }] });
+      expect(w.stored().tiers.gdummy.offerings[0].providerLinks[0]).toMatchObject({ providerId: 'dummy', enabled: true });
+      expect((await w.op('setProviderActivation', 'dummy', true)).ok).toBe(true);
+
+      const bought = await w.op('initiatePaidSubscription', USER, 'udummy', 'o-udummy', { providerId: 'dummy', variantId: 'dummy_monthly_999', buyerId: USERS[0] });
+
+      expect(bought).toMatchObject({ ok: true });
+      expect(w.recordOf(USER).active).toMatchObject({ tierId: 'udummy', providerId: 'dummy', buyerId: USERS[0] });
+      expect(driver.view(w.recordOf(USER).active.providerSubId)).toMatchObject({ status: 'active' });
+    } finally {
+      await driver.detach();
+    }
+  });
+
+  it('findOrphansFor a user asks the P1 seller and the Dummy', async () => {
+    const driver = dummyDriver();
+    await driver.attach(null);
+    try {
+      expect(await w.orphans(USER)).toEqual([]);
+      expect(w.calls()).toEqual([sellerListCall(USER)]);
+      expect(driver.calls()).toEqual([{ method: 'listSubscriptionsFor', args: [USER] }]);
+    } finally {
+      await driver.detach();
+    }
   });
 });
 
@@ -283,7 +324,7 @@ describe('P1 claim 14: setTier and a link of a provider that does not sell the t
     expect(state()).toEqual(before);
     expect(await w.op('setTier', 'plain', { displayName: 'Plain', priority: 6, overrides: {}, offerings: [sellerOffering('o-seller', 'Seller monthly')] })).toMatchObject({ ok: true });
     expect(await w.op('setTier', 'uplain', { ...userSoldTierDef('vlow', 'U Plain'), priority: 5, offerings: [sellerOffering('o-seller', 'Seller monthly')] })).toMatchObject({ ok: true });
-    expect(w.seller.calls).toEqual([]);
+    expect(w.calls()).toEqual([]);
   });
 
   it('the seller sells a user: a purchase for a user is installed under the user\'s key', async () => {

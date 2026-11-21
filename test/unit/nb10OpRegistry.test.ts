@@ -167,7 +167,7 @@ beforeEach(async () => {
     migrationSilencePolicy: 'cancel',
   });
   const dummyRecord = (providerSubId: string, paused: boolean) => ({
-    providerSubId, guildId: G, tierId: 'gold', offeringId: 'o1', variantId: 'dummy_weekly_249', durationDays: 7, startDate: now(), endDate: future(7),
+    providerSubId, holder: gh(G), buyerId: '80000000000000001', tierId: 'gold', offeringId: 'o1', variantId: 'dummy_weekly_249', durationDays: 7, startDate: now(), endDate: future(7),
     autoRenew: true, status: paused ? 'paused' : 'active', paused: paused ? true : undefined, pausedAt: paused ? now() : undefined, resumesAt: paused ? null : undefined, createdAt: now(), updatedAt: now(),
   });
   put(dataPath('global', 'payment-providers', 'dummy', 'state.json'), {

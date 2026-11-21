@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { allowDropLines } from '../helpers/p1Guard';
+import { allowDropLines, droppedLines } from '../helpers/p1Guard';
 
 // P1 claim 23: the log guard of helpers/setup.ts fails a row during which premium says it left stored entries out
 // (L1), dropped an event that names no holder (L2) or did not install a created event (L3), unless the row opted in.
@@ -129,5 +129,30 @@ describe('a row that logs none of them passes', () => {
     console.info = original;
     expect(lines).toEqual([['a', 'b']]);
     expect(console.info).toBe(original);
+  });
+});
+
+// P2 part 0: the guard knows DL1, the Dummy provider's line for subscription records its load left out (sheet P2,
+// section 3). A row that expects it opts in by name.
+const DL1 = '[DummyProvider] payment-providers/dummy/state.json holds 3 subscription record(s) this version does not read (its holder, buyer, id or status is not one this version writes). They are not loaded, and the next Dummy save writes the file without them. The bot may still hold a subscription for one of them: "Cancel & remove now" on a server\'s subscription page or "End now" under "Test purchase" for a user removes an active one from the bot, and "Cancel & remove" removes a queued one.';
+
+describe('P2: the guard and DL1', () => {
+  it.fails('DL1 through a spy that swallows it fails the row', () => {
+    swallow('log');
+    console.log(DL1);
+  });
+
+  it.fails('DL1 when the row opted in to L1 to L3 without naming them fails the row', () => {
+    swallow('log');
+    allowDropLines();
+    console.log(DL1);
+  });
+
+  it('DL1 the row opted in to by name passes, and droppedLines reads it', () => {
+    const log = swallow('log');
+    allowDropLines('DL1');
+    console.log(DL1);
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(droppedLines('DL1')).toEqual([DL1]);
   });
 });

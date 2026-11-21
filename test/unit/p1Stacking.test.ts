@@ -4,14 +4,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 // and for a user, with the seller: the higher priority takes the slot, a manual grant wins a tie, a paid one at a tie
 // is refused, the lower priority queues paused, the queue resumes when the slot frees. The clock is the real one; the
 // one entry that "ran out in the queue" comes from a created event whose paid period had ended when it arrived.
+// P2 claim 12 (parts 0 and 2): the table runs again through the real Dummy provider, for a server and for a user; its
+// expiry is the driver's, and the steps that need a delivery are absent from that run.
 
 vi.mock('../../src/bot/internalSetup/utils/payment/paymentRegistry', async orig => (await import('../helpers/p1Mocks')).bareRegistry(await orig<any>()));
 vi.mock('../../src/bot/internalSetup/utils/premiumNotifications', async () => (await import('../helpers/p1Mocks')).noticeModule());
 
 import { gh, uh } from '../helpers/p1Holder';
-import { brokenHolders, brokenStacking, DAY_MS, p1World, SELLER_LIST_CALL, SERVERS, USERS } from '../helpers/p1World';
+import { brokenHolders, brokenStacking, DAY_MS, eachSeller, p1World, SELLER_LIST_CALL, SERVERS, USERS, type SellerDriver } from '../helpers/p1World';
 
-const w = p1World();
+let w: ReturnType<typeof p1World>;
 
 const kinds = [
   { name: 'a server', who: gh(SERVERS[0]), other: uh(SERVERS[0]), low: 'low', mid: 'mid', alt: 'alt', high: 'high' },
@@ -21,21 +23,28 @@ const shape = (record: any) => record === null ? null : {
   active: record.active ? `${record.active.tierId}/${record.active.source}/${record.active.status}` : null,
   paused: record.paused.map((p: any) => `${p.tierId}/${p.source}/${p.status}`),
 };
-const methods = () => w.seller.calls.map(c => c.method);
-const callsOf = (method: string) => w.seller.calls.filter(c => c.method === method);
+const methods = () => w.calls().map(c => c.method);
+const callsOf = (method: string) => w.calls().filter(c => c.method === method);
 const near = (iso: string | null, ms: number): boolean => iso !== null && Math.abs(Date.parse(iso) - ms) < 120_000;
 
-beforeEach(async () => {
-  await w.setup();
-  await w.addSoldUserTiers();
-  for (const level of ['log', 'warn'] as const) vi.spyOn(console, level).mockImplementation(() => undefined);
-});
-afterEach(async () => {
-  vi.restoreAllMocks();
-  await w.teardown();
-});
+/** The world of the rows that follow, on this driver's seller. */
+function useWorld(driver: SellerDriver): void {
+  const world = p1World('json', driver);
+  beforeEach(async () => {
+    w = world;
+    await w.setup();
+    await w.addSoldUserTiers();
+    for (const level of ['log', 'warn'] as const) vi.spyOn(console, level).mockImplementation(() => undefined);
+  });
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await w.teardown();
+  });
+}
 
-describe.each(kinds)('P1 claim 7(b): the stacking of $name', k => {
+describe.each(kinds)('P1 claim 7(b): the stacking of $name', k => eachSeller(['p1seller', 'dummy'], make => {
+  const driver = make();
+  useWorld(driver);
   const sound = () => {
     expect(brokenStacking(w.stored())).toEqual([]);
     expect(brokenHolders(w.stored())).toEqual([]);
@@ -51,7 +60,7 @@ describe.each(kinds)('P1 claim 7(b): the stacking of $name', k => {
     expect(w.recordOf(k.who).paused[0]).toMatchObject({ providerSubId: lowSub, remainingDaysAtPause: 30 });
     expect(methods()).toEqual([SELLER_LIST_CALL, 'initiatePurchase', SELLER_LIST_CALL, 'initiatePurchase', 'pauseSubscription']);
     expect(callsOf('pauseSubscription')[0].args).toEqual([lowSub, null, 30]);
-    expect(w.seller.records.get(lowSub)).toMatchObject({ status: 'paused', pausedDaysLeft: 30 });
+    expect(w.view(lowSub)).toMatchObject({ status: 'paused', ...(driver.keepsDaysLeft ? { daysLeft: 30 } : {}) });
     sound();
   });
 
@@ -78,7 +87,7 @@ describe.each(kinds)('P1 claim 7(b): the stacking of $name', k => {
     expect(same.error).toContain(`You already have a '${k.mid.toUpperCase()}' subscription. Cancel or let the existing one expire first.`);
     expect({ premium: w.storedText(), audit: w.auditText() }).toEqual(before);
     expect(callsOf('initiatePurchase')).toHaveLength(1);
-    expect(w.seller.records.size).toBe(1);
+    expect(w.ids()).toHaveLength(1);
   });
 
   it('a lower priority queues paused: a purchase starts paused at the seller, and a checkout that ended there is paused by a call', async () => {
@@ -89,14 +98,16 @@ describe.each(kinds)('P1 claim 7(b): the stacking of $name', k => {
     expect(shape(w.recordOf(k.who))).toEqual({ active: `${k.high}/paid/active`, paused: [`${k.low}/paid/paused`] });
     const lowSub = w.recordOf(k.who).paused[0].providerSubId;
     expect(callsOf('initiatePurchase')[1].args[0]).toMatchObject({ tierId: k.low, startPausedUntil: highEnd });
-    expect(w.seller.records.get(lowSub)!.status).toBe('paused');
+    expect(w.view(lowSub)!.status).toBe('paused');
     expect(callsOf('pauseSubscription')).toEqual([]);
 
-    expect(await w.created(k.who, k.mid)).toMatchObject({ ok: true });
-    expect(shape(w.recordOf(k.who))).toEqual({ active: `${k.high}/paid/active`, paused: [`${k.mid}/paid/paused`, `${k.low}/paid/paused`] });
-    const midSub = w.recordOf(k.who).paused[0].providerSubId;
-    expect(callsOf('pauseSubscription').map(c => c.args)).toEqual([[midSub, highEnd, 30]]);
-    expect(w.seller.records.get(midSub)!.status).toBe('paused');
+    if (driver.delivers) {
+      expect(await w.created(k.who, k.mid)).toMatchObject({ ok: true });
+      expect(shape(w.recordOf(k.who))).toEqual({ active: `${k.high}/paid/active`, paused: [`${k.mid}/paid/paused`, `${k.low}/paid/paused`] });
+      const midSub = w.recordOf(k.who).paused[0].providerSubId;
+      expect(callsOf('pauseSubscription').map(c => c.args)).toEqual([[midSub, highEnd, 30]]);
+      expect(w.view(midSub)!.status).toBe('paused');
+    }
     sound();
   });
 
@@ -107,7 +118,7 @@ describe.each(kinds)('P1 claim 7(b): the stacking of $name', k => {
     const pausedStart = w.recordOf(k.who).paused[0].startDate;
     await new Promise(resolve => setTimeout(resolve, 15));
 
-    expect(await w.expired(k.who)).toMatchObject({ ok: true });
+    await w.expire(k.who);
 
     const record = w.recordOf(k.who);
     expect(shape(record)).toEqual({ active: `${k.low}/paid/active`, paused: [] });
@@ -119,7 +130,7 @@ describe.each(kinds)('P1 claim 7(b): the stacking of $name', k => {
     sound();
   });
 
-  it("an entry that ran out in the queue is skipped with its 'expired-while-queued' line", async () => {
+  if (driver.delivers) it("an entry that ran out in the queue is skipped with its 'expired-while-queued' line", async () => {
     expect(await w.purchase(k.who, k.high)).toMatchObject({ ok: true });
     // The seller's checkout of the lower tier ended its paid period before its event arrived.
     const late = w.orphan(k.who, k.low);
@@ -148,8 +159,8 @@ describe.each(kinds)('P1 claim 7(b): the stacking of $name', k => {
     expect(shape(w.recordOf(k.who))).toEqual({ active: `${k.low}/paid/active`, paused: [] });
     expect(callsOf('cancelSubscription').map(c => c.args)).toEqual([[highSub, true]]);
     expect(callsOf('resumeSubscription').map(c => c.args[0])).toEqual([lowSub]);
-    expect(w.seller.records.get(highSub)!.status).toBe('expired');
-    expect(w.seller.records.get(lowSub)!.status).toBe('active');
+    expect(w.view(highSub)!.status).toBe('expired');
+    expect(w.view(lowSub)!.status).toBe('active');
     sound();
   });
 
@@ -166,9 +177,10 @@ describe.each(kinds)('P1 claim 7(b): the stacking of $name', k => {
     expect(callsOf('cancelSubscription')).toEqual([]);
     sound();
   });
-});
+}));
 
-describe('P1 claim 7(b): deleteTier', () => {
+describe('P1 claim 7(b): deleteTier', () => eachSeller(['p1seller'], make => {
+  useWorld(make());
   it('empties both kinds: the subscriptions of a deleted server tier and of a deleted user tier are gone, the others stay', async () => {
     const [server, user] = [gh(SERVERS[0]), uh(USERS[0])];
     expect(await w.purchase(server, 'low')).toMatchObject({ ok: true });
@@ -186,4 +198,4 @@ describe('P1 claim 7(b): deleteTier', () => {
     expect(Object.keys(w.stored().subscriptions).sort()).toEqual([server, user].sort());
     expect(brokenStacking(w.stored())).toEqual([]);
   });
-});
+}));

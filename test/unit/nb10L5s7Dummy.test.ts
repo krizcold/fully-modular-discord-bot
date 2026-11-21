@@ -78,7 +78,7 @@ function expiredState(autoRenew: boolean): string {
   return JSON.stringify({
     variants: {}, products: {}, coupons: {}, nextId: 2,
     subscriptions: {
-      dummy_1: { providerSubId: 'dummy_1', guildId: '70000000000000001', tierId: 't', offeringId: 'o', variantId: 'x', durationDays: 30,
+      dummy_1: { providerSubId: 'dummy_1', holder: 'guild:70000000000000001', buyerId: '80000000000000001', tierId: 't', offeringId: 'o', variantId: 'x', durationDays: 30,
         startDate: past, endDate: past, autoRenew, status: 'active', createdAt: past, updatedAt: past },
     },
   });
@@ -350,7 +350,7 @@ describe('initiatePurchase', () => {
     expect(res.providerSubId).toBe('dummy_1');
     expect(res.state?.status).toBe('active');
     expect(h.saves.length).toBe(1);
-    expect(h.saves[0].subscriptions.dummy_1.guildId).toBe('70000000000000001');
+    expect(h.saves[0].subscriptions.dummy_1.holder).toBe('guild:70000000000000001');
   });
 });
 

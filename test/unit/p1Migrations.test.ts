@@ -70,13 +70,13 @@ describe('P1 claim 18: price changes by holder', () => {
     expect(await w.op('recordMigrationDecision', id, gh(B), 'declined')).toMatchObject({ ok: true, result: true });
     const subA = w.recordOf(A).active.providerSubId;
     const subB = w.recordOf(B).active.providerSubId;
-    const callsBefore = w.seller.calls.length;
+    const callsBefore = w.calls().length;
     await new Promise(resolve => setTimeout(resolve, 450));
 
     await getPremiumManager().processDueMigrations();
     await w.settle();
 
-    expect(w.seller.calls.slice(callsBefore)).toEqual([
+    expect(w.calls().slice(callsBefore)).toEqual([
       { method: 'migrateSubscriptionPrice', args: [subA, SELLER_VARIANT, 'none'] },
       { method: 'cancelSubscription', args: [subB, false] },
     ]);

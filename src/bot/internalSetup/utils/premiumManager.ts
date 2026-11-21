@@ -894,6 +894,9 @@ export class MigrationBusy extends Error {
   }
 }
 
+/** A refusal made before any payment provider call: its answer carries no sentence about a provider call. */
+export class BeforeProviderCall extends Error {}
+
 /** The journal's lines in file order; a line that does not parse (cut short or damaged) is returned apart. */
 function parseJournal(raw: string): { lines: JournalLine[]; bad: string[] } {
   const lines: JournalLine[] = [];
@@ -984,7 +987,7 @@ function wrongKindText(tier: PremiumTier, holderKind: HolderKind): string {
 }
 
 const PURCHASE_NEEDS_BUYER = 'A paid subscription needs the Discord id of the user who pays; none was given.';
-const BUYER_IS_NOT_THE_USER = "A user's subscription is paid by that user; the buyer given is someone else.";
+export const BUYER_IS_NOT_THE_USER = "A user's subscription is paid by that user; the buyer given is someone else.";
 const NOTICES_ARE_A_SERVERS = "Notices for a user go to that user's direct messages; there is no channel to set.";
 const LINK_NEEDS_BUYER = 'A provider account link needs the Discord id of the user who linked it; none was given.';
 const NO_PRICE_CHANGE_FOR_USERS = 'Price changes cannot be scheduled for a user tier: a user has no page to accept or decline one until the "My account" page exists.';
@@ -1009,6 +1012,11 @@ const sleepOutside = (ms: number): Promise<void> => new Promise(resolve => {
   const timer = setTimeout(resolve, ms);
   timer.unref?.();
 });
+
+/** PL1. */
+function recordMissingLine(providerSubId: string, holder: HolderKey): string {
+  return `[PremiumManager] The Dummy provider holds no record of subscription ${providerSubId} (${holderWords(holder)}), so nothing was cancelled there; the bot's copy was removed.`;
+}
 
 export class PremiumManager {
   private config: PremiumConfig;
@@ -1040,6 +1048,8 @@ export class PremiumManager {
   /** Set by the final stop step or a deposition: from then on nothing is written. */
   private stopped: StopKind | null = null;
   private saveHeld = false;
+  /** JSON: PL1 lines of removals a held save holds, written once the save of its retry lands. */
+  private heldLogs: string[] = [];
   /** invalidate() came while a save was held: the cache is dropped if that save ends without an op. */
   private dropOwed = false;
   private unstorableSave = false;
@@ -1828,6 +1838,7 @@ export class PremiumManager {
         }
         this.answerWaits(null);
         runItems(taken);
+        if (tracked.ticket.kind === 'file') this.logWhenLanded(tracked.ticket, this.heldLogs.splice(0));
         return { key: PREMIUM_KEY, outcome: null, ticket: tracked.ticket };
       }
       cause = tracked.outcome === 'frozen' ? 'frozen' : tracked.cause;
@@ -1842,6 +1853,7 @@ export class PremiumManager {
     }
     if (cause === 'unstorable' && eventBase === undefined) {
       this.saveHeld = false;
+      this.heldLogs.length = 0;
       if (this.dropOwed) this.invalidate();
       this.unstorableSave = true;
       this.refuseItems(taken, cause);
@@ -3933,13 +3945,72 @@ export class PremiumManager {
     const active = this.config.subscriptions[holder]?.active;
     if (!active || active.source !== 'paid') return 'gone';
 
-    if (active.providerId && active.providerSubId) {
-      const provider = getPaymentRegistry().get(active.providerId);
-      if (provider?.cancelSubscription && provider.capabilities.supportsCancel) {
-        await provider.cancelSubscription(active.providerSubId, true);
-      }
+    const missing = active.providerId && active.providerSubId ? await this.cancelAtProvider(active.providerId, active.providerSubId) : false;
+    return this.dropCancelledSubscription(holder, active, { immediately: true, ...(missing ? { providerRecordMissing: true } : {}) }, true, missing ? recordMissingLine(active.providerSubId!, holder) : undefined);
+  }
+
+  /**
+   * A cancel now at the provider. True when the Dummy provider holds no record of the subscription (its error with the
+   * code 'not-found'): the bot's copy is removed all the same (sheet P2, section 4). Any other error is thrown.
+   */
+  private async cancelAtProvider(providerId: string, providerSubId: string): Promise<boolean> {
+    const provider = getPaymentRegistry().get(providerId);
+    if (!provider?.cancelSubscription || !provider.capabilities.supportsCancel) return false;
+    try {
+      await provider.cancelSubscription(providerSubId, true);
+      return false;
+    } catch (err: any) {
+      if (err?.code !== 'not-found' || providerId !== 'dummy') throw err;
+      return true;
     }
-    return this.dropCancelledSubscription(holder, active, { immediately: true }, true);
+  }
+
+  /** PL1 as an item of a Postgres op: written when the op lands, and dropped with no log when it does not. */
+  private landedLog(line: string): Item {
+    return makeItem({
+      kind: 'event',
+      id: crypto.randomUUID(),
+      owner: this,
+      run: () => { console.warn(line); },
+      drop: () => undefined,
+    });
+  }
+
+  /**
+   * JSON: writes the lines once the save's file ticket has landed. A ticket the disk did not take (its flush failed or
+   * its write was dropped) drops them with no log.
+   */
+  private logWhenLanded(ticket: FileTicket, lines: string[]): void {
+    if (lines.length === 0) return;
+    outsideLedgers(() => {
+      void (async () => {
+        while (!landed(ticket)) {
+          if (this.disposed) return;
+          const answer = await confirmFile(ticket, CONFIRM_MS);
+          if (answer === 'unavailable') return;
+          if (answer !== 'ok') await sleepOutside(WATCH_IDLE_MS);
+        }
+        for (const line of lines) console.warn(line);
+      })().catch(error => {
+        console.error(`[PremiumManager] The watch for a removal's save failed (${error instanceof Error ? error.message : String(error)})`);
+      });
+    });
+  }
+
+  /**
+   * Saves a removal. PL1 (`missingLine`) is written once the removal is stored: on Postgres when its op lands; on JSON
+   * when the save's file ticket lands, for a held save the ticket of the retry that takes it.
+   */
+  private saveRemoval(carry: Carry, missingLine?: string): CancelStep {
+    const shared = this.sharedBackend();
+    if (missingLine && shared) carry.items.push(this.landedLog(missingLine));
+    const op = this.save({ carry });
+    if (!op) return 'not saved';
+    if (missingLine && !shared) {
+      if (op.ticket?.kind === 'file') this.logWhenLanded(op.ticket, [missingLine]);
+      else if (!op.ticket) this.heldLogs.push(missingLine);
+    }
+    return 'done';
   }
 
   /**
@@ -3953,12 +4024,13 @@ export class PremiumManager {
     cancelled: Subscription,
     metadata: Record<string, unknown>,
     notifyOwner: boolean,
+    missingLine?: string,
   ): CancelStep {
     const subs = this.config.subscriptions[holder];
-    if (!subs) return this.saveRemovedMeanwhile(holder, cancelled.id);
+    if (!subs) return this.saveRemovedMeanwhile(holder, cancelled.id, missingLine);
     const inActive = subs.active?.id === cancelled.id;
     const at = inActive ? -1 : subs.paused.findIndex(p => p.id === cancelled.id);
-    if (!inActive && at < 0) return this.saveRemovedMeanwhile(holder, cancelled.id);
+    if (!inActive && at < 0) return this.saveRemovedMeanwhile(holder, cancelled.id, missingLine);
     const carry = newCarry();
     this.writeAudit({
       timestamp: new Date().toISOString(),
@@ -3982,16 +4054,17 @@ export class PremiumManager {
       subs.paused.splice(at, 1);
     }
     if (this.recordEmpty(subs)) delete this.config.subscriptions[holder];
-    return this.save({ carry }) ? 'done' : 'not saved';
+    return this.saveRemoval(carry, missingLine);
   }
 
   /**
    * After the stop the other op's removal is judged by the last save this cache handed to the disk: an unlanded one is
    * waited on (a deposition's drop answers writer-lost). lastRaw changes only on an accepted save, so a removal held or
-   * made only in memory still shows the subscription there and is not saved.
+   * made only in memory still shows the subscription there and is not saved. After the stop PL1 is not written: this op
+   * did not store the removal.
    */
-  private saveRemovedMeanwhile(holder: HolderKey, subscriptionId: string): CancelStep {
-    if (!this.stopped) return this.save() ? 'done' : 'not saved';
+  private saveRemovedMeanwhile(holder: HolderKey, subscriptionId: string, missingLine?: string): CancelStep {
+    if (!this.stopped) return this.saveRemoval(newCarry(), missingLine);
     if (this.savedStillHolds(holder, subscriptionId)) {
       recordRefusal(stopCause(this.stopped), PREMIUM_DOC);
       return 'not saved';
@@ -4026,13 +4099,10 @@ export class PremiumManager {
     const removed = this.config.subscriptions[holder]?.paused.find(p => p.id === subscriptionId);
     if (!removed) return 'gone';
 
-    if (removed.source === 'paid' && removed.providerId && removed.providerSubId) {
-      const provider = getPaymentRegistry().get(removed.providerId);
-      if (provider?.cancelSubscription && provider.capabilities.supportsCancel) {
-        await provider.cancelSubscription(removed.providerSubId, true);
-      }
-    }
-    return this.dropCancelledSubscription(holder, removed, { fromPausedQueue: true }, false);
+    const missing = removed.source === 'paid' && removed.providerId && removed.providerSubId
+      ? await this.cancelAtProvider(removed.providerId, removed.providerSubId)
+      : false;
+    return this.dropCancelledSubscription(holder, removed, { fromPausedQueue: true, ...(missing ? { providerRecordMissing: true } : {}) }, false, missing ? recordMissingLine(removed.providerSubId!, holder) : undefined);
   }
 
   // ============================================================================
@@ -4355,6 +4425,12 @@ export class PremiumManager {
     throw new Error(`Subscription '${providerSubId}' was not adopted: ${why}.`);
   }
 
+  /** Whether any holder's active slot or queue holds the provider's subscription. */
+  private holdsProviderSub(providerId: string, providerSubId: string): boolean {
+    return Object.values(this.config.subscriptions).some(subs =>
+      [subs?.active, ...(subs?.paused ?? [])].some(sub => sub?.providerId === providerId && sub.providerSubId === providerSubId));
+  }
+
   cancelOrphan(providerId: string, providerSubId: string): Promise<boolean> {
     return this.work.run(CHANGE_WORK, () => this.cancelOrphanRun(providerId, providerSubId));
   }
@@ -4362,17 +4438,20 @@ export class PremiumManager {
   private async cancelOrphanRun(providerId: string, providerSubId: string): Promise<boolean> {
     if (this.refusedAtEntry()) return false;
     const provider = getPaymentRegistry().get(providerId);
-    if (!provider) throw new Error(`Provider '${providerId}' is not registered.`);
+    if (!provider) throw new BeforeProviderCall(`Provider '${providerId}' is not registered.`);
     if (!provider.cancelSubscription || !provider.capabilities.supportsCancel) {
-      throw new Error(`Provider '${providerId}' does not support cancellation.`);
+      throw new BeforeProviderCall(`Provider '${providerId}' does not support cancellation.`);
     }
     const key = `${providerId}:${providerSubId}`;
     const running = this.adopting.get(key);
     if (running === 'adoption') {
-      throw new Error(`Subscription '${providerSubId}' was not cancelled: an adoption of it is running; reload the page when it has finished.`);
+      throw new BeforeProviderCall(`Subscription '${providerSubId}' was not cancelled: an adoption of it is running; reload the page when it has finished.`);
     }
     if (running === 'cancel') {
-      throw new Error(`Subscription '${providerSubId}' was not cancelled: another cancel of it is already running; reload the page when it has finished.`);
+      throw new BeforeProviderCall(`Subscription '${providerSubId}' was not cancelled: another cancel of it is already running; reload the page when it has finished.`);
+    }
+    if (this.holdsProviderSub(providerId, providerSubId)) {
+      throw new BeforeProviderCall(`Subscription '${providerSubId}' was not cancelled at the provider: the bot holds it as a subscription. Reload the page to see it.`);
     }
     this.adopting.set(key, 'cancel');
     try {
