@@ -1,0 +1,17 @@
+{
+  "name": "oracle",
+  "version": "1.0.0",
+  "displayName": "Oracle Actions",
+  "description": "The data-loss oracle's action module for NX3's act runs: one panel button and one command, each saving one doc per run of the action. Installed for the live tests only and removed after them.",
+  "author": "kriz_cold",
+  "category": "misc",
+  "requiredIntents": ["Guilds"],
+  "requiredPermissions": [],
+  "dependencies": {
+    "required": {},
+    "optional": {}
+  },
+  "dataContract": 2,
+  "enabled": true,
+  "exports": {}
+}
