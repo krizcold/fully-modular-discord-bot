@@ -86,11 +86,16 @@ describe('ruling 6: booting in maintenance mode', () => {
     expect(sent).toContainEqual({ type: 'maintenance:mode', data: { mode: 'maintenance', boot: true } });
   });
 
-  it('a payment provider registered in maintenance mode is not started', () => {
+  it('a payment provider registered in maintenance mode is not started, before or after the bot starts the tickers', () => {
     const registry = new PaymentProviderRegistry();
-    const start = vi.fn();
-    registry.register({ id: 'p', start } as any);
-    expect(start).not.toHaveBeenCalled();
+    const before = { id: 'p', capabilities: { sells: ['guild'] }, start: vi.fn() } as any;
+    const after = { id: 'q', capabilities: { sells: ['guild'] }, start: vi.fn() } as any;
+    expect(registry.register(before)).toBe(true);
+    registry.startTickers();
+    expect(registry.register(after)).toBe(true);
+    expect([registry.get('p'), registry.get('q')]).toEqual([before, after]);
+    expect(before.start).not.toHaveBeenCalled();
+    expect(after.start).not.toHaveBeenCalled();
   });
 
   it('keeps the Discord payment bridge attached (ruling 10)', () => {

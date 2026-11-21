@@ -11,10 +11,10 @@ vi.mock('../../src/bot/internalSetup/utils/payment/paymentRegistry', async orig 
   const real = await orig<typeof import('../../src/bot/internalSetup/utils/payment/paymentRegistry')>();
   return { ...real, getPaymentRegistry: () => (reg.current ??= new real.PaymentProviderRegistry()) };
 });
-const notes = vi.hoisted(() => ({ calls: [] as Array<{ guildId: string; kind: string; payload: any }> }));
+const notes = vi.hoisted(() => ({ calls: [] as Array<{ holder: string; kind: string; payload: any }> }));
 vi.mock('../../src/bot/internalSetup/utils/premiumNotifications', () => ({
-  dispatchPremiumNotification: async (guildId: string, kind: string, payload: any) => {
-    notes.calls.push({ guildId, kind, payload });
+  dispatchPremiumNotification: async (holder: string, kind: string, payload: any) => {
+    notes.calls.push({ holder, kind, payload });
     return { delivered: true, via: 'dm' };
   },
 }));
@@ -32,6 +32,7 @@ vi.mock('../../src/utils/updateSafety', () => ({ getSafetyManager: () => safety 
 import { getPremiumManager, isPremiumReplaying, PremiumManager, resetPremiumManager } from '../../src/bot/internalSetup/utils/premiumManager';
 import { getPaymentRegistry } from '../../src/bot/internalSetup/utils/payment/paymentRegistry';
 import { AUDIT, clearGlobal, gate, JOURNAL, linesOf, paidSub, quiet, settleQueue, tick, TIERS, writePremium } from './nb10PremiumRig';
+import { gh } from '../helpers/p1Holder';
 
 const G = '900000000000000811';
 const HOUR = 3_600_000;
@@ -54,7 +55,7 @@ const manualSub = (id: string, endMs: number, notesText: string) => ({
 function cancelProvider(): { cancels: string[]; held: ReturnType<typeof gate<void>> } {
   const p = { cancels: [] as string[], held: gate<void>() };
   getPaymentRegistry().register({
-    id: 'fake', displayName: 'Fake Pay', isConfigured: () => true, capabilities: { supportsCancel: true },
+    id: 'fake', displayName: 'Fake Pay', isConfigured: () => true, capabilities: { sells: ['guild'], supportsCancel: true },
     cancelSubscription: async (id: string) => { p.cancels.push(id); await p.held.promise; },
   } as any);
   return p;
@@ -87,25 +88,25 @@ afterEach(async () => {
 
 describe('the expiry tick', () => {
   it('a manual grant past its end sends manual.grant.ended with the tier name and the grant notes', async () => {
-    writePremium({ [G]: { active: manualSub('m1', Date.now() - HOUR, 'gift for events'), paused: [] } });
+    writePremium({ [gh(G)]: { active: manualSub('m1', Date.now() - HOUR, 'gift for events'), paused: [] } });
     const pm = manager();
     pm.startExpiryChecker(5);
     await vi.waitFor(() => expect(notes.calls.some(c => c.kind === 'manual.grant.ended')).toBe(true), { timeout: 2000, interval: 5 });
     pm.stopExpiryChecker();
     expect(notes.calls.filter(c => c.kind === 'manual.grant.ended')).toEqual([
-      { guildId: G, kind: 'manual.grant.ended', payload: { tierName: 'Low', notes: 'gift for events' } },
+      { holder: `guild:${G}`, kind: 'manual.grant.ended', payload: { tierName: 'Low', notes: 'gift for events' } },
     ]);
   });
 
   it('a manual grant ending within a day sends manual.grant.ending-soon with the tier name and the end date', async () => {
     const end = Date.now() + HOUR;
-    writePremium({ [G]: { active: manualSub('m1', end, 'trial'), paused: [] } });
+    writePremium({ [gh(G)]: { active: manualSub('m1', end, 'trial'), paused: [] } });
     const pm = manager();
     pm.startExpiryChecker(5);
     await vi.waitFor(() => expect(notes.calls.some(c => c.kind === 'manual.grant.ending-soon')).toBe(true), { timeout: 2000, interval: 5 });
     pm.stopExpiryChecker();
     expect(notes.calls.filter(c => c.kind === 'manual.grant.ending-soon')).toEqual([
-      { guildId: G, kind: 'manual.grant.ending-soon', payload: { tierName: 'Low', endDate: new Date(end).toISOString() } },
+      { holder: `guild:${G}`, kind: 'manual.grant.ending-soon', payload: { tierName: 'Low', endDate: new Date(end).toISOString() } },
     ]);
   });
 });
@@ -114,22 +115,22 @@ describe('a higher grant pausing the active one', () => {
   it('writes the subscription.pause audit line with the admin as actor', async () => {
     writePremium();
     const pm = manager();
-    expect(await pm.grantManual(G, 'low', 30)).toBe(true);
-    expect(await pm.grantManual(G, 'high', 30)).toBe(true);
+    expect(await pm.grantManual(gh(G), 'low', 30)).toBe(true);
+    expect(await pm.grantManual(gh(G), 'high', 30)).toBe(true);
     await settleQueue();
     const pauses = linesOf(AUDIT).filter(l => l.action === 'subscription.pause');
     expect(pauses).toHaveLength(1);
     expect(pauses[0].actor).toBe('admin');
-    expect(pauses[0].guildId).toBe(G);
+    expect(pauses[0].holder).toBe(gh(G));
   });
 });
 
 describe('a cancel whose subscription another change removed, judged after the stop', () => {
   it('answers not saved when the saved text is no longer known (the cache was dropped)', async () => {
-    writePremium({ [G]: { active: paidSub('s1', 'p1', 'low', 'fake'), paused: [] } });
+    writePremium({ [gh(G)]: { active: paidSub('s1', 'p1', 'low', 'fake'), paused: [] } });
     const pm = manager();
     const p = cancelProvider();
-    const answer = pm.cancelPaidSubscriptionImmediately(G);
+    const answer = pm.cancelPaidSubscriptionImmediately(gh(G));
     await tick();
     expect(p.cancels).toEqual(['p1']);
     const cfg = pm.getFullConfig();
@@ -141,17 +142,17 @@ describe('a cancel whose subscription another change removed, judged after the s
     expect(await answer).toBe(false);
   });
 
-  it('answers done when the last saved text holds the guild without that subscription and without a paused list', async () => {
+  it('answers done when the last saved text holds the guild with another subscription and an empty paused list', async () => {
     writePremium();
     const pm = manager();
     const noId: Record<string, unknown> = { ...paidSub('x', 'p1', 'low', 'fake') };
     delete noId.id;
-    expect(pm.setFullConfig(fullConfig({ [G]: { active: noId, paused: [] } }))).toBe(true);
+    expect(pm.setFullConfig(fullConfig({ [gh(G)]: { active: noId, paused: [] } }))).toBe(true);
     const p = cancelProvider();
-    const answer = pm.cancelPaidSubscriptionImmediately(G);
+    const answer = pm.cancelPaidSubscriptionImmediately(gh(G));
     await tick();
     expect(p.cancels).toEqual(['p1']);
-    expect(pm.setFullConfig(fullConfig({ [G]: { active: paidSub('other', 'p9', 'low', 'fake') } }))).toBe(true);
+    expect(pm.setFullConfig(fullConfig({ [gh(G)]: { active: paidSub('other', 'p9', 'low', 'fake') } }))).toBe(true);
     await settleQueue();
     inject.refuseSave = true;
     expect(pm.setFullConfig(fullConfig({}))).toBe(false);
@@ -172,7 +173,7 @@ describe('isPremiumReplaying', () => {
   it('is true while the bot holds provider events it has not applied', () => {
     process.env.BOT_PROCESS_ROLE = 'bot';
     writePremium();
-    const event = { type: 'subscription.renewed', providerId: 'fake', providerSubId: 'p1', guildId: G };
+    const event = { type: 'subscription.renewed', providerId: 'fake', providerSubId: 'p1', holder: gh(G) };
     fs.writeFileSync(JOURNAL, `${JSON.stringify({ writer: 'w-old', n: 1, event })}\n`);
     expect(getPremiumManager().cacheState()).toBe('replaying');
     expect(isPremiumReplaying()).toBe(true);

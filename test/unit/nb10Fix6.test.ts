@@ -30,6 +30,7 @@ import { sharedOpFailure } from '../../src/webui/routes/hopFailure';
 import { releaseWriterLock, writerLockDepth, writerLockPath } from '../../src/bot/internalSetup/utils/writerLock';
 import { freshWriterLock, resetForks } from '../helpers/nb10Rig';
 import { AUDIT, clearGlobal, gate, jsonOf, linesOf, paidSub, PREMIUM, settleQueue, tick, writePremium } from './nb10PremiumRig';
+import { gh } from '../helpers/p1Holder';
 
 const G = '900000000000000666';
 const G2 = '900000000000000667';
@@ -67,7 +68,7 @@ afterEach(async () => {
 
 describe("expire now with the Dummy provider, whose own event removes the subscription during the call (D1)", () => {
   it('answers done: the subscription is gone, the paused one is active, and the route answers 200', async () => {
-    writePremium({ [G]: { active: paidSub('sA', 'dA', 'low', 'dummy'), paused: [paused('sP', 'dP', 'low', 'patreon')] } });
+    writePremium({ [gh(G)]: { active: paidSub('sA', 'dA', 'low', 'dummy'), paused: [paused('sP', 'dP', 'low', 'patreon')] } });
     const dummy = new DummyProvider();
     getPaymentRegistry().register(dummy);
     dummy.adminListVariants();
@@ -77,11 +78,11 @@ describe("expire now with the Dummy provider, whose own event removes the subscr
       startDate: now, endDate: new Date(Date.now() + 30 * 86_400_000).toISOString(), autoRenew: true, status: 'active',
       createdAt: now, updatedAt: now,
     };
-    const reply = await op('premium.cancelPaidSubscriptionImmediately', G);
+    const reply = await op('premium.cancelPaidSubscriptionImmediately', gh(G));
     expect(reply).toEqual({ ok: true, result: true });
     expect(sharedOpFailure(reply)).toBeNull();
     await settleQueue();
-    const subs = jsonOf(PREMIUM).subscriptions[G];
+    const subs = jsonOf(PREMIUM).subscriptions[gh(G)];
     expect(subs.active.id).toBe('sP');
     expect(subs.paused).toEqual([]);
     dummy.stop();
@@ -93,19 +94,19 @@ describe("an install that pauses the active subscription saves before the provid
   // during the pause leaves nothing of the op unsaved and the op answers ok (NB10 answered partial: its grant line was
   // written after the pause).
   it('a stop during the pause answers ok: the save before the pause took the grant line, and the store holds the grant once', async () => {
-    writePremium({ [G]: { active: paidSub('sA', 'pA', 'low', 'patreon'), paused: [] } });
+    writePremium({ [gh(G)]: { active: paidSub('sA', 'pA', 'low', 'patreon'), paused: [] } });
     const pause = gate();
     const pauses: string[] = [];
     getPaymentRegistry().register({
-      id: 'patreon', displayName: 'patreon', capabilities: { supportsCancel: true, supportsPause: true }, isConfigured: () => true,
+      id: 'patreon', displayName: 'patreon', capabilities: { sells: ['guild'], supportsCancel: true, supportsPause: true }, isConfigured: () => true,
       cancelSubscription: async () => undefined,
       pauseSubscription: async (id: string) => { pauses.push(id); await pause.promise; },
     } as any);
-    const answer = op('premium.grantManual', G, 'high', 5);
+    const answer = op('premium.grantManual', gh(G), 'high', 5);
     await tick();
     expect(pauses).toEqual(['pA']);
     await settleQueue();
-    const onDisk = jsonOf(PREMIUM).subscriptions[G];
+    const onDisk = jsonOf(PREMIUM).subscriptions[gh(G)];
     expect(onDisk.active.source).toBe('manual');
     expect(onDisk.paused.map((p: any) => p.id)).toEqual(['sA']);
     expect(linesOf(AUDIT).map(l => l.action)).toEqual(['subscription.grant.manual', 'subscription.pause']);
@@ -116,7 +117,7 @@ describe("an install that pauses the active subscription saves before the provid
     expect(reply.partial).toBeUndefined();
     (getPremiumManager() as any).stopped = null;
     await settleQueue();
-    const subs = jsonOf(PREMIUM).subscriptions[G];
+    const subs = jsonOf(PREMIUM).subscriptions[gh(G)];
     expect([subs.active, ...subs.paused].filter((s: any) => s.source === 'manual')).toHaveLength(1);
     expect(linesOf(AUDIT).map(l => l.action)).toEqual(['subscription.grant.manual', 'subscription.pause']);
   });
@@ -140,7 +141,7 @@ function migrateProvider(): MigrateProvider {
   };
   const p: MigrateProvider = { migrates: [], cancels: [], open: id => of(id).open(undefined) };
   getPaymentRegistry().register({
-    id: 'patreon', displayName: 'patreon', capabilities: { supportsCancel: true, supportsPause: true }, isConfigured: () => true,
+    id: 'patreon', displayName: 'patreon', capabilities: { sells: ['guild'], supportsCancel: true, supportsPause: true }, isConfigured: () => true,
     cancelSubscription: async (id: string) => { p.cancels.push(id); },
     pauseSubscription: async () => undefined,
     migrateSubscriptionPrice: async (id: string) => { p.migrates.push(id); await of(id).promise; },
@@ -149,14 +150,14 @@ function migrateProvider(): MigrateProvider {
 }
 
 const silent = (guildId: string, subscriptionId: string, providerSubId: string) =>
-  ({ guildId, subscriptionId, providerSubId, decision: 'pending', notifiedAt: new Date().toISOString() });
+  ({ holder: gh(guildId), subscriptionId, providerSubId, decision: 'pending', notifiedAt: new Date().toISOString() });
 
 describe('a due migration is applied once, and changes to it are refused while it runs (D3, D4, O1)', () => {
   it('a second due run while the first awaits the provider applies nothing, and no subscriber is cancelled', async () => {
     writePremium(
       {
-        [G]: { active: { ...paidSub('s1', 'p1', 'low', 'patreon'), variantId: 'v1' }, paused: [] },
-        [G2]: { active: { ...paidSub('s2', 'p2', 'low', 'patreon'), variantId: 'v1' }, paused: [] },
+        [gh(G)]: { active: { ...paidSub('s1', 'p1', 'low', 'patreon'), variantId: 'v1' }, paused: [] },
+        [gh(G2)]: { active: { ...paidSub('s2', 'p2', 'low', 'patreon'), variantId: 'v1' }, paused: [] },
       },
       { migrationSilencePolicy: 'continue', migrations: [migration([silent(G, 's1', 'p1'), silent(G2, 's2', 'p2')])] },
     );
@@ -178,13 +179,13 @@ describe('a due migration is applied once, and changes to it are refused while i
     const stored = jsonOf(PREMIUM);
     expect(stored.migrations[0].status).toBe('applied');
     expect(stored.migrations[0].decisions.map((d: any) => d.outcome)).toEqual(['migrated', 'migrated']);
-    expect(stored.subscriptions[G].active.variantId).toBe('v2');
-    expect(stored.subscriptions[G2].active.autoRenew).toBe(true);
+    expect(stored.subscriptions[gh(G)].active.variantId).toBe('v2');
+    expect(stored.subscriptions[gh(G2)].active.autoRenew).toBe(true);
   });
 
   it("an operator's cancel and an owner's decline during the run are refused with nothing changed; afterwards the migration is applied", async () => {
     writePremium(
-      { [G]: { active: { ...paidSub('s1', 'p1', 'low', 'patreon'), variantId: 'v1' }, paused: [] } },
+      { [gh(G)]: { active: { ...paidSub('s1', 'p1', 'low', 'patreon'), variantId: 'v1' }, paused: [] } },
       { migrationSilencePolicy: 'continue', migrations: [migration([silent(G, 's1', 'p1')])] },
     );
     const provider = migrateProvider();
@@ -194,7 +195,7 @@ describe('a due migration is applied once, and changes to it are refused while i
     const cancel: any = await op('premium.cancelMigration', 'mig1');
     expect(cancel).toEqual({ ok: false, code: 'changed', error: BUSY });
     expect(sharedOpFailure(cancel)).toEqual({ status: 409, error: BUSY });
-    const decline: any = await op('premium.recordMigrationDecision', 'mig1', G, 'declined');
+    const decline: any = await op('premium.recordMigrationDecision', 'mig1', gh(G), 'declined');
     expect(decline).toEqual({ ok: false, code: 'changed', error: BUSY });
     provider.open('p1');
     await run;
@@ -212,8 +213,8 @@ describe('a due migration is applied once, and changes to it are refused while i
     const applied = new Date(Date.now() - 5000).toISOString();
     writePremium(
       {
-        [G]: { active: { ...paidSub('s1', 'p1', 'low', 'patreon'), variantId: 'v1' }, paused: [] },
-        [G2]: { active: { ...paidSub('s2', 'p2', 'low', 'patreon'), variantId: 'v1' }, paused: [] },
+        [gh(G)]: { active: { ...paidSub('s1', 'p1', 'low', 'patreon'), variantId: 'v1' }, paused: [] },
+        [gh(G2)]: { active: { ...paidSub('s2', 'p2', 'low', 'patreon'), variantId: 'v1' }, paused: [] },
       },
       {
         migrationSilencePolicy: 'continue',

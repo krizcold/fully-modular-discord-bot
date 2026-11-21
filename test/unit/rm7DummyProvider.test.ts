@@ -82,7 +82,7 @@ let logs: string[];
 
 function rec(id: string, fields: Record<string, unknown> = {}): Record<string, unknown> {
   return {
-    providerSubId: id, guildId: 'g1', tierId: 'gold', offeringId: 'o1', variantId: MONTHLY, durationDays: 30,
+    providerSubId: id, guildId: '70000000000000001', tierId: 'gold', offeringId: 'o1', variantId: MONTHLY, durationDays: 30,
     startDate: PAST, endDate: FUTURE, autoRenew: true, status: 'active', createdAt: PAST, updatedAt: PAST, ...fields,
   };
 }

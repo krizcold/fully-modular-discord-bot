@@ -26,6 +26,7 @@
 import { PROVIDER_FETCH_MS } from './paymentTypes';
 import { providerCredentials } from '@/utils/envLoader';
 import { getPaymentRegistry } from './paymentRegistry';
+import { guildIdFor, holderFromWire, parseHolder, type HolderKey } from '../premiumHolder';
 import type {
   PaymentProvider,
   ProviderCapabilities,
@@ -54,6 +55,7 @@ const CAPABILITIES: ProviderCapabilities = {
   mechanism: 'client_handoff',
   variantIdLabel: 'Discord SKU ID',
   productIdLabel: '',             // no product concept
+  sells: ['guild'],
 };
 
 interface DiscordEntitlement {
@@ -77,6 +79,8 @@ interface DiscordSku {
   slug: string;
   flags: number;
 }
+
+const userEntitlementsLogged = new Set<string>();
 
 export class DiscordProvider implements PaymentProvider {
   readonly id = 'discord';
@@ -114,7 +118,8 @@ export class DiscordProvider implements PaymentProvider {
    * cannot initiate. The SubscribeModal special-cases client_handoff
    * mechanism and surfaces an instruction instead of a button.
    */
-  async initiatePurchase(_opts: InitiateOpts): Promise<InitiateResult> {
+  async initiatePurchase(opts: InitiateOpts): Promise<InitiateResult> {
+    guildIdFor(opts.holder as HolderKey, this.displayName);
     return {
       clientHandoff: {
         type: 'discord-premium-menu',
@@ -197,7 +202,10 @@ export class DiscordProvider implements PaymentProvider {
    * for this guild that aren't in our local cache. PremiumManager
    * compares this against its records.
    */
-  async listSubscriptionsForGuild(guildId: string): Promise<ProviderSubscriptionRef[]> {
+  async listSubscriptionsFor(holder: HolderKey): Promise<ProviderSubscriptionRef[]> {
+    const parsed = parseHolder(holder);
+    if (!parsed || parsed.kind !== 'guild') return [];
+    const guildId = parsed.id;
     const creds = providerCredentials('discord');
     if (!creds.DISCORD_APPLICATION_ID) return [];
     const all = await this.api<DiscordEntitlement[]>(
@@ -216,7 +224,8 @@ export class DiscordProvider implements PaymentProvider {
         providerSubId: ent.id,
         state,
         metadata: {
-          guildId,
+          holder,
+          ...(ent.user_id ? { buyerId: String(ent.user_id) } : {}),
           variantId: ent.sku_id,
           // Discord doesn't carry tierId/offeringId metadata - those would
           // need to be derived by matching SKU id against our wired
@@ -263,19 +272,28 @@ export class DiscordProvider implements PaymentProvider {
       try {
         const ent = this.normalizeRawEntitlement(raw);
         if (!ent) return;
-        if (!ent.guild_id) return; // user-scoped entitlements - we only handle guild subs
+        if (!ent.guild_id) {
+          if (ent.user_id && !userEntitlementsLogged.has(ent.id)) {
+            userEntitlementsLogged.add(ent.id);
+            console.warn(`[DiscordProvider] Entitlement ${ent.id} (SKU ${ent.sku_id}) is for a user, not a server; this version does not handle user entitlements, so its events are not applied.`);
+          }
+          return;
+        }
+        const holder = holderFromWire(ent.guild_id);
+        if (!holder) return;
         const state = this.stateFromEntitlement(ent);
         const registry = getPaymentRegistry();
         if (kind === 'created') {
           // Discord doesn't carry tier/offering metadata - emit as orphan-adopt
           // candidate by populating tierId/offeringId as empty. PremiumManager
-          // will fall back to listSubscriptionsForGuild on next orphan scan.
+          // will fall back to listSubscriptionsFor on next orphan scan.
           // We still emit so the audit log records the event.
           registry.emitEvent({
             type: 'subscription.created',
             providerId: this.id,
             providerSubId: ent.id,
-            guildId: ent.guild_id,
+            holder,
+            ...(ent.user_id ? { buyerId: String(ent.user_id) } : {}),
             tierId: '',
             offeringId: '',
             variantId: ent.sku_id,
@@ -286,7 +304,7 @@ export class DiscordProvider implements PaymentProvider {
             type: 'subscription.updated',
             providerId: this.id,
             providerSubId: ent.id,
-            guildId: ent.guild_id,
+            holder,
             state,
           });
         } else {
@@ -294,7 +312,7 @@ export class DiscordProvider implements PaymentProvider {
             type: 'subscription.expired',
             providerId: this.id,
             providerSubId: ent.id,
-            guildId: ent.guild_id,
+            holder,
             state: { ...state, status: 'expired' },
           });
         }

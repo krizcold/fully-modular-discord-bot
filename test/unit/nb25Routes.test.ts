@@ -13,6 +13,7 @@ vi.mock('../../src/bot/internalSetup/utils/premiumManager', async orig => ({
 }));
 
 import { createGuildSubscriptionRoutes } from '../../src/webui/routes/guildSubscriptions';
+import { gh } from '../helpers/p1Holder';
 
 const G = '123456789012345678';
 const ROUTE = '/:guildId/orphans/:providerId/:providerSubId/adopt';
@@ -31,12 +32,12 @@ describe('the adopt route', () => {
   it("passes the body's plan as the op's fourth argument", async () => {
     const plan = { kind: 'resume', days: 12, from: 'recorded', at: '2026-11-01T00:00:00.000Z', autoRenew: true, call: true, line: 'x' };
     const sent = JSON.parse(JSON.stringify(plan));
-    expect(await adoptWith({ plan })).toEqual([{ op: 'premium.adoptOrphan', args: { args: [G, 'stripe', 'sub_1', sent] } }]);
+    expect(await adoptWith({ plan })).toEqual([{ op: 'premium.adoptOrphan', args: { args: [gh(G), 'stripe', 'sub_1', sent] } }]);
   });
 
   it('a body with no plan passes undefined in its place', async () => {
     const ops = await adoptWith({});
     expect(ops).toHaveLength(1);
-    expect((ops[0].args as { args: unknown[] }).args).toEqual([G, 'stripe', 'sub_1', undefined]);
+    expect((ops[0].args as { args: unknown[] }).args).toEqual([gh(G), 'stripe', 'sub_1', undefined]);
   });
 });

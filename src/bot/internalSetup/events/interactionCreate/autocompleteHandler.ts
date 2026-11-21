@@ -3,6 +3,14 @@ import getLocalCommands from '../../utils/getLocalCommands';
 import { getPremiumManager } from '../../utils/premiumManager';
 import { instrument } from '../../utils/metrics/instrument';
 
+/** Whether the module's user gate names this command, as handleCommands reads it. */
+function userGated(commandObject: any): boolean {
+  const gate = commandObject._tierRequirement?.user;
+  if (!gate || typeof gate.minPriority !== 'number') return false;
+  const listed = Array.isArray(gate.gatedCommands) && gate.gatedCommands.length > 0;
+  return !listed || gate.gatedCommands.includes(commandObject.name);
+}
+
 /**
  * Autocomplete dispatcher.
  *
@@ -57,6 +65,15 @@ export default async function handleAutocomplete(client: Client, interaction: In
           try { await interaction.respond([]); } catch {}
           return;
         }
+      }
+    } catch { /* premium manager not available; allow autocomplete */ }
+  }
+
+  if (commandObject._moduleName && userGated(commandObject)) {
+    try {
+      if (!getPremiumManager().hasUserFeatureAccess(interaction.user.id, commandObject._tierRequirement.user.minPriority)) {
+        try { await interaction.respond([]); } catch {}
+        return;
       }
     } catch { /* premium manager not available; allow autocomplete */ }
   }

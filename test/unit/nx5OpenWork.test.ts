@@ -13,7 +13,7 @@ vi.mock('../../src/bot/internalSetup/utils/payment/paymentRegistry', async orig 
 });
 const notices = vi.hoisted(() => ({ hold: null as Promise<void> | null, sent: [] as string[] }));
 vi.mock('../../src/bot/internalSetup/utils/premiumNotifications', () => ({
-  dispatchPremiumNotification: async (_guildId: string, kind: string) => {
+  dispatchPremiumNotification: async (_holder: string, kind: string) => {
     if (notices.hold) await notices.hold;
     notices.sent.push(kind);
     return { delivered: true, via: 'dm' };
@@ -112,9 +112,9 @@ function migrationTiers() {
 
 describe('G8-14: the review\'s case, a scheduled migration\'s notice landing after the answer', () => {
   it('no true answer until notifiedAt is on the store; the answer meanwhile carries NULL counts', async () => {
-    writePremium({ g1: { active: { ...paidSub('s1', 'sub1', 'low'), variantId: 'v1' }, paused: [] } }, { tiers: migrationTiers() });
+    writePremium({ 'guild:70000000000000001': { active: { ...paidSub('s1', 'sub1', 'low'), variantId: 'v1' }, paused: [] } }, { tiers: migrationTiers() });
     getPaymentRegistry().register({
-      id: 'fake', displayName: 'Fake', isConfigured: () => true, capabilities: { supportsPriceMigration: true },
+      id: 'fake', displayName: 'Fake', isConfigured: () => true, capabilities: { sells: ['guild'], supportsPriceMigration: true },
       migrateSubscriptionPrice: async () => providerState(true),
     } as any);
     const held = gate();
@@ -138,16 +138,16 @@ describe('G8-14: the review\'s case, a scheduled migration\'s notice landing aft
 
 describe('G8-14: premium\'s other asynchronous paths', () => {
   it('a subscription.created event whose install awaits the provider\'s pause: counted until the pause answered', async () => {
-    writePremium({ g1: { active: paidSub('s1', 'sub1', 'high'), paused: [] } });
+    writePremium({ 'guild:70000000000000001': { active: paidSub('s1', 'sub1', 'high'), paused: [] } });
     const pause = gate<ReturnType<typeof providerState>>();
     const paused: string[] = [];
     const pm = getPremiumManager();
     getPaymentRegistry().register({
-      id: 'fake', displayName: 'Fake', isConfigured: () => true, capabilities: { supportsPause: true },
+      id: 'fake', displayName: 'Fake', isConfigured: () => true, capabilities: { sells: ['guild'], supportsPause: true },
       pauseSubscription: async (subId: string) => { paused.push(subId); return pause.promise; },
     } as any);
     getPaymentRegistry().emitEvent({
-      type: 'subscription.created', providerId: 'fake', providerSubId: 'sub2', guildId: 'g1', tierId: 'low', offeringId: 'o1',
+      type: 'subscription.created', buyerId: '80000000000000001', providerId: 'fake', providerSubId: 'sub2', holder: 'guild:70000000000000001', tierId: 'low', offeringId: 'o1',
       variantId: 'v1', state: providerState(true),
     } as any);
     await vi.waitFor(() => expect(paused).toEqual(['sub2']));
@@ -155,21 +155,21 @@ describe('G8-14: premium\'s other asynchronous paths', () => {
 
     pause.open(providerState(true, 'paused'));
     await answerOnceEnded(store);
-    expect(pm.getFullConfig().subscriptions.g1.paused.map((s: any) => s.providerSubId)).toEqual(['sub2']);
+    expect(pm.getFullConfig().subscriptions['guild:70000000000000001'].paused.map((s: any) => s.providerSubId)).toEqual(['sub2']);
   });
 
   it('a queued subscription resumed after the active one expired: the provider\'s resume call is counted until it answered', async () => {
     const queued = { ...paidSub('s2', 'sub2', 'low'), status: 'paused', remainingDaysAtPause: 10, pausedAt: new Date().toISOString() };
-    writePremium({ g1: { active: paidSub('s1', 'sub1', 'high'), paused: [queued] } });
+    writePremium({ 'guild:70000000000000001': { active: paidSub('s1', 'sub1', 'high'), paused: [queued] } });
     const resume = gate<ReturnType<typeof providerState>>();
     const resumed: string[] = [];
     const pm = getPremiumManager();
     getPaymentRegistry().register({
-      id: 'fake', displayName: 'Fake', isConfigured: () => true, capabilities: { supportsPause: true },
+      id: 'fake', displayName: 'Fake', isConfigured: () => true, capabilities: { sells: ['guild'], supportsPause: true },
       resumeSubscription: async (subId: string) => { resumed.push(subId); return resume.promise; },
     } as any);
     getPaymentRegistry().emitEvent({
-      type: 'subscription.expired', providerId: 'fake', providerSubId: 'sub1', guildId: 'g1',
+      type: 'subscription.expired', providerId: 'fake', providerSubId: 'sub1', holder: 'guild:70000000000000001',
       state: { ...providerState(false, 'expired'), endDate: new Date(Date.now() - 1000).toISOString() },
     } as any);
     await vi.waitFor(() => expect(resumed).toEqual(['sub2']));
@@ -178,7 +178,7 @@ describe('G8-14: premium\'s other asynchronous paths', () => {
 
     resume.open(providerState(true));
     await answerOnceEnded(store);
-    expect(pm.getFullConfig().subscriptions.g1.active?.providerSubId).toBe('sub2');
+    expect(pm.getFullConfig().subscriptions['guild:70000000000000001'].active?.providerSubId).toBe('sub2');
   });
 });
 
@@ -188,7 +188,7 @@ describe('G8-14: the Dummy provider', () => {
     getPaymentRegistry().register(dummy);
     const check = gate<{ valid: boolean }>();
     vi.spyOn(dummy, 'validateCoupon').mockReturnValue(check.promise as any);
-    const bought = dummy.initiatePurchase({ guildId: 'g1', tierId: 'low', offeringId: 'o1', variantId: 'dummy_monthly_999', couponCode: 'NONE' });
+    const bought = dummy.initiatePurchase({ holder: 'guild:70000000000000001', buyerId: '80000000000000001', tierId: 'low', offeringId: 'o1', variantId: 'dummy_monthly_999', couponCode: 'NONE' });
     await settle();
     const store = await answerWhileOpen(/^the Dummy provider: 1 purchase\(s\) not saved yet$/);
 
@@ -202,16 +202,16 @@ describe('G8-14: the Dummy provider', () => {
 
 describe('G8-14: the leave waits while counted work runs', () => {
   it('the order ends while premium\'s provider call runs: the leave logs what it waits for and asks for its restart once the call ended', async () => {
-    writePremium({ g1: { active: paidSub('s1', 'sub1', 'high'), paused: [] } });
+    writePremium({ 'guild:70000000000000001': { active: paidSub('s1', 'sub1', 'high'), paused: [] } });
     const call = gate<ReturnType<typeof providerState>>();
     const seen: string[] = [];
     getPaymentRegistry().register({
-      id: 'fake', displayName: 'Fake', capabilities: { supportsCancel: true }, isConfigured: () => true,
+      id: 'fake', displayName: 'Fake', capabilities: { sells: ['guild'], supportsCancel: true }, isConfigured: () => true,
       cancelSubscription: async (subId: string) => { seen.push(subId); return call.promise; },
     } as any);
     const sent: any[] = [];
     maintenance._setMaintenanceSender(message => { sent.push(message); });
-    const running = getPremiumManager().cancelPaidSubscription('g1');
+    const running = getPremiumManager().cancelPaidSubscription('guild:70000000000000001');
     await vi.waitFor(() => expect(seen).toEqual(['sub1']));
     const store = await inOrder();
     await vi.waitFor(() => expect(store.acks).toHaveLength(1), { timeout: 3000, interval: 20 });
@@ -227,7 +227,7 @@ describe('G8-14: the leave waits while counted work runs', () => {
     await running;
     await vi.waitFor(() => expect(sent.filter(s => s.type === 'control:restart-bot')).toHaveLength(1), { timeout: 5000, interval: 20 });
     expect(waits()).toHaveLength(1);
-    expect(jsonOf(PREMIUM).subscriptions.g1.active.autoRenew).toBe(false);
+    expect(jsonOf(PREMIUM).subscriptions['guild:70000000000000001'].active.autoRenew).toBe(false);
   });
 
   it('the nothing-held wait says what the operator\'s restart does', async () => {
@@ -289,11 +289,11 @@ describe('G8-14: a false answer names the work that still runs', () => {
 describe('G8-14: the content-refusal leave waits while counted work runs', () => {
   it('a guild held for its content while premium\'s provider call runs: no restart until the call answered, then the restart that drops the guild', async () => {
     maintenance._setMaintenanceTiming({ leaveRetryMs: 30, leaveSaveBoundMs: 100 });
-    writePremium({ g1: { active: paidSub('s1', 'sub1', 'high'), paused: [] } });
+    writePremium({ 'guild:70000000000000001': { active: paidSub('s1', 'sub1', 'high'), paused: [] } });
     const call = gate<ReturnType<typeof providerState>>();
     const seen: string[] = [];
     getPaymentRegistry().register({
-      id: 'fake', displayName: 'Fake', capabilities: { supportsCancel: true }, isConfigured: () => true,
+      id: 'fake', displayName: 'Fake', capabilities: { sells: ['guild'], supportsCancel: true }, isConfigured: () => true,
       cancelSubscription: async (subId: string) => { seen.push(subId); return call.promise; },
     } as any);
     const sent: any[] = [];
@@ -309,7 +309,7 @@ describe('G8-14: the content-refusal leave waits while counted work runs', () =>
     const watcher = m.watchDataBackend({ onLoginRefused: () => undefined, askDatabase: async () => 'answers' }, { retryMs: 3_600_000 });
     await watcher.probeNow();
 
-    const running = getPremiumManager().cancelPaidSubscription('g1');
+    const running = getPremiumManager().cancelPaidSubscription('guild:70000000000000001');
     await vi.waitFor(() => expect(seen).toEqual(['sub1']));
     m.startLeave('The hook says running');
     const waits = () => logged(spies.warn).filter(l => l.includes('refuses for their content') && l.includes('work this process accepted still runs'));
@@ -328,7 +328,7 @@ describe('G8-14: the content-refusal leave waits while counted work runs', () =>
     expect(waits()).toHaveLength(1);
     expect(logged(spies.error).filter(l => l.includes('saves in a row left changes the database refuses for their content')
       && l.endsWith('the bot process asks for its restart, which drops these changes'))).toHaveLength(1);
-    expect(jsonOf(PREMIUM).subscriptions.g1.active.autoRenew).toBe(false);
+    expect(jsonOf(PREMIUM).subscriptions['guild:70000000000000001'].active.autoRenew).toBe(false);
   });
 
   /** One guild whose save the database refuses for its content, under a watcher whose database answers. */
@@ -455,11 +455,11 @@ describe('G8-14: a maintenance boot\'s leave waits while counted work runs', () 
   it('a hook boot with no order: maintenance.json goes to running while premium\'s provider call runs; no restart until the call answered, then one', async () => {
     maintenance._setMaintenanceTiming({ filePollMs: 20, leaveRetryMs: 30 });
     writeMaintenanceFile('maintenance', 'm');
-    writePremium({ g1: { active: paidSub('s1', 'sub1', 'high'), paused: [] } });
+    writePremium({ 'guild:70000000000000001': { active: paidSub('s1', 'sub1', 'high'), paused: [] } });
     const call = gate<ReturnType<typeof providerState>>();
     const seen: string[] = [];
     getPaymentRegistry().register({
-      id: 'fake', displayName: 'Fake', capabilities: { supportsCancel: true }, isConfigured: () => true,
+      id: 'fake', displayName: 'Fake', capabilities: { sells: ['guild'], supportsCancel: true }, isConfigured: () => true,
       cancelSubscription: async (subId: string) => { seen.push(subId); return call.promise; },
     } as any);
     const sent: any[] = [];
@@ -467,7 +467,7 @@ describe('G8-14: a maintenance boot\'s leave waits while counted work runs', () 
     const restarts = () => sent.filter(s => s.type === 'control:restart-bot');
     await maintenance.runMaintenanceBoot({ cause: 'hook', message: 'm' }, { shards: async () => 1, login: async () => undefined });
 
-    const running = getPremiumManager().cancelPaidSubscription('g1');
+    const running = getPremiumManager().cancelPaidSubscription('guild:70000000000000001');
     await vi.waitFor(() => expect(seen).toEqual(['sub1']));
     writeMaintenanceFile('running', 'm');
     const waits = () => logged(spies.warn).filter(l => l.includes('[Maintenance] Nothing is held, but work this process accepted still runs'));
@@ -485,16 +485,16 @@ describe('G8-14: a maintenance boot\'s leave waits while counted work runs', () 
   it('the hook in a maintenance boot while premium\'s provider call runs: saved null with the work named, then saved true once the call answered', async () => {
     maintenance._setMaintenanceTiming({ filePollMs: 20 });
     writeMaintenanceFile('maintenance', 'm');
-    writePremium({ g1: { active: paidSub('s1', 'sub1', 'high'), paused: [] } });
+    writePremium({ 'guild:70000000000000001': { active: paidSub('s1', 'sub1', 'high'), paused: [] } });
     const call = gate<ReturnType<typeof providerState>>();
     const seen: string[] = [];
     getPaymentRegistry().register({
-      id: 'fake', displayName: 'Fake', capabilities: { supportsCancel: true }, isConfigured: () => true,
+      id: 'fake', displayName: 'Fake', capabilities: { sells: ['guild'], supportsCancel: true }, isConfigured: () => true,
       cancelSubscription: async (subId: string) => { seen.push(subId); return call.promise; },
     } as any);
     await maintenance.runMaintenanceBoot({ cause: 'hook', message: 'm' }, { shards: async () => 1, login: async () => undefined });
 
-    const running = getPremiumManager().cancelPaidSubscription('g1');
+    const running = getPremiumManager().cancelPaidSubscription('guild:70000000000000001');
     await vi.waitFor(() => expect(seen).toEqual(['sub1']));
     const answer = await maintenance.enterMaintenance('m', { handlerWaitMs: 50, saveBoundMs: 50 });
     expect(answer).toMatchObject({ saved: null, running: expect.stringContaining('premium: 1 change(s) waiting for a payment provider') });

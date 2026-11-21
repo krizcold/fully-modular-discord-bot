@@ -60,27 +60,27 @@ afterEach(async () => {
 describe("R2-D2: an op refused 'changed-elsewhere' while a later save is held", () => {
   it('settles the held save as refused at once and reads the stored version', async () => {
     const pm = r.pm();
-    expect(await pm.grantManual('g0', 'gold', 30)).toBe(true);
+    expect(await pm.grantManual('guild:70000000000000000', 'gold', 30)).toBe(true);
     await d.settle();
-    expect(r.row().subscriptions?.g0).toBeDefined();
+    expect(r.row().subscriptions?.['guild:70000000000000000']).toBeDefined();
     const release = hold();
-    expect(await pm.grantManual('g1', 'gold', 30)).toBe(true);
+    expect(await pm.grantManual('guild:70000000000000001', 'gold', 30)).toBe(true);
     inject.premium.push({ cause: 'database-backlog' });
-    expect(await pm.grantManual('g2', 'gold', 30)).toBe(true);
+    expect(await pm.grantManual('guild:70000000000000002', 'gold', 30)).toBe(true);
     await d.otherPremium(config => { config.messages = { ...(config.messages ?? {}), moduleBlocked: 'from BRAVO' }; });
     release();
     await d.settle();
-    expect(pm.getGuildSubscriptions('g1')?.active ?? null).toBeNull();
-    expect(pm.getGuildSubscriptions('g2')?.active ?? null).toBeNull();
+    expect(pm.getHolderSubscriptions('guild:70000000000000001')?.active ?? null).toBeNull();
+    expect(pm.getHolderSubscriptions('guild:70000000000000002')?.active ?? null).toBeNull();
     // The mirror's file is the last version this machine stored until the next pass brings BRAVO's.
     await d.otherPremium(() => undefined);
     expect(pm.getMessages().moduleBlocked).toBe('from BRAVO');
-    expect(pm.getGuildSubscriptions('g0')?.active?.tierId).toBe('gold');
+    expect(pm.getHolderSubscriptions('guild:70000000000000000')?.active?.tierId).toBe('gold');
     const grants = r.lines(AUDIT_KEY).filter(l => l.action === 'subscription.grant.manual');
-    expect(grants.map(l => [l.guildId, l.metadata?.notSaved?.cause]).sort()).toEqual([['g0', undefined], ['g1', 'changed-elsewhere'], ['g2', 'changed-elsewhere']]);
+    expect(grants.map(l => [l.holder, l.metadata?.notSaved?.cause]).sort()).toEqual([['guild:70000000000000000', undefined], ['guild:70000000000000001', 'changed-elsewhere'], ['guild:70000000000000002', 'changed-elsewhere']]);
     expect((pm as any).saveHeld).toBe(false);
-    expect(notices.sent).toEqual(['manual.grant.added:g0']);
-    expect(r.row().subscriptions?.g1).toBeUndefined();
-    expect(r.row().subscriptions?.g2).toBeUndefined();
+    expect(notices.sent).toEqual(['manual.grant.added:guild:70000000000000000']);
+    expect(r.row().subscriptions?.['guild:70000000000000001']).toBeUndefined();
+    expect(r.row().subscriptions?.['guild:70000000000000002']).toBeUndefined();
   }, 20_000);
 });

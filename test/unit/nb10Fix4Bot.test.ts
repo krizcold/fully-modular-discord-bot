@@ -37,6 +37,7 @@ import { startApp } from '../helpers/configRig';
 import { forks } from '../helpers/forkMock';
 import { exitChild, freshWriterLock, report, resetForks, startedWith } from '../helpers/nb10Rig';
 import { clearGlobal, jsonOf, paidSub, PREMIUM, settleQueue, writePremium } from './nb10PremiumRig';
+import { gh, linkOf } from '../helpers/p1Holder';
 
 const G = '900000000000000777';
 const role = process.env.BOT_PROCESS_ROLE;
@@ -68,8 +69,8 @@ afterEach(async () => {
 
 function seedLinked(): void {
   writePremium(
-    { [G]: { active: paidSub('sA', 'pA', 'low', 'patreon'), paused: [{ ...paidSub('sP', 'pP', 'high', 'patreon'), status: 'paused' }] } },
-    { providerAccountLinks: { patreon: { acct1: G } } },
+    { [gh(G)]: { active: paidSub('sA', 'pA', 'low', 'patreon'), paused: [{ ...paidSub('sP', 'pP', 'high', 'patreon'), status: 'paused' }] } },
+    { providerAccountLinks: { patreon: { acct1: linkOf(G) } } },
   );
 }
 
@@ -87,7 +88,7 @@ describe('the provider-link DELETE as one op (O1)', () => {
       await settleQueue();
       const stored = jsonOf(PREMIUM);
       expect(stored.providerAccountLinks.patreon).toBeUndefined();
-      expect(stored.subscriptions[G]).toBeUndefined();
+      expect(stored.subscriptions[gh(G)]).toBeUndefined();
       const again = await fetch(`${app.url}/guild/api/subscriptions/${G}/provider-links/patreon`, { method: 'DELETE' });
       expect(again.status).toBe(404);
     } finally {
@@ -99,20 +100,20 @@ describe('the provider-link DELETE as one op (O1)', () => {
     seedLinked();
     let fail = true;
     getPaymentRegistry().register({
-      id: 'patreon', displayName: 'Patreon', capabilities: { supportsCancel: true }, isConfigured: () => true,
+      id: 'patreon', displayName: 'Patreon', capabilities: { sells: ['guild'], supportsCancel: true }, isConfigured: () => true,
       cancelSubscription: async () => { if (fail) throw new Error('Patreon did not answer'); },
     } as any);
-    const first: any = await applySharedOp({ op: 'premium.unlinkProviderAccount', args: { args: [G, 'patreon'] } });
+    const first: any = await applySharedOp({ op: 'premium.unlinkProviderAccount', args: { args: [gh(G), 'patreon'] } });
     expect(first.ok).toBe(false);
     expect(first.error).not.toContain('nothing was saved');
     await settleQueue();
-    expect(jsonOf(PREMIUM).providerAccountLinks.patreon).toEqual({ acct1: G });
-    expect(getPremiumManager().getFullConfig().providerAccountLinks.patreon).toEqual({ acct1: G });
+    expect(jsonOf(PREMIUM).providerAccountLinks.patreon).toEqual({ acct1: linkOf(G) });
+    expect(getPremiumManager().getFullConfig().providerAccountLinks.patreon).toEqual({ acct1: linkOf(G) });
     fail = false;
-    expect(await applySharedOp({ op: 'premium.unlinkProviderAccount', args: { args: [G, 'patreon'] } })).toEqual({ ok: true, result: true });
+    expect(await applySharedOp({ op: 'premium.unlinkProviderAccount', args: { args: [gh(G), 'patreon'] } })).toEqual({ ok: true, result: true });
     await settleQueue();
     expect(jsonOf(PREMIUM).providerAccountLinks.patreon).toBeUndefined();
-    expect(jsonOf(PREMIUM).subscriptions[G]).toBeUndefined();
+    expect(jsonOf(PREMIUM).subscriptions[gh(G)]).toBeUndefined();
   });
 });
 

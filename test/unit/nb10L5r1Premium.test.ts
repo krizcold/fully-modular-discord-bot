@@ -34,7 +34,7 @@ function newProcess(): Manager {
   resetPremiumManager();
   reg.current = null;
   getPaymentRegistry().register({
-    id: 'fake', displayName: 'Fake', capabilities: { supportsCancel: true }, isConfigured: () => true,
+    id: 'fake', displayName: 'Fake', capabilities: { sells: ['guild'], supportsCancel: true }, isConfigured: () => true,
     cancelSubscription: async () => undefined,
   } as any);
   return getPremiumManager();
@@ -80,7 +80,7 @@ describe("the watch for the replay's save", () => {
     writePremium({});
     const pm = newProcess() as any;
     fs.writeFileSync(JOURNAL, `${JSON.stringify({ writer: 'w-old', n: 1, event: { type: 'subscription.expired' } })}\n`);
-    const entry = { timestamp: '2026-10-01T00:00:00.000Z', actor: 'admin', action: 'tier.update', guildId: 'g1' };
+    const entry = { timestamp: '2026-10-01T00:00:00.000Z', actor: 'admin', action: 'tier.update', holder: 'guild:70000000000000001' };
     pm.raisedMarks = { 'w-old': 1 };
     pm.journal = [];
     pm.replayBuffer = [{ line: `${JSON.stringify(entry)}\n`, entry }];
@@ -105,8 +105,8 @@ describe("the watch for the replay's save", () => {
 });
 
 describe('a redelivery reads install lines with Unicode whitespace around them', () => {
-  const created = { type: 'subscription.created', providerId: 'fake', providerSubId: 'ps1', guildId: 'g1', tierId: 'low', offeringId: 'o1', state: state() };
-  const install = JSON.stringify({ timestamp: 't', actor: 'admin', action: 'subscription.install.paid', guildId: 'g1', subscriptionId: 's1' });
+  const created = { type: 'subscription.created', buyerId: '80000000000000001', providerId: 'fake', providerSubId: 'ps1', holder: 'guild:70000000000000001', tierId: 'low', offeringId: 'o1', state: state() };
+  const install = JSON.stringify({ timestamp: 't', actor: 'admin', action: 'subscription.install.paid', holder: 'guild:70000000000000001', subscriptionId: 's1' });
   const installCount = () => (rawOf(AUDIT) ?? '').split('\n').filter(l => l.includes('"subscription.install.paid"')).length;
 
   async function redeliver(pm: Manager): Promise<void> {
@@ -119,7 +119,7 @@ describe('a redelivery reads install lines with Unicode whitespace around them',
   }
 
   it('a line that starts with a BOM is the landed install line: nothing more is written', async () => {
-    writePremium({ g1: { active: paidSub('s1', 'ps1'), paused: [] } });
+    writePremium({ 'guild:70000000000000001': { active: paidSub('s1', 'ps1'), paused: [] } });
     fs.writeFileSync(AUDIT, `${BOM}${install}\n`);
     const pm = newProcess();
     await redeliver(pm);
@@ -128,7 +128,7 @@ describe('a redelivery reads install lines with Unicode whitespace around them',
   });
 
   it('a line that ends with a no-break space is the landed install line: nothing more is written', async () => {
-    writePremium({ g1: { active: paidSub('s1', 'ps1'), paused: [] } });
+    writePremium({ 'guild:70000000000000001': { active: paidSub('s1', 'ps1'), paused: [] } });
     fs.writeFileSync(AUDIT, `${install}${NBSP}\n`);
     const pm = newProcess();
     await redeliver(pm);
@@ -141,7 +141,7 @@ describe('the web UI load after this process journaled events as the bot', () =>
     fs.writeFileSync(PREMIUM, '{ not json');
     const pm = newProcess();
     expect(pm.cacheState()).toBe('unreadable');
-    getPaymentRegistry().emitEvent({ type: 'subscription.renewal-failed', providerId: 'fake', providerSubId: 'nope', guildId: 'g-none', reason: 'card' } as any);
+    getPaymentRegistry().emitEvent({ type: 'subscription.renewal-failed', providerId: 'fake', providerSubId: 'nope', holder: 'guild:70000000000009001', reason: 'card' } as any);
     expect((pm as any).journal).toHaveLength(1);
     await settleQueue();
     fs.rmSync(JOURNAL, { force: true });

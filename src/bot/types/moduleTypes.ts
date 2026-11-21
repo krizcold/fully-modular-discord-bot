@@ -167,14 +167,13 @@ export interface ModuleManifest {
   apiCredentials?: ApiCredentialsSchema;
 
   /**
-   * Premium tier gate: declarative feature restriction based on the guild's active tier.
-   * If a guild's effective tier priority is below `minPriority`, the module (or the listed
-   * commands / features) is blocked with the configured moduleBlocked / commandBlocked message.
+   * Premium tier gates. Two gates: the server gate (the top-level fields, the server's active tier) blocks with
+   * moduleBlocked / commandBlocked; the user gate (`user`, the acting user's own tier) blocks with userBlocked.
    */
   tierRequirement?: {
-    /** Minimum tier priority required (matched against PremiumTier.priority). */
-    minPriority: number;
-    /** If set, only these specific commands are gated; the rest of the module works for all tiers. */
+    /** Minimum server tier priority required; leave it out to gate on a user tier alone. */
+    minPriority?: number;
+    /** If set, the server gate covers only these commands; the user gate reads its own list. */
     gatedCommands?: string[];
     /**
      * Named features within the module that are gated. Modules call
@@ -183,6 +182,11 @@ export interface ModuleManifest {
      * `minPriority` AND the feature name is in this list.
      */
     gatedFeatures?: string[];
+    /**
+     * The user gate: the acting user's own tier, wherever the command runs. It stands beside the server gate, and a
+     * command named by both must pass both. Modules call `pm.hasUserFeature(userId, moduleName, featureName)`.
+     */
+    user?: { minPriority: number; gatedCommands?: string[]; gatedFeatures?: string[] };
   };
 }
 

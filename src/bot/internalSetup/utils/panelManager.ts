@@ -1,6 +1,7 @@
 import { ButtonBuilder, ButtonStyle, Client } from 'discord.js';
 import { getConfigProperty } from './configManager';
 import { getPremiumManager } from './premiumManager';
+import { userGateText } from './panel/panelUserGate';
 import { getModuleRegistry } from './moduleRegistry';
 import {
   PanelOptions,
@@ -69,6 +70,12 @@ export function extractModuleNameFromPanel(panel: PanelOptions): string | null {
   if (id.startsWith('settings_global_')) return id.replace('settings_global_', '');
   if (id.startsWith('settings_')) return id.replace('settings_', '');
   return null;
+}
+
+/** The module's user gate for the acting user of any panel interaction: 'Tier Restricted' below its priority. */
+function userGateRefusal(panel: PanelOptions, context: PanelContext): PanelResponse | null {
+  const text = userGateText(panel, context);
+  return text === null ? null : createPanelError('Tier Restricted', text);
 }
 
 /**
@@ -240,6 +247,9 @@ export class PanelManager {
       }
     }
 
+    const userRefusal = userGateRefusal(panel, context);
+    if (userRefusal) return userRefusal;
+
     if (!checkPanelPermissions(panel, context)) {
       return createPanelError(
         'Access Denied',
@@ -282,6 +292,9 @@ export class PanelManager {
         'This panel does not support button interactions.'
       );
     }
+
+    const userRefusal = userGateRefusal(panel, context);
+    if (userRefusal) return userRefusal;
 
     if (!checkPanelPermissions(panel, context)) {
       return createPanelError(
@@ -328,6 +341,9 @@ export class PanelManager {
       );
     }
 
+    const userRefusal = userGateRefusal(panel, context);
+    if (userRefusal) return userRefusal;
+
     if (!checkPanelPermissions(panel, context)) {
       return createPanelError(
         'Access Denied',
@@ -362,6 +378,9 @@ export class PanelManager {
         'This panel does not support modal interactions.'
       );
     }
+
+    const userRefusal = userGateRefusal(panel, context);
+    if (userRefusal) return userRefusal;
 
     if (!checkPanelPermissions(panel, context)) {
       return createPanelError(

@@ -23,7 +23,7 @@ describe('web UI panel access', () => {
 const BATCH: WalkBatch = {
   premiumSha: null,
   events: [{
-    type: 'subscription.renewed', providerId: 'dummy', providerSubId: 'dummy_1', guildId: 'g1',
+    type: 'subscription.renewed', providerId: 'dummy', providerSubId: 'dummy_1', holder: 'guild:70000000000000001',
     state: { status: 'active', startDate: '2026-01-01T00:00:00.000Z', endDate: null, autoRenew: true },
   }],
 };

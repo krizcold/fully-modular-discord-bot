@@ -14,6 +14,7 @@ import { EventEmitter } from 'events';
 import * as fs from 'fs';
 import * as path from 'path';
 import type { PaymentProvider, ProviderEvent, SubscriptionReader, SubscriptionView, WalkBatch } from './paymentTypes';
+import type { HolderKey } from '../premiumHolder';
 import { isMaintenanceBoot } from '../maintenanceGate';
 import { sharedWritesGatedHere } from '../dataManager';
 
@@ -26,12 +27,23 @@ function isTickerOwner(): boolean {
   return process.env.BOT_PROCESS_ROLE === 'bot' && !isMaintenanceBoot();
 }
 
+// A provider reaches register untyped (a custom file, a module's provider), so its `sells` is checked here.
+function listsWhatItSells(provider: PaymentProvider): boolean {
+  const sells: unknown = (provider as { capabilities?: { sells?: unknown } } | undefined)?.capabilities?.sells;
+  return Array.isArray(sells) && sells.length > 0 && sells.every(kind => kind === 'guild' || kind === 'user');
+}
+
 export class PaymentProviderRegistry extends EventEmitter {
   private providers = new Map<string, PaymentProvider>();
   /** startTickers() ran: a provider registered from now on starts at once. */
   private tickersStarted = false;
 
-  register(provider: PaymentProvider): void {
+  /** Adds the provider; false, with one line, when its capabilities do not say which kinds of holder it sells. */
+  register(provider: PaymentProvider, from?: string): boolean {
+    if (!listsWhatItSells(provider)) {
+      console.warn(`[PaymentRegistry] Skipping provider '${provider.id}'${from === undefined ? '' : ` from ${from}`}: its capabilities.sells must list the kinds of holder it sells (guild, user); it was not registered`);
+      return false;
+    }
     const existing = this.providers.get(provider.id);
     if (existing) {
       console.warn(`[PaymentRegistry] Replacing existing provider '${provider.id}'`);
@@ -41,6 +53,7 @@ export class PaymentProviderRegistry extends EventEmitter {
     }
     this.providers.set(provider.id, provider);
     if (this.tickersStarted) this.startOne(provider);
+    return true;
   }
 
   /** Starts every registered provider's tick, and every one registered later; the bot calls it once it has its Discord client. */
@@ -95,8 +108,8 @@ export class PaymentProviderRegistry extends EventEmitter {
     return this.reader !== null && this.reader.ready();
   }
 
-  readSubscription(providerId: string, guildId: string, providerSubId: string): SubscriptionView | null {
-    return this.reader?.read(providerId, guildId, providerSubId) ?? null;
+  readSubscription(providerId: string, holder: HolderKey, providerSubId: string): SubscriptionView | null {
+    return this.reader?.read(providerId, holder, providerSubId) ?? null;
   }
 
   subscriptionReaderSha(): string | null {
@@ -163,10 +176,8 @@ export function getPaymentRegistry(): PaymentProviderRegistry {
   return instance;
 }
 
-function loadCustomProviders(registry: PaymentProviderRegistry): void {
-  // The custom-providers dir lives next to this file under the build
-  // tree. In dev (no overlay merge) the dir won't exist; that's fine.
-  const dir = path.resolve(__dirname, '../payment-providers');
+// The custom-providers dir lives next to this file under the build tree. In dev (no overlay merge) it does not exist.
+export function loadCustomProviders(registry: PaymentProviderRegistry, dir: string = path.resolve(__dirname, '../payment-providers')): void {
   let entries: string[];
   try { entries = fs.readdirSync(dir); }
   catch { return; }
@@ -193,8 +204,9 @@ function loadCustomProviders(registry: PaymentProviderRegistry): void {
         console.warn(`[PaymentRegistry] Skipping '${file}': provider id '${provider.id}' is already registered`);
         continue;
       }
-      registry.register(provider as PaymentProvider);
-      console.log(`[PaymentRegistry] Loaded custom provider '${provider.id}' from ${file}`);
+      if (registry.register(provider as PaymentProvider, file)) {
+        console.log(`[PaymentRegistry] Loaded custom provider '${provider.id}' from ${file}`);
+      }
     } catch (err) {
       console.error(`[PaymentRegistry] Failed to load custom provider '${file}':`, err);
     }

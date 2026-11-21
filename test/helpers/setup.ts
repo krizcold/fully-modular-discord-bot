@@ -3,9 +3,10 @@ import { createRequire } from 'module';
 import os from 'os';
 import path from 'path';
 import fc from 'fast-check';
-import { afterAll, beforeEach, vi } from 'vitest';
+import { afterAll, afterEach, beforeEach, vi } from 'vitest';
 import { setBackendKind } from './backendKind';
 import { DEAD_ENDS, scrubEnv } from './env';
+import { installDropLineGuard } from './p1Guard';
 import { WAIT_MS } from './time.mjs';
 
 type WaitOptions = Parameters<typeof vi.waitFor>[1];
@@ -14,6 +15,9 @@ const bounded = (options: WaitOptions): WaitOptions =>
 const { waitFor, waitUntil } = vi;
 vi.waitFor = ((callback, options) => waitFor(callback, bounded(options))) as typeof vi.waitFor;
 vi.waitUntil = ((callback, options) => waitUntil(callback, bounded(options))) as typeof vi.waitUntil;
+
+// A row that logs premium's dropped-entries lines without expecting them fails (p1Guard.ts).
+installDropLineGuard(beforeEach, afterEach);
 
 vi.mock('../../src/utils/envLoader', async orig => (await import('./backendKind')).withBackendKind(await orig<any>()));
 // Every copy of folderChain a test file loaded, as vi.resetModules gives a new one beside the one older imports hold.

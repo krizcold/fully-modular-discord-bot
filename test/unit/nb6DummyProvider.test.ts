@@ -8,6 +8,7 @@ import { resetPremiumManager, startPremiumTickers } from '../../src/bot/internal
 import { setBackendKind } from '../helpers/backendKind';
 import { AUDIT_KEY, JOURNAL_KEY, PREMIUM_KEY, premiumRig } from '../helpers/nb6PremiumRig';
 import { DAY_MS, DUMMY_KEY, ELSEWHERE, MONTHLY, YEARLY, dummyRig } from '../helpers/nb6DummyRig';
+import { gh } from '../helpers/p1Holder';
 
 // NB6 test 61 (wip-redesign/sheets/NB6.md decisions 71, 84 to 86, 94 to 96, 102, 108, 110 and 113; rows 268 to 271,
 // 273, 274, 282, 283, 304, 316 to 324, 342 to 346, 349 to 351, 378, 379, 381, 392 to 402 and 411 to 415): the Dummy
@@ -24,8 +25,8 @@ vi.mock('../../src/bot/internalSetup/utils/payment/paymentRegistry', async orig 
 });
 const notices = vi.hoisted(() => ({ sent: [] as string[] }));
 vi.mock('../../src/bot/internalSetup/utils/premiumNotifications', () => ({
-  dispatchPremiumNotification: async (guildId: string, kind: string) => {
-    notices.sent.push(`${kind}:${guildId}`);
+  dispatchPremiumNotification: async (holder: string, kind: string) => {
+    notices.sent.push(`${kind}:${holder}`);
     return { delivered: true, via: 'dm' };
   },
 }));
@@ -91,7 +92,7 @@ function loseNextCommit(): void {
   };
 }
 
-const premiumSub = (guild = 'g1') => r.row()?.subscriptions?.[guild]?.active;
+const premiumSub = (guild = '70000000000000001') => r.row()?.subscriptions?.[gh(guild)]?.active;
 const t26Lines = () => r.logged('[DummyProvider] Subscription ');
 const auditActions = () => r.lines(AUDIT_KEY).map(l => l.action);
 const loads = () => r.pm().getAllTiers();
@@ -118,10 +119,10 @@ function premiumRefusedElsewhere(): void {
 }
 
 /** Guild g1's gold sub dummy_1, whose record autoRenew is false while premium's is true: premium's cancel save was refused after the Dummy's op landed. */
-async function autoRenewDiffers(guild = 'g1'): Promise<string> {
+async function autoRenewDiffers(guild = '70000000000000001'): Promise<string> {
   const bought = await d.buy(guild);
   premiumRefusedElsewhere();
-  expect(await r.pm().cancelPaidSubscription(guild)).toBe(true);
+  expect(await r.pm().cancelPaidSubscription(gh(guild))).toBe(true);
   await d.settle();
   r.m.state.rows.fault = undefined;
   await runSharedPass();
@@ -134,7 +135,7 @@ describe('a Dummy method answers once its op settled (71)', () => {
   it('268: a purchase resolves after its op landed; premium installs it and its items ride the install save', async () => {
     const release = hold();
     let done = false;
-    const buying = r.pm().initiatePaidSubscription('g1', 'gold', 'o1', { providerId: 'dummy', variantId: MONTHLY }).then(res => { done = true; return res; });
+    const buying = r.pm().initiatePaidSubscription('guild:70000000000000001', 'gold', 'o1', { buyerId: '80000000000000001', providerId: 'dummy', variantId: MONTHLY }).then(res => { done = true; return res; });
     await new Promise(resolve => setTimeout(resolve, 30));
     expect(done).toBe(false);
     expect(premiumSub()).toBeUndefined();
@@ -142,10 +143,10 @@ describe('a Dummy method answers once its op settled (71)', () => {
     const result = await buying;
     await d.settle();
     expect(result.providerSubId).toBe('dummy_1');
-    expect(d.record('dummy_1')).toMatchObject({ guildId: 'g1', status: 'active' });
+    expect(d.record('dummy_1')).toMatchObject({ guildId: '70000000000000001', status: 'active' });
     expect(premiumSub()).toMatchObject({ providerId: 'dummy', providerSubId: 'dummy_1', status: 'active' });
     expect(auditActions()).toContain('subscription.install.paid');
-    expect(notices.sent).toEqual(['paid.sub.started:g1']);
+    expect(notices.sent).toEqual(['paid.sub.started:guild:70000000000000001']);
   });
 
   it('269: refused at the accept: T20; nothing installed; the cache dropped, so the next purchase mints the same id', async () => {
@@ -181,7 +182,7 @@ describe('a Dummy method answers once its op settled (71)', () => {
     expect(error.reason).toBe("the database's answer was lost");
     expect(error.message).toBe(`Can't confirm that the Dummy provider saved this change (the database's answer was lost), so the bot did not apply it. Check the subscription before trying again. If the purchase was saved, it is listed under "Subscriptions needing attention" on this server's subscription page, where it can be adopted or cancelled.`);
     expect(premiumSub()).toBeUndefined();
-    const orphans = await r.pm().findOrphansForGuild('g1');
+    const orphans = await r.pm().findOrphansFor('guild:70000000000000001');
     expect(orphans.map(o => o.ref.providerSubId)).toEqual(['dummy_1']);
   });
 
@@ -202,10 +203,10 @@ describe('a Dummy method answers once its op settled (71)', () => {
     const other = d.make();
     other.adminListVariants();
     expect((await d.buy()).providerSubId).toBe('dummy_1');
-    const purchase = { guildId: 'g2', tierId: 'gold', offeringId: 'o1', variantId: MONTHLY };
+    const purchase = { holder: gh('70000000000000002'), buyerId: '80000000000000001', tierId: 'gold', offeringId: 'o1', variantId: MONTHLY };
     await expect(other.initiatePurchase(purchase)).rejects.toThrow(T20(ELSEWHERE));
     expect(Object.keys(d.stored().subscriptions)).toEqual(['dummy_1']);
-    expect(d.record('dummy_1').guildId).toBe('g1');
+    expect(d.record('dummy_1').guildId).toBe('70000000000000001');
     expect((await other.initiatePurchase(purchase)).providerSubId).toBe('dummy_2');
   });
 
@@ -217,16 +218,16 @@ describe('a Dummy method answers once its op settled (71)', () => {
       state.nextId = 9;
       r.m.state.rows.put(DUMMY_KEY, JSON.stringify(state, null, 2));
     });
-    await expect(r.pm().cancelPaidSubscription('g1')).rejects.toThrow(T20(ELSEWHERE));
+    await expect(r.pm().cancelPaidSubscription('guild:70000000000000001')).rejects.toThrow(T20(ELSEWHERE));
     await d.settle();
     expect(premiumSub().autoRenew).toBe(true);
     expect(auditActions()).toHaveLength(lines);
-    expect(notices.sent).toEqual(['paid.sub.started:g1']);
+    expect(notices.sent).toEqual(['paid.sub.started:guild:70000000000000001']);
   });
 
   it('274: a call that finds nothing to change throws T25 before any change: no write, no line, no notice', async () => {
     await d.buy();
-    await d.buy('g1', 'silver');
+    await d.buy('70000000000000001', 'silver');
     const writes = d.writes(DUMMY_KEY);
     const lines = auditActions().length;
     await expect(d.dummy.cancelSubscription('dummy_9')).rejects.toThrow("Dummy subscription 'dummy_9' not found.");
@@ -239,7 +240,7 @@ describe('a Dummy method answers once its op settled (71)', () => {
     await d.settle();
     expect(d.writes(DUMMY_KEY)).toBe(writes);
     expect(auditActions()).toHaveLength(lines);
-    expect(notices.sent).toEqual(['paid.sub.started:g1', 'paid.sub.started:g1']);
+    expect(notices.sent).toEqual(['paid.sub.started:guild:70000000000000001', 'paid.sub.started:guild:70000000000000001']);
   });
 
   it('274: an expired record is neither paused nor reactivated', async () => {
@@ -284,7 +285,7 @@ describe("the tick's reconcile (94, 96, 102)", () => {
     await d.otherDummy(state => { state.subscriptions.dummy_1.updatedAt = new Date(Date.now() + 1000).toISOString(); });
     await d.tick();
     expect(d.record('dummy_1').autoRenew).toBe(false);
-    await d.otherPremium(config => { config.subscriptions.g1.active.endDate = new Date(Date.now() + 40 * DAY_MS).toISOString(); });
+    await d.otherPremium(config => { config.subscriptions['guild:70000000000000001'].active.endDate = new Date(Date.now() + 40 * DAY_MS).toISOString(); });
     await d.tick();
     expect(d.record('dummy_1').autoRenew).toBe(false);
     await d.tick();
@@ -335,7 +336,7 @@ describe("the tick's reconcile (94, 96, 102)", () => {
     ['premium replaying', async () => {
       r.m.state.rows.putLine(JOURNAL_KEY, 'j1', JSON.stringify({
         writer: 'p-dead', node: 'node-alfa', nodeName: 'ALFA', n: 1,
-        event: { type: 'subscription.updated', providerId: 'nb6x', providerSubId: 'zz', guildId: 'g9', state: { status: 'active', startDate: '2026-01-01T00:00:00.000Z', endDate: null, autoRenew: false } },
+        event: { type: 'subscription.updated', providerId: 'nb6x', providerSubId: 'zz', holder: 'guild:70000000000000009', state: { status: 'active', startDate: '2026-01-01T00:00:00.000Z', endDate: null, autoRenew: false } },
       }));
       await runSharedPass();
       loads();
@@ -402,10 +403,10 @@ describe("the tick's reconcile (94, 96, 102)", () => {
 
   it('304: premium holds the sub active, the record paused: written active with premium\'s fields at two runs; no event', async () => {
     await d.buy();
-    await d.buy('g1', 'silver');
+    await d.buy('70000000000000001', 'silver');
     expect(d.record('dummy_2')).toMatchObject({ status: 'paused', paused: true });
     inject.dummy.push(null, { cause: 'unstorable', thrown: false });
-    expect(await r.pm().cancelPaidSubscriptionImmediately('g1')).toBe(true);
+    expect(await r.pm().cancelPaidSubscriptionImmediately('guild:70000000000000001')).toBe(true);
     await d.settle();
     expect(r.logged(`[PremiumManager] provider resumeSubscription failed for 'dummy': ${T20('unstorable')}`)).toHaveLength(1);
     const active = premiumSub();
@@ -425,7 +426,7 @@ describe("the tick's reconcile (94, 96, 102)", () => {
   it('319: the record expired, premium\'s sub active: written active at two runs; it stays active while its end is ahead', async () => {
     await d.buy();
     premiumRefusedElsewhere();
-    expect(await r.pm().cancelPaidSubscriptionImmediately('g1')).toBe(true);
+    expect(await r.pm().cancelPaidSubscriptionImmediately('guild:70000000000000001')).toBe(true);
     await d.settle();
     r.m.state.rows.fault = undefined;
     await runSharedPass();
@@ -439,11 +440,11 @@ describe("the tick's reconcile (94, 96, 102)", () => {
 
   it("319: written active with autoRenew false and its end passed: the walk expires it again; premium expires the sub and resumes the queue", async () => {
     await d.buy();
-    await d.buy('g1', 'silver');
-    expect(await r.pm().cancelPaidSubscription('g1')).toBe(true);
+    await d.buy('70000000000000001', 'silver');
+    expect(await r.pm().cancelPaidSubscription('guild:70000000000000001')).toBe(true);
     await d.settle();
     premiumRefusedElsewhere();
-    expect(await r.pm().cancelPaidSubscriptionImmediately('g1')).toBe(true);
+    expect(await r.pm().cancelPaidSubscriptionImmediately('guild:70000000000000001')).toBe(true);
     await d.settle();
     r.m.state.rows.fault = undefined;
     await runSharedPass();
@@ -453,7 +454,7 @@ describe("the tick's reconcile (94, 96, 102)", () => {
     await d.tick();
     expect(d.record('dummy_1').status).toBe('expired');
     expect(premiumSub()).toMatchObject({ providerSubId: 'dummy_2', status: 'active' });
-    expect(notices.sent).toEqual(['paid.sub.expired:g1', 'paid.sub.resumed-from-queue:g1']);
+    expect(notices.sent).toEqual(['paid.sub.expired:guild:70000000000000001', 'paid.sub.resumed-from-queue:guild:70000000000000001']);
     expect(t26Lines()).toHaveLength(2);
   });
 
@@ -501,7 +502,7 @@ describe("the tick's reconcile (94, 96, 102)", () => {
   });
 
   it('316: the reader answers null: nothing written or recorded; the walk renews the record and its event finds no sub', async () => {
-    await d.dummy.initiatePurchase({ guildId: 'g2', tierId: 'gold', offeringId: 'o1', variantId: MONTHLY });
+    await d.dummy.initiatePurchase({ holder: gh('70000000000000002'), buyerId: '80000000000000001', tierId: 'gold', offeringId: 'o1', variantId: MONTHLY });
     await d.settle();
     const end = d.record('dummy_1').endDate;
     const premiumWrites = d.writes(PREMIUM_KEY);
@@ -519,7 +520,7 @@ describe("the tick's reconcile (94, 96, 102)", () => {
       state.subscriptions.dummy_1.updatedAt = new Date().toISOString();
     });
     await d.tick();
-    await d.otherPremium(config => { config.subscriptions.g1.active.autoRenew = false; });
+    await d.otherPremium(config => { config.subscriptions['guild:70000000000000001'].active.autoRenew = false; });
     await d.tick();
     await d.tick();
     expect(d.record('dummy_1').autoRenew).toBe(false);
@@ -527,10 +528,10 @@ describe("the tick's reconcile (94, 96, 102)", () => {
   });
 
   it('342: premium queued the sub paused, the record active (its pause refused): written paused at two runs; the walk skips it', async () => {
-    await d.buy('g1', 'silver');
+    await d.buy('70000000000000001', 'silver');
     inject.dummy.push(null, { cause: 'unstorable', thrown: false });
-    await d.buy('g1', 'gold');
-    expect(r.row().subscriptions.g1.paused[0]).toMatchObject({ providerSubId: 'dummy_1', status: 'paused' });
+    await d.buy('70000000000000001', 'gold');
+    expect(r.row().subscriptions['guild:70000000000000001'].paused[0]).toMatchObject({ providerSubId: 'dummy_1', status: 'paused' });
     expect(d.record('dummy_1').status).toBe('active');
     d.later(31);
     await d.tick();
@@ -543,9 +544,9 @@ describe("the tick's reconcile (94, 96, 102)", () => {
 
   it("344: a machine holding a premium save runs no tick; another writes the record, then both follow premium's stored copy", async () => {
     await d.buy();
-    await d.buy('g1', 'silver');
+    await d.buy('70000000000000001', 'silver');
     inject.dummy.push(null, { cause: 'unstorable', thrown: false });
-    await r.pm().cancelPaidSubscriptionImmediately('g1');
+    await r.pm().cancelPaidSubscriptionImmediately('guild:70000000000000001');
     await d.settle();
     inject.premium.push({ cause: 'database-backlog', thrown: true });
     r.pm().setMessages({});
@@ -558,9 +559,9 @@ describe("the tick's reconcile (94, 96, 102)", () => {
     await d.tick();
     expect(d.record('dummy_2').status).toBe('active');
     await d.otherPremium(config => {
-      const sub = config.subscriptions.g1.active;
-      delete config.subscriptions.g1.active;
-      config.subscriptions.g1.paused = [{ ...sub, status: 'paused', resumesAtHint: '2027-01-01T00:00:00.000Z' }];
+      const sub = config.subscriptions['guild:70000000000000001'].active;
+      delete config.subscriptions['guild:70000000000000001'].active;
+      config.subscriptions['guild:70000000000000001'].paused = [{ ...sub, status: 'paused', resumesAtHint: '2027-01-01T00:00:00.000Z' }];
     });
     await d.tick();
     await d.tick();
@@ -569,11 +570,11 @@ describe("the tick's reconcile (94, 96, 102)", () => {
   });
 
   it('346: premium puts a paused Dummy sub into the active slot with no provider call; the tick writes the record active at two runs', async () => {
-    await d.dummy.initiatePurchase({ guildId: 'g1', tierId: 'gold', offeringId: 'o1', variantId: MONTHLY, startPausedUntil: null });
+    await d.dummy.initiatePurchase({ holder: gh('70000000000000001'), buyerId: '80000000000000001', tierId: 'gold', offeringId: 'o1', variantId: MONTHLY, startPausedUntil: null });
     await d.settle();
     const writes = d.writes(DUMMY_KEY);
-    const plan = (await r.pm().findOrphansForGuild('g1')).find(o => o.ref.providerSubId === 'dummy_1')?.plan;
-    expect(await r.pm().adoptOrphan('g1', 'dummy', 'dummy_1', plan)).toBe(true);
+    const plan = (await r.pm().findOrphansFor('guild:70000000000000001')).find(o => o.ref.providerSubId === 'dummy_1')?.plan;
+    expect(await r.pm().adoptOrphan('guild:70000000000000001', 'dummy', 'dummy_1', plan)).toBe(true);
     await d.settle();
     expect(premiumSub()).toMatchObject({ providerSubId: 'dummy_1', status: 'active' });
     expect(premiumSub().pausedAt).toBeUndefined();
@@ -623,8 +624,8 @@ describe("the tick's reconcile (94, 96, 102)", () => {
   });
 
   it('350: a tick save that lands with two written records logs T26 once for each', async () => {
-    await autoRenewDiffers('g1');
-    await autoRenewDiffers('g2');
+    await autoRenewDiffers('70000000000000001');
+    await autoRenewDiffers('70000000000000002');
     await d.tick();
     await d.tick();
     expect(t26Lines().sort()).toEqual([T26('dummy_1', 'autoRenew was false, now true'), T26('dummy_2', 'autoRenew was false, now true')]);
@@ -634,7 +635,7 @@ describe("the tick's reconcile (94, 96, 102)", () => {
     await d.buy();
     d.later(31);
     const config = r.row();
-    config.subscriptions.g1.active.autoRenew = false;
+    config.subscriptions['guild:70000000000000001'].active.autoRenew = false;
     r.m.state.rows.put(PREMIUM_KEY, JSON.stringify(config, null, 2));
     const state = d.stored();
     state.subscriptions.dummy_1.autoRenew = false;
@@ -680,7 +681,7 @@ describe("the tick's reconcile (94, 96, 102)", () => {
       effectiveDate: new Date(Date.now() + DAY_MS).toISOString(), message: '',
     });
     await d.settle();
-    expect(pm.recordMigrationDecision(migration.id, 'g1', 'accepted')).toBe(true);
+    expect(pm.recordMigrationDecision(migration.id, 'guild:70000000000000001', 'accepted')).toBe(true);
     await d.settle();
     d.later(2);
     loseNextCommit();
@@ -708,7 +709,7 @@ describe("the tick's reconcile (94, 96, 102)", () => {
       effectiveDate: new Date(Date.now() + DAY_MS).toISOString(), message: '',
     });
     await d.settle();
-    pm.recordMigrationDecision(migration.id, 'g1', 'accepted');
+    pm.recordMigrationDecision(migration.id, 'guild:70000000000000001', 'accepted');
     await d.settle();
     d.later(2);
     atLockRead(PREMIUM_KEY, () => {
@@ -728,40 +729,40 @@ describe("the tick's reconcile (94, 96, 102)", () => {
     expect(r.row().migrations[0].decisions[0].outcome).toBe('migrated');
     expect(d.record('dummy_1').endDate).toBe(moved);
     expect(premiumSub()).toMatchObject({ variantId: YEARLY, endDate: moved });
-    expect(notices.sent).toContain('migration.applied:g1');
+    expect(notices.sent).toContain('migration.applied:guild:70000000000000001');
   }, 20_000);
 });
 
 describe('the walk batch reaches premium as one (110, 113)', () => {
   /** Guild g2: gold with autoRenew off at both, and silver queued behind it. */
   async function g2Expires(): Promise<void> {
-    await d.buy('g2');
-    await d.buy('g2', 'silver');
-    expect(await r.pm().cancelPaidSubscription('g2')).toBe(true);
+    await d.buy('70000000000000002');
+    await d.buy('70000000000000002', 'silver');
+    expect(await r.pm().cancelPaidSubscription('guild:70000000000000002')).toBe(true);
     await d.settle();
   }
 
   it('399, 396: two records due in one minute: one guard, both applied in walk order, one save; the notices once it landed', async () => {
-    await d.buy('g1');
+    await d.buy('70000000000000001');
     await g2Expires();
-    const end = premiumSub('g1').endDate;
+    const end = premiumSub('70000000000000001').endDate;
     d.later(31);
     notices.sent.length = 0;
     const premiumWrites = d.writes(PREMIUM_KEY);
     await d.tick();
-    expect(Date.parse(premiumSub('g1').endDate)).toBe(Date.parse(end) + 30 * DAY_MS);
-    expect(premiumSub('g2')).toMatchObject({ providerSubId: 'dummy_3', status: 'active' });
+    expect(Date.parse(premiumSub('70000000000000001').endDate)).toBe(Date.parse(end) + 30 * DAY_MS);
+    expect(premiumSub('70000000000000002')).toMatchObject({ providerSubId: 'dummy_3', status: 'active' });
     expect(d.writes(PREMIUM_KEY)).toBe(premiumWrites + 1);
     expect(auditActions().slice(-2)).toEqual(['subscription.expire.paid', 'subscription.resume']);
-    expect(notices.sent).toEqual(['paid.sub.expired:g2', 'paid.sub.resumed-from-queue:g2']);
+    expect(notices.sent).toEqual(['paid.sub.expired:guild:70000000000000002', 'paid.sub.resumed-from-queue:guild:70000000000000002']);
     expect(r.logged('was not applied')).toEqual([]);
   });
 
   it("400, 392: premium's sha differs from the batch's at the handler: nothing changed; T34 (a) for each event in walk order", async () => {
-    await d.buy('g1');
+    await d.buy('70000000000000001');
     await g2Expires();
     d.later(31);
-    const end = premiumSub('g1').endDate;
+    const end = premiumSub('70000000000000001').endDate;
     const premiumWrites = d.writes(PREMIUM_KEY);
     let done = false;
     r.m.state.rows.fault = async sql => {
@@ -779,13 +780,13 @@ describe('the walk batch reaches premium as one (110, 113)', () => {
     expect(d.record('dummy_2').status).toBe('expired');
     expect(r.logged('was not applied')).toEqual([T34a('subscription.renewed', 'dummy_1'), T34a('subscription.expired', 'dummy_2')]);
     expect(d.writes(PREMIUM_KEY)).toBe(premiumWrites);
-    expect(premiumSub('g1').endDate).toBe(end);
-    expect(premiumSub('g2').providerSubId).toBe('dummy_2');
+    expect(premiumSub('70000000000000001').endDate).toBe(end);
+    expect(premiumSub('70000000000000002').providerSubId).toBe('dummy_2');
   });
 
   it('401, 402: a record premium does not hold is skipped with no T34; a batch with no record found saves nothing', async () => {
-    await d.buy('g1');
-    await d.dummy.initiatePurchase({ guildId: 'g3', tierId: 'gold', offeringId: 'o1', variantId: MONTHLY });
+    await d.buy('70000000000000001');
+    await d.dummy.initiatePurchase({ holder: gh('70000000000000003'), buyerId: '80000000000000001', tierId: 'gold', offeringId: 'o1', variantId: MONTHLY });
     await d.settle();
     d.later(31);
     const premiumWrites = d.writes(PREMIUM_KEY);
@@ -795,7 +796,7 @@ describe('the walk batch reaches premium as one (110, 113)', () => {
     expect(Date.parse(d.record('dummy_2').endDate)).toBeGreaterThan(Date.now());
     const after = d.writes(PREMIUM_KEY);
     d.later(31);
-    expect(await r.pm().cancelPaidSubscriptionImmediately('g1')).toBe(true);
+    expect(await r.pm().cancelPaidSubscriptionImmediately('guild:70000000000000001')).toBe(true);
     await d.settle();
     const cancelled = d.writes(PREMIUM_KEY);
     expect(cancelled).toBe(after + 1);
@@ -818,14 +819,14 @@ describe('the walk batch reaches premium as one (110, 113)', () => {
     expect(marked).toHaveLength(1);
     expect(marked[0].metadata.notSaved.cause).toBe('changed-elsewhere');
     expect(notices.sent).toEqual([]);
-    expect(r.logged(`[PremiumManager] The paid.sub.expired notice for guild g2 was not sent: the change it announces was not saved (${ELSEWHERE})`)).toHaveLength(1);
-    expect(r.row().subscriptions.g2.active.providerSubId).toBe('dummy_1');
+    expect(r.logged(`[PremiumManager] The paid.sub.expired notice for guild 70000000000000002 was not sent: the change it announces was not saved (${ELSEWHERE})`)).toHaveLength(1);
+    expect(r.row().subscriptions['guild:70000000000000002'].active.providerSubId).toBe('dummy_1');
   });
 
   it('394: a premium save held when the batch arrives: nothing changed; T34 (b)', async () => {
-    await d.buy('g1');
+    await d.buy('70000000000000001');
     d.later(31);
-    const end = premiumSub('g1').endDate;
+    const end = premiumSub('70000000000000001').endDate;
     const release = hold();
     vi.advanceTimersByTime(60_000);
     inject.premium.push({ cause: 'database-backlog', thrown: true });
@@ -833,7 +834,7 @@ describe('the walk batch reaches premium as one (110, 113)', () => {
     release();
     await d.settle();
     expect(r.logged("[PremiumManager] The subscription.renewed event for subscription dummy_1 was not applied: premium-tiers.json holds a change that is not saved yet; the Dummy provider compares the subscription with the bot's copy again at its next checks after that change is saved")).toHaveLength(1);
-    expect(premiumSub('g1').endDate).toBe(end);
+    expect(premiumSub('70000000000000001').endDate).toBe(end);
     (r.pm() as any).retryPass();
     await d.settle();
   });
@@ -849,30 +850,30 @@ describe('the walk batch reaches premium as one (110, 113)', () => {
     expect(marked[0].metadata.notSaved.cause).toBe('database-backlog');
     expect(notices.sent).toEqual([]);
     expect(r.pm().cacheState()).toBe('normal');
-    expect(r.row().subscriptions.g2.active.providerSubId).toBe('dummy_1');
+    expect(r.row().subscriptions['guild:70000000000000002'].active.providerSubId).toBe('dummy_1');
   });
 
   it("398: another provider's event on a Postgres bot: no guard; the save on premium's own sha", async () => {
-    await d.buy('g1');
+    await d.buy('70000000000000001');
     const config = r.row();
-    config.subscriptions.g4 = { active: { ...config.subscriptions.g1.active, id: 'sub-g4', providerId: 'nb6p', providerSubId: 'ps1' }, paused: [] };
+    config.subscriptions['guild:70000000000000004'] = { active: { ...config.subscriptions['guild:70000000000000001'].active, id: 'sub-70000000000000004', providerId: 'nb6p', providerSubId: 'ps1' }, paused: [] };
     r.m.state.rows.put(PREMIUM_KEY, JSON.stringify(config, null, 2));
     await runSharedPass();
     const later = new Date(Date.now() + 60 * DAY_MS).toISOString();
-    getPaymentRegistry().emitEvent({ type: 'subscription.renewed', providerId: 'nb6p', providerSubId: 'ps1', guildId: 'g4', state: { status: 'active', startDate: config.subscriptions.g1.active.startDate, endDate: later, autoRenew: true } } as any);
+    getPaymentRegistry().emitEvent({ type: 'subscription.renewed', providerId: 'nb6p', providerSubId: 'ps1', holder: 'guild:70000000000000004', state: { status: 'active', startDate: config.subscriptions['guild:70000000000000001'].active.startDate, endDate: later, autoRenew: true } } as any);
     await d.settle();
-    expect(premiumSub('g4').endDate).toBe(later);
+    expect(premiumSub('70000000000000004').endDate).toBe(later);
   });
 
   it("411: a batch meeting premium 'replaying' (a dead writer's pending journal line) is dropped: nothing journaled, changed or saved; T34 (d)", async () => {
-    await d.buy('g1');
+    await d.buy('70000000000000001');
     d.later(31);
-    const end = premiumSub('g1').endDate;
+    const end = premiumSub('70000000000000001').endDate;
     const release = hold();
     vi.advanceTimersByTime(60_000);
     r.m.state.rows.putLine(JOURNAL_KEY, 'j1', JSON.stringify({
       writer: 'p-dead', node: 'node-alfa', nodeName: 'ALFA', n: 1,
-      event: { type: 'subscription.updated', providerId: 'nb6x', providerSubId: 'zz', guildId: 'g9', state: { status: 'active', startDate: '2026-01-01T00:00:00.000Z', endDate: null, autoRenew: false } },
+      event: { type: 'subscription.updated', providerId: 'nb6x', providerSubId: 'zz', holder: 'guild:70000000000000009', state: { status: 'active', startDate: '2026-01-01T00:00:00.000Z', endDate: null, autoRenew: false } },
     }));
     await runSharedPass();
     expect(r.pm().cacheState()).toBe('replaying');
@@ -882,12 +883,12 @@ describe('the walk batch reaches premium as one (110, 113)', () => {
     expect(r.logged('[PremiumManager] The subscription.renewed event for subscription dummy_1 was not applied: the bot is still applying the provider events kept in premium-tiers.events.jsonl')).toHaveLength(1);
     expect(r.lines(JOURNAL_KEY)).toHaveLength(1);
     expect(r.row()).toEqual(premiumBody);
-    expect(premiumSub('g1').endDate).toBe(end);
+    expect(premiumSub('70000000000000001').endDate).toBe(end);
   });
 
   it("412: a batch of two meeting premium unreadable: dropped with T34 (c) twice in walk order; once readable the walk sends both again", async () => {
-    await d.buy('g1');
-    await d.buy('g2');
+    await d.buy('70000000000000001');
+    await d.buy('70000000000000002');
     d.later(31);
     const mirror = dataPath('global', 'premium-tiers.json');
     const good = fs.readFileSync(mirror, 'utf8');
@@ -906,15 +907,15 @@ describe('the walk batch reaches premium as one (110, 113)', () => {
     fs.writeFileSync(mirror, good);
     d.later(0.0001);
     loads();
-    const end = JSON.parse(good).subscriptions.g1.active.endDate;
+    const end = JSON.parse(good).subscriptions['guild:70000000000000001'].active.endDate;
     await d.tick();
     await d.tick();
-    expect(Date.parse(premiumSub('g1').endDate)).toBeGreaterThan(Date.parse(end));
-    expect(Date.parse(premiumSub('g2').endDate)).toBeGreaterThan(Date.parse(end));
+    expect(Date.parse(premiumSub('70000000000000001').endDate)).toBeGreaterThan(Date.parse(end));
+    expect(Date.parse(premiumSub('70000000000000002').endDate)).toBeGreaterThan(Date.parse(end));
   });
 
   it("414: premium's cache dropped and step 2's load failing: dropped at step 2 with T34 (c) for each event", async () => {
-    await d.buy('g1');
+    await d.buy('70000000000000001');
     d.later(31);
     const release = hold();
     vi.advanceTimersByTime(60_000);
@@ -926,14 +927,14 @@ describe('the walk batch reaches premium as one (110, 113)', () => {
   });
 
   it("413: premium's cache dropped while a journal line is pending: step 2's load enters 'replaying'; T34 (d)", async () => {
-    await d.buy('g1');
+    await d.buy('70000000000000001');
     d.later(31);
     const release = hold();
     vi.advanceTimersByTime(60_000);
     r.pm().invalidate();
     r.m.state.rows.putLine(JOURNAL_KEY, 'j1', JSON.stringify({
       writer: 'p-dead', node: 'node-alfa', nodeName: 'ALFA', n: 1,
-      event: { type: 'subscription.updated', providerId: 'nb6x', providerSubId: 'zz', guildId: 'g9', state: { status: 'active', startDate: '2026-01-01T00:00:00.000Z', endDate: null, autoRenew: false } },
+      event: { type: 'subscription.updated', providerId: 'nb6x', providerSubId: 'zz', holder: 'guild:70000000000000009', state: { status: 'active', startDate: '2026-01-01T00:00:00.000Z', endDate: null, autoRenew: false } },
     }));
     await runSharedPass();
     release();
@@ -949,22 +950,22 @@ describe('a JSON bot (397, 415)', () => {
   });
 
   it('397: the walk batch applies with no guard and one save', async () => {
-    await d.buy('g1');
-    const end = r.pm().getSubscriptions('g1').active!.endDate;
+    await d.buy('70000000000000001');
+    const end = r.pm().getSubscriptions('guild:70000000000000001').active!.endDate;
     d.later(31);
     await d.tick();
-    expect(Date.parse(r.pm().getSubscriptions('g1').active!.endDate!)).toBe(Date.parse(end!) + 30 * DAY_MS);
+    expect(Date.parse(r.pm().getSubscriptions('guild:70000000000000001').active!.endDate!)).toBe(Date.parse(end!) + 30 * DAY_MS);
   });
 
   it("415: a batch meeting premium 'replaying' is dropped at step 1 with T34 (d); no journal append", async () => {
-    await d.buy('g1');
+    await d.buy('70000000000000001');
     const journal = dataPath('global', 'premium-tiers.events.jsonl');
-    fs.writeFileSync(journal, `${JSON.stringify({ writer: 'p-dead', n: 1, event: { type: 'subscription.updated', providerId: 'nb6x', providerSubId: 'zz', guildId: 'g9', state: { status: 'active', startDate: '2026-01-01T00:00:00.000Z', endDate: null, autoRenew: false } } })}\n`);
+    fs.writeFileSync(journal, `${JSON.stringify({ writer: 'p-dead', n: 1, event: { type: 'subscription.updated', providerId: 'nb6x', providerSubId: 'zz', holder: 'guild:70000000000000009', state: { status: 'active', startDate: '2026-01-01T00:00:00.000Z', endDate: null, autoRenew: false } } })}\n`);
     r.pm().invalidate();
     loads();
     expect(r.pm().cacheState()).toBe('replaying');
     const before = fs.readFileSync(journal, 'utf8');
-    getPaymentRegistry().emitWalkBatch({ premiumSha: null, events: [{ type: 'subscription.renewed', providerId: 'dummy', providerSubId: 'dummy_1', guildId: 'g1', state: { status: 'active', startDate: '2026-01-01T00:00:00.000Z', endDate: null, autoRenew: true } }] });
+    getPaymentRegistry().emitWalkBatch({ premiumSha: null, events: [{ type: 'subscription.renewed', providerId: 'dummy', providerSubId: 'dummy_1', holder: 'guild:70000000000000001', state: { status: 'active', startDate: '2026-01-01T00:00:00.000Z', endDate: null, autoRenew: true } }] });
     expect(r.logged('[PremiumManager] The subscription.renewed event for subscription dummy_1 was not applied: the bot is still applying the provider events kept in premium-tiers.events.jsonl')).toHaveLength(1);
     expect(fs.readFileSync(journal, 'utf8')).toBe(before);
   });

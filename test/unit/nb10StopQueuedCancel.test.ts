@@ -33,6 +33,7 @@ import { forks } from '../helpers/forkMock';
 import { failFlushes } from '../helpers/configRig';
 import { answering, exitChild, freshWriterLock, resetForks, startedWith } from '../helpers/nb10Rig';
 import { clearGlobal, gate, paidSub, PREMIUM, quiet, settleQueue, tick, writePremium } from './nb10PremiumRig';
+import { gh } from '../helpers/p1Holder';
 
 const G = '900000000000000867';
 const role = process.env.BOT_PROCESS_ROLE;
@@ -68,19 +69,19 @@ describe("an expire-now whose subscription another op removed, that op's save qu
     let exited = false;
     vi.spyOn(process, 'exit').mockImplementation((() => { exited = true; return undefined as never; }) as typeof process.exit);
     process.env.BOT_PROCESS_ROLE = 'bot';
-    writePremium({ [G]: { active: paidSub('sA', 'pA', 'low', 'patreon'), paused: [] } });
+    writePremium({ [gh(G)]: { active: paidSub('sA', 'pA', 'low', 'patreon'), paused: [] } });
     const cancel = gate();
     getPaymentRegistry().register({
-      id: 'patreon', displayName: 'patreon', capabilities: { supportsCancel: true }, isConfigured: () => true,
+      id: 'patreon', displayName: 'patreon', capabilities: { sells: ['guild'], supportsCancel: true }, isConfigured: () => true,
       cancelSubscription: async () => { await cancel.promise; },
     } as any);
-    const answer = applySharedOp({ op: 'premium.cancelPaidSubscriptionImmediately', args: { args: [G] } });
+    const answer = applySharedOp({ op: 'premium.cancelPaidSubscriptionImmediately', args: { args: [gh(G)] } });
     await tick();
     const undo = failFlushes(PREMIUM);
     try {
       await runSealed('console', null, null, async () => {
         const pm = getPremiumManager() as any;
-        delete pm.config.subscriptions[G];
+        delete pm.config.subscriptions[gh(G)];
         pm.save();
       });
       expect(queuedFilePaths()).toContain(PREMIUM);
@@ -101,7 +102,7 @@ describe("an expire-now whose subscription another op removed, that op's save qu
       expect(reply.error).not.toContain('keeps retrying');
       expect(reply.error).not.toContain('Please check again in a few minutes');
       expect(reply.error).toContain(PROVIDER_SENTENCE);
-      expect(JSON.parse(raw).subscriptions[G].active.id).toBe('sA');
+      expect(JSON.parse(raw).subscriptions[gh(G)].active.id).toBe('sA');
       childReply = reply;
       await vi.waitFor(() => expect(exited).toBe(true), { timeout: 15_000, interval: 20 });
     } finally {
@@ -121,7 +122,7 @@ describe("an expire-now whose subscription another op removed, that op's save qu
       }
       return undefined;
     });
-    const sent = manager.runSharedOp('premium.cancelPaidSubscriptionImmediately', { args: [G] });
+    const sent = manager.runSharedOp('premium.cancelPaidSubscriptionImmediately', { args: [gh(G)] });
     await tick(10);
     const stopping = manager.shutdown(false);
     held.open();

@@ -40,6 +40,7 @@ vi.mock('../../src/utils/updateSafety', () => ({ getSafetyManager: () => safety 
 
 import { PremiumManager } from '../../src/bot/internalSetup/utils/premiumManager';
 import { AUDIT, clearGlobal, jsonOf, linesOf, logged, PREMIUM, quiet, settleQueue, tick, writePremium } from './nb10PremiumRig';
+import { gh } from '../helpers/p1Holder';
 
 const G = '900000000000000931';
 const HOUR = 3_600_000;
@@ -98,7 +99,7 @@ afterEach(async () => {
 
 describe('the expiry tick of a stopped cache', () => {
   it('reads premium-tiers.json once and neither logs it unreadable nor turns the cache unreadable', async () => {
-    writePremium({ [G]: { active: manualSub('m1', Date.now() + HOUR), paused: [] } });
+    writePremium({ [gh(G)]: { active: manualSub('m1', Date.now() + HOUR), paused: [] } });
     const pm = manager();
     pm.markStopped('stopping');
     vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
@@ -119,7 +120,7 @@ describe('the expiry tick of a stopped cache', () => {
 
 describe('a tick whose expiry pass finds premium-tiers.json unreadable', () => {
   it('keeps the ending-soon mark, so the grant is warned once after the file can be read again', async () => {
-    writePremium({ [G]: { active: manualSub('m1', Date.now() + HOUR), paused: [] } });
+    writePremium({ [gh(G)]: { active: manualSub('m1', Date.now() + HOUR), paused: [] } });
     const pm = manager();
     vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
     pm.startExpiryChecker(1000);

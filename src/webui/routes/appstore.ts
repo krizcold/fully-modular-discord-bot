@@ -14,7 +14,8 @@ import {
   StoreModuleInfo,
   StoreWriteError,
 } from '../../bot/internalSetup/utils/appStoreManager';
-import { getPremiumManager, DEFAULT_MESSAGES, PremiumMessages } from '../../bot/internalSetup/utils/premiumManager';
+import { getPremiumManager, DEFAULT_MESSAGES, EMPTY_USER_BLOCKED, emptyUserBlocked, PremiumMessages, tierKind } from '../../bot/internalSetup/utils/premiumManager';
+import { guildHolder, isDiscordId, parseHolder, userHolder, type HolderKey } from '../../bot/internalSetup/utils/premiumHolder';
 import {
   globalModuleConfigFrom,
   globalSettingsRel,
@@ -289,8 +290,9 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
           baselineUnavailable[name] = served.error;
         }
       }));
-      const tiers = premiumMgr.getAllTiersWithEffectiveFree(name => freeBaselines.get(name)
+      const everyTier = premiumMgr.getAllTiersWithEffectiveFree(name => freeBaselines.get(name)
         ?? (name in baselineUnavailable ? globalModuleConfigFrom({}) : loadGlobalModuleConfig(name)));
+      const tiers = Object.fromEntries(Object.entries(everyTier).filter(([, tier]) => tierKind(tier) === 'guild'));
       if (tiers.free && (baselineNotice || Object.keys(baselineUnavailable).length > 0)) {
         tiers.free = {
           ...tiers.free,
@@ -316,7 +318,8 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
           githubToken: repo.githubToken ? '***' : null
         })),
         tiers,
-        subscriptions: premiumMgr.getAllSubscriptions(),
+        userTiers: premiumMgr.getAllTiers('user'),
+        ...subscriptionsByKind(premiumMgr.getAllSubscriptions()),
         messages: premiumMgr.getMessages(),
         messageDefaults: DEFAULT_MESSAGES,
         installQueue: installQueue.getSnapshot()
@@ -865,11 +868,10 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
   router.get('/premium/tiers', (_req: Request, res: Response) => {
     try {
       const manager = getPremiumManager();
-      const tiers = manager.getAllTiers();
-
       res.json({
         success: true,
-        tiers
+        tiers: manager.getAllTiers('guild'),
+        userTiers: manager.getAllTiers('user'),
       });
     } catch (error) {
       if (error instanceof SharedOpAnswered) return;
@@ -884,7 +886,8 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
   /**
    * PUT /api/appstore/premium/tiers/:id
    * Create or update a tier
-   * Body: { displayName, priority, overrides, offerings }
+   * Body: { displayName, priority, overrides, offerings, kind }; kind is 'user' for a tier users hold,
+   * 'guild' or absent for a server tier.
    *
    * Each offering with a `primaryProviderId` is enforced: the primary's price
    * is fetched, the offering's money fields are overridden with the primary's
@@ -895,7 +898,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
   router.put('/premium/tiers/:id', async (req: Request, res: Response) => {
     try {
       const { id } = req.params;
-      const { displayName, priority, overrides, offerings } = req.body;
+      const { displayName, priority, overrides, offerings, kind } = req.body;
 
       // Free tier is the deployment baseline; its data lives in the Global
       // module config (`/data/global/{module}/settings.json`) and is edited
@@ -922,6 +925,10 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         });
       }
 
+      if (kind !== undefined && kind !== 'user' && kind !== 'guild') {
+        return res.status(400).json({ success: false, error: "kind must be 'user' or 'guild'" });
+      }
+
       if (overrides !== undefined && (!overrides || typeof overrides !== 'object' || Array.isArray(overrides))) {
         return res.status(400).json({ success: false, error: 'overrides must be an object' });
       }
@@ -930,6 +937,10 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       for (const [moduleName, moduleOverride] of Object.entries((overrides || {}) as Record<string, any>)) {
         if (!moduleOverride || typeof moduleOverride !== 'object' || Array.isArray(moduleOverride)) {
           overrideErrors.push(`${moduleName}: must be an object`);
+          continue;
+        }
+        if (kind === 'user') {
+          overrideErrors.push(...moduleConfigErrors(getSettingsSchema(moduleName), moduleOverride, {}).map(e => `${moduleName}.${e}`));
           continue;
         }
         const { _hardLimits, ...rest } = moduleOverride;
@@ -969,6 +980,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         priority,
         overrides: overrides || {},
         offerings: refreshedOfferings,
+        ...(kind === 'user' ? { kind: 'user' } : {}),
       }]);
 
       res.json({
@@ -1039,16 +1051,20 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
 
   /**
    * PUT /api/appstore/premium/messages
-   * Body: { moduleBlocked?, commandBlocked?, panelBlocked?, upgradeButtonLabel? }
+   * Body: { moduleBlocked?, commandBlocked?, panelBlocked?, upgradeButtonLabel?, userBlocked? }
    */
   router.put('/premium/messages', async (req: Request, res: Response) => {
     try {
-      const { moduleBlocked, commandBlocked, panelBlocked, upgradeButtonLabel } = req.body || {};
+      const { moduleBlocked, commandBlocked, panelBlocked, upgradeButtonLabel, userBlocked } = req.body || {};
       const partial: Partial<PremiumMessages> = {};
       if (typeof moduleBlocked === 'string') partial.moduleBlocked = moduleBlocked;
       if (typeof commandBlocked === 'string') partial.commandBlocked = commandBlocked;
       if (typeof panelBlocked === 'string') partial.panelBlocked = panelBlocked;
       if (typeof upgradeButtonLabel === 'string') partial.upgradeButtonLabel = upgradeButtonLabel;
+      if (typeof userBlocked === 'string') partial.userBlocked = userBlocked;
+      if (emptyUserBlocked(partial)) {
+        return res.status(400).json({ success: false, error: EMPTY_USER_BLOCKED });
+      }
 
       if (Object.keys(partial).length === 0) {
         return res.status(400).json({ success: false, error: 'No valid message fields provided' });
@@ -1535,6 +1551,80 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
   // SUBSCRIPTIONS
   // ============================================================================
 
+  /** The store's records as the lists answer them: servers and users apart, each keyed by the bare Discord id. */
+  function subscriptionsByKind(all: Record<string, unknown>): { subscriptions: Record<string, unknown>; userSubscriptions: Record<string, unknown> } {
+    const subscriptions: Record<string, unknown> = {};
+    const userSubscriptions: Record<string, unknown> = {};
+    for (const [key, record] of Object.entries(all)) {
+      const parsed = parseHolder(key);
+      if (parsed) (parsed.kind === 'user' ? userSubscriptions : subscriptions)[parsed.id] = record;
+    }
+    return { subscriptions, userSubscriptions };
+  }
+
+  /** The holder of a route's `:guildId` or `:userId`; null after answering 400 for an id that is no Discord id. */
+  function holderParam(res: Response, kind: 'guild' | 'user', id: unknown): HolderKey | null {
+    if (!isDiscordId(id)) {
+      res.status(400).json({ success: false, error: kind === 'user' ? 'Invalid user id' : 'Invalid server id' });
+      return null;
+    }
+    return kind === 'user' ? userHolder(id) : guildHolder(id);
+  }
+
+  /** A user's manual subscription, as the three routes above it do for a server. */
+  router.post('/premium/users/:userId/manual', async (req: Request, res: Response) => {
+    try {
+      const holder = holderParam(res, 'user', req.params.userId);
+      if (!holder) return;
+      const { tierId, durationDays, notes } = req.body || {};
+      if (!tierId || typeof tierId !== 'string') {
+        return res.status(400).json({ success: false, error: 'tierId is required' });
+      }
+      if (durationDays !== null && (typeof durationDays !== 'number' || durationDays <= 0)) {
+        return res.status(400).json({ success: false, error: 'durationDays must be a positive number or null (for Lifetime)' });
+      }
+      const manager = getPremiumManager();
+      const success = await shared(res, 'premium.grantManual', [holder, tierId, durationDays, typeof notes === 'string' ? notes : undefined]);
+      res.json({ success, subscriptions: manager.getSubscriptions(holder) });
+    } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  router.post('/premium/users/:userId/manual/extend', async (req: Request, res: Response) => {
+    try {
+      const holder = holderParam(res, 'user', req.params.userId);
+      if (!holder) return;
+      const { addDays } = req.body || {};
+      if (typeof addDays !== 'number' || addDays <= 0) {
+        return res.status(400).json({ success: false, error: 'addDays must be a positive number' });
+      }
+      const manager = getPremiumManager();
+      const success = await shared(res, 'premium.extendManual', [holder, addDays]);
+      res.json({ success, subscriptions: manager.getSubscriptions(holder) });
+    } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  router.delete('/premium/users/:userId/manual', async (req: Request, res: Response) => {
+    try {
+      const holder = holderParam(res, 'user', req.params.userId);
+      if (!holder) return;
+      const manager = getPremiumManager();
+      const success = await shared(res, 'premium.revokeManual', [holder]);
+      res.json({ success, subscriptions: manager.getSubscriptions(holder) });
+    } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
   /**
    * GET /api/appstore/premium/subscriptions
    * List all guilds with any subscription (Main Web-UI table).
@@ -1542,7 +1632,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
   router.get('/premium/subscriptions', (_req: Request, res: Response) => {
     try {
       const manager = getPremiumManager();
-      res.json({ success: true, subscriptions: manager.getAllSubscriptions() });
+      res.json({ success: true, ...subscriptionsByKind(manager.getAllSubscriptions()) });
     } catch (error) {
       if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -1557,8 +1647,10 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
   router.get('/premium/subscriptions/:guildId', (req: Request, res: Response) => {
     try {
       const { guildId } = req.params;
+      const holder = holderParam(res, 'guild', guildId);
+      if (!holder) return;
       const manager = getPremiumManager();
-      const subscriptions = manager.getSubscriptions(guildId);
+      const subscriptions = manager.getSubscriptions(holder);
       const resolved = manager.resolveActiveTier(guildId);
       res.json({
         success: true,
@@ -1583,7 +1675,8 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
    */
   router.post('/premium/subscriptions/:guildId/manual', async (req: Request, res: Response) => {
     try {
-      const { guildId } = req.params;
+      const holder = holderParam(res, 'guild', req.params.guildId);
+      if (!holder) return;
       const { tierId, durationDays, notes } = req.body || {};
       if (!tierId || typeof tierId !== 'string') {
         return res.status(400).json({ success: false, error: 'tierId is required' });
@@ -1592,8 +1685,8 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         return res.status(400).json({ success: false, error: 'durationDays must be a positive number or null (for Lifetime)' });
       }
       const manager = getPremiumManager();
-      const success = await shared(res, 'premium.grantManual', [guildId, tierId, durationDays, typeof notes === 'string' ? notes : undefined]);
-      res.json({ success, subscriptions: manager.getSubscriptions(guildId) });
+      const success = await shared(res, 'premium.grantManual', [holder, tierId, durationDays, typeof notes === 'string' ? notes : undefined]);
+      res.json({ success, subscriptions: manager.getSubscriptions(holder) });
     } catch (error) {
       if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -1608,14 +1701,15 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
    */
   router.post('/premium/subscriptions/:guildId/manual/extend', async (req: Request, res: Response) => {
     try {
-      const { guildId } = req.params;
+      const holder = holderParam(res, 'guild', req.params.guildId);
+      if (!holder) return;
       const { addDays } = req.body || {};
       if (typeof addDays !== 'number' || addDays <= 0) {
         return res.status(400).json({ success: false, error: 'addDays must be a positive number' });
       }
       const manager = getPremiumManager();
-      const success = await shared(res, 'premium.extendManual', [guildId, addDays]);
-      res.json({ success, subscriptions: manager.getSubscriptions(guildId) });
+      const success = await shared(res, 'premium.extendManual', [holder, addDays]);
+      res.json({ success, subscriptions: manager.getSubscriptions(holder) });
     } catch (error) {
       if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -1629,10 +1723,11 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
    */
   router.delete('/premium/subscriptions/:guildId/manual', async (req: Request, res: Response) => {
     try {
-      const { guildId } = req.params;
+      const holder = holderParam(res, 'guild', req.params.guildId);
+      if (!holder) return;
       const manager = getPremiumManager();
-      const success = await shared(res, 'premium.revokeManual', [guildId]);
-      res.json({ success, subscriptions: manager.getSubscriptions(guildId) });
+      const success = await shared(res, 'premium.revokeManual', [holder]);
+      res.json({ success, subscriptions: manager.getSubscriptions(holder) });
     } catch (error) {
       if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -1643,7 +1738,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
   /**
    * POST /api/appstore/premium/subscriptions/:guildId/paid
    * Initiate a paid subscription through the offering's provider.
-   * Body: { tierId, offeringId, providerId, variantId, couponCode?, userId? }
+   * Body: { tierId, offeringId, providerId, variantId, couponCode?, buyerId }
    * Response shape depends on the provider's mechanism:
    *   immediate      -> { providerSubId, state }
    *   redirect       -> { redirectUrl }
@@ -1652,8 +1747,9 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
    */
   router.post('/premium/subscriptions/:guildId/paid', async (req: Request, res: Response) => {
     try {
-      const { guildId } = req.params;
-      const { tierId, offeringId, providerId, variantId, couponCode, userId } = req.body || {};
+      const holder = holderParam(res, 'guild', req.params.guildId);
+      if (!holder) return;
+      const { tierId, offeringId, providerId, variantId, couponCode, buyerId } = req.body || {};
       if (!tierId || typeof tierId !== 'string') {
         return res.status(400).json({ success: false, error: 'tierId is required' });
       }
@@ -1666,12 +1762,15 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       if (!variantId || typeof variantId !== 'string') {
         return res.status(400).json({ success: false, error: 'variantId is required' });
       }
+      if (!isDiscordId(buyerId)) {
+        return res.status(400).json({ success: false, error: 'buyerId is required: the Discord id of the user who pays' });
+      }
       const manager = getPremiumManager();
-      const result = await shared(res, 'premium.initiatePaidSubscription', [guildId, tierId, offeringId, { providerId, variantId, couponCode, userId }]);
+      const result = await shared(res, 'premium.initiatePaidSubscription', [holder, tierId, offeringId, { providerId, variantId, couponCode, buyerId }]);
       res.json({
         success: true,
         result,
-        subscriptions: manager.getSubscriptions(guildId),
+        subscriptions: manager.getSubscriptions(holder),
       });
     } catch (error) {
       if (error instanceof SharedOpAnswered) return;
@@ -1686,10 +1785,11 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
    */
   router.delete('/premium/subscriptions/:guildId/paid', async (req: Request, res: Response) => {
     try {
-      const { guildId } = req.params;
+      const holder = holderParam(res, 'guild', req.params.guildId);
+      if (!holder) return;
       const manager = getPremiumManager();
-      const success = await shared(res, 'premium.cancelPaidSubscription', [guildId]);
-      res.json({ success, subscriptions: manager.getSubscriptions(guildId) });
+      const success = await shared(res, 'premium.cancelPaidSubscription', [holder]);
+      res.json({ success, subscriptions: manager.getSubscriptions(holder) });
     } catch (error) {
       if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -1703,10 +1803,11 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
    */
   router.post('/premium/subscriptions/:guildId/paid/reactivate', async (req: Request, res: Response) => {
     try {
-      const { guildId } = req.params;
+      const holder = holderParam(res, 'guild', req.params.guildId);
+      if (!holder) return;
       const manager = getPremiumManager();
-      const success = await shared(res, 'premium.reactivatePaidSubscription', [guildId]);
-      res.json({ success, subscriptions: manager.getSubscriptions(guildId) });
+      const success = await shared(res, 'premium.reactivatePaidSubscription', [holder]);
+      res.json({ success, subscriptions: manager.getSubscriptions(holder) });
     } catch (error) {
       if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -1835,13 +1936,19 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
   /**
    * GET /api/appstore/premium/audit
    * Read the premium audit log with optional filters.
-   * Query: from, to (ISO timestamps), action, tierId, providerId, guildId,
-   *        subscriptionId, limit. Returns newest-first up to `limit`.
+   * Query: from, to (ISO timestamps), action, tierId, providerId, guildId (a server's lines),
+   *        holder (guild:<id> or user:<id>), subscriptionId, limit. Returns newest-first up to `limit`.
    */
   router.get('/premium/audit', async (req: Request, res: Response) => {
     try {
       const manager = getPremiumManager();
-      const { from, to, action, tierId, providerId, guildId, subscriptionId, limit } = req.query as Record<string, string | undefined>;
+      const { from, to, action, tierId, providerId, guildId, holder, subscriptionId, limit } = req.query as Record<string, string | undefined>;
+      if (guildId && !isDiscordId(guildId)) {
+        return res.status(400).json({ success: false, error: 'Invalid server id' });
+      }
+      if (holder && !parseHolder(holder)) {
+        return res.status(400).json({ success: false, error: 'Invalid holder: it is guild:<id> or user:<id>' });
+      }
       const parsedLimit = limit ? parseInt(limit, 10) : undefined;
       const result = await manager.readAuditEntries({
         from: from || undefined,
@@ -1849,7 +1956,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         action: action || undefined,
         tierId: tierId || undefined,
         providerId: providerId || undefined,
-        guildId: guildId || undefined,
+        holder: holder || (guildId ? `guild:${guildId}` : undefined),
         subscriptionId: subscriptionId || undefined,
         limit: Number.isFinite(parsedLimit) ? parsedLimit : undefined,
       });

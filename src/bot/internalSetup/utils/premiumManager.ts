@@ -1,11 +1,12 @@
 /**
  * Premium Manager - unified single-active-slot subscription model.
  *
- * Each guild has at most one ACTIVE subscription. Everything else lives in a
- * single priority-sorted PAUSED queue. Subscriptions of either source (manual
- * or paid) coexist in the same data structure.
+ * Each holder (a server or a user, keyed guild:<id> or user:<id>) has at most
+ * one ACTIVE subscription. Everything else lives in a single priority-sorted
+ * PAUSED queue. Subscriptions of either source (manual or paid) coexist in the
+ * same data structure.
  *
- *     guildSubscriptions[guildId] = {
+ *     subscriptions[holder] = {
  *       active?: Subscription,
  *       paused: Subscription[],   // priority desc; manual wins ties
  *     }
@@ -52,6 +53,9 @@ import {
 } from './dataManager';
 import { confirmFile, enqueueAppend, fileTicket, fileTicketFailure, fileTicketState, type FileTicket } from './dataBackends/fileBackend';
 import { syncWords } from './folderChain';
+import type { ModuleManifest } from '../../types/moduleTypes';
+import { doesNotSellText, holderFromWire, holderWords, isDiscordId, notHolderText, parseHolder, userHolder, type HolderKey, type HolderKind } from './premiumHolder';
+import type { InitiateOpts, PaymentProvider } from './payment/paymentTypes';
 import {
   currentLedger,
   isPaymentLedger,
@@ -185,6 +189,12 @@ export interface PremiumTier {
   overrides: Record<string, Record<string, any>>;
   /** Offerings that acquire this tier. Free tier must be empty. */
   offerings: TierOffering[];
+  /** Present only on a tier users hold; a tier without it is a server tier. */
+  kind?: 'user';
+}
+
+export function tierKind(tier: { kind?: unknown } | null | undefined): HolderKind {
+  return tier?.kind === 'user' ? 'user' : 'guild';
 }
 
 export type SubscriptionSource = 'manual' | 'paid';
@@ -207,7 +217,7 @@ export interface PurchasedSnapshot {
   purchasedAt: string;
 }
 
-/** A subscription instance tying a guild to a tier. */
+/** A subscription instance tying a holder to a tier. */
 export interface Subscription {
   /** Unique local id for queue management; survives across saves. */
   id: string;
@@ -222,6 +232,8 @@ export interface Subscription {
   providerSubId?: string;
   providerMeta?: Record<string, any>;
   purchasedSnapshot?: PurchasedSnapshot;
+  /** The Discord id of the user who paid; never on a manual grant. */
+  buyerId?: string;
 
   // Lifecycle:
   startDate: string;
@@ -248,19 +260,25 @@ export interface Subscription {
   updatedAt: string;
 }
 
-/** Per-guild subscription record. */
-export interface GuildSubscriptions {
+/** One holder's subscription record. */
+export interface HolderSubscriptions {
   /** Currently-effective subscription. At most one. */
   active?: Subscription;
   /** Priority desc; manual wins ties at equal priority. */
   paused: Subscription[];
   /**
-   * Optional fallback Discord channel id for subscription notifications when
+   * A server's record only. Optional fallback Discord channel id for subscription notifications when
    * the bot can't DM the guild owner (DMs disabled, owner left guild, etc.).
    * Default is the guild's system channel; admins override here. Empty / unset
    * means "use system channel; if that's missing, log silently."
    */
   notificationsChannelId?: string;
+}
+
+/** A provider account linked to a holder, and the Discord user who linked it. */
+export interface AccountLink {
+  holder: HolderKey;
+  buyerId: string;
 }
 
 /** Editable restriction messages shown when tier-gating blocks something. */
@@ -269,12 +287,21 @@ export interface PremiumMessages {
   commandBlocked: string;
   panelBlocked: string;
   /**
-   * Label on the "go upgrade" button appended to a blocked response when
-   * `WEBUI_BASE_URL` is set. The button links to the guild's subscription
+   * Label on the "go upgrade" button appended to a server gate's blocked response when
+   * `WEBUI_BASE_URL` is set (never to the user gate's). The button links to the guild's subscription
    * page. When `WEBUI_BASE_URL` is missing the button is omitted entirely
    * (the rest of the message still shows).
    */
   upgradeButtonLabel: string;
+  /** Sent when a module's user gate refuses the acting user; never empty, as it is the reply's only content. */
+  userBlocked: string;
+}
+
+export const EMPTY_USER_BLOCKED = 'The user gate message cannot be empty: Discord sends no empty reply.';
+
+/** True for a userBlocked text the gate cannot send. */
+export function emptyUserBlocked(partial: { userBlocked?: unknown }): boolean {
+  return 'userBlocked' in partial && (typeof partial.userBlocked !== 'string' || partial.userBlocked.trim() === '');
 }
 
 /**
@@ -290,8 +317,8 @@ export interface PremiumMessages {
 export type MigrationDecisionStatus = 'pending' | 'accepted' | 'declined' | 'silent-applied';
 export type MigrationOutcome = 'migrated' | 'cancelled' | 'continued' | 'failed' | 'skipped';
 
-export interface MigrationGuildDecision {
-  guildId: string;
+export interface MigrationHolderDecision {
+  holder: HolderKey;
   /** Local Subscription.id at scheduling time. The actual sub may change
    * before effectiveDate (cancel, swap), in which case apply skips. */
   subscriptionId: string;
@@ -323,20 +350,20 @@ export interface Migration {
   scheduledAt: string;
   scheduledBy: string;
   status: 'pending' | 'applied' | 'cancelled';
-  decisions: MigrationGuildDecision[];
+  decisions: MigrationHolderDecision[];
   appliedAt?: string;
 }
 
 /** Premium tiers configuration (no global coupons in the new model). */
 export interface PremiumConfig {
   tiers: Record<string, PremiumTier>;
-  subscriptions: Record<string, GuildSubscriptions>;
+  subscriptions: Record<HolderKey, HolderSubscriptions>;
   messages: PremiumMessages;
   /**
    * Anti-duplicate registry for providers that link an external account.
-   * providerAccountLinks[providerId][externalAccountId] = guildId.
+   * providerAccountLinks[providerId][externalAccountId] = { holder, buyerId }.
    */
-  providerAccountLinks: Record<string, Record<string, string>>;
+  providerAccountLinks: Record<string, Record<string, AccountLink>>;
   activatedProviders: Record<string, ActivatedProvider>;
   /** Scheduled price/variant migrations (Stage 5). Pending entries get
    * applied by the scheduler when their effectiveDate passes. */
@@ -377,7 +404,7 @@ export interface AuditEntry {
   offeringId?: string;
   providerId?: string;
   subscriptionId?: string;
-  guildId?: string;
+  holder?: HolderKey;
   migrationId?: string;
   before?: any;
   after?: any;
@@ -393,6 +420,7 @@ export const DEFAULT_MESSAGES: PremiumMessages = {
   commandBlocked: ':no_entry_sign: This command is not available for your server\'s current tier.',
   panelBlocked: ':no_entry_sign: This module is not available for your server\'s current tier.',
   upgradeButtonLabel: 'Upgrade your tier',
+  userBlocked: ':no_entry_sign: This is not available for your personal subscription tier.',
 };
 
 const DEFAULT_CONFIG: PremiumConfig = {
@@ -503,7 +531,7 @@ function normalizeOffering(raw: any): TierOffering {
 
 /**
  * Normalize a Subscription coming off disk. Backfills `id` for old records,
- * coerces status to the new three-value enum, and ensures the GuildSubscriptions
+ * coerces status to the new three-value enum, and ensures the HolderSubscriptions
  * shape (active + paused: []).
  */
 function normalizeSubscription(raw: any): Subscription | null {
@@ -524,6 +552,7 @@ function normalizeSubscription(raw: any): Subscription | null {
     providerSubId: typeof raw.providerSubId === 'string' ? raw.providerSubId : undefined,
     providerMeta: raw.providerMeta && typeof raw.providerMeta === 'object' ? raw.providerMeta : undefined,
     purchasedSnapshot: raw.purchasedSnapshot && typeof raw.purchasedSnapshot === 'object' ? raw.purchasedSnapshot : undefined,
+    ...(source === 'paid' && isDiscordId(raw.buyerId) ? { buyerId: raw.buyerId } : {}),
     startDate: typeof raw.startDate === 'string' ? raw.startDate : new Date().toISOString(),
     endDate: typeof raw.endDate === 'string' ? raw.endDate : null,
     autoRenew: !!raw.autoRenew,
@@ -651,7 +680,19 @@ function defaultConfig(): PremiumConfig {
   return JSON.parse(JSON.stringify(DEFAULT_CONFIG));
 }
 
-function normalizeConfig(loaded: Partial<PremiumConfig>): PremiumConfig {
+/** What a load left out of a stored document because it does not fit this version's shape (sheet P1, section 3). */
+interface LeftOut {
+  records: number;
+  noBuyer: number;
+  links: number;
+  decisions: number;
+}
+
+const leftOutTotal = (leftOut: LeftOut): number => leftOut.records + leftOut.noBuyer + leftOut.links + leftOut.decisions;
+const leftOutCounts = (leftOut: LeftOut): string =>
+  `${leftOut.records} subscription record(s) not keyed by a holder, ${leftOut.noBuyer} paid subscription(s) with no buyer, ${leftOut.links} provider account link(s), ${leftOut.decisions} price-change decision(s)`;
+
+function normalizeConfig(loaded: Partial<PremiumConfig>, leftOut: LeftOut = { records: 0, noBuyer: 0, links: 0, decisions: 0 }): PremiumConfig {
   const mergedTiers: Record<string, PremiumTier> = {};
   for (const [id, t] of Object.entries(loaded.tiers || {})) {
     const tier = t as any;
@@ -660,6 +701,7 @@ function normalizeConfig(loaded: Partial<PremiumConfig>): PremiumConfig {
       priority: tier.priority,
       overrides: tier.overrides || {},
       offerings: (Array.isArray(tier.offerings) ? tier.offerings : []).map(normalizeOffering),
+      ...(tier.kind === 'user' ? { kind: 'user' as const } : {}),
     };
   }
   // Force the free tier to exist with correct invariants.
@@ -670,20 +712,31 @@ function normalizeConfig(loaded: Partial<PremiumConfig>): PremiumConfig {
     offerings: [],
   };
 
-  // Normalize each guild's subscription record into the new shape.
-  const subscriptions: Record<string, GuildSubscriptions> = {};
-  for (const [guildId, raw] of Object.entries(loaded.subscriptions || {})) {
+  const subscriptions: Record<HolderKey, HolderSubscriptions> = {};
+  for (const [key, raw] of Object.entries(loaded.subscriptions || {})) {
+    const parsed = parseHolder(key);
+    if (!parsed) {
+      leftOut.records += 1;
+      continue;
+    }
     const r = raw as any;
-    const active = r?.active ? normalizeSubscription(r.active) : null;
+    // A paid subscription names its buyer, and a user's is paid by that user; one that does not is not loaded.
+    const withBuyer = (sub: Subscription | null): Subscription | null => {
+      if (!sub || sub.source !== 'paid') return sub;
+      if (sub.buyerId !== undefined && (parsed.kind === 'guild' || sub.buyerId === parsed.id)) return sub;
+      leftOut.noBuyer += 1;
+      return null;
+    };
+    const active = r?.active ? withBuyer(normalizeSubscription(r.active)) : null;
     const pausedRaw = Array.isArray(r?.paused) ? r.paused : [];
     const paused = pausedRaw
-      .map(normalizeSubscription)
+      .map((entry: unknown) => withBuyer(normalizeSubscription(entry)))
       .filter((s: Subscription | null): s is Subscription => !!s);
-    const notificationsChannelId = typeof r?.notificationsChannelId === 'string' && r.notificationsChannelId.length > 0
+    const notificationsChannelId = parsed.kind === 'guild' && typeof r?.notificationsChannelId === 'string' && r.notificationsChannelId.length > 0
       ? r.notificationsChannelId
       : undefined;
     if (active || paused.length > 0 || notificationsChannelId) {
-      subscriptions[guildId] = {
+      subscriptions[parsed.key] = {
         ...(active ? { active } : {}),
         paused,
         ...(notificationsChannelId ? { notificationsChannelId } : {}),
@@ -698,13 +751,39 @@ function normalizeConfig(loaded: Partial<PremiumConfig>): PremiumConfig {
     }
   }
 
+  const providerAccountLinks: Record<string, Record<string, AccountLink>> = {};
+  const storedLinks: unknown = loaded.providerAccountLinks;
+  if (storedLinks && typeof storedLinks === 'object') {
+    for (const [providerId, accounts] of Object.entries(storedLinks as Record<string, unknown>)) {
+      if (!accounts || typeof accounts !== 'object') {
+        leftOut.links += 1;
+        continue;
+      }
+      for (const [accountId, raw] of Object.entries(accounts as Record<string, any>)) {
+        const holder = raw && typeof raw === 'object' ? parseHolder(raw.holder) : null;
+        if (!holder || !isDiscordId(raw.buyerId)) {
+          leftOut.links += 1;
+          continue;
+        }
+        (providerAccountLinks[providerId] ??= {})[accountId] = { holder: holder.key, buyerId: raw.buyerId };
+      }
+    }
+  }
+
+  const migrations: Migration[] = (Array.isArray(loaded.migrations) ? loaded.migrations : []).map(migration => {
+    const stored: unknown[] = Array.isArray(migration?.decisions) ? migration.decisions : [];
+    const decisions = stored.filter((d): d is MigrationHolderDecision => !!d && typeof d === 'object' && parseHolder((d as { holder?: unknown }).holder) !== null);
+    leftOut.decisions += stored.length - decisions.length;
+    return { ...migration, decisions };
+  });
+
   return {
     tiers: mergedTiers,
     subscriptions,
     messages: { ...DEFAULT_MESSAGES, ...(loaded.messages || {}) },
-    providerAccountLinks: loaded.providerAccountLinks || {},
+    providerAccountLinks,
     activatedProviders: loaded.activatedProviders || {},
-    migrations: Array.isArray(loaded.migrations) ? loaded.migrations : [],
+    migrations,
     migrationSilencePolicy: (loaded.migrationSilencePolicy === 'continue' ? 'continue' : 'cancel'),
     ...(Object.keys(eventsApplied).length > 0 ? { eventsApplied } : {}),
   };
@@ -805,7 +884,8 @@ interface SharedJournalLine extends JournalLine {
 }
 type CancelStep = 'done' | 'gone' | 'not saved';
 /** An install's outcome (decision 64's in-flight form): its save's op, its save's refusal, or why nothing was installed. */
-type InstallOutcome = { op: SaveOp } | { refused: string } | { skipped: string };
+/** `why` says in words what a skip of the kind, the provider's kinds or the buyer found. */
+type InstallOutcome = { op: SaveOp } | { refused: string } | { skipped: string; why?: string };
 
 /** A change to a migration refused while that migration is being applied. */
 export class MigrationBusy extends Error {
@@ -885,8 +965,44 @@ function utcDate(iso: string): string {
 /** NB25 decision 6: the provider whose records follow premium's subscriptions (decision 95's, as intoActiveSlot reads it). */
 const followsPremium = (providerId: string): boolean => providerId === 'dummy';
 
+/** "guild <id>" or "user <id>" for an audit line's holder; "guild none" for a line with none. */
+function auditWho(entry: AuditEntry): string {
+  return entry.holder ? holderWords(entry.holder) : 'guild none';
+}
+
+const kindWord = (kind: HolderKind): string => (kind === 'user' ? 'user' : 'server');
+
+/** hasFeature's rule for one gate: the listed features, none when only commands are listed, else every feature. */
+function featureIsGated(gate: { gatedFeatures?: unknown; gatedCommands?: unknown }, featureName: string): boolean {
+  if (Array.isArray(gate.gatedFeatures)) return gate.gatedFeatures.includes(featureName);
+  return !Array.isArray(gate.gatedCommands);
+}
+
+/** X2: a tier of one kind asked for a holder of the other. */
+function wrongKindText(tier: PremiumTier, holderKind: HolderKind): string {
+  return `'${tier.displayName}' is a ${kindWord(tierKind(tier))} tier and cannot be given to a ${kindWord(holderKind)}.`;
+}
+
+const PURCHASE_NEEDS_BUYER = 'A paid subscription needs the Discord id of the user who pays; none was given.';
+const BUYER_IS_NOT_THE_USER = "A user's subscription is paid by that user; the buyer given is someone else.";
+const NOTICES_ARE_A_SERVERS = "Notices for a user go to that user's direct messages; there is no channel to set.";
+const LINK_NEEDS_BUYER = 'A provider account link needs the Discord id of the user who linked it; none was given.';
+const NO_PRICE_CHANGE_FOR_USERS = 'Price changes cannot be scheduled for a user tier: a user has no page to accept or decline one until the "My account" page exists.';
+
+type CreatedEvent = Extract<ProviderEvent, { type: 'subscription.created' }>;
+
+/** Whether a provider sells to this kind of holder; a provider that is not registered is taken to sell servers. */
+function sellsTo(provider: Pick<PaymentProvider, 'capabilities'> | undefined, kind: HolderKind): boolean {
+  return provider ? provider.capabilities.sells.includes(kind) : kind === 'guild';
+}
+
+const eventHolder = (event: { holder?: unknown }): HolderKey | null => parseHolder(event.holder)?.key ?? null;
+
+const listedBuyer = (ref: ProviderSubscriptionRef): string | undefined => (isDiscordId(ref.metadata.buyerId) ? ref.metadata.buyerId : undefined);
+
 function eventWords(event: ProviderEvent): string {
-  return `${event.type} event from ${event.providerId} (subscription ${event.providerSubId}, guild ${event.guildId})`;
+  const holder = eventHolder(event);
+  return `${event.type} event from ${event.providerId} (subscription ${event.providerSubId}, ${holder ? holderWords(holder) : 'no holder'})`;
 }
 
 const sleepOutside = (ms: number): Promise<void> => new Promise(resolve => {
@@ -914,6 +1030,8 @@ export class PremiumManager {
   private cacheSha: string | undefined = undefined;
   private unreadable: { file: string; cause: string } | null = null;
   private loggedUnreadable: string | null = null;
+  /** The shas of the stored documents whose left-out entries this process has logged (L1). */
+  private loggedLeftOut = new Set<string>();
   private loggedRecheck: string | null = null;
   private lastLoadTry = -Infinity;
   private episodeFile = 'premium-tiers.json';
@@ -1011,7 +1129,7 @@ export class PremiumManager {
       const outcome = made instanceof Promise ? await this.installOutcome(made) : made?.outcome ? await made.outcome : null;
       if (!outcome || typeof outcome !== 'object' || outcome.refused !== 'changed-elsewhere') return;
       if (hand >= 3) {
-        console.error(`[PremiumManager] A ${event.type} event from ${event.providerId} (subscription ${event.providerSubId}, guild ${event.guildId}) could not be applied: premium-tiers.json kept changing on other machines (3 tries); it is lost: ${JSON.stringify(event)}`);
+        console.error(`[PremiumManager] A ${eventWords(event)} could not be applied: premium-tiers.json kept changing on other machines (3 tries); it is lost: ${JSON.stringify(event)}`);
         return;
       }
       await refreshShared([PREMIUM_KEY]);
@@ -1036,12 +1154,18 @@ export class PremiumManager {
 
   /** One event: the save it made (null when it saved nothing or was refused), or a created event's install. */
   private handleEvent(event: ProviderEvent): SaveOp | null | Promise<InstallOutcome> {
+    const holder = eventHolder(event);
+    if (!holder) {
+      console.warn(`[PremiumManager] A ${event.type} event from ${event.providerId} (subscription ${event.providerSubId}) names no holder; it was not applied: ${JSON.stringify(event)}`);
+      return null;
+    }
     if (event.type === 'subscription.created') {
       const providerSubId = event.providerSubId;
       const before = this.inFlight.get(providerSubId);
+      const created: CreatedEvent = { ...event, holder };
       const promise: Promise<InstallOutcome> = this.work.run(EVENT_WORK, async () => {
         if (before) await before.promise;
-        return this.installAsyncSubscription(event);
+        return this.installAsyncSubscription(created);
       }).catch(err => {
         console.error('[PremiumManager] installAsyncSubscription failed:', err);
         return { skipped: err instanceof Error ? err.message : String(err) };
@@ -1056,7 +1180,7 @@ export class PremiumManager {
 
     // For lifecycle events on existing subs, find the record (active or paused)
     // by providerSubId and update in place.
-    const subs = this.config.subscriptions[event.guildId];
+    const subs = this.config.subscriptions[holder];
     if (!subs) return null;
 
     const matching = this.findSubscriptionByProviderSubId(subs, event.providerSubId);
@@ -1067,7 +1191,7 @@ export class PremiumManager {
     // Provider owns the dunning timeline; if it gives up, a separate
     // subscription.expired event fires and triggers the standard expiry path.
     if (event.type === 'subscription.renewal-failed') {
-      void this.notify(event.guildId, 'paid.sub.renewal-failed', {
+      void this.notify(holder, 'paid.sub.renewal-failed', {
         tierName: this.config.tiers[sub.tierId]?.displayName || sub.tierId,
         providerName: this.providerDisplayName(event.providerId),
         details: event.reason,
@@ -1085,7 +1209,7 @@ export class PremiumManager {
     }
 
     const carry = newCarry();
-    this.applyStateEvent(event, matching, carry);
+    this.applyStateEvent(holder, event, matching, carry);
     return this.save({ carry });
   }
 
@@ -1094,11 +1218,12 @@ export class PremiumManager {
    * active sub dropped from the slot with the queue resumed; its items join the carry. No save.
    */
   private applyStateEvent(
+    holder: HolderKey,
     event: Extract<ProviderEvent, { state: ProviderSubscriptionState }>,
     matching: { sub: Subscription; location: 'active' | 'paused' },
     carry: Carry,
   ): void {
-    const subs = this.config.subscriptions[event.guildId];
+    const subs = this.config.subscriptions[holder];
     const { sub } = matching;
     this.copyProviderState(sub, event.state);
 
@@ -1108,16 +1233,16 @@ export class PremiumManager {
         timestamp: new Date().toISOString(),
         actor: 'admin',
         action: 'subscription.expire.paid',
-        guildId: event.guildId,
+        holder,
         subscriptionId: sub.id,
         providerId: event.providerId,
       }, { carry });
-      void this.notify(event.guildId, 'paid.sub.expired', {
+      void this.notify(holder, 'paid.sub.expired', {
         tierName: this.config.tiers[sub.tierId]?.displayName || sub.tierId,
         providerName: this.providerDisplayName(event.providerId),
       }, { carry });
       delete subs.active;
-      this.resumeNext(event.guildId, carry);
+      this.resumeNext(holder, carry);
     }
   }
 
@@ -1156,7 +1281,8 @@ export class PremiumManager {
     this.ensureLoaded();
     if (dropped()) return;
     const found = events.filter(event => {
-      const subs = this.config.subscriptions[event.guildId];
+      const holder = eventHolder(event);
+      const subs = holder ? this.config.subscriptions[holder] : undefined;
       return !!subs && !!this.findSubscriptionByProviderSubId(subs, event.providerSubId);
     });
     if (found.length === 0) return;
@@ -1173,10 +1299,11 @@ export class PremiumManager {
     const carry = newCarry();
     let applied = false;
     for (const event of events) {
-      const subs = this.config.subscriptions[event.guildId];
+      const holder = eventHolder(event);
+      const subs = holder ? this.config.subscriptions[holder] : undefined;
       const matching = subs ? this.findSubscriptionByProviderSubId(subs, event.providerSubId) : null;
-      if (!matching) continue;
-      this.applyStateEvent(event, matching, carry);
+      if (!holder || !matching) continue;
+      this.applyStateEvent(holder, event, matching, carry);
       applied = true;
     }
     if (!applied) return;
@@ -1198,9 +1325,10 @@ export class PremiumManager {
       if (this.saveHeld) return false;
       return !this.premiumOpOpen();
     },
-    read: (providerId: string, guildId: string, providerSubId: string): SubscriptionView | null => {
+    read: (providerId: string, holderText: string, providerSubId: string): SubscriptionView | null => {
       this.ensureLoaded();
-      const subs = this.config.subscriptions[guildId];
+      const holder = parseHolder(holderText)?.key ?? null;
+      const subs = holder ? this.config.subscriptions[holder] : undefined;
       if (!subs) return null;
       const active = subs.active;
       if (active && active.providerId === providerId && active.providerSubId === providerSubId) {
@@ -1247,13 +1375,14 @@ export class PremiumManager {
    * through `installSubscription` so stacking rules apply uniformly.
    */
   private async installAsyncSubscription(
-    event: Extract<ProviderEvent, { type: 'subscription.created' }>,
+    event: CreatedEvent,
     opts: { carry?: Carry } = {},
   ): Promise<InstallOutcome> {
+    const holder = event.holder;
     // Idempotency: webhook deliveries are at-least-once.
-    const existing = this.findGuildSubscriptionByProviderSubId(event.guildId, event.providerSubId);
+    const existing = this.findHeldByProviderSubId(holder, event.providerSubId);
     if (existing) {
-      if (isPaymentLedger(currentLedger())) await this.confirmRedelivery(event.guildId, existing);
+      if (isPaymentLedger(currentLedger())) await this.confirmRedelivery(holder, existing);
       return { skipped: 'already' };
     }
 
@@ -1266,6 +1395,23 @@ export class PremiumManager {
     if (!offering) {
       console.warn(`[PremiumManager] subscription.created for unknown offering '${event.offeringId}' on tier '${event.tierId}'`);
       return { skipped: 'offering' };
+    }
+    const kind = this.kindOf(holder);
+    const seller = getPaymentRegistry().get(event.providerId);
+    const buyerId = isDiscordId(event.buyerId) ? event.buyerId : undefined;
+    const notInstalled: { skipped: string; why: string } | null = tierKind(tier) !== kind
+      ? { skipped: 'kind', why: `'${tier.displayName}' is a ${kindWord(tierKind(tier))} tier` }
+      : !sellsTo(seller, kind)
+        ? { skipped: 'provider-kind', why: `${this.providerDisplayName(event.providerId)} does not sell ${kindWord(kind)} subscriptions` }
+        : buyerId === undefined
+          ? { skipped: 'buyer', why: 'it names no buyer' }
+          : kind === 'user' && buyerId !== parseHolder(holder)?.id
+            ? { skipped: 'buyer', why: 'its buyer is not the user it is for' }
+            : null;
+    if (notInstalled) {
+      // An adoption (it brings its carry) answers with these words itself; no created event came from the provider.
+      if (!opts.carry) console.warn(`[PremiumManager] subscription.created from ${event.providerId} (subscription ${event.providerSubId}, ${holderWords(holder)}) was not installed: ${notInstalled.why}`);
+      return notInstalled;
     }
 
     const variant = event.variantSnapshot
@@ -1289,6 +1435,7 @@ export class PremiumManager {
       providerSubId: event.providerSubId,
       providerMeta: event.state.meta,
       purchasedSnapshot,
+      buyerId,
       startDate: event.state.startDate,
       endDate: event.state.endDate,
       autoRenew: event.state.autoRenew,
@@ -1305,21 +1452,21 @@ export class PremiumManager {
       timestamp: nowIso,
       actor: 'admin',
       action: 'subscription.install.paid',
-      guildId: event.guildId,
+      holder,
       tierId: event.tierId,
       offeringId: event.offeringId,
       providerId: event.providerId,
       subscriptionId: sub.id,
-      metadata: { variantId: event.variantId },
+      metadata: { variantId: event.variantId, buyerId },
     }, { carry }, event.providerSubId);
-    void this.notify(event.guildId, 'paid.sub.started', {
+    void this.notify(holder, 'paid.sub.started', {
       tierName: tier.displayName,
       providerName: this.providerDisplayName(event.providerId),
       endDate: sub.endDate,
     }, { carry });
     let op: SaveOp | null;
     try {
-      op = await this.installSubscription(event.guildId, sub, carry);
+      op = await this.installSubscription(holder, sub, carry);
     } catch (error) {
       forgetItems(carry.items.splice(0));
       throw error;
@@ -1331,7 +1478,7 @@ export class PremiumManager {
    * A delivery of a subscription already in the cache, in a payment op: its ledger judges a save of the file that holds
    * the subscription and the subscription's install line, which it writes when the audit file has none.
    */
-  private async confirmRedelivery(guildId: string, sub: Subscription): Promise<void> {
+  private async confirmRedelivery(holder: HolderKey, sub: Subscription): Promise<void> {
     let line = this.installLines.get(sub.id);
     if (!line && !this.installLinesFilled) {
       if (!(await this.fillInstallLines())) {
@@ -1347,12 +1494,12 @@ export class PremiumManager {
         timestamp: new Date().toISOString(),
         actor: 'admin',
         action: 'subscription.install.paid',
-        guildId,
+        holder,
         tierId: sub.tierId,
         offeringId: sub.offeringId,
         providerId: sub.providerId,
         subscriptionId: sub.id,
-        metadata: { variantId: sub.variantId, redelivered: true },
+        metadata: { variantId: sub.variantId, redelivered: true, buyerId: sub.buyerId },
       }, { carry }, sub.providerSubId);
       this.save({ carry });
       return;
@@ -1471,9 +1618,14 @@ export class PremiumManager {
         return;
       }
     }
-    this.config = loaded ? normalizeConfig(loaded) : defaultConfig();
+    const leftOut: LeftOut = { records: 0, noBuyer: 0, links: 0, decisions: 0 };
+    this.config = loaded ? normalizeConfig(loaded, leftOut) : defaultConfig();
     this.lastRaw = raw;
     this.cacheSha = raw === null ? 'absent' : shaOf(Buffer.from(raw, 'utf8'));
+    if (leftOutTotal(leftOut) > 0 && !this.loggedLeftOut.has(this.cacheSha)) {
+      this.loggedLeftOut.add(this.cacheSha);
+      console.warn(`[PremiumManager] premium-tiers.json holds entries this version does not read: ${leftOutCounts(leftOut)}. They are not loaded, and the next premium save writes the file without them.`);
+    }
     this.configLoaded = true;
     if (this.unreadable) console.log(`[PremiumManager] ${this.unreadable.file} can be read again`);
     this.unreadable = null;
@@ -1796,7 +1948,7 @@ export class PremiumManager {
       recordRefusal(stopCause(this.stopped), AUDIT_DOC);
       console.error(entry.action === 'subscription.install.paid' && typeof entry.subscriptionId === 'string'
         ? this.installLineLost({ state: 'queued', webhook: paymentOpOf(currentLedger()) === 'payment.webhook', line: `${line}\n`, entry, providerSubId }, 'was not written', this.stopped)
-        : `[PremiumManager] The audit line ${entry.action} (guild ${entry.guildId ?? 'none'}, ${entry.timestamp}) was not written: ${stopWords(this.stopped)}; it is lost`);
+        : `[PremiumManager] The audit line ${entry.action} (${auditWho(entry)}, ${entry.timestamp}) was not written: ${stopWords(this.stopped)}; it is lost`);
       return;
     }
     let install: InstallLine | undefined;
@@ -1823,11 +1975,11 @@ export class PremiumManager {
       run: () => this.writeAuditLine(entry, install),
       drop: how => {
         if (how.kind === 'stopped') {
-          console.error(`[PremiumManager] The audit line ${entry.action} (guild ${entry.guildId ?? 'none'}, ${entry.timestamp}) was not written: ${how.words}; it is lost`);
+          console.error(`[PremiumManager] The audit line ${entry.action} (${auditWho(entry)}, ${entry.timestamp}) was not written: ${how.words}; it is lost`);
         } else if (how.kind === 'unsure') {
-          console.error(`[PremiumManager] The audit line ${entry.action} (guild ${entry.guildId ?? 'none'}, ${entry.timestamp}) was being written ${how.words}; can't confirm whether it is stored: ${line}`);
+          console.error(`[PremiumManager] The audit line ${entry.action} (${auditWho(entry)}, ${entry.timestamp}) was being written ${how.words}; can't confirm whether it is stored: ${line}`);
         } else if (how.kind === 'refused') {
-          console.error(`[PremiumManager] The audit line ${entry.action} (guild ${entry.guildId ?? 'none'}, ${entry.timestamp}) was not written: the change it records was not saved (${how.words})`);
+          console.error(`[PremiumManager] The audit line ${entry.action} (${auditWho(entry)}, ${entry.timestamp}) was not written: the change it records was not saved (${how.words})`);
         }
       },
       settledLine: state => {
@@ -1864,7 +2016,7 @@ export class PremiumManager {
         this.installLines.delete(entry.subscriptionId!);
         console.error(this.installLineLost(install, 'was not written', this.stopped));
       } else {
-        console.error(`[PremiumManager] The audit line ${entry.action} (guild ${entry.guildId ?? 'none'}, ${entry.timestamp}) was not written: ${stopWords(this.stopped)}; it is lost`);
+        console.error(`[PremiumManager] The audit line ${entry.action} (${auditWho(entry)}, ${entry.timestamp}) was not written: ${stopWords(this.stopped)}; it is lost`);
       }
       return;
     }
@@ -1890,7 +2042,7 @@ export class PremiumManager {
     if (result.cause === 'node-stopping' || result.cause === 'writer-lost') {
       if (install) this.installLines.delete(entry.subscriptionId!);
       const kind: StopKind = result.cause === 'writer-lost' ? 'deposed' : 'stopping';
-      console.error(`[PremiumManager] The audit line ${entry.action} (guild ${entry.guildId ?? 'none'}, ${entry.timestamp}) was not written: ${stopWords(kind)}; it is lost`);
+      console.error(`[PremiumManager] The audit line ${entry.action} (${auditWho(entry)}, ${entry.timestamp}) was not written: ${stopWords(kind)}; it is lost`);
       return;
     }
     markRetried(AUDIT_DOC);
@@ -2019,13 +2171,13 @@ export class PremiumManager {
       if (held.install) {
         console.error(this.installLineLost(held.install, 'was refused by the disk', kind));
       } else {
-        console.error(`[PremiumManager] The audit line ${held.entry.action} (guild ${held.entry.guildId ?? 'none'}, ${held.entry.timestamp}) was refused by the disk and is ${lostWords(kind)}`);
+        console.error(`[PremiumManager] The audit line ${held.entry.action} (${auditWho(held.entry)}, ${held.entry.timestamp}) was refused by the disk and is ${lostWords(kind)}`);
       }
     }
   }
 
   private installLineLost(install: InstallLine, what: string, kind: StopKind): string {
-    const head = `[PremiumManager] The audit line subscription.install.paid (guild ${install.entry.guildId ?? 'none'}, subscription ${install.providerSubId ?? install.entry.subscriptionId}) ${what} ${beforeWords(kind)}`;
+    const head = `[PremiumManager] The audit line subscription.install.paid (${auditWho(install.entry)}, subscription ${install.providerSubId ?? install.entry.subscriptionId}) ${what} ${beforeWords(kind)}`;
     const json = install.line.trimEnd();
     return install.webhook
       ? `${head}; the webhook was answered 503, and the provider's next delivery of it writes this line, or, when the subscription's own save was lost too, installs the subscription again under a new id with its own line: ${json}`
@@ -2034,7 +2186,7 @@ export class PremiumManager {
 
   /** An install line whose bytes may be in the file: the disk did not confirm them, or a write of them was cut. */
   private installLineUnsure(install: InstallLine, fate: 'unconfirmed' | 'written', kind: StopKind): string {
-    const head = `[PremiumManager] The audit line subscription.install.paid (guild ${install.entry.guildId ?? 'none'}, subscription ${install.providerSubId ?? install.entry.subscriptionId})`;
+    const head = `[PremiumManager] The audit line subscription.install.paid (${auditWho(install.entry)}, subscription ${install.providerSubId ?? install.entry.subscriptionId})`;
     const why = chainWhy(install.ticket);
     const what = fate === 'unconfirmed'
       ? why
@@ -2119,7 +2271,7 @@ export class PremiumManager {
         continue;
       }
       const fate = exitFate(pending.ticket);
-      const head = `[PremiumManager] The audit line ${pending.entry.action} (guild ${pending.entry.guildId ?? 'none'}, ${pending.entry.timestamp})`;
+      const head = `[PremiumManager] The audit line ${pending.entry.action} (${auditWho(pending.entry)}, ${pending.entry.timestamp})`;
       const why = chainWhy(pending.ticket);
       if (fate === 'unconfirmed' && why) console.error(`${head} is in the file and synced, but ${why}; can't confirm whether it is stored: ${pending.line.trimEnd()}`);
       else if (fate === 'unconfirmed') console.error(`${head} is in the file, but the disk did not confirm its sync; can't confirm whether it is stored: ${pending.line.trimEnd()}`);
@@ -2479,19 +2631,19 @@ export class PremiumManager {
    * that takes the carry landed; standalone at once. After the stop or a deposition none is sent, and each is logged.
    * A follow-up that records the outcome goes in `after`: the notice is premium's open work until it ran (G8-14).
    */
-  private notify(guildId: string, kind: NotificationType, payload: NotificationPayload, link: Link, after?: (outcome: NotifyOutcome) => void): Promise<NotifyOutcome> {
-    const outcome = this.stopped || 'standalone' in link ? this.sendNotice(guildId, kind, payload) : new Promise<NotifyOutcome>(resolve => {
+  private notify(holder: HolderKey, kind: NotificationType, payload: NotificationPayload, link: Link, after?: (outcome: NotifyOutcome) => void): Promise<NotifyOutcome> {
+    const outcome = this.stopped || 'standalone' in link ? this.sendNotice(holder, kind, payload) : new Promise<NotifyOutcome>(resolve => {
       link.carry.items.push(makeItem({
         kind: 'notice',
         id: crypto.randomUUID(),
         owner: this,
-        run: () => this.sendNotice(guildId, kind, payload).then(resolve),
+        run: () => this.sendNotice(holder, kind, payload).then(resolve),
         drop: how => {
           const cause = how.kind === 'refused'
             ? `the change it announces was not saved (${how.words})`
             : how.kind === 'unconfirmed' ? "can't confirm that the change it announces was saved" : how.words;
           const told = how.kind === 'unconfirmed' ? `${cause} (the database's answer was lost)` : cause;
-          console.warn(`[PremiumManager] The ${kind} notice for guild ${guildId} was not sent: ${told}`);
+          console.warn(`[PremiumManager] The ${kind} notice for ${holderWords(holder)} was not sent: ${told}`);
           resolve({ delivered: false, cause });
         },
         forget: () => resolve({ delivered: false, cause: 'the change it announces was not saved' }),
@@ -2500,12 +2652,12 @@ export class PremiumManager {
     return this.work.track(NOTICE_WORK, after ? outcome.then(o => { after(o); return o; }) : outcome);
   }
 
-  private sendNotice(guildId: string, kind: NotificationType, payload: NotificationPayload): Promise<NotifyOutcome> {
+  private sendNotice(holder: HolderKey, kind: NotificationType, payload: NotificationPayload): Promise<NotifyOutcome> {
     if (this.stopped) {
-      console.warn(`[PremiumManager] The ${kind} notice for guild ${guildId} was not sent: ${stopWords(this.stopped)}`);
+      console.warn(`[PremiumManager] The ${kind} notice for ${holderWords(holder)} was not sent: ${stopWords(this.stopped)}`);
       return Promise.resolve({ delivered: false, cause: stopWords(this.stopped) });
     }
-    return dispatchPremiumNotification(guildId, kind, payload);
+    return dispatchPremiumNotification(holder, kind, payload);
   }
 
   /**
@@ -2525,7 +2677,7 @@ export class PremiumManager {
     action?: string;
     tierId?: string;
     providerId?: string;
-    guildId?: string;
+    holder?: string;
     subscriptionId?: string;
     limit?: number;
   } = {}): Promise<{ entries: AuditEntry[]; total: number; truncated: boolean }> {
@@ -2559,7 +2711,7 @@ export class PremiumManager {
       if (filters.action && entry.action !== filters.action) continue;
       if (filters.tierId && entry.tierId !== filters.tierId) continue;
       if (filters.providerId && entry.providerId !== filters.providerId) continue;
-      if (filters.guildId && entry.guildId !== filters.guildId) continue;
+      if (filters.holder && entry.holder !== filters.holder) continue;
       if (filters.subscriptionId && entry.subscriptionId !== filters.subscriptionId) continue;
       matched.push(entry);
     }
@@ -2572,9 +2724,10 @@ export class PremiumManager {
   // TIER MANAGEMENT
   // ============================================================================
 
-  getAllTiers(): Record<string, PremiumTier> {
+  getAllTiers(kind?: HolderKind): Record<string, PremiumTier> {
     this.ensureLoaded();
-    return { ...this.config.tiers };
+    if (!kind) return { ...this.config.tiers };
+    return Object.fromEntries(Object.entries(this.config.tiers).filter(([, tier]) => tierKind(tier) === kind));
   }
 
   /**
@@ -2637,15 +2790,37 @@ export class PremiumManager {
     if (tierId === 'free') {
       throw new Error("Cannot edit the 'free' tier via setTier - edit Global module config via the System Panel or the global-config route instead");
     }
-    const before = this.config.tiers[tierId] ? JSON.parse(JSON.stringify(this.config.tiers[tierId])) : null;
+    const stored = this.config.tiers[tierId];
+    const kind = tierKind(tier);
+    if (stored && tierKind(stored) !== kind) {
+      throw new Error(`A tier's kind cannot be changed: '${stored.displayName}' is a ${tierKind(stored) === 'user' ? 'user' : 'server'} tier. Make a new tier.`);
+    }
+    if (kind === 'user') {
+      for (const [moduleName, moduleOverride] of Object.entries(tier.overrides || {})) {
+        const key = Object.keys(moduleOverride || {}).find(k => k.startsWith('_'));
+        if (key !== undefined) {
+          throw new Error(`A user tier cannot set ${key} for ${moduleName}: module switches, command switches and limits belong to server tiers.`);
+        }
+      }
+    }
+    for (const offering of tier.offerings || []) {
+      for (const link of offering?.providerLinks || []) {
+        if (!link?.enabled) continue;
+        const provider = getPaymentRegistry().get(link.providerId);
+        if (provider && !sellsTo(provider, kind)) {
+          throw new Error(`${provider.displayName} does not sell ${kindWord(kind)} subscriptions; turn its link off on offering '${offering.label}'.`);
+        }
+      }
+    }
+    const before = stored ? JSON.parse(JSON.stringify(stored)) : null;
     this.config.tiers[tierId] = {
       displayName: tier.displayName,
       priority: tier.priority,
-      overrides: this.pruneOverridesAgainstFree(
-        this.sanitizeTierAgainstFree(tier.overrides || {}),
-        before?.overrides,
-      ),
+      overrides: kind === 'user'
+        ? tier.overrides || {}
+        : this.pruneOverridesAgainstFree(this.sanitizeTierAgainstFree(tier.overrides || {}), before?.overrides),
       offerings: (tier.offerings || []).map(normalizeOffering),
+      ...(kind === 'user' ? { kind: 'user' as const } : {}),
     };
     const carry = newCarry();
     this.writeAudit({
@@ -2660,13 +2835,16 @@ export class PremiumManager {
     // beneficial changes (more features, higher limits) don't need a DM.
     if (before && this.tierChangeIsStricter(before, this.config.tiers[tierId])) {
       const after = this.config.tiers[tierId];
-      for (const [guildId, subs] of Object.entries(this.config.subscriptions)) {
+      for (const holder of this.holders()) {
+        const subs = this.config.subscriptions[holder];
         const onThisTier = subs.active?.tierId === tierId
           || subs.paused.some(p => p.tierId === tierId);
         if (!onThisTier) continue;
-        void this.notify(guildId, 'tier.config-change-affecting-subscriber', {
+        void this.notify(holder, 'tier.config-change-affecting-subscriber', {
           tierName: after.displayName,
-          details: 'Some perks or limits were reduced. Open the subscription panel to see the latest tier contents.',
+          details: this.kindOf(holder) === 'user'
+            ? 'Some perks or limits were reduced.'
+            : 'Some perks or limits were reduced. Open the subscription panel to see the latest tier contents.',
         }, { carry });
       }
     }
@@ -2701,7 +2879,7 @@ export class PremiumManager {
 
     let changed = false;
     for (const [tierId, tier] of Object.entries(this.config.tiers)) {
-      if (tierId === 'free') continue;
+      if (tierId === 'free' || tierKind(tier) === 'user') continue;
       if (!tier.overrides[moduleName]) continue;
       const sanitized = this.sanitizeTierAgainstFree({ [moduleName]: tier.overrides[moduleName] });
       if (deepEqual(sanitized[moduleName], tier.overrides[moduleName])) continue;
@@ -2773,8 +2951,8 @@ export class PremiumManager {
     if (!before) return false;
 
     const carry = newCarry();
-    for (const guildId of Object.keys(this.config.subscriptions)) {
-      const subs = this.config.subscriptions[guildId];
+    for (const holder of this.holders()) {
+      const subs = this.config.subscriptions[holder];
       const activeWasOnDeleted = subs.active?.tierId === tierId;
       if (activeWasOnDeleted) delete subs.active;
       if (subs.paused.length > 0) {
@@ -2782,9 +2960,9 @@ export class PremiumManager {
       }
       // Pop the next paused entry if active is now empty.
       if (!subs.active && subs.paused.length > 0) {
-        this.resumeNext(guildId, carry);
+        this.resumeNext(holder, carry);
       }
-      if (this.guildSubsEmpty(subs)) delete this.config.subscriptions[guildId];
+      if (this.recordEmpty(subs)) delete this.config.subscriptions[holder];
     }
 
     delete this.config.tiers[tierId];
@@ -2799,7 +2977,34 @@ export class PremiumManager {
     return ok;
   }
 
-  private guildSubsEmpty(subs: GuildSubscriptions): boolean {
+  /** Every holder with a record, as the store keys them. */
+  private holders(): HolderKey[] {
+    return Object.keys(this.config.subscriptions) as HolderKey[];
+  }
+
+  private kindOf(holder: HolderKey): HolderKind {
+    return parseHolder(holder)?.kind === 'user' ? 'user' : 'guild';
+  }
+
+  /** A management method's holder argument: X1 for a text that is no holder key, before anything else is read. */
+  private holderArg(holder: unknown): { kind: HolderKind; id: string; key: HolderKey } {
+    const parsed = parseHolder(holder);
+    if (!parsed) throw new Error(notHolderText(holder));
+    return parsed;
+  }
+
+  /** The active subscription of a holder when it is active, not past its end, and of a tier of the holder's kind. */
+  private activeOf(holder: HolderKey | null): { tierId: string; tier: PremiumTier; source: SubscriptionSource } | null {
+    if (!holder) return null;
+    const active = this.config.subscriptions[holder]?.active;
+    if (!active || active.status !== 'active') return null;
+    if (active.endDate !== null && !(Date.parse(active.endDate) > Date.now())) return null;
+    const tier = this.config.tiers[active.tierId];
+    if (!tier || tierKind(tier) !== this.kindOf(holder)) return null;
+    return { tierId: active.tierId, tier, source: active.source };
+  }
+
+  private recordEmpty(subs: HolderSubscriptions): boolean {
     if (subs.active) return false;
     if (subs.paused.length > 0) return false;
     if (subs.notificationsChannelId) return false;
@@ -2918,19 +3123,13 @@ export class PremiumManager {
    */
   resolveActiveTier(guildId: string): { tierId: string; tier: PremiumTier; source: SubscriptionSource | null } {
     this.ensureLoaded();
-    const subs = this.config.subscriptions[guildId];
-    const now = Date.now();
-    const active = subs?.active;
+    return this.activeOf(holderFromWire(guildId)) ?? { tierId: 'free', tier: this.config.tiers.free, source: null };
+  }
 
-    if (active
-      && active.status === 'active'
-      && (active.endDate === null || Date.parse(active.endDate) > now)
-    ) {
-      const tier = this.config.tiers[active.tierId];
-      if (tier) return { tierId: active.tierId, tier, source: active.source };
-    }
-
-    return { tierId: 'free', tier: this.config.tiers.free, source: null };
+  /** A user's own active tier; null for no subscription, and for a text that is not a Discord id. */
+  resolveActiveUserTier(userId: string): { tierId: string; tier: PremiumTier; source: SubscriptionSource } | null {
+    this.ensureLoaded();
+    return this.activeOf(isDiscordId(userId) ? userHolder(userId) : null);
   }
 
   // ============================================================================
@@ -2994,7 +3193,7 @@ export class PremiumManager {
    * (active vs paused index) so the caller can mutate in place.
    */
   private findSubscriptionByProviderSubId(
-    subs: GuildSubscriptions,
+    subs: HolderSubscriptions,
     providerSubId: string,
   ): { sub: Subscription; location: 'active' | 'paused'; pausedIndex?: number } | null {
     if (subs.active?.providerSubId === providerSubId) {
@@ -3005,15 +3204,15 @@ export class PremiumManager {
     return null;
   }
 
-  private subscriptionById(guildId: string, subscriptionId: string): Subscription | undefined {
-    const subs = this.config.subscriptions[guildId];
+  private subscriptionById(holder: HolderKey, subscriptionId: string): Subscription | undefined {
+    const subs = this.config.subscriptions[holder];
     if (!subs) return undefined;
     return subs.active?.id === subscriptionId ? subs.active : subs.paused.find(p => p.id === subscriptionId);
   }
 
-  /** Cross-guild lookup helper for orphan dedup. */
-  private findGuildSubscriptionByProviderSubId(guildId: string, providerSubId: string): Subscription | null {
-    const subs = this.config.subscriptions[guildId];
+  /** The holder's subscription, active or queued, that the provider knows by this id. */
+  private findHeldByProviderSubId(holder: HolderKey, providerSubId: string): Subscription | null {
+    const subs = this.config.subscriptions[holder];
     if (!subs) return null;
     return this.findSubscriptionByProviderSubId(subs, providerSubId)?.sub || null;
   }
@@ -3026,8 +3225,14 @@ export class PremiumManager {
    *   same priority + paid   -> caller already rejected; defensive throw here
    *   lower priority -> insert into paused queue at correct position
    */
-  private async installSubscription(guildId: string, incoming: Subscription, carry: Carry, opts: { boughtPaused?: true } = {}): Promise<SaveOp | null> {
-    const subs = (this.config.subscriptions[guildId] ??= { paused: [] });
+  private async installSubscription(holder: HolderKey, incoming: Subscription, carry: Carry, opts: { boughtPaused?: true } = {}): Promise<SaveOp | null> {
+    const incomingTier = this.config.tiers[incoming.tierId];
+    if (incomingTier && tierKind(incomingTier) !== this.kindOf(holder)) throw new Error(wrongKindText(incomingTier, this.kindOf(holder)));
+    if (incoming.source === 'paid') {
+      if (!isDiscordId(incoming.buyerId)) throw new Error(PURCHASE_NEEDS_BUYER);
+      if (this.kindOf(holder) === 'user' && incoming.buyerId !== parseHolder(holder)?.id) throw new Error(BUYER_IS_NOT_THE_USER);
+    }
+    const subs = (this.config.subscriptions[holder] ??= { paused: [] });
     const incomingPriority = this.config.tiers[incoming.tierId]?.priority ?? 0;
 
     const active = subs.active;
@@ -3045,13 +3250,13 @@ export class PremiumManager {
     const activePriority = this.config.tiers[active!.tierId]?.priority ?? 0;
 
     if (incomingPriority > activePriority) {
-      return this.pauseActiveIntoQueue(guildId, this.intoActiveSlot(incoming), carry);
+      return this.pauseActiveIntoQueue(holder, this.intoActiveSlot(incoming), carry);
     }
 
     if (incomingPriority === activePriority) {
       if (incoming.source === 'manual') {
         // Manual replaces (manual wins ties at equal priority).
-        return this.pauseActiveIntoQueue(guildId, incoming, carry);
+        return this.pauseActiveIntoQueue(holder, incoming, carry);
       }
       // Same-priority paid: caller is expected to reject upstream.
       throw new Error(
@@ -3118,8 +3323,8 @@ export class PremiumManager {
    * Move the currently-active subscription to the paused queue and install the replacement, saved before the
    * provider's pause is awaited. Snapshots remaining days, sorts the queue priority-desc.
    */
-  private async pauseActiveIntoQueue(guildId: string, replacement: Subscription, carry: Carry): Promise<SaveOp | null> {
-    const subs = this.config.subscriptions[guildId];
+  private async pauseActiveIntoQueue(holder: HolderKey, replacement: Subscription, carry: Carry): Promise<SaveOp | null> {
+    const subs = this.config.subscriptions[holder];
     if (!subs) return null;
     if (!subs.active) {
       subs.active = replacement;
@@ -3155,12 +3360,12 @@ export class PremiumManager {
       timestamp: nowIso,
       actor: 'admin',
       action: 'subscription.pause',
-      guildId,
+      holder,
       subscriptionId: paused.id,
       providerId: paused.providerId,
     }, { carry });
     if (paused.source === 'paid') {
-      void this.notify(guildId, 'paid.sub.paused-by-stacking', {
+      void this.notify(holder, 'paid.sub.paused-by-stacking', {
         tierName: this.config.tiers[paused.tierId]?.displayName || paused.tierId,
         providerName: this.providerDisplayName(paused.providerId),
         remainingDays: paused.remainingDaysAtPause ?? null,
@@ -3185,7 +3390,7 @@ export class PremiumManager {
    * Sort the paused queue priority-desc, with manual winning over paid at
    * equal priority (so manual resumes first when the active slot frees up).
    */
-  private sortPausedQueue(subs: GuildSubscriptions): void {
+  private sortPausedQueue(subs: HolderSubscriptions): void {
     subs.paused.sort((a, b) => {
       const pa = this.config.tiers[a.tierId]?.priority ?? 0;
       const pb = this.config.tiers[b.tierId]?.priority ?? 0;
@@ -3206,8 +3411,8 @@ export class PremiumManager {
    * Repeats if the popped entry is itself already past its endDate (lossy
    * pauses can race expiry).
    */
-  private resumeNext(guildId: string, carry: Carry): void {
-    const subs = this.config.subscriptions[guildId];
+  private resumeNext(holder: HolderKey, carry: Carry): void {
+    const subs = this.config.subscriptions[holder];
     if (!subs) return;
     while (!subs.active && subs.paused.length > 0) {
       const next = subs.paused.shift()!;
@@ -3236,7 +3441,7 @@ export class PremiumManager {
           action: resumed.source === 'manual'
             ? 'subscription.revoke.manual'
             : 'subscription.expire.paid',
-          guildId,
+          holder,
           subscriptionId: resumed.id,
           providerId: resumed.providerId,
           metadata: { reason: 'expired-while-queued' },
@@ -3245,11 +3450,11 @@ export class PremiumManager {
         // entry went into the queue; it never resumes, so close the loop with
         // an "ended" notification matching its source.
         if (resumed.source === 'manual') {
-          void this.notify(guildId, 'manual.grant.ended', {
+          void this.notify(holder, 'manual.grant.ended', {
             tierName: this.config.tiers[resumed.tierId]?.displayName || resumed.tierId,
           }, { carry });
         } else {
-          void this.notify(guildId, 'paid.sub.expired', {
+          void this.notify(holder, 'paid.sub.expired', {
             tierName: this.config.tiers[resumed.tierId]?.displayName || resumed.tierId,
             providerName: this.providerDisplayName(resumed.providerId),
           }, { carry });
@@ -3273,12 +3478,12 @@ export class PremiumManager {
         timestamp: nowIso,
         actor: 'admin',
         action: 'subscription.resume',
-        guildId,
+        holder,
         subscriptionId: resumed.id,
         providerId: resumed.providerId,
       }, { carry });
       if (resumed.source === 'paid') {
-        void this.notify(guildId, 'paid.sub.resumed-from-queue', {
+        void this.notify(holder, 'paid.sub.resumed-from-queue', {
           tierName: this.config.tiers[resumed.tierId]?.displayName || resumed.tierId,
           providerName: this.providerDisplayName(resumed.providerId),
           endDate: resumed.endDate,
@@ -3297,20 +3502,22 @@ export class PremiumManager {
    * is higher priority, manual goes to paused queue; if active is lower,
    * manual takes the active slot; same priority manual replaces (manual wins ties).
    */
-  grantManual(guildId: string, tierId: string, durationDays: number | null, notes?: string, grantedBy?: string): Promise<boolean> {
-    return this.work.run(CHANGE_WORK, () => this.grantManualRun(guildId, tierId, durationDays, notes, grantedBy));
+  grantManual(holder: HolderKey, tierId: string, durationDays: number | null, notes?: string, grantedBy?: string): Promise<boolean> {
+    return this.work.run(CHANGE_WORK, () => this.grantManualRun(holder, tierId, durationDays, notes, grantedBy));
   }
 
   private async grantManualRun(
-    guildId: string,
+    holder: HolderKey,
     tierId: string,
     durationDays: number | null,
     notes?: string,
     grantedBy?: string,
   ): Promise<boolean> {
+    const who = this.holderArg(holder);
     if (this.refusedAtEntry()) return false;
     if (tierId === 'free' || !this.config.tiers[tierId]) return false;
     const tier = this.config.tiers[tierId];
+    if (tierKind(tier) !== who.kind) throw new Error(wrongKindText(tier, who.kind));
 
     const nowIso = new Date().toISOString();
     const endDate = durationDays === null ? null : new Date(Date.now() + durationDays * DAY_MS).toISOString();
@@ -3344,18 +3551,18 @@ export class PremiumManager {
       timestamp: nowIso,
       actor: 'admin',
       action: 'subscription.grant.manual',
-      guildId,
+      holder,
       tierId,
       subscriptionId: sub.id,
       metadata: { durationDays, notes, grantedBy },
     }, { carry });
-    void this.notify(guildId, 'manual.grant.added', {
+    void this.notify(holder, 'manual.grant.added', {
       tierName: tier.displayName,
       endDate,
       notes,
     }, { carry });
     try {
-      await this.installSubscription(guildId, sub, carry);
+      await this.installSubscription(holder, sub, carry);
     } catch (error) {
       forgetItems(carry.items.splice(0));
       throw error;
@@ -3367,9 +3574,10 @@ export class PremiumManager {
    * Add days to the active manual sub's endDate. No-op for lifetime manual.
    * Doesn't touch paused-queue manuals (those don't tick yet).
    */
-  extendManual(guildId: string, addDays: number): boolean {
+  extendManual(holder: HolderKey, addDays: number): boolean {
+    this.holderArg(holder);
     if (this.refusedAtEntry()) return false;
-    const subs = this.config.subscriptions[guildId];
+    const subs = this.config.subscriptions[holder];
     const active = subs?.active;
     if (!active || active.source !== 'manual') return false;
     if (active.endDate === null) return true;
@@ -3386,7 +3594,7 @@ export class PremiumManager {
       timestamp: new Date().toISOString(),
       actor: 'admin',
       action: 'subscription.extend.manual',
-      guildId,
+      holder,
       subscriptionId: active.id,
       metadata: { addDays, before, after: active.endDate },
     }, { carry });
@@ -3398,9 +3606,10 @@ export class PremiumManager {
    * Revoke the manual subscription entirely (active OR paused). Resumes the
    * next paused entry into the active slot if active was the manual.
    */
-  revokeManual(guildId: string): boolean {
+  revokeManual(holder: HolderKey): boolean {
+    this.holderArg(holder);
     if (this.refusedAtEntry()) return false;
-    const subs = this.config.subscriptions[guildId];
+    const subs = this.config.subscriptions[holder];
     if (!subs) return true;
 
     let removed: Subscription | null = null;
@@ -3408,7 +3617,7 @@ export class PremiumManager {
     if (subs.active?.source === 'manual') {
       removed = subs.active;
       delete subs.active;
-      this.resumeNext(guildId, carry);
+      this.resumeNext(holder, carry);
     } else {
       const idx = subs.paused.findIndex(p => p.source === 'manual');
       if (idx >= 0) {
@@ -3416,18 +3625,18 @@ export class PremiumManager {
         subs.paused.splice(idx, 1);
       }
     }
-    if (this.guildSubsEmpty(subs)) delete this.config.subscriptions[guildId];
+    if (this.recordEmpty(subs)) delete this.config.subscriptions[holder];
 
     if (removed) {
       this.writeAudit({
         timestamp: new Date().toISOString(),
         actor: 'admin',
         action: 'subscription.revoke.manual',
-        guildId,
+        holder,
         tierId: removed.tierId,
         subscriptionId: removed.id,
       }, { carry });
-      void this.notify(guildId, 'manual.grant.revoked', {
+      void this.notify(holder, 'manual.grant.revoked', {
         tierName: this.config.tiers[removed.tierId]?.displayName || removed.tierId,
       }, { carry });
     }
@@ -3444,24 +3653,26 @@ export class PremiumManager {
    * install via `subscription.created` after the webhook arrives.
    */
   initiatePaidSubscription(
-    guildId: string,
+    holder: HolderKey,
     tierId: string,
     offeringId: string,
-    opts: { providerId: string; variantId: string; couponCode?: string; userId?: string; autoRenewOptOut?: boolean },
+    opts: { providerId: string; variantId: string; couponCode?: string; buyerId: string; autoRenewOptOut?: boolean },
   ): Promise<InitiateResult> {
-    return this.work.run(CHANGE_WORK, () => this.initiatePaidRun(guildId, tierId, offeringId, opts));
+    return this.work.run(CHANGE_WORK, () => this.initiatePaidRun(holder, tierId, offeringId, opts));
   }
 
   private async initiatePaidRun(
-    guildId: string,
+    holder: HolderKey,
     tierId: string,
     offeringId: string,
-    opts: { providerId: string; variantId: string; couponCode?: string; userId?: string; autoRenewOptOut?: boolean },
+    opts: { providerId: string; variantId: string; couponCode?: string; buyerId: string; autoRenewOptOut?: boolean },
   ): Promise<InitiateResult> {
+    const who = this.holderArg(holder);
     if (this.refusedAtEntry()) throw new Error(this.refusalText());
     const tier = this.config.tiers[tierId];
     if (!tier) throw new Error(`Tier '${tierId}' does not exist`);
     if (tierId === 'free') throw new Error('Cannot subscribe to the free tier');
+    if (tierKind(tier) !== who.kind) throw new Error(wrongKindText(tier, who.kind));
 
     const offering = tier.offerings.find(o => o.id === offeringId);
     if (!offering) throw new Error(`Offering '${offeringId}' not found on tier '${tierId}'`);
@@ -3481,28 +3692,35 @@ export class PremiumManager {
     const registry = getPaymentRegistry();
     const provider = registry.get(providerId);
     if (!provider) throw new Error(`Provider '${providerId}' is not registered`);
+    if (!sellsTo(provider, who.kind)) throw new Error(doesNotSellText(provider.displayName, who.kind));
     if (!provider.isConfigured()) throw new Error(`Provider '${providerId}' is not configured`);
     if (!provider.capabilities.canInitiatePurchase) {
       throw new Error(`Provider '${providerId}' cannot initiate purchase server-side`);
     }
 
+    const buyerId = opts.buyerId;
+    if (!isDiscordId(buyerId)) throw new Error(PURCHASE_NEEDS_BUYER);
+    if (who.kind === 'user' && buyerId !== who.id) throw new Error(BUYER_IS_NOT_THE_USER);
+
     // Pre-flight orphan check: refuse if the provider already has an
-    // unknown sub for this guild.
-    if (provider.listSubscriptionsForGuild) {
+    // unknown sub for this holder.
+    if (!!provider.listSubscriptionsFor) {
       try {
-        const orphans = await provider.listSubscriptionsForGuild(guildId);
-        const known = this.knownProviderSubIds(guildId);
+        const orphans = await provider.listSubscriptionsFor!(holder);
+        const known = this.knownProviderSubIds(holder);
         const truly = orphans.filter(r => !known.has(`${providerId}:${r.providerSubId}`));
         if (truly.length > 0) {
           const ids = truly.map(r => r.providerSubId).join(', ');
-          throw new Error(
-            `Provider '${providerId}' already has ${truly.length} subscription(s) for this guild that aren't tracked locally (${ids}). ` +
-            `Adopt or cancel them in the Subscriptions panel before starting a new one.`,
+          throw new Error(who.kind === 'user'
+            ? `Provider '${providerId}' already has ${truly.length} subscription(s) for this user that aren't tracked locally (${ids}). ` +
+              `They must be adopted or cancelled before a new one starts.`
+            : `Provider '${providerId}' already has ${truly.length} subscription(s) for this guild that aren't tracked locally (${ids}). ` +
+              `Adopt or cancel them in the Subscriptions panel before starting a new one.`,
           );
         }
       } catch (err: any) {
         if (err?.message?.startsWith(`Provider '${providerId}' already has`)) throw err;
-        console.warn(`[PremiumManager] orphan pre-flight failed for '${providerId}' guild ${guildId}: ${err?.message || err}`);
+        console.warn(`[PremiumManager] orphan pre-flight failed for '${providerId}' ${holderWords(holder)}: ${err?.message || err}`);
       }
     }
 
@@ -3523,7 +3741,7 @@ export class PremiumManager {
 
     // Stacking conflict check: same-priority paid is rejected.
     const newPriority = tier.priority;
-    const guildSubs = this.config.subscriptions[guildId];
+    const guildSubs = this.config.subscriptions[holder];
     const conflictingExisting = [
       guildSubs?.active,
       ...(guildSubs?.paused || []),
@@ -3563,13 +3781,13 @@ export class PremiumManager {
     const startPausedUntil = willGoToQueue ? active!.endDate : undefined;
 
     const result = await provider.initiatePurchase({
-      guildId,
+      holder,
+      buyerId,
       tierId,
       offeringId,
       variantId: opts.variantId,
       autoRenew: autoRenewIntent,
       couponCode: opts.couponCode,
-      userId: opts.userId,
       startPausedUntil,
     });
 
@@ -3587,6 +3805,7 @@ export class PremiumManager {
         providerSubId: result.providerSubId,
         providerMeta: result.state.meta,
         purchasedSnapshot: this.buildPurchasedSnapshot(tier, offering, variantSnapshot, providerId),
+        buyerId,
         startDate: result.state.startDate,
         endDate: result.state.endDate,
         autoRenew: result.state.autoRenew,
@@ -3602,20 +3821,20 @@ export class PremiumManager {
         timestamp: nowIso,
         actor: 'admin',
         action: 'subscription.install.paid',
-        guildId,
+        holder,
         tierId,
         offeringId,
         providerId,
         subscriptionId: sub.id,
-        metadata: { variantId: opts.variantId, couponCode: opts.couponCode },
+        metadata: { variantId: opts.variantId, couponCode: opts.couponCode, buyerId },
       }, { carry }, result.providerSubId);
-      void this.notify(guildId, 'paid.sub.started', {
+      void this.notify(holder, 'paid.sub.started', {
         tierName: tier.displayName,
         providerName: this.providerDisplayName(providerId),
         endDate: sub.endDate,
       }, { carry });
       try {
-        await this.installSubscription(guildId, sub, carry, willGoToQueue ? { boughtPaused: true } : {});
+        await this.installSubscription(holder, sub, carry, willGoToQueue ? { boughtPaused: true } : {});
       } catch (error) {
         forgetItems(carry.items.splice(0));
         throw error;
@@ -3631,13 +3850,14 @@ export class PremiumManager {
    * reflect the change. We propagate provider errors so the UI shows the
    * actual cause instead of a false-positive success.
    */
-  cancelPaidSubscription(guildId: string): Promise<boolean> {
-    return this.work.run(CHANGE_WORK, () => this.cancelPaidRun(guildId));
+  cancelPaidSubscription(holder: HolderKey): Promise<boolean> {
+    return this.work.run(CHANGE_WORK, () => this.cancelPaidRun(holder));
   }
 
-  private async cancelPaidRun(guildId: string): Promise<boolean> {
+  private async cancelPaidRun(holder: HolderKey): Promise<boolean> {
+    this.holderArg(holder);
     if (this.refusedAtEntry()) return false;
-    const active = this.config.subscriptions[guildId]?.active;
+    const active = this.config.subscriptions[holder]?.active;
     if (!active || active.source !== 'paid') return false;
     if (!active.providerId || !active.providerSubId) return false;
     const provider = getPaymentRegistry().get(active.providerId);
@@ -3645,8 +3865,8 @@ export class PremiumManager {
     const state = await provider.cancelSubscription(active.providerSubId);
     // Decisions 72 and 73: a returned state is stored at the provider; premium copies it into the sub it holds now
     // (other changes may have reloaded or removed it during the call) and its save carries the items.
-    const current = this.subscriptionById(guildId, active.id);
-    if (state && !current) return this.saveRemovedMeanwhile(guildId, active.id) === 'done';
+    const current = this.subscriptionById(holder, active.id);
+    if (state && !current) return this.saveRemovedMeanwhile(holder, active.id) === 'done';
     const carry = newCarry();
     const link: Link = state ? { carry } : { standalone: 'the provider stored the change' };
     if (state && current) this.copyProviderState(current, state);
@@ -3654,12 +3874,12 @@ export class PremiumManager {
       timestamp: new Date().toISOString(),
       actor: 'admin',
       action: 'subscription.cancel.paid',
-      guildId,
+      holder,
       subscriptionId: active.id,
       providerId: active.providerId,
       metadata: { immediately: false },
     }, link);
-    void this.notify(guildId, 'paid.sub.cancelled-by-user', {
+    void this.notify(holder, 'paid.sub.cancelled-by-user', {
       tierName: this.config.tiers[active.tierId]?.displayName || active.tierId,
       providerName: this.providerDisplayName(active.providerId),
       endDate: (current ?? active).endDate,
@@ -3668,13 +3888,14 @@ export class PremiumManager {
   }
 
   /** Reactivate a cancelled paid sub while still inside its active window. */
-  reactivatePaidSubscription(guildId: string): Promise<boolean> {
-    return this.work.run(CHANGE_WORK, () => this.reactivatePaidRun(guildId));
+  reactivatePaidSubscription(holder: HolderKey): Promise<boolean> {
+    return this.work.run(CHANGE_WORK, () => this.reactivatePaidRun(holder));
   }
 
-  private async reactivatePaidRun(guildId: string): Promise<boolean> {
+  private async reactivatePaidRun(holder: HolderKey): Promise<boolean> {
+    this.holderArg(holder);
     if (this.refusedAtEntry()) return false;
-    const active = this.config.subscriptions[guildId]?.active;
+    const active = this.config.subscriptions[holder]?.active;
     if (!active || active.source !== 'paid') return false;
     if (!active.providerId || !active.providerSubId) return false;
     if (active.status !== 'active') return false;
@@ -3682,15 +3903,15 @@ export class PremiumManager {
     const provider = getPaymentRegistry().get(active.providerId);
     if (!provider?.reactivateSubscription || !provider.capabilities.supportsReactivate) return false;
     const state = await provider.reactivateSubscription(active.providerSubId);
-    const current = this.subscriptionById(guildId, active.id);
-    if (state && !current) return this.saveRemovedMeanwhile(guildId, active.id) === 'done';
+    const current = this.subscriptionById(holder, active.id);
+    if (state && !current) return this.saveRemovedMeanwhile(holder, active.id) === 'done';
     const carry = newCarry();
     if (state && current) this.copyProviderState(current, state);
     this.writeAudit({
       timestamp: new Date().toISOString(),
       actor: 'admin',
       action: 'subscription.reactivate.paid',
-      guildId,
+      holder,
       subscriptionId: active.id,
       providerId: active.providerId,
     }, state ? { carry } : { standalone: 'the provider stored the change' });
@@ -3702,13 +3923,14 @@ export class PremiumManager {
    * slot, resumes the next paused entry. Provider call must succeed before
    * we wipe local state.
    */
-  cancelPaidSubscriptionImmediately(guildId: string): Promise<boolean> {
-    return this.work.run(CHANGE_WORK, async () => (await this.cancelActiveImmediately(guildId)) === 'done');
+  cancelPaidSubscriptionImmediately(holder: HolderKey): Promise<boolean> {
+    return this.work.run(CHANGE_WORK, async () => (await this.cancelActiveImmediately(holder)) === 'done');
   }
 
-  private async cancelActiveImmediately(guildId: string): Promise<CancelStep> {
+  private async cancelActiveImmediately(holder: HolderKey): Promise<CancelStep> {
+    this.holderArg(holder);
     if (this.refusedAtEntry()) return 'not saved';
-    const active = this.config.subscriptions[guildId]?.active;
+    const active = this.config.subscriptions[holder]?.active;
     if (!active || active.source !== 'paid') return 'gone';
 
     if (active.providerId && active.providerSubId) {
@@ -3717,7 +3939,7 @@ export class PremiumManager {
         await provider.cancelSubscription(active.providerSubId, true);
       }
     }
-    return this.dropCancelledSubscription(guildId, active, { immediately: true }, true);
+    return this.dropCancelledSubscription(holder, active, { immediately: true }, true);
   }
 
   /**
@@ -3727,39 +3949,39 @@ export class PremiumManager {
    * judged in this op's ledger; after a stop it is judged by the last save handed to the disk.
    */
   private dropCancelledSubscription(
-    guildId: string,
+    holder: HolderKey,
     cancelled: Subscription,
     metadata: Record<string, unknown>,
     notifyOwner: boolean,
   ): CancelStep {
-    const subs = this.config.subscriptions[guildId];
-    if (!subs) return this.saveRemovedMeanwhile(guildId, cancelled.id);
+    const subs = this.config.subscriptions[holder];
+    if (!subs) return this.saveRemovedMeanwhile(holder, cancelled.id);
     const inActive = subs.active?.id === cancelled.id;
     const at = inActive ? -1 : subs.paused.findIndex(p => p.id === cancelled.id);
-    if (!inActive && at < 0) return this.saveRemovedMeanwhile(guildId, cancelled.id);
+    if (!inActive && at < 0) return this.saveRemovedMeanwhile(holder, cancelled.id);
     const carry = newCarry();
     this.writeAudit({
       timestamp: new Date().toISOString(),
       actor: 'admin',
       action: cancelled.source === 'manual' ? 'subscription.revoke.manual' : 'subscription.cancel.paid',
-      guildId,
+      holder,
       subscriptionId: cancelled.id,
       providerId: cancelled.providerId,
       metadata,
     }, { carry });
     if (notifyOwner) {
-      void this.notify(guildId, 'paid.sub.cancelled-by-user', {
+      void this.notify(holder, 'paid.sub.cancelled-by-user', {
         tierName: this.config.tiers[cancelled.tierId]?.displayName || cancelled.tierId,
         providerName: this.providerDisplayName(cancelled.providerId),
       }, { carry });
     }
     if (inActive) {
       delete subs.active;
-      if (subs.paused.length > 0) this.resumeNext(guildId, carry);
+      if (subs.paused.length > 0) this.resumeNext(holder, carry);
     } else {
       subs.paused.splice(at, 1);
     }
-    if (this.guildSubsEmpty(subs)) delete this.config.subscriptions[guildId];
+    if (this.recordEmpty(subs)) delete this.config.subscriptions[holder];
     return this.save({ carry }) ? 'done' : 'not saved';
   }
 
@@ -3768,9 +3990,9 @@ export class PremiumManager {
    * waited on (a deposition's drop answers writer-lost). lastRaw changes only on an accepted save, so a removal held or
    * made only in memory still shows the subscription there and is not saved.
    */
-  private saveRemovedMeanwhile(guildId: string, subscriptionId: string): CancelStep {
+  private saveRemovedMeanwhile(holder: HolderKey, subscriptionId: string): CancelStep {
     if (!this.stopped) return this.save() ? 'done' : 'not saved';
-    if (this.savedStillHolds(guildId, subscriptionId)) {
+    if (this.savedStillHolds(holder, subscriptionId)) {
       recordRefusal(stopCause(this.stopped), PREMIUM_DOC);
       return 'not saved';
     }
@@ -3779,10 +4001,10 @@ export class PremiumManager {
   }
 
   /** True when the last saved or loaded text still holds the subscription, or that text is not known. */
-  private savedStillHolds(guildId: string, subscriptionId: string): boolean {
+  private savedStillHolds(holder: HolderKey, subscriptionId: string): boolean {
     if (typeof this.lastRaw !== 'string') return true;
     try {
-      const subs = (JSON.parse(this.lastRaw) as PremiumConfig).subscriptions?.[guildId];
+      const subs = (JSON.parse(this.lastRaw) as PremiumConfig).subscriptions?.[holder];
       if (!subs) return false;
       return subs.active?.id === subscriptionId || (subs.paused ?? []).some(p => p.id === subscriptionId);
     } catch {
@@ -3794,13 +4016,14 @@ export class PremiumManager {
    * Cancel a paused subscription (paid or manual) and remove it from the
    * queue. Provider call must succeed before we drop the queue entry.
    */
-  cancelAndRemovePausedSubscription(guildId: string, subscriptionId: string): Promise<boolean> {
-    return this.work.run(CHANGE_WORK, async () => (await this.cancelPausedStep(guildId, subscriptionId)) === 'done');
+  cancelAndRemovePausedSubscription(holder: HolderKey, subscriptionId: string): Promise<boolean> {
+    return this.work.run(CHANGE_WORK, async () => (await this.cancelPausedStep(holder, subscriptionId)) === 'done');
   }
 
-  private async cancelPausedStep(guildId: string, subscriptionId: string): Promise<CancelStep> {
+  private async cancelPausedStep(holder: HolderKey, subscriptionId: string): Promise<CancelStep> {
+    this.holderArg(holder);
     if (this.refusedAtEntry()) return 'not saved';
-    const removed = this.config.subscriptions[guildId]?.paused.find(p => p.id === subscriptionId);
+    const removed = this.config.subscriptions[holder]?.paused.find(p => p.id === subscriptionId);
     if (!removed) return 'gone';
 
     if (removed.source === 'paid' && removed.providerId && removed.providerSubId) {
@@ -3809,15 +4032,15 @@ export class PremiumManager {
         await provider.cancelSubscription(removed.providerSubId, true);
       }
     }
-    return this.dropCancelledSubscription(guildId, removed, { fromPausedQueue: true }, false);
+    return this.dropCancelledSubscription(holder, removed, { fromPausedQueue: true }, false);
   }
 
   // ============================================================================
   // ORPHANS
   // ============================================================================
 
-  private knownProviderSubIds(guildId: string): Set<string> {
-    const subs = this.config.subscriptions[guildId];
+  private knownProviderSubIds(holder: HolderKey): Set<string> {
+    const subs = this.config.subscriptions[holder];
     const ids = new Set<string>();
     if (subs?.active?.providerSubId && subs.active.providerId) {
       ids.add(`${subs.active.providerId}:${subs.active.providerSubId}`);
@@ -3830,27 +4053,29 @@ export class PremiumManager {
     return ids;
   }
 
-  async findOrphansForGuild(guildId: string): Promise<Array<{ providerId: string; ref: ProviderSubscriptionRef; plan?: AdoptPlan }>> {
+  async findOrphansFor(holder: HolderKey): Promise<Array<{ providerId: string; ref: ProviderSubscriptionRef; plan?: AdoptPlan }>> {
     this.ensureLoaded();
     const out: Array<{ providerId: string; ref: ProviderSubscriptionRef; plan?: AdoptPlan }> = [];
+    if (!parseHolder(holder)) return out;
     for (const provider of getPaymentRegistry().listAll()) {
-      if (!provider.listSubscriptionsForGuild) continue;
+      if (!provider.listSubscriptionsFor) continue;
       if (!provider.isConfigured()) continue;
+      if (!sellsTo(provider, this.kindOf(holder))) continue;
       try {
-        const refs = await provider.listSubscriptionsForGuild(guildId);
+        const refs = await provider.listSubscriptionsFor!(holder);
         this.ensureLoaded();
-        const known = this.knownProviderSubIds(guildId);
+        const known = this.knownProviderSubIds(holder);
         const blocked = !this.configLoaded || !!this.unreadable ? this.blockedReason() : null;
         for (const ref of refs) {
           if (!known.has(`${provider.id}:${ref.providerSubId}`)) {
             const plan = !ref.metadata.tierId || !ref.metadata.offeringId ? null
               : blocked !== null ? { kind: 'refuse' as const, reason: blocked, line: `It cannot be adopted: ${blocked}.` }
-              : this.adoptPlan(guildId, provider.id, ref);
+              : this.adoptPlan(holder, provider.id, ref);
             out.push(plan ? { providerId: provider.id, ref, plan } : { providerId: provider.id, ref });
           }
         }
       } catch (err: any) {
-        console.warn(`[PremiumManager] '${provider.id}' listSubscriptionsForGuild failed for guild ${guildId}: ${err?.message || err}`);
+        console.warn(`[PremiumManager] '${provider.id}' could not list its subscriptions for ${holderWords(holder)}: ${err?.message || err}`);
       }
     }
     return out;
@@ -3869,8 +4094,8 @@ export class PremiumManager {
    * NB25 decision 2's slot rule for a paid sub of this tier, as installSubscription places one: 'active' with no live
    * active sub or a higher priority, 'tie' at equal priority, 'queue' below.
    */
-  private slotFor(guildId: string, tierId: string): { kind: 'active' } | { kind: 'tie' | 'queue'; activeTierId: string; activeTier: string } {
-    const active = this.config.subscriptions[guildId]?.active;
+  private slotFor(holder: HolderKey, tierId: string): { kind: 'active' } | { kind: 'tie' | 'queue'; activeTierId: string; activeTier: string } {
+    const active = this.config.subscriptions[holder]?.active;
     const alive = active
       && active.status === 'active'
       && (active.endDate === null || Date.parse(active.endDate) > Date.now());
@@ -3883,13 +4108,18 @@ export class PremiumManager {
   }
 
   /** NB25 decision 2: what adopting this orphan (with tierId and offeringId metadata) does, with the card's line. */
-  private adoptPlan(guildId: string, providerId: string, ref: ProviderSubscriptionRef): AdoptPlan {
+  private adoptPlan(holder: HolderKey, providerId: string, ref: ProviderSubscriptionRef): AdoptPlan {
     const name = this.providerDisplayName(providerId) ?? providerId;
-    if (ref.state.status !== 'paused') return { kind: 'install', line: `It is active at ${name}, and adopting adds it as it is.` };
     const refuse = (reason: string): AdoptPlan => ({ kind: 'refuse', reason, line: `It cannot be adopted: ${reason}.` });
     const tierId = ref.metadata.tierId ?? '';
     const offeringId = ref.metadata.offeringId ?? '';
     const tier = this.config.tiers[tierId];
+    const who = parseHolder(holder);
+    const buyerId = listedBuyer(ref);
+    if (buyerId === undefined) return refuse(`${name}'s record does not name the Discord user who paid; cancel it at ${name} instead`);
+    if (who?.kind === 'user' && buyerId !== who.id) return refuse(`its buyer is not the user it is for; cancel it at ${name} instead`);
+    if (tier && tierKind(tier) !== this.kindOf(holder)) return refuse(wrongKindText(tier, this.kindOf(holder)).replace(/\.$/, ''));
+    if (ref.state.status !== 'paused') return { kind: 'install', line: `It is active at ${name}, and adopting adds it as it is.` };
     if (!tier) return refuse(`tier '${tierId}' does not exist`);
     if (!tier.offerings.some(o => o.id === offeringId)) return refuse(`tier '${tierId}' has no offering '${offeringId}'`);
     if (ref.state.resumable === false) {
@@ -3901,9 +4131,9 @@ export class PremiumManager {
     }
     const left = pausedDaysLeft(ref, Date.now());
     if (left.days === 0) return refuse(`it is paused with no paid days left; cancel it at ${name} instead`);
-    const slot = this.slotFor(guildId, tierId);
+    const slot = this.slotFor(holder, tierId);
     if (slot.kind === 'tie') {
-      return refuse(`the server already has a '${slot.activeTier}' subscription of the same priority; cancel one of them or let it end first`);
+      return refuse(`${this.kindOf(holder) === 'user' ? 'this user' : 'the server'} already has a '${slot.activeTier}' subscription of the same priority; cancel one of them or let it end first`);
     }
     const at = left.from === 'recorded' ? left.at : undefined;
     const source = at !== undefined
@@ -3952,19 +4182,21 @@ export class PremiumManager {
     };
   }
 
-  adoptOrphan(guildId: string, providerId: string, providerSubId: string, shown?: unknown): Promise<boolean> {
-    return this.work.run(CHANGE_WORK, () => this.adoptOrphanRun(guildId, providerId, providerSubId, shown));
+  adoptOrphan(holder: HolderKey, providerId: string, providerSubId: string, shown?: unknown): Promise<boolean> {
+    return this.work.run(CHANGE_WORK, () => this.adoptOrphanRun(holder, providerId, providerSubId, shown));
   }
 
-  private async adoptOrphanRun(guildId: string, providerId: string, providerSubId: string, shown?: unknown): Promise<boolean> {
+  private async adoptOrphanRun(holder: HolderKey, providerId: string, providerSubId: string, shown?: unknown): Promise<boolean> {
+    const who = this.holderArg(holder);
     if (this.refusedAtEntry()) return false;
     const key = `${providerId}:${providerSubId}`;
     const seen = this.adoptEnded.get(key) ?? 0;
     const provider = getPaymentRegistry().get(providerId);
-    if (!provider?.listSubscriptionsForGuild) {
+    if (!provider || !provider.listSubscriptionsFor) {
       throw new Error(`Provider '${providerId}' does not support orphan listing.`);
     }
-    const refs = await provider.listSubscriptionsForGuild(guildId);
+    if (!sellsTo(provider, who.kind)) throw new Error(doesNotSellText(provider.displayName, who.kind));
+    const refs = await provider.listSubscriptionsFor!(holder);
     const reload = await this.adoptionReload();
     if (reload && 'stop' in reload) {
       if (this.stopped) {
@@ -3977,9 +4209,9 @@ export class PremiumManager {
     if (this.refusedAtEntry()) return false;
     const ref = refs.find(r => r.providerSubId === providerSubId);
     if (!ref) {
-      throw new Error(`Subscription '${providerSubId}' not found at '${providerId}' for guild ${guildId}.`);
+      throw new Error(`Subscription '${providerSubId}' not found at '${providerId}' for ${holderWords(holder)}.`);
     }
-    if (this.knownProviderSubIds(guildId).has(`${providerId}:${providerSubId}`)) {
+    if (this.knownProviderSubIds(holder).has(`${providerId}:${providerSubId}`)) {
       throw new Error(`Subscription '${providerSubId}' is already in the local cache.`);
     }
     if (!ref.metadata.tierId || !ref.metadata.offeringId) {
@@ -4001,7 +4233,7 @@ export class PremiumManager {
     }
     this.adopting.set(key, 'adoption');
     try {
-      const plan = this.adoptPlan(guildId, providerId, ref);
+      const plan = this.adoptPlan(holder, providerId, ref);
       if (plan.kind === 'refuse') throw new Error(`Subscription '${providerSubId}' was not adopted: ${plan.reason}.`);
       if (!samePlan(shown, plan)) {
         throw new Error(
@@ -4009,11 +4241,11 @@ export class PremiumManager {
           `the bot now says: "${plan.line}"; reload the page before adopting it.`,
         );
       }
-      if (plan.kind === 'resume' && plan.call) return await this.adoptByResume(guildId, providerId, ref, plan);
+      if (plan.kind === 'resume' && plan.call) return await this.adoptByResume(holder, providerId, ref, plan);
       const state = plan.kind === 'queue'
         ? { ...ref.state, endDate: plan.days === null ? null : new Date(Date.now() + plan.days * DAY_MS).toISOString() }
         : ref.state;
-      return await this.installAdopted(guildId, providerId, ref, state, false);
+      return await this.installAdopted(holder, providerId, ref, state, false);
     } finally {
       this.adopting.delete(key);
       this.adoptEnded.set(key, (this.adoptEnded.get(key) ?? 0) + 1);
@@ -4025,7 +4257,7 @@ export class PremiumManager {
    * when another adoption holds it active, or pauses it again (T7). Nothing is awaited between the plan and the call.
    */
   private async adoptByResume(
-    guildId: string,
+    holder: HolderKey,
     providerId: string,
     ref: ProviderSubscriptionRef,
     plan: Extract<AdoptPlan, { kind: 'resume' }>,
@@ -4036,32 +4268,33 @@ export class PremiumManager {
     const days = plan.days;
     const endDate = days === null ? null : new Date(Date.now() + days * DAY_MS).toISOString();
     const left = days === null ? 'with no end date' : `with ${dayWords(days)} left`;
-    console.warn(`[PremiumManager] Adoption is resuming ${name} subscription ${providerSubId} for guild ${guildId} ${left}.`);
+    console.warn(`[PremiumManager] Adoption is resuming ${name} subscription ${providerSubId} for ${holderWords(holder)} ${left}.`);
     try {
       await provider.resumeSubscription!(providerSubId, endDate);
     } catch (error: any) {
       throw new Error(`Subscription '${providerSubId}' was not adopted: the resume call to ${name} failed (${error?.message || error}).`);
     }
-    console.warn(`[PremiumManager] Adoption resumed ${name} subscription ${providerSubId} for guild ${guildId} ${left}; the bot may not have saved it yet.`);
+    console.warn(`[PremiumManager] Adoption resumed ${name} subscription ${providerSubId} for ${holderWords(holder)} ${left}; the bot may not have saved it yet.`);
 
     const reload = await this.adoptionReload();
     this.ensureLoaded();
     const readable = this.configLoaded && !this.unreadable;
-    const subs = readable ? this.config.subscriptions[guildId] : undefined;
+    const subs = readable ? this.config.subscriptions[holder] : undefined;
     const held = subs ? this.findSubscriptionByProviderSubId(subs, providerSubId) : null;
     if (held?.location === 'active') throw new Error(`Subscription '${providerSubId}' was not adopted: it is already in this bot's subscriptions.`);
     const tierId = ref.metadata.tierId ?? '';
     const offeringId = ref.metadata.offeringId ?? '';
     const tier = this.config.tiers[tierId];
-    const slot = this.slotFor(guildId, tierId);
+    const slot = this.slotFor(holder, tierId);
     const reason = reload && 'stop' in reload ? stopWords(reload.stop)
       : reload ? reload.refresh
       : this.stopped ? stopWords(this.stopped)
       : !readable || this.replay ? CANNOT_TAKE_CHANGES
       : held ? 'the bot already holds it, queued behind a higher-priority subscription'
       : !tier ? `tier '${tierId}' does not exist`
+      : tierKind(tier) !== this.kindOf(holder) ? `tier '${tierId}' is now a ${kindWord(tierKind(tier))} tier`
       : !tier.offerings.some(o => o.id === offeringId) ? `tier '${tierId}' has no offering '${offeringId}'`
-      : slot.kind !== 'active' ? `the server now holds a '${slot.activeTier}' subscription of equal or higher priority`
+      : slot.kind !== 'active' ? `${this.kindOf(holder) === 'user' ? 'this user' : 'the server'} now holds a '${slot.activeTier}' subscription of equal or higher priority`
       : null;
     if (reason !== null) {
       let after = ` It was paused again at ${name}.`;
@@ -4076,12 +4309,12 @@ export class PremiumManager {
       }
       throw new Error(`Subscription '${providerSubId}' was not adopted: it was resumed at ${name}, but not installed: ${reason}.${after}`);
     }
-    return this.installAdopted(guildId, providerId, ref, { ...ref.state, status: 'active', startDate: new Date().toISOString(), endDate }, true);
+    return this.installAdopted(holder, providerId, ref, { ...ref.state, status: 'active', startDate: new Date().toISOString(), endDate }, true);
   }
 
   /** Today's install of an adopted orphan with the state given; the adoption line rides its save (decision 72). */
   private async installAdopted(
-    guildId: string,
+    holder: HolderKey,
     providerId: string,
     ref: ProviderSubscriptionRef,
     state: ProviderSubscriptionState,
@@ -4095,7 +4328,7 @@ export class PremiumManager {
       timestamp: new Date().toISOString(),
       actor: 'admin',
       action: 'subscription.adopt.orphan',
-      guildId,
+      holder,
       providerId,
       metadata: { providerSubId, tierId, offeringId, ...(resumed ? { resumed: true } : {}) },
     }, { carry });
@@ -4103,7 +4336,8 @@ export class PremiumManager {
       type: 'subscription.created',
       providerId,
       providerSubId,
-      guildId,
+      holder,
+      buyerId: listedBuyer(ref),
       tierId,
       offeringId,
       variantId: ref.metadata.variantId,
@@ -4115,7 +4349,9 @@ export class PremiumManager {
     forgetItems(carry.items.splice(0));
     const why = outcome.skipped === 'tier'
       ? `tier '${tierId}' does not exist`
-      : outcome.skipped === 'offering' ? `tier '${tierId}' has no offering '${offeringId}'` : "it is already in this bot's subscriptions";
+      : outcome.skipped === 'offering' ? `tier '${tierId}' has no offering '${offeringId}'`
+      : 'why' in outcome && outcome.why ? outcome.why
+      : "it is already in this bot's subscriptions";
     throw new Error(`Subscription '${providerSubId}' was not adopted: ${why}.`);
   }
 
@@ -4159,21 +4395,22 @@ export class PremiumManager {
   // QUERY
   // ============================================================================
 
-  getSubscriptions(guildId: string): GuildSubscriptions {
+  /** A holder's record; an empty one for a holder with none and for a text that is no holder key. */
+  getSubscriptions(holder: HolderKey): HolderSubscriptions {
     this.ensureLoaded();
-    const subs = this.config.subscriptions[guildId];
+    const subs = parseHolder(holder) ? this.config.subscriptions[holder] : undefined;
     return subs ? { ...subs } : { paused: [] };
   }
 
-  getAllSubscriptions(): Record<string, GuildSubscriptions> {
+  getAllSubscriptions(): Record<HolderKey, HolderSubscriptions> {
     this.ensureLoaded();
     return JSON.parse(JSON.stringify(this.config.subscriptions));
   }
 
   /** Read-only snapshot of one guild's subscription record (or null if none). */
-  getGuildSubscriptions(guildId: string): GuildSubscriptions | null {
+  getHolderSubscriptions(holder: HolderKey): HolderSubscriptions | null {
     this.ensureLoaded();
-    const subs = this.config.subscriptions[guildId];
+    const subs = parseHolder(holder) ? this.config.subscriptions[holder] : undefined;
     return subs ? JSON.parse(JSON.stringify(subs)) : null;
   }
 
@@ -4184,18 +4421,19 @@ export class PremiumManager {
    * false if the guild has no subscription record yet AND the new value
    * is empty (no point creating an empty record).
    */
-  setNotificationsChannelId(guildId: string, channelId: string | null): boolean {
+  setNotificationsChannelId(holder: HolderKey, channelId: string | null): boolean {
+    if (this.holderArg(holder).kind === 'user') throw new Error(NOTICES_ARE_A_SERVERS);
     if (this.refusedAtEntry()) return false;
     const next = (channelId && channelId.trim()) ? channelId.trim() : undefined;
-    const subs = this.config.subscriptions[guildId];
+    const subs = this.config.subscriptions[holder];
     if (!subs && !next) return false;
     if (!subs) {
-      this.config.subscriptions[guildId] = { paused: [], notificationsChannelId: next };
+      this.config.subscriptions[holder] = { paused: [], notificationsChannelId: next };
     } else if (next) {
       subs.notificationsChannelId = next;
     } else {
       delete subs.notificationsChannelId;
-      if (this.guildSubsEmpty(subs)) delete this.config.subscriptions[guildId];
+      if (this.recordEmpty(subs)) delete this.config.subscriptions[holder];
     }
     return this.save() !== null;
   }
@@ -4265,26 +4503,37 @@ export class PremiumManager {
     return tier.priority >= requiredPriority;
   }
 
-  hasFeature(guildId: string, moduleName: string, featureName: string): boolean {
-    let registry: { getModule: (name: string) => { manifest?: any } | undefined };
+  /** A copy of the user tier's own map for the module; no baseline and no default is merged. */
+  getUserTierOverrides(userId: string, moduleName: string): Record<string, any> {
+    const map = this.resolveActiveUserTier(userId)?.tier.overrides?.[moduleName];
+    return map && typeof map === 'object' ? JSON.parse(JSON.stringify(map)) : {};
+  }
+
+  hasUserFeatureAccess(userId: string, requiredPriority: number): boolean {
+    return (this.resolveActiveUserTier(userId)?.tier.priority ?? 0) >= requiredPriority;
+  }
+
+  hasUserFeature(userId: string, moduleName: string, featureName: string): boolean {
+    const gate = this.moduleTierRequirement(moduleName)?.user;
+    if (!gate || typeof gate.minPriority !== 'number') return true;
+    if (!featureIsGated(gate, featureName)) return true;
+    return this.hasUserFeatureAccess(userId, gate.minPriority);
+  }
+
+  private moduleTierRequirement(moduleName: string): ModuleManifest['tierRequirement'] {
     try {
-      registry = (require('./moduleRegistry') as typeof import('./moduleRegistry')).getModuleRegistry();
+      const registry = (require('./moduleRegistry') as typeof import('./moduleRegistry')).getModuleRegistry();
+      return registry.getModule(moduleName)?.manifest?.tierRequirement;
     } catch {
-      return true;
+      return undefined;
     }
-    const mod = registry.getModule(moduleName);
-    const tr = mod?.manifest?.tierRequirement;
+  }
+
+  hasFeature(guildId: string, moduleName: string, featureName: string): boolean {
+    const tr = this.moduleTierRequirement(moduleName);
     if (!tr || typeof tr.minPriority !== 'number') return true;
 
-    let featureIsGated: boolean;
-    if (Array.isArray(tr.gatedFeatures)) {
-      featureIsGated = tr.gatedFeatures.includes(featureName);
-    } else if (Array.isArray(tr.gatedCommands)) {
-      featureIsGated = false;
-    } else {
-      featureIsGated = true;
-    }
-    if (!featureIsGated) return true;
+    if (!featureIsGated(tr, featureName)) return true;
     return this.hasFeatureAccess(guildId, tr.minPriority);
   }
 
@@ -4292,19 +4541,22 @@ export class PremiumManager {
   // PROVIDER ACCOUNT LINKS (anti-duplicate registry)
   // ============================================================================
 
-  getAccountLink(providerId: string, externalAccountId: string): string | undefined {
+  getAccountLink(providerId: string, externalAccountId: string): AccountLink | undefined {
     this.ensureLoaded();
-    return this.config.providerAccountLinks[providerId]?.[externalAccountId];
+    const link = this.config.providerAccountLinks[providerId]?.[externalAccountId];
+    return link ? { ...link } : undefined;
   }
 
-  linkAccount(providerId: string, externalAccountId: string, guildId: string): boolean {
+  linkAccount(providerId: string, externalAccountId: string, holder: HolderKey, buyerId: string): boolean {
+    this.holderArg(holder);
+    if (!isDiscordId(buyerId)) throw new Error(LINK_NEEDS_BUYER);
     if (this.refusedAtEntry()) return false;
     if (!this.config.providerAccountLinks[providerId]) {
       this.config.providerAccountLinks[providerId] = {};
     }
     const existing = this.config.providerAccountLinks[providerId][externalAccountId];
-    if (existing && existing !== guildId) return false;
-    this.config.providerAccountLinks[providerId][externalAccountId] = guildId;
+    if (existing) return existing.holder === holder;
+    this.config.providerAccountLinks[providerId][externalAccountId] = { holder, buyerId };
     return this.save() !== null;
   }
 
@@ -4323,28 +4575,29 @@ export class PremiumManager {
    * save stops it with the link kept, so the same request can finish the change; the op's verdict answers the failure.
    * The subscriptions are read again before each step, since other changes may move or remove them meanwhile.
    */
-  unlinkProviderAccount(guildId: string, providerId: string): Promise<boolean> {
-    return this.work.run(CHANGE_WORK, () => this.unlinkProviderRun(guildId, providerId));
+  unlinkProviderAccount(holder: HolderKey, providerId: string): Promise<boolean> {
+    return this.work.run(CHANGE_WORK, () => this.unlinkProviderRun(holder, providerId));
   }
 
-  private async unlinkProviderRun(guildId: string, providerId: string): Promise<boolean> {
+  private async unlinkProviderRun(holder: HolderKey, providerId: string): Promise<boolean> {
+    this.holderArg(holder);
     if (this.refusedAtEntry()) return false;
     const links = this.config.providerAccountLinks[providerId] || {};
-    const externalAccountId = Object.entries(links).find(([, gid]) => gid === guildId)?.[0];
+    const externalAccountId = Object.entries(links).find(([, link]) => link.holder === holder)?.[0];
     if (!externalAccountId) return false;
     const tried = new Set<string>();
     for (;;) {
-      const subs = this.config.subscriptions[guildId];
+      const subs = this.config.subscriptions[holder];
       const next = [...(subs?.paused || []), ...(subs?.active ? [subs.active] : [])]
         .find(s => s.source === 'paid' && s.providerId === providerId && s.id && !tried.has(s.id));
       if (!next) break;
       tried.add(next.id);
       const step = subs!.active?.id === next.id
-        ? await this.cancelActiveImmediately(guildId)
-        : await this.cancelPausedStep(guildId, next.id);
+        ? await this.cancelActiveImmediately(holder)
+        : await this.cancelPausedStep(holder, next.id);
       if (step === 'not saved') return true;
     }
-    if (this.config.providerAccountLinks[providerId]?.[externalAccountId] === guildId) {
+    if (this.config.providerAccountLinks[providerId]?.[externalAccountId]?.holder === holder) {
       this.unlinkAccount(providerId, externalAccountId);
     }
     return true;
@@ -4403,8 +4656,8 @@ export class PremiumManager {
     const ENDING_SOON_WINDOW_MS = 24 * 60 * 60 * 1000;
     const stillActiveIds = new Set<string>();
     const carry = newCarry();
-    for (const guildId of Object.keys(this.config.subscriptions)) {
-      const subs = this.config.subscriptions[guildId];
+    for (const holder of this.holders()) {
+      const subs = this.config.subscriptions[holder];
       const active = subs.active;
       if (!active) continue;
       if (active.endDate === null) continue;
@@ -4423,18 +4676,18 @@ export class PremiumManager {
           timestamp: nowIso,
           actor: 'admin',
           action: 'subscription.revoke.manual',
-          guildId,
+          holder,
           subscriptionId: active.id,
           metadata: { reason: 'expired' },
         }, { carry });
-        void this.notify(guildId, 'manual.grant.ended', {
+        void this.notify(holder, 'manual.grant.ended', {
           tierName,
           notes: expiredNotes,
         }, { carry });
         this.endingSoonNotified.delete(expiredId);
         delete subs.active;
-        if (subs.paused.length > 0) this.resumeNext(guildId, carry);
-        if (this.guildSubsEmpty(subs)) delete this.config.subscriptions[guildId];
+        if (subs.paused.length > 0) this.resumeNext(holder, carry);
+        if (this.recordEmpty(subs)) delete this.config.subscriptions[holder];
         continue;
       }
 
@@ -4446,7 +4699,7 @@ export class PremiumManager {
       if (endMs - now > ENDING_SOON_WINDOW_MS) continue;
       if (this.endingSoonNotified.has(active.id)) continue;
       this.endingSoonNotified.add(active.id);
-      void this.notify(guildId, 'manual.grant.ending-soon', {
+      void this.notify(holder, 'manual.grant.ending-soon', {
         tierName: this.config.tiers[active.tierId]?.displayName || active.tierId,
         endDate: active.endDate,
       }, { standalone: 'endingSoonNotified is memory' });
@@ -4469,6 +4722,7 @@ export class PremiumManager {
   }
 
   setMessages(partial: Partial<PremiumMessages>): boolean {
+    if (emptyUserBlocked(partial)) throw new Error(EMPTY_USER_BLOCKED);
     if (this.refusedAtEntry()) return false;
     const before = { ...this.config.messages };
     this.config.messages = { ...this.config.messages, ...partial };
@@ -4534,11 +4788,11 @@ export class PremiumManager {
 
   /** Pending migrations that affect this guild (source variant matches a
    * sub the guild owns and migration is still pending). */
-  getPendingMigrationsForGuild(guildId: string): Migration[] {
+  getPendingMigrationsFor(holder: HolderKey): Migration[] {
     this.ensureLoaded();
     return this.config.migrations
       .filter(m => m.status === 'pending')
-      .filter(m => m.decisions.some(d => d.guildId === guildId))
+      .filter(m => m.decisions.some(d => d.holder === holder))
       .map(m => JSON.parse(JSON.stringify(m)));
   }
 
@@ -4609,6 +4863,7 @@ export class PremiumManager {
     const sourceTier = this.config.tiers[opts.sourceTierId];
     const targetTier = this.config.tiers[opts.targetTierId];
     if (!sourceTier || !targetTier) throw new Error('Unknown source or target tier.');
+    if (tierKind(sourceTier) === 'user' || tierKind(targetTier) === 'user') throw new Error(NO_PRICE_CHANGE_FOR_USERS);
     const sourceOffering = sourceTier.offerings.find(o => o.id === opts.sourceOfferingId);
     const targetOffering = targetTier.offerings.find(o => o.id === opts.targetOfferingId);
     if (!sourceOffering || !targetOffering) throw new Error('Unknown source or target offering.');
@@ -4619,8 +4874,10 @@ export class PremiumManager {
       throw new Error(`Target variant '${opts.targetVariantId}' is not on offering '${opts.targetOfferingId}' for provider '${opts.providerId}'.`);
     }
 
-    const decisions: MigrationGuildDecision[] = [];
-    for (const [guildId, subs] of Object.entries(this.config.subscriptions)) {
+    const decisions: MigrationHolderDecision[] = [];
+    for (const holder of this.holders()) {
+      if (this.kindOf(holder) !== 'guild') continue;
+      const subs = this.config.subscriptions[holder];
       const candidates: Subscription[] = [];
       if (subs.active) candidates.push(subs.active);
       candidates.push(...subs.paused);
@@ -4630,7 +4887,7 @@ export class PremiumManager {
         if (sub.variantId !== opts.sourceVariantId) continue;
         if (!sub.providerSubId) continue;
         decisions.push({
-          guildId,
+          holder,
           subscriptionId: sub.id,
           providerSubId: sub.providerSubId,
           decision: 'pending',
@@ -4680,9 +4937,9 @@ export class PremiumManager {
       details: opts.message || `Your subscription will move from "${sourceTier.displayName}" to "${targetTier.displayName}". Open the subscription panel to accept or decline.`,
     };
     for (const d of migration.decisions) {
-      void this.notify(d.guildId, 'migration.scheduled', notice, { carry }, (outcome) => {
+      void this.notify(d.holder, 'migration.scheduled', notice, { carry }, (outcome) => {
         if (outcome.delivered) this.markMigrationNotified(migration.id, d.subscriptionId, new Date().toISOString());
-        else console.warn(`[PremiumManager] Migration ${migration.id} request not delivered to guild ${d.guildId}: ${outcome.cause}`);
+        else console.warn(`[PremiumManager] Migration ${migration.id} request not delivered to ${holderWords(d.holder)}: ${outcome.cause}`);
       });
     }
     if (this.save({ carry }) === null) throw new Error('Failed to persist migration.');
@@ -4697,7 +4954,7 @@ export class PremiumManager {
     const entry = migration?.decisions.find(d => d.subscriptionId === subscriptionId);
     if (!entry || entry.notifiedAt) return;
     entry.notifiedAt = stamp;
-    if (this.save() === null) console.warn(`[PremiumManager] Migration ${migrationId}: delivery to guild ${entry.guildId} not recorded (save failed)`);
+    if (this.save() === null) console.warn(`[PremiumManager] Migration ${migrationId}: delivery to ${holderWords(entry.holder)} not recorded (save failed)`);
   }
 
   /**
@@ -4705,14 +4962,16 @@ export class PremiumManager {
    * same decision is a no-op; flipping is allowed up until the migration
    * is applied.
    */
-  recordMigrationDecision(migrationId: string, guildId: string, decision: 'accepted' | 'declined'): boolean {
+  recordMigrationDecision(migrationId: string, holder: HolderKey, decision: 'accepted' | 'declined'): boolean {
+    // Price changes are a server's until a user has a page to decide on (sheet P1, X11): no decision exists for a user.
+    if (this.holderArg(holder).kind === 'user') return false;
     if (this.refusedAtEntry()) return false;
     if (decision !== 'accepted' && decision !== 'declined') return false;
     const migration = this.config.migrations.find(m => m.id === migrationId);
     if (!migration) return false;
     if (migration.status !== 'pending') return false;
     if (this.migrating.has(migrationId)) throw new MigrationBusy();
-    const entry = migration.decisions.find(d => d.guildId === guildId);
+    const entry = migration.decisions.find(d => d.holder === holder);
     if (!entry) return false;
     if (entry.decision === decision) return true;
     entry.decision = decision;
@@ -4722,12 +4981,12 @@ export class PremiumManager {
       timestamp: entry.decidedAt,
       actor: 'guild-owner',
       action: 'migration.decision',
-      guildId,
+      holder,
       migrationId,
       metadata: { decision },
     }, { carry });
     const targetTier = this.config.tiers[migration.targetTierId];
-    void this.notify(guildId, decision === 'accepted' ? 'migration.accepted' : 'migration.declined', {
+    void this.notify(holder, decision === 'accepted' ? 'migration.accepted' : 'migration.declined', {
       tierName: targetTier?.displayName || migration.targetTierId,
       endDate: migration.effectiveDate,
     }, { carry });
@@ -4846,7 +5105,7 @@ export class PremiumManager {
       const decidedEarlier = decided;
       decided = true;
       // Skip if guild lost their sub (cancelled before effective date).
-      const subs = this.config.subscriptions[decision.guildId];
+      const subs = this.config.subscriptions[decision.holder];
       if (!subs) {
         decision.outcome = 'skipped';
         decision.outcomeNote = 'guild has no subscriptions';
@@ -4891,11 +5150,18 @@ export class PremiumManager {
       if (wasSilent) decision.decision = 'silent-applied';
 
       try {
-        if (effective === 'accepted') {
+        const targetNow = this.config.tiers[migration.targetTierId];
+        if (effective === 'accepted' && !targetNow) {
+          decision.outcome = 'failed';
+          decision.outcomeNote = 'the target tier no longer exists';
+        } else if (effective === 'accepted' && tierKind(targetNow) !== this.kindOf(decision.holder)) {
+          decision.outcome = 'failed';
+          decision.outcomeNote = `the target tier is now a ${kindWord(tierKind(targetNow))} tier`;
+        } else if (effective === 'accepted') {
           const state = await provider.migrateSubscriptionPrice(sub.providerSubId, migration.targetVariantId, 'none');
           // Update local cache to match the new variant. Provider webhooks
           // may also fire and we'll reconcile on top.
-          const current = this.subscriptionById(decision.guildId, sub.id);
+          const current = this.subscriptionById(decision.holder, sub.id);
           if (current && state) this.copyProviderState(current, state);
           if (current) {
             current.tierId = migration.targetTierId;
@@ -4909,7 +5175,7 @@ export class PremiumManager {
           const state = provider.cancelSubscription && provider.capabilities.supportsCancel
             ? await provider.cancelSubscription(sub.providerSubId, false)
             : undefined;
-          const current = this.subscriptionById(decision.guildId, sub.id);
+          const current = this.subscriptionById(decision.holder, sub.id);
           if (current && state) this.copyProviderState(current, state);
           if (current) {
             current.autoRenew = false;
@@ -4928,15 +5194,18 @@ export class PremiumManager {
         decision.outcomeNote = err?.message || String(err);
       }
       decision.appliedAt = stamp;
+      if (decision.outcome === 'failed') {
+        console.warn(`[PremiumManager] The price change ${migration.id} was not applied for ${holderWords(decision.holder)}: ${decision.outcomeNote}`);
+      }
 
       // Per-decision notification.
       if (wasSilent && (decision.outcome === 'migrated' || decision.outcome === 'cancelled')) {
-        void this.notify(decision.guildId, 'migration.silence-applied', {
+        void this.notify(decision.holder, 'migration.silence-applied', {
           tierName: targetTier?.displayName || migration.targetTierId,
           details: policy === 'continue' ? 'Migrated to the new plan automatically.' : 'Set to cancel at period end.',
         }, { carry });
       } else if (!wasSilent && decision.outcome === 'migrated') {
-        void this.notify(decision.guildId, 'migration.applied', {
+        void this.notify(decision.holder, 'migration.applied', {
           tierName: targetTier?.displayName || migration.targetTierId,
           providerName: this.providerDisplayName(migration.providerId),
         }, { carry });
@@ -4995,16 +5264,12 @@ export class PremiumManager {
     if (!config.tiers.free) {
       config.tiers.free = { displayName: 'Free', priority: 0, overrides: {}, offerings: [] };
     }
-    this.config = {
-      tiers: config.tiers,
-      subscriptions: config.subscriptions || {},
-      messages: { ...DEFAULT_MESSAGES, ...(config.messages || {}) },
-      providerAccountLinks: config.providerAccountLinks || {},
-      activatedProviders: config.activatedProviders || {},
-      migrations: Array.isArray(config.migrations) ? config.migrations : [],
-      migrationSilencePolicy: config.migrationSilencePolicy === 'continue' ? 'continue' : 'cancel',
-      ...(this.config.eventsApplied ? { eventsApplied: this.config.eventsApplied } : {}),
-    };
+    const leftOut: LeftOut = { records: 0, noBuyer: 0, links: 0, decisions: 0 };
+    const { eventsApplied: _given, ...kept } = normalizeConfig(config, leftOut);
+    this.config = { ...kept, ...(this.config.eventsApplied ? { eventsApplied: this.config.eventsApplied } : {}) };
+    if (leftOutTotal(leftOut) > 0) {
+      console.warn(`[PremiumManager] The configuration given to setFullConfig holds entries this version does not read: ${leftOutCounts(leftOut)}. They are left out of what is saved.`);
+    }
     return this.save() !== null;
   }
 }

@@ -51,6 +51,7 @@ import { sharedOpFailure } from '../../src/webui/routes/hopFailure';
 import { releaseWriterLock, writerLockDepth, writerLockPath } from '../../src/bot/internalSetup/utils/writerLock';
 import { freshWriterLock, resetForks } from '../helpers/nb10Rig';
 import { AUDIT, clearGlobal, gate, jsonOf, linesOf, logged, paidSub, PREMIUM, quiet, settleQueue, tick, writePremium } from './nb10PremiumRig';
+import { gh } from '../helpers/p1Holder';
 
 const G = '900000000000000766';
 const G2 = '900000000000000767';
@@ -86,7 +87,7 @@ afterEach(async () => {
 
 describe('an install line refused after the stop (D1)', () => {
   const installLine = (webhook: boolean) => {
-    const entry = { timestamp: new Date().toISOString(), actor: 'provider', action: 'subscription.install.paid', guildId: G, subscriptionId: 'sW' };
+    const entry = { timestamp: new Date().toISOString(), actor: 'provider', action: 'subscription.install.paid', holder: gh(G), subscriptionId: 'sW' };
     return { line: `${JSON.stringify(entry)}\n`, entry, install: { state: 'queued', webhook, line: `${JSON.stringify(entry)}\n`, entry, providerSubId: 'pW' } };
   };
 
@@ -114,18 +115,18 @@ describe('an install line refused after the stop (D1)', () => {
 describe('expire now whose subscription another op removed during the provider call (D2, O2)', () => {
   it("answers held when that op's save is held, and ok once the disk took the save", async () => {
     process.env.BOT_PROCESS_ROLE = 'bot';
-    writePremium({ [G]: { active: paidSub('sA', 'pA', 'low', 'patreon'), paused: [] } });
+    writePremium({ [gh(G)]: { active: paidSub('sA', 'pA', 'low', 'patreon'), paused: [] } });
     const cancel = gate();
     getPaymentRegistry().register({
-      id: 'patreon', displayName: 'patreon', capabilities: { supportsCancel: true }, isConfigured: () => true,
+      id: 'patreon', displayName: 'patreon', capabilities: { sells: ['guild'], supportsCancel: true }, isConfigured: () => true,
       cancelSubscription: async () => { await cancel.promise; },
     } as any);
-    const answer = op('premium.cancelPaidSubscriptionImmediately', G);
+    const answer = op('premium.cancelPaidSubscriptionImmediately', gh(G));
     await tick();
     inject.refuse.set('premium-tiers.json', 'storage-failing');
     const other = await runSealed('console', null, null, async ledger => {
       const pm = getPremiumManager() as any;
-      delete pm.config.subscriptions[G];
+      delete pm.config.subscriptions[gh(G)];
       pm.save();
       return verdictOf([ledger]);
     });
@@ -136,7 +137,7 @@ describe('expire now whose subscription another op removed during the provider c
     expect(sharedOpFailure(reply)).not.toBeNull();
     expect(reply.error).toContain('the bot keeps retrying');
     inject.refuse.clear();
-    await vi.waitFor(() => expect(jsonOf(PREMIUM).subscriptions[G]).toBeUndefined(), { timeout: 5000, interval: 50 });
+    await vi.waitFor(() => expect(jsonOf(PREMIUM).subscriptions[gh(G)]).toBeUndefined(), { timeout: 5000, interval: 50 });
   });
 });
 
@@ -174,7 +175,7 @@ function migrateProvider(): MigrateProvider {
   };
   const p: MigrateProvider = { migrates: [], cancels: [], open: id => of(id).open(undefined) };
   getPaymentRegistry().register({
-    id: 'patreon', displayName: 'patreon', capabilities: { supportsCancel: true, supportsPause: true }, isConfigured: () => true,
+    id: 'patreon', displayName: 'patreon', capabilities: { sells: ['guild'], supportsCancel: true, supportsPause: true }, isConfigured: () => true,
     cancelSubscription: async (id: string) => { p.cancels.push(id); },
     pauseSubscription: async () => undefined,
     migrateSubscriptionPrice: async (id: string) => { p.migrates.push(id); await of(id).promise; },
@@ -191,14 +192,14 @@ function migration(id: string, decisions: unknown[]) {
 }
 
 const silent = (guildId: string, subscriptionId: string, providerSubId: string) =>
-  ({ guildId, subscriptionId, providerSubId, decision: 'pending', notifiedAt: new Date().toISOString() });
+  ({ holder: gh(guildId), subscriptionId, providerSubId, decision: 'pending', notifiedAt: new Date().toISOString() });
 
 const onV1 = (id: string, providerSubId: string) => ({ ...paidSub(id, providerSubId, 'low', 'patreon'), variantId: 'v1' });
 
 describe('due migrations are read again before each one, and a stop ends the run (O1, O4)', () => {
   it('a migration cancelled while an earlier one runs stays cancelled, and none of its subscribers is called', async () => {
     writePremium(
-      { [G]: { active: onV1('s1', 'p1'), paused: [] }, [G2]: { active: onV1('s2', 'p2'), paused: [] } },
+      { [gh(G)]: { active: onV1('s1', 'p1'), paused: [] }, [gh(G2)]: { active: onV1('s2', 'p2'), paused: [] } },
       { migrationSilencePolicy: 'continue', migrations: [migration('m1', [silent(G, 's1', 'p1')]), migration('m2', [silent(G2, 's2', 'p2')])] },
     );
     const provider = migrateProvider();
@@ -217,13 +218,13 @@ describe('due migrations are read again before each one, and a stop ends the run
     expect(provider.cancels).toEqual([]);
     const stored = jsonOf(PREMIUM);
     expect(stored.migrations.map((m: any) => [m.id, m.status])).toEqual([['m1', 'applied'], ['m2', 'cancelled']]);
-    expect(stored.subscriptions[G2].active.variantId).toBe('v1');
+    expect(stored.subscriptions[gh(G2)].active.variantId).toBe('v1');
     expect(linesOf(AUDIT).filter(l => l.action === 'migration.applied').map(l => l.migrationId)).toEqual(['m1']);
   });
 
   it('a stop during a run makes no further provider call and does not mark the migration applied', async () => {
     writePremium(
-      { [G]: { active: onV1('s1', 'p1'), paused: [] }, [G2]: { active: onV1('s2', 'p2'), paused: [] } },
+      { [gh(G)]: { active: onV1('s1', 'p1'), paused: [] }, [gh(G2)]: { active: onV1('s2', 'p2'), paused: [] } },
       { migrationSilencePolicy: 'continue', migrations: [migration('m1', [silent(G, 's1', 'p1'), silent(G2, 's2', 'p2')])] },
     );
     const provider = migrateProvider();
@@ -248,14 +249,14 @@ describe('a partial answer names what was saved and asks for a reload (ruling)',
   // during the pause leaves nothing unsaved and the op answers ok (NB10 answered partial, its grant line written after
   // the pause). The partial texts stay pinned by the next row.
   it('a grant stopped during the pause answers ok: its save before the pause stored the grant and both lines', async () => {
-    writePremium({ [G]: { active: paidSub('sA', 'pA', 'low', 'patreon'), paused: [] } });
+    writePremium({ [gh(G)]: { active: paidSub('sA', 'pA', 'low', 'patreon'), paused: [] } });
     const pause = gate();
     getPaymentRegistry().register({
-      id: 'patreon', displayName: 'patreon', capabilities: { supportsCancel: true, supportsPause: true }, isConfigured: () => true,
+      id: 'patreon', displayName: 'patreon', capabilities: { sells: ['guild'], supportsCancel: true, supportsPause: true }, isConfigured: () => true,
       cancelSubscription: async () => undefined,
       pauseSubscription: async () => { await pause.promise; },
     } as any);
-    const answer = op('premium.grantManual', G, 'high', 5);
+    const answer = op('premium.grantManual', gh(G), 'high', 5);
     await tick();
     await settleQueue();
     (getPremiumManager() as any).stopped = 'stopping';
@@ -265,7 +266,7 @@ describe('a partial answer names what was saved and asks for a reload (ruling)',
     expect(reply).toMatchObject({ ok: true, result: true });
     expect(reply.error).toBeUndefined();
     await settleQueue();
-    expect(jsonOf(PREMIUM).subscriptions[G].active.source).toBe('manual');
+    expect(jsonOf(PREMIUM).subscriptions[gh(G)].active.source).toBe('manual');
     expect(linesOf(AUDIT).map(l => l.action)).toEqual(['subscription.grant.manual', 'subscription.pause']);
   });
 

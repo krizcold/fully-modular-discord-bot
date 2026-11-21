@@ -34,6 +34,8 @@ import { getPremiumManager, resetPremiumManager } from '../../src/bot/internalSe
 import { getPaymentRegistry } from '../../src/bot/internalSetup/utils/payment/paymentRegistry';
 import { markPaymentLedger, runSealed } from '../../src/bot/internalSetup/utils/dataBackends/writeLedger';
 import { AUDIT, clearGlobal, gate, linesOf, logged, paidSub, quiet, settleQueue, state, tick, writePremium } from './nb10PremiumRig';
+import { gh } from '../helpers/p1Holder';
+import { allowDropLines } from '../helpers/p1Guard';
 
 const role = process.env.BOT_PROCESS_ROLE;
 const AUDIT_DOC = 'global:/premium-tiers.audit.jsonl';
@@ -44,13 +46,13 @@ function newProcess(): Manager {
   resetPremiumManager();
   reg.current = null;
   getPaymentRegistry().register({
-    id: 'fake', displayName: 'Fake', capabilities: { supportsCancel: true }, isConfigured: () => true,
+    id: 'fake', displayName: 'Fake', capabilities: { sells: ['guild'], supportsCancel: true }, isConfigured: () => true,
     cancelSubscription: () => cancelGate.promise,
   } as any);
   return getPremiumManager();
 }
-const created = (providerSubId: string, guildId = 'g1') => ({
-  type: 'subscription.created', providerId: 'fake', providerSubId, guildId, tierId: 'low', offeringId: 'o1', state: state(),
+const created = (providerSubId: string, guildId = '70000000000000001') => ({
+  type: 'subscription.created', buyerId: '80000000000000001', providerId: 'fake', providerSubId, holder: gh(guildId), tierId: 'low', offeringId: 'o1', state: state(),
 });
 /** A webhook delivery of the event in a payment op; answers the op's ledger. */
 function redeliver(pm: Manager, event: object) {
@@ -63,7 +65,7 @@ function redeliver(pm: Manager, event: object) {
 }
 const installLines = () => linesOf(AUDIT).filter(l => l?.action === 'subscription.install.paid');
 const auditLine = (entry: object) => `${JSON.stringify({ timestamp: 't', actor: 'admin', ...entry })}\n`;
-const withS1 = () => writePremium({ g1: { active: paidSub('s1', 'ps1'), paused: [] } });
+const withS1 = () => writePremium({ 'guild:70000000000000001': { active: paidSub('s1', 'ps1'), paused: [] } });
 
 async function until(check: () => boolean, ms = 2000): Promise<void> {
   const end = Date.now() + ms;
@@ -99,6 +101,7 @@ afterAll(() => {
 
 describe('an install that fails', () => {
   it('leaves none of its audit line and notice for the exit to report', async () => {
+    allowDropLines('install');
     withS1();
     const pm = newProcess();
     getPaymentRegistry().emitEvent(created('ps9') as any);
@@ -125,7 +128,7 @@ describe("a redelivery's read of the audit file", () => {
 
   it('counts an install line whose metadata is null', async () => {
     withS1();
-    fs.writeFileSync(AUDIT, auditLine({ action: 'subscription.install.paid', guildId: 'g1', subscriptionId: 's1', metadata: null }));
+    fs.writeFileSync(AUDIT, auditLine({ action: 'subscription.install.paid', holder: 'guild:70000000000000001', subscriptionId: 's1', metadata: null }));
     const pm = newProcess();
     const ledger = await redeliver(pm, created('ps1'));
     await settleQueue();
@@ -136,7 +139,7 @@ describe("a redelivery's read of the audit file", () => {
 
   it('counts an install line whose metadata is text', async () => {
     withS1();
-    fs.writeFileSync(AUDIT, auditLine({ action: 'subscription.install.paid', guildId: 'g1', subscriptionId: 's1', metadata: 'notSaved' }));
+    fs.writeFileSync(AUDIT, auditLine({ action: 'subscription.install.paid', holder: 'guild:70000000000000001', subscriptionId: 's1', metadata: 'notSaved' }));
     const pm = newProcess();
     const ledger = await redeliver(pm, created('ps1'));
     await settleQueue();
@@ -147,7 +150,7 @@ describe("a redelivery's read of the audit file", () => {
 
   it('is made again after the cache is dropped, for a line read from the file', async () => {
     withS1();
-    fs.writeFileSync(AUDIT, auditLine({ action: 'subscription.install.paid', guildId: 'g1', subscriptionId: 's1' }));
+    fs.writeFileSync(AUDIT, auditLine({ action: 'subscription.install.paid', holder: 'guild:70000000000000001', subscriptionId: 's1' }));
     const pm = newProcess();
     await redeliver(pm, created('ps1'));
     await settleQueue();
@@ -163,17 +166,17 @@ describe("a redelivery's read of the audit file", () => {
 
   it('is made again after the cache is dropped, for a line this process wrote and landed', async () => {
     const pm = newProcess();
-    getPaymentRegistry().emitEvent(created('psN', 'g3') as any);
+    getPaymentRegistry().emitEvent(created('psN', '70000000000000003') as any);
     await pm.settled(undefined);
     await settleQueue();
     expect(installLines()).toHaveLength(1);
     fs.rmSync(AUDIT, { force: true });
     pm.invalidate();
-    await redeliver(pm, created('psN', 'g3'));
+    await redeliver(pm, created('psN', '70000000000000003'));
     await settleQueue();
     const lines = installLines();
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toMatchObject({ guildId: 'g3', metadata: { redelivered: true } });
+    expect(lines[0]).toMatchObject({ holder: 'guild:70000000000000003', metadata: { redelivered: true } });
   });
 });
 
@@ -198,7 +201,7 @@ describe('a stop during the provider call of a cancel', () => {
     withS1();
     const pm = newProcess();
     const refused = await runSealed('console', null, 'premium', async ledger => {
-      const cancelled = pm.cancelPaidSubscription('g1');
+      const cancelled = pm.cancelPaidSubscription('guild:70000000000000001');
       await tick(2);
       pm.markStopped('stopping');
       cancelGate.open(state());

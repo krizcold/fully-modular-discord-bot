@@ -122,7 +122,7 @@ describe('the local chain with storage-failing injected (NB10 test 20)', () => {
   it('premium.grantManual answers not saved with the provider sentence, and the route says nothing was saved', async () => {
     const before = rawOf(PREMIUM);
     refuse('premium-tiers.json', 'premium-tiers.audit.jsonl');
-    const reply = await new BotManager().runSharedOp('premium.grantManual', { args: ['g1', 'high', 30] });
+    const reply = await new BotManager().runSharedOp('premium.grantManual', { args: ['guild:70000000000000001', 'high', 30] });
     expect(reply).toMatchObject({ ok: false, code: 'unconfirmed', answer: STORAGE, partial: false });
     expect(reply.error).toBe(`${truthText(STORAGE, false)} ${PROVIDER_SENTENCE}`);
     const route = await routeAnswer(reply);
@@ -151,10 +151,10 @@ describe('the local chain with storage-failing injected (NB10 test 20)', () => {
 
   it('payment.webhook answers not ok and the webhook route answers 503 with nothing claimed saved', async () => {
     getPaymentRegistry().register({
-      id: 'hook', displayName: 'Hook', capabilities: {}, isConfigured: () => true,
+      id: 'hook', displayName: 'Hook', capabilities: { sells: ['guild'] }, isConfigured: () => true,
       handleWebhook: async (body: Buffer) => { getPaymentRegistry().emitEvent(JSON.parse(body.toString())); },
     } as any);
-    const event = { type: 'subscription.created', providerId: 'hook', providerSubId: 'h1', guildId: 'g5', tierId: 'low', offeringId: 'o1', state: { status: 'active', startDate: new Date().toISOString(), endDate: null, autoRenew: true } };
+    const event = { type: 'subscription.created', buyerId: '80000000000000001', providerId: 'hook', providerSubId: 'h1', holder: 'guild:70000000000000005', tierId: 'low', offeringId: 'o1', state: { status: 'active', startDate: new Date().toISOString(), endDate: null, autoRenew: true } };
     refuse('premium-tiers.json', 'premium-tiers.audit.jsonl');
     const reply = await new BotManager().runSharedOp('payment.webhook', { providerId: 'hook', body: Buffer.from(JSON.stringify(event)).toString('base64') });
     expect(reply).toMatchObject({ ok: false, answer: STORAGE });
@@ -162,7 +162,7 @@ describe('the local chain with storage-failing injected (NB10 test 20)', () => {
     expect(answer.status).toBe(503);
     expect(answer.body.error).toBe(`${truthText(STORAGE, false)} ${PROVIDER_SENTENCE}`);
     await settleQueue();
-    expect(jsonOf(PREMIUM).subscriptions.g5).toBeUndefined();
+    expect(jsonOf(PREMIUM).subscriptions['guild:70000000000000005']).toBeUndefined();
   });
 });
 

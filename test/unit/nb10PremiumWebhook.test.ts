@@ -51,6 +51,7 @@ import { webhookAnswer } from '../../src/webui/routes/hopFailure';
 import { cancelQueued, queuedFilePaths } from '../../src/bot/internalSetup/utils/dataBackends/fileBackend';
 import { AUDIT, clearGlobal, gate, jsonOf, linesOf, logged, paidSub, PREMIUM, quiet, rawOf, settleQueue, state, tick, writePremium } from './nb10PremiumRig';
 import { stubAppendHandles } from '../helpers/fileHandleStub';
+import { gh } from '../helpers/p1Holder';
 
 const role = process.env.BOT_PROCESS_ROLE;
 const asBot = (bot: boolean) => {
@@ -66,14 +67,14 @@ const pauses = new Map<string, ReturnType<typeof gate<void>>>();
 const pauseCalls: string[] = [];
 function registerFake(): void {
   getPaymentRegistry().register({
-    id: 'fake', displayName: 'Fake', capabilities: { supportsPause: true }, isConfigured: () => true,
+    id: 'fake', displayName: 'Fake', capabilities: { sells: ['guild'], supportsPause: true }, isConfigured: () => true,
     handleWebhook: async (body: Buffer) => { getPaymentRegistry().emitEvent(JSON.parse(body.toString())); },
     pauseSubscription: (providerSubId: string) => { pauseCalls.push(providerSubId); return (pauses.get(providerSubId) ?? pause).promise; },
-    listSubscriptionsForGuild: async (guildId: string) => (guildId === 'g3'
-      ? [{ providerSubId: 'orph1', metadata: { tierId: 'low', offeringId: 'o1' }, state: state() }]
+    listSubscriptionsFor: async (holder: string) => (holder === 'guild:70000000000000003'
+      ? [{ providerSubId: 'orph1', metadata: { buyerId: '80000000000000001', tierId: 'low', offeringId: 'o1' }, state: state() }]
       : []),
   } as any);
-  getPaymentRegistry().register({ id: 'boost', displayName: 'Boost', capabilities: {}, isConfigured: () => true } as any);
+  getPaymentRegistry().register({ id: 'boost', displayName: 'Boost', capabilities: { sells: ['guild'] }, isConfigured: () => true } as any);
 }
 
 /** Writes to the audit file fail with EIO before any byte while `on`. */
@@ -102,8 +103,8 @@ const answers503 = (reply: any) => {
   expect(reply).toMatchObject({ ok: false });
   expect(webhookAnswer(reply).status).toBe(503);
 };
-const created = (providerSubId: string, guildId = 'g1', tierId = 'low') => ({
-  type: 'subscription.created', providerId: 'fake', providerSubId, guildId, tierId, offeringId: tierId === 'low' ? 'o1' : 'o2', state: state(),
+const created = (providerSubId: string, guildId = '70000000000000001', tierId = 'low') => ({
+  type: 'subscription.created', buyerId: '80000000000000001', providerId: 'fake', providerSubId, holder: gh(guildId), tierId, offeringId: tierId === 'low' ? 'o1' : 'o2', state: state(),
 });
 const deliver = (event: object) => applySharedOp({ op: 'payment.webhook', args: { providerId: 'fake', body: Buffer.from(JSON.stringify(event)).toString('base64'), signature: '' } });
 /** The bot answers a delivery itself; the web UI sends it through BotManager's local chain, its write gate and the writer lock. */
@@ -167,7 +168,7 @@ describe.each([['in the bot', true], ['in the local chain', false]])('test 19: a
   localChainHooks(bot);
   it('no answer while the provider pause is open; a second delivery answers after it; one subscription', async () => {
     asBot(bot);
-    writePremium({ g1: { active: manualHigh(), paused: [] } });
+    writePremium({ 'guild:70000000000000001': { active: manualHigh(), paused: [] } });
     pause = gate();
     let firstDone = false;
     const first = send(created('ps1')).then(r => { firstDone = true; return r; });
@@ -177,11 +178,11 @@ describe.each([['in the bot', true], ['in the local chain', false]])('test 19: a
     expect(firstDone).toBe(false);
     pause.open();
     expect(await first).toMatchObject({ ok: true });
-    expect(jsonOf(PREMIUM).subscriptions.g1.paused).toHaveLength(1);
+    expect(jsonOf(PREMIUM).subscriptions['guild:70000000000000001'].paused).toHaveLength(1);
     expect(installLines()).toHaveLength(1);
     expect(await second).toMatchObject({ ok: true });
     await settleQueue();
-    expect(jsonOf(PREMIUM).subscriptions.g1.paused).toHaveLength(1);
+    expect(jsonOf(PREMIUM).subscriptions['guild:70000000000000001'].paused).toHaveLength(1);
     expect(installLines()).toHaveLength(1);
     if (!bot) expect(fs.existsSync(writerLockPath())).toBe(false);
   });
@@ -193,7 +194,7 @@ describe('test 19 through the web UI chain (BotManager, the shared write gate an
     setSharedWriteGate(() => inLocalOp());
     freshWriterLock('webui');
     try {
-      writePremium({ g1: { active: manualHigh(), paused: [] } });
+      writePremium({ 'guild:70000000000000001': { active: manualHigh(), paused: [] } });
       pause = gate();
       let done = false;
       const body = Buffer.from(JSON.stringify(created('ps9'))).toString('base64');
@@ -203,7 +204,7 @@ describe('test 19 through the web UI chain (BotManager, the shared write gate an
       expect(JSON.parse(fs.readFileSync(writerLockPath(), 'utf8'))).toMatchObject({ pid: process.pid, role: 'webui' });
       pause.open();
       expect(await reply).toMatchObject({ ok: true });
-      expect(jsonOf(PREMIUM).subscriptions.g1.paused).toHaveLength(1);
+      expect(jsonOf(PREMIUM).subscriptions['guild:70000000000000001'].paused).toHaveLength(1);
       expect(linesOf(AUDIT).filter(l => l.action === 'subscription.install.paid')).toHaveLength(1);
       expect(logged(spies.error).some(l => l.includes('writes data files only inside a change it applies itself'))).toBe(false);
       expect(fs.existsSync(writerLockPath())).toBe(false);
@@ -215,7 +216,7 @@ describe('test 19 through the web UI chain (BotManager, the shared write gate an
 
 describe('test 37: an op waits only for the installs started under its own ledger', () => {
   it('premium.setMessages answers while an entitlement install is held open; a webhook answers only after its own', async () => {
-    writePremium({ g1: { active: manualHigh(), paused: [] } });
+    writePremium({ 'guild:70000000000000001': { active: manualHigh(), paused: [] } });
     getPremiumManager();
     const entPause = gate();
     const hookPause = gate();
@@ -230,7 +231,7 @@ describe('test 37: an op waits only for the installs started under its own ledge
     await settleQueue();
     expect(installLines()).toHaveLength(1);
     let done = false;
-    const hook = deliver(created('ps2', 'g1')).then(r => { done = true; return r; });
+    const hook = deliver(created('ps2', '70000000000000001')).then(r => { done = true; return r; });
     await vi.waitFor(() => expect(pauseCalls).toEqual(['ent1', 'ps2']), { timeout: 5000, interval: 5 });
     expect(done).toBe(false);
     await settleQueue();
@@ -254,7 +255,7 @@ describe('test 35: redeliveries', () => {
     expect(await deliver(created('ps1'))).toMatchObject({ ok: true });
     await settleQueue();
     expect(installLines()).toHaveLength(1);
-    expect(Object.keys(jsonOf(PREMIUM).subscriptions)).toEqual(['g1']);
+    expect(Object.keys(jsonOf(PREMIUM).subscriptions)).toEqual(['guild:70000000000000001']);
   });
 
   it('only premium-tiers.json refused: a redelivery is answered on its own save of the file, not on the landed line', async () => {
@@ -262,7 +263,7 @@ describe('test 35: redeliveries', () => {
     answers503(await deliver(created('ps1')));
     await vi.waitFor(() => expect(installLines()).toHaveLength(1), { timeout: 10_000, interval: 20 });
     answers503(await deliver(created('ps1')));
-    expect(jsonOf(PREMIUM)?.subscriptions?.g1).toBeUndefined();
+    expect(jsonOf(PREMIUM)?.subscriptions?.['guild:70000000000000001']).toBeUndefined();
     expect(installLines()).toHaveLength(1);
     recover();
     const real = fs.promises.rename.bind(fs.promises);
@@ -271,14 +272,14 @@ describe('test 35: redeliveries', () => {
       return real(from, to);
     }) as typeof fs.promises.rename);
     let onDisk: unknown = 'unanswered';
-    const third = deliver(created('ps1')).then(r => { onDisk = jsonOf(PREMIUM)?.subscriptions?.g1?.paused?.[0]?.providerSubId ?? jsonOf(PREMIUM)?.subscriptions?.g1?.active?.providerSubId ?? null; return r; });
+    const third = deliver(created('ps1')).then(r => { onDisk = jsonOf(PREMIUM)?.subscriptions?.['guild:70000000000000001']?.paused?.[0]?.providerSubId ?? jsonOf(PREMIUM)?.subscriptions?.['guild:70000000000000001']?.active?.providerSubId ?? null; return r; });
     await tick(50);
     expect(onDisk).toBe('unanswered');
     expect(await third).toMatchObject({ ok: true });
     expect(onDisk).toBe('ps1');
     await settleQueue();
     expect(installLines()).toHaveLength(1);
-    expect(Object.keys(jsonOf(PREMIUM).subscriptions)).toEqual(['g1']);
+    expect(Object.keys(jsonOf(PREMIUM).subscriptions)).toEqual(['guild:70000000000000001']);
   });
 
   it("(c) in the web UI with no child: another writer adds B and its line between two local redeliveries; B's redelivery appends no line", async () => {
@@ -286,25 +287,25 @@ describe('test 35: redeliveries', () => {
     setSharedWriteGate(() => inLocalOp());
     freshWriterLock('webui', new Set([process.pid, 5151]));
     try {
-      writePremium({ g1: { active: paidSub('s1', 'ps1'), paused: [] } });
-      const line = (guildId: string, subscriptionId: string) => `${JSON.stringify({ timestamp: 't', actor: 'admin', action: 'subscription.install.paid', guildId, subscriptionId })}\n`;
-      fs.writeFileSync(AUDIT, line('g1', 's1'));
+      writePremium({ 'guild:70000000000000001': { active: paidSub('s1', 'ps1'), paused: [] } });
+      const line = (guildId: string, subscriptionId: string) => `${JSON.stringify({ timestamp: 't', actor: 'admin', action: 'subscription.install.paid', holder: `guild:${guildId}`, subscriptionId })}\n`;
+      fs.writeFileSync(AUDIT, line('70000000000000001', 's1'));
       const manager = new BotManager();
       const hook = (event: object) => manager.runSharedOp('payment.webhook', { providerId: 'fake', body: Buffer.from(JSON.stringify(event)).toString('base64'), signature: '' });
       expect(await hook(created('ps1'))).toMatchObject({ ok: true });
       expect(fs.existsSync(writerLockPath())).toBe(false);
 
       fs.writeFileSync(writerLockPath(), JSON.stringify({ pid: 5151, start: null, role: 'bot', at: Date.now() }));
-      writePremium({ g1: { active: paidSub('s1', 'ps1'), paused: [] }, g2: { active: paidSub('s2', 'ps2'), paused: [] } });
-      fs.appendFileSync(AUDIT, line('g2', 's2'));
+      writePremium({ 'guild:70000000000000001': { active: paidSub('s1', 'ps1'), paused: [] }, 'guild:70000000000000002': { active: paidSub('s2', 'ps2'), paused: [] } });
+      fs.appendFileSync(AUDIT, line('70000000000000002', 's2'));
       fs.rmSync(writerLockPath());
       const audit = fs.readFileSync(AUDIT, 'utf8');
 
-      expect(await hook(created('ps2', 'g2'))).toMatchObject({ ok: true });
+      expect(await hook(created('ps2', '70000000000000002'))).toMatchObject({ ok: true });
       await settleQueue();
       expect(fs.readFileSync(AUDIT, 'utf8')).toBe(audit);
       expect(linesOf(AUDIT).filter(l => l.action === 'subscription.install.paid').map(l => l.subscriptionId)).toEqual(['s1', 's2']);
-      expect(jsonOf(PREMIUM).subscriptions.g2.active).toMatchObject({ id: 's2', providerSubId: 'ps2' });
+      expect(jsonOf(PREMIUM).subscriptions['guild:70000000000000002'].active).toMatchObject({ id: 's2', providerSubId: 'ps2' });
       expect(fs.existsSync(writerLockPath())).toBe(false);
     } finally {
       setSharedWriteGate(null);
@@ -312,15 +313,15 @@ describe('test 35: redeliveries', () => {
   });
 
   it('two concurrent deliveries install one subscription', async () => {
-    const [a, b] = await Promise.all([deliver(created('ps3', 'g3')), deliver(created('ps3', 'g3'))]);
+    const [a, b] = await Promise.all([deliver(created('ps3', '70000000000000003')), deliver(created('ps3', '70000000000000003'))]);
     expect(a).toMatchObject({ ok: true });
     expect(b).toMatchObject({ ok: true });
-    expect(jsonOf(PREMIUM).subscriptions.g3.active.providerSubId).toBe('ps3');
+    expect(jsonOf(PREMIUM).subscriptions['guild:70000000000000003'].active.providerSubId).toBe('ps3');
     expect(installLines()).toHaveLength(1);
   });
 
   it('a new process with the subscription but no install line: the redelivery writes one marked redelivered, a second writes none', async () => {
-    writePremium({ g1: { active: paidSub('s1', 'ps1'), paused: [] } });
+    writePremium({ 'guild:70000000000000001': { active: paidSub('s1', 'ps1'), paused: [] } });
     fs.writeFileSync(AUDIT, `${JSON.stringify({ timestamp: 't', actor: 'admin', action: 'tier.create', tierId: 'low' })}\n`);
     expect(await deliver(created('ps1'))).toMatchObject({ ok: true });
     const lines = linesOf(AUDIT).filter(l => l.action === 'subscription.install.paid');
@@ -333,36 +334,36 @@ describe('test 35: redeliveries', () => {
   });
 
   it('the audit file that cannot be read: the redelivery answers not ok and appends nothing', async () => {
-    writePremium({ g1: { active: paidSub('s1', 'ps1'), paused: [] } });
+    writePremium({ 'guild:70000000000000001': { active: paidSub('s1', 'ps1'), paused: [] } });
     fs.mkdirSync(AUDIT);
     expect(await deliver(created('ps1'))).toMatchObject({ ok: false, answer: 'io' });
     expect(fs.statSync(AUDIT).isDirectory()).toBe(true);
   });
 
   it('6000 install lines: the oldest subscription is found by the whole-file scan, so no line is appended', async () => {
-    const subs: Record<string, unknown> = { g0: { active: paidSub('s0', 'ps0'), paused: [] } };
+    const subs: Record<string, unknown> = { 'guild:70000000000000000': { active: paidSub('s0', 'ps0'), paused: [] } };
     writePremium(subs);
-    const body = Array.from({ length: 6000 }, (_, i) => JSON.stringify({ timestamp: 't', actor: 'admin', action: 'subscription.install.paid', guildId: `g${i}`, subscriptionId: `s${i}` })).join('\n') + '\n';
+    const body = Array.from({ length: 6000 }, (_, i) => JSON.stringify({ timestamp: 't', actor: 'admin', action: 'subscription.install.paid', holder: `guild:7${String(i).padStart(16, '0')}`, subscriptionId: `s${i}` })).join('\n') + '\n';
     fs.writeFileSync(AUDIT, body);
-    expect(await deliver(created('ps0', 'g0'))).toMatchObject({ ok: true });
+    expect(await deliver(created('ps0', '70000000000000000'))).toMatchObject({ ok: true });
     await settleQueue();
     expect(linesOf(AUDIT)).toHaveLength(6000);
   });
 
   it("a tick's re-emits of 300 installed subscriptions read the audit file zero times and write nothing; 20 redeliveries read it once", async () => {
     const subs: Record<string, unknown> = {};
-    for (let i = 0; i < 300; i++) subs[`g${i}`] = { active: paidSub(`s${i}`, `ps${i}`), paused: [] };
+    for (let i = 0; i < 300; i++) subs[`guild:7${String(i).padStart(16, '0')}`] = { active: paidSub(`s${i}`, `ps${i}`), paused: [] };
     writePremium(subs);
     fs.writeFileSync(AUDIT, '');
     const premiumBefore = fs.readFileSync(PREMIUM, 'utf8');
     getPremiumManager();
-    for (let i = 0; i < 300; i++) getPaymentRegistry().emitEvent(created(`ps${i}`, `g${i}`) as any);
+    for (let i = 0; i < 300; i++) getPaymentRegistry().emitEvent(created(`ps${i}`, `7${String(i).padStart(16, '0')}`) as any);
     await tick(50);
     await settleQueue();
     expect(inject.reads.get(AUDIT) ?? 0).toBe(0);
     expect(fs.readFileSync(PREMIUM, 'utf8')).toBe(premiumBefore);
     expect(linesOf(AUDIT)).toEqual([]);
-    for (let i = 0; i < 20; i++) expect(await deliver(created(`ps${i}`, `g${i}`))).toMatchObject({ ok: true });
+    for (let i = 0; i < 20; i++) expect(await deliver(created(`ps${i}`, `7${String(i).padStart(16, '0')}`))).toMatchObject({ ok: true });
     expect(inject.reads.get(AUDIT)).toBe(1);
   });
 });
@@ -370,25 +371,25 @@ describe('test 35: redeliveries', () => {
 describe('the endings of an install line lost at a stop', () => {
   it('held at the final step: the webhook line names the next delivery, the entitlement line is lost', async () => {
     refuse('premium-tiers.json', 'premium-tiers.audit.jsonl');
-    expect(await deliver(created('ps1', 'g1'))).toMatchObject({ ok: false, answer: 'held' });
+    expect(await deliver(created('ps1', '70000000000000001'))).toMatchObject({ ok: false, answer: 'held' });
     const refusedBefore = inject.refused;
-    getPaymentRegistry().emitEvent(created('ent2', 'g2') as any);
+    getPaymentRegistry().emitEvent(created('ent2', '70000000000000002') as any);
     await vi.waitFor(() => expect(inject.refused).toBeGreaterThan(refusedBefore), { timeout: 5000, interval: 5 });
     getPremiumManager().finalStop();
     const errors = logged(spies.error);
     const hook = errors.find(l => l.includes('subscription ps1'));
     const ent = errors.find(l => l.includes('subscription ent2'));
-    expect(hook).toMatch(/^\[PremiumManager\] The audit line subscription\.install\.paid \(guild g1, subscription ps1\) was refused by the disk before this stop; the webhook was answered 503, and the provider's next delivery of it writes this line, or, when the subscription's own save was lost too, installs the subscription again under a new id with its own line: \{/);
+    expect(hook).toMatch(/^\[PremiumManager\] The audit line subscription\.install\.paid \(guild 70000000000000001, subscription ps1\) was refused by the disk before this stop; the webhook was answered 503, and the provider's next delivery of it writes this line, or, when the subscription's own save was lost too, installs the subscription again under a new id with its own line: \{/);
     expect(hook).not.toContain('redelivered');
-    expect(ent).toMatch(/^\[PremiumManager\] The audit line subscription\.install\.paid \(guild g2, subscription ent2\) was refused by the disk before this stop and is lost: \{/);
+    expect(ent).toMatch(/^\[PremiumManager\] The audit line subscription\.install\.paid \(guild 70000000000000002, subscription ent2\) was refused by the disk before this stop and is lost: \{/);
   });
 
   it('queued and not landed at the exit: the exit handler logs each with its ending, and nothing is called lost twice', async () => {
     fs.mkdirSync(AUDIT);
-    expect(await deliver(created('ps1', 'g1'))).toMatchObject({ ok: false });
-    getPaymentRegistry().emitEvent(created('ent2', 'g2') as any);
+    expect(await deliver(created('ps1', '70000000000000001'))).toMatchObject({ ok: false });
+    getPaymentRegistry().emitEvent(created('ent2', '70000000000000002') as any);
     await vi.waitFor(() => {
-      expect(jsonOf(PREMIUM)?.subscriptions?.g2?.active?.providerSubId).toBe('ent2');
+      expect(jsonOf(PREMIUM)?.subscriptions?.['guild:70000000000000002']?.active?.providerSubId).toBe('ent2');
       expect(queuedFilePaths()).toContain(AUDIT);
     }, { timeout: 5000, interval: 5 });
     const pm = getPremiumManager();
@@ -411,7 +412,7 @@ describe.each([['in the bot', true], ['in the local chain', false]])('test 35, t
   localChainHooks(bot);
   it('a duplicate that arrives while the first install, whose save was refused, awaits the provider answers 503', async () => {
     asBot(bot);
-    writePremium({ g1: { active: manualHigh(), paused: [] } });
+    writePremium({ 'guild:70000000000000001': { active: manualHigh(), paused: [] } });
     const before = fs.readFileSync(PREMIUM, 'utf8');
     pause = gate();
     refuse('premium-tiers.json', 'premium-tiers.audit.jsonl');
@@ -430,7 +431,7 @@ describe.each([['in the bot', true], ['in the local chain', false]])('test 35, t
     if (bot) {
       await vi.waitFor(() => {
         expect(installLines()).toHaveLength(1);
-        expect(jsonOf(PREMIUM).subscriptions.g1.paused.map((p: any) => p.providerSubId)).toEqual(['ps1']);
+        expect(jsonOf(PREMIUM).subscriptions['guild:70000000000000001'].paused.map((p: any) => p.providerSubId)).toEqual(['ps1']);
       }, { timeout: 10_000, interval: 50 });
     } else {
       await settleQueue();
@@ -439,7 +440,7 @@ describe.each([['in the bot', true], ['in the local chain', false]])('test 35, t
       expect(fs.existsSync(writerLockPath())).toBe(false);
       const again: any = await send(created('ps1'));
       expect(again).toMatchObject({ ok: true });
-      expect(jsonOf(PREMIUM).subscriptions.g1.paused.map((p: any) => p.providerSubId)).toEqual(['ps1']);
+      expect(jsonOf(PREMIUM).subscriptions['guild:70000000000000001'].paused.map((p: any) => p.providerSubId)).toEqual(['ps1']);
       expect(installLines()).toHaveLength(1);
       expect(fs.existsSync(writerLockPath())).toBe(false);
     }
@@ -448,16 +449,16 @@ describe.each([['in the bot', true], ['in the local chain', false]])('test 35, t
   it('an install line whose flush fails (EIO): the delivery and a redelivery answer 503 while it is queued, and 200 only once it landed', async () => {
     asBot(bot);
     const audit = failingAudit();
-    answers503(await send(created('ps5', 'g5')));
+    answers503(await send(created('ps5', '70000000000000005')));
     expect(audit.calls).toBeGreaterThan(0);
-    expect(jsonOf(PREMIUM).subscriptions.g5.active.providerSubId).toBe('ps5');
-    answers503(await send(created('ps5', 'g5')));
+    expect(jsonOf(PREMIUM).subscriptions['guild:70000000000000005'].active.providerSubId).toBe('ps5');
+    answers503(await send(created('ps5', '70000000000000005')));
     expect(rawOf(AUDIT) ?? '').toBe('');
     audit.on = false;
-    expect(await send(created('ps5', 'g5'))).toMatchObject({ ok: true });
+    expect(await send(created('ps5', '70000000000000005'))).toMatchObject({ ok: true });
     const lines = installLines();
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toMatchObject({ guildId: 'g5', subscriptionId: jsonOf(PREMIUM).subscriptions.g5.active.id });
+    expect(lines[0]).toMatchObject({ holder: 'guild:70000000000000005', subscriptionId: jsonOf(PREMIUM).subscriptions['guild:70000000000000005'].active.id });
     await settleQueue();
     expect(installLines()).toHaveLength(1);
     if (!bot) expect(fs.existsSync(writerLockPath())).toBe(false);
@@ -472,7 +473,7 @@ describe('test 35 round 4 and round 8 (d): the retry appends the held install li
     const audit = failingAudit();
     recover();
     await vi.waitFor(() => {
-      expect(jsonOf(PREMIUM).subscriptions.g1?.active?.providerSubId).toBe('ps1');
+      expect(jsonOf(PREMIUM).subscriptions['guild:70000000000000001']?.active?.providerSubId).toBe('ps1');
       expect(audit.calls).toBeGreaterThan(0);
     }, { timeout: 10_000, interval: 50 });
     expect(queuedFilePaths()).toContain(AUDIT);
@@ -501,7 +502,7 @@ describe('test 35 round 4 and round 8 (d): the retry appends the held install li
     pm.logLossesAtExit();
     const about = logged(spies.error).filter(l => l.includes('subscription ps1'));
     expect(about).toHaveLength(1);
-    expect(about[0]).toMatch(/^\[PremiumManager\] The audit line subscription\.install\.paid \(guild g1, subscription ps1\) did not reach the disk before this stop; the webhook was answered 503, and the provider's next delivery of it writes this line, or, when the subscription's own save was lost too, installs the subscription again under a new id with its own line: \{.*"action":"subscription\.install\.paid"/);
+    expect(about[0]).toMatch(/^\[PremiumManager\] The audit line subscription\.install\.paid \(guild 70000000000000001, subscription ps1\) did not reach the disk before this stop; the webhook was answered 503, and the provider's next delivery of it writes this line, or, when the subscription's own save was lost too, installs the subscription again under a new id with its own line: \{.*"action":"subscription\.install\.paid"/);
     expect(about[0]).not.toContain('is lost');
     expect(about[0]).not.toContain('redelivered');
     expect(stopLines().filter(l => l.includes('subscription ps1'))).toEqual(about);
@@ -514,7 +515,7 @@ describe('test 35 round 4 and round 8 (d): the retry appends the held install li
     expect(await deliver(created('ps1'))).toMatchObject({ ok: true });
     const lines = installLines();
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toMatchObject({ guildId: 'g1', subscriptionId: jsonOf(PREMIUM).subscriptions.g1.active.id, metadata: { redelivered: true } });
+    expect(lines[0]).toMatchObject({ holder: 'guild:70000000000000001', subscriptionId: jsonOf(PREMIUM).subscriptions['guild:70000000000000001'].active.id, metadata: { redelivered: true } });
     expect(await deliver(created('ps1'))).toMatchObject({ ok: true });
     await settleQueue();
     expect(installLines()).toHaveLength(1);
@@ -524,7 +525,7 @@ describe('test 35 round 4 and round 8 (d): the retry appends the held install li
 
 describe('test 35 round 6: a new process whose redelivered line cannot land', () => {
   it('each redelivery answers 503 while /data/global fails; after the disk recovers the audit file holds one install line and was read once', async () => {
-    writePremium({ g1: { active: paidSub('s1', 'ps1'), paused: [] } });
+    writePremium({ 'guild:70000000000000001': { active: paidSub('s1', 'ps1'), paused: [] } });
     fs.writeFileSync(AUDIT, `${JSON.stringify({ timestamp: 't', actor: 'admin', action: 'tier.create', tierId: 'low' })}\n`);
     const audit = failingAudit();
     const undo = failFlushes(PREMIUM, 'EIO');
@@ -551,13 +552,13 @@ describe('test 35 round 7 (a): install lines of every origin that did not land a
   it('the entitlement, boost tick and adoptOrphan lines are logged as lost and the webhook line with its ending; after a restart and the re-emits no line is appended and no log promises one', async () => {
     const audit = failingAudit();
     const pm = getPremiumManager();
-    getPaymentRegistry().emitEvent(created('ent1', 'g1') as any);
-    getPaymentRegistry().emitEvent({ ...created('bst1', 'g2'), providerId: 'boost' } as any);
-    expect(await applySharedOp({ op: 'premium.adoptOrphan', args: { args: ['g3', 'fake', 'orph1', { kind: 'install' }] } })).toMatchObject({ ok: false });
-    answers503(await deliver(created('ps4', 'g4')));
+    getPaymentRegistry().emitEvent(created('ent1', '70000000000000001') as any);
+    getPaymentRegistry().emitEvent({ ...created('bst1', '70000000000000002'), providerId: 'boost' } as any);
+    expect(await applySharedOp({ op: 'premium.adoptOrphan', args: { args: ['guild:70000000000000003', 'fake', 'orph1', { kind: 'install' }] } })).toMatchObject({ ok: false });
+    answers503(await deliver(created('ps4', '70000000000000004')));
     await vi.waitFor(() => {
       const subs = jsonOf(PREMIUM).subscriptions;
-      expect(['g1', 'g2', 'g3', 'g4'].map(g => subs[g]?.active?.providerSubId)).toEqual(['ent1', 'bst1', 'orph1', 'ps4']);
+      expect(['70000000000000001', '70000000000000002', '70000000000000003', '70000000000000004'].map(g => subs[`guild:${g}`]?.active?.providerSubId)).toEqual(['ent1', 'bst1', 'orph1', 'ps4']);
     }, { timeout: 10_000, interval: 20 });
     const premiumAtStop = fs.readFileSync(PREMIUM, 'utf8');
     spies.error.mockClear();
@@ -565,7 +566,7 @@ describe('test 35 round 7 (a): install lines of every origin that did not land a
     pm.finalStop();
     pm.logLossesAtExit();
     const errors = logged(spies.error);
-    for (const [guild, sub] of [['g1', 'ent1'], ['g2', 'bst1'], ['g3', 'orph1']]) {
+    for (const [guild, sub] of [['70000000000000001', 'ent1'], ['70000000000000002', 'bst1'], ['70000000000000003', 'orph1']]) {
       const about = errors.filter(l => l.includes(`subscription ${sub})`));
       expect(about).toHaveLength(1);
       expect(about[0]).toMatch(new RegExp(`^\\[PremiumManager\\] The audit line subscription\\.install\\.paid \\(guild ${guild}, subscription ${sub}\\) did not reach the disk before this stop and is lost: \\{.*"action":"subscription\\.install\\.paid"`));
@@ -583,8 +584,8 @@ describe('test 35 round 7 (a): install lines of every origin that did not land a
     spies.warn.mockClear();
     newProcess();
     expect(fs.readFileSync(PREMIUM, 'utf8')).toBe(premiumAtStop);
-    getPaymentRegistry().emitEvent({ ...created('bst1', 'g2'), providerId: 'boost' } as any);
-    getPaymentRegistry().emitEvent(created('ent1', 'g1') as any);
+    getPaymentRegistry().emitEvent({ ...created('bst1', '70000000000000002'), providerId: 'boost' } as any);
+    getPaymentRegistry().emitEvent(created('ent1', '70000000000000001') as any);
     await tick(50);
     await settleQueue();
     expect(installLines()).toEqual([]);
@@ -600,7 +601,7 @@ describe('test 35 round 8 (f): a webhook install whose save and line both did no
     const before = fs.readFileSync(PREMIUM, 'utf8');
     let firstId = '';
     try {
-      answers503(await deliver(created('ps6', 'g6')));
+      answers503(await deliver(created('ps6', '70000000000000006')));
       const pm = getPremiumManager();
       spies.error.mockClear();
       spies.warn.mockClear();
@@ -623,8 +624,8 @@ describe('test 35 round 8 (f): a webhook install whose save and line both did no
     expect(rawOf(AUDIT)).toBeNull();
 
     newProcess();
-    expect(await deliver(created('ps6', 'g6'))).toMatchObject({ ok: true });
-    const active = jsonOf(PREMIUM).subscriptions.g6.active;
+    expect(await deliver(created('ps6', '70000000000000006'))).toMatchObject({ ok: true });
+    const active = jsonOf(PREMIUM).subscriptions['guild:70000000000000006'].active;
     expect(active.providerSubId).toBe('ps6');
     expect(active.id).not.toBe(firstId);
     const lines = installLines();

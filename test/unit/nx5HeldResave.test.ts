@@ -44,12 +44,13 @@ import { applySharedOp } from '../../src/bot/internalSetup/utils/sharedOps';
 import { writeMaintenanceFile } from '../../src/utils/maintenanceFile';
 import { ME, OrderStore, order, settle } from '../helpers/nx5Rig';
 import { clearGlobal, DUMMY_STATE, jsonOf, logged, paidSub, PREMIUM, quiet, settleQueue, writePremium } from './nb10PremiumRig';
+import { gh } from '../helpers/p1Holder';
 
 const m = maintenance as any;
 const role = process.env.BOT_PROCESS_ROLE;
 const refuse = (...files: string[]) => { for (const f of files) inject.refuse.set(f, 'storage-failing'); };
 const recover = () => inject.refuse.clear();
-const grant = (guildId = 'g1', tierId = 'high') => applySharedOp({ op: 'premium.grantManual', args: { args: [guildId, tierId, 30] } });
+const grant = (guildId = '70000000000000001', tierId = 'high') => applySharedOp({ op: 'premium.grantManual', args: { args: [gh(guildId), tierId, 30] } });
 const refusal = { name: 'DataBackendUnavailableError', causeKey: 'maintenance' };
 
 let spies: ReturnType<typeof quiet>;
@@ -95,7 +96,7 @@ async function inOrder(): Promise<OrderStore> {
 describe('G8-9 (a) and (b): a change premium held before the order', () => {
   it('the review\'s case: held before the order, the answer is not saved true while it is held, and a stop during the order saves it', async () => {
     refuse('premium-tiers.json');
-    expect(await grant('g1')).toMatchObject({ answer: 'held' });
+    expect(await grant('70000000000000001')).toMatchObject({ answer: 'held' });
     const store = await inOrder();
     await vi.waitFor(() => expect(store.acks).toHaveLength(1));
     expect(store.acks[0]).toMatchObject({ saved: false, unsavedFiles: 1 });
@@ -104,18 +105,18 @@ describe('G8-9 (a) and (b): a change premium held before the order', () => {
     getPremiumManager().finalStop();
     await settleQueue();
     expect(isMaintenanceGateClosed()).toBe(true);
-    expect(jsonOf(PREMIUM).subscriptions.g1?.active?.tierId).toBe('high');
+    expect(jsonOf(PREMIUM).subscriptions['guild:70000000000000001']?.active?.tierId).toBe('high');
     expect(logged(spies.error).filter(l => l.includes('holds changes the disk refused'))).toEqual([]);
   });
 
   it('a hold that appears after a true answer (an entitlement event whose save is refused) makes the next order read answer again, not saved', async () => {
-    writePremium({ g1: { active: paidSub('s1', 'd1', 'low', 'discord'), paused: [] } });
-    expect(getPremiumManager().resolveActiveTier('g1').tierId).toBe('low');
+    writePremium({ 'guild:70000000000000001': { active: paidSub('s1', 'd1', 'low', 'discord'), paused: [] } });
+    expect(getPremiumManager().resolveActiveTier('70000000000000001').tierId).toBe('low');
     const store = await inOrder();
     await vi.waitFor(() => expect(store.acks).toHaveLength(1));
     expect(store.acks[0].saved).toBe(true);
     refuse('premium-tiers.json');
-    const expired = { type: 'subscription.expired', providerId: 'discord', providerSubId: 'd1', guildId: 'g1', state: { status: 'expired', startDate: new Date().toISOString(), endDate: new Date(Date.now() - 1000).toISOString(), autoRenew: false } };
+    const expired = { type: 'subscription.expired', providerId: 'discord', providerSubId: 'd1', holder: 'guild:70000000000000001', state: { status: 'expired', startDate: new Date().toISOString(), endDate: new Date(Date.now() - 1000).toISOString(), autoRenew: false } };
     runEntitlementEvent(() => getPaymentRegistry().emitEvent(expired as any));
     await vi.waitFor(() => expect((getPremiumManager() as any).saveHeld).toBe(true), { timeout: 2000, interval: 20 });
     // The event's audit line lands; what stays held is premium's in-memory save alone.
@@ -130,13 +131,13 @@ describe('G8-9 (a) and (b): a change premium held before the order', () => {
     const dummy = new DummyProvider();
     getPaymentRegistry().register(dummy);
     refuse('premium-tiers.json', 'state.json');
-    expect(await grant('g1')).toMatchObject({ answer: 'held' });
+    expect(await grant('70000000000000001')).toMatchObject({ answer: 'held' });
     const variant = { variantId: 'v9', label: 'V9', amount: 1, currency: 'USD', durationDays: 1, recurring: false, active: true };
     expect(await applySharedOp({ op: 'dummy.adminSetVariant', args: { args: [variant] } })).toMatchObject({ answer: 'held' });
     const store = await inOrder();
     await vi.waitFor(() => expect(store.acks).toHaveLength(1));
     recover();
-    await vi.waitFor(() => expect(jsonOf(PREMIUM).subscriptions.g1?.active?.tierId).toBe('high'), { timeout: 5000, interval: 50 });
+    await vi.waitFor(() => expect(jsonOf(PREMIUM).subscriptions['guild:70000000000000001']?.active?.tierId).toBe('high'), { timeout: 5000, interval: 50 });
     await vi.waitFor(() => expect(Object.keys(jsonOf(DUMMY_STATE)?.variants ?? {})).toContain('v9'), { timeout: 5000, interval: 50 });
     expect(isMaintenanceGateClosed() && orderRefusesSharedOps()).toBe(true);
     expect(() => saveGlobalModuleData('state.json', 'nx5-timer-module', { v: 1 })).toThrow(expect.objectContaining(refusal));

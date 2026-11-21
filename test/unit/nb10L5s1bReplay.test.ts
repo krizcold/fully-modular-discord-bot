@@ -46,15 +46,16 @@ import {
 import { getPaymentRegistry } from '../../src/bot/internalSetup/utils/payment/paymentRegistry';
 import { flushAll } from '../../src/bot/internalSetup/utils/dataManager';
 import { AUDIT, clearGlobal, gate, JOURNAL, logged, paidSub, PREMIUM, quiet, rawOf, settleQueue, state, tick, writePremium } from './nb10PremiumRig';
+import { gh } from '../helpers/p1Holder';
 
 type Manager = ReturnType<typeof getPremiumManager>;
 const role = process.env.BOT_PROCESS_ROLE;
 const journalLine = (writer: string, n: number, event: object) => `${JSON.stringify({ writer, n, event })}\n`;
 const expired = (providerSubId: string, guildId: string) => ({
-  type: 'subscription.expired', providerId: 'discord', providerSubId, guildId,
+  type: 'subscription.expired', providerId: 'discord', providerSubId, holder: gh(guildId),
   state: { ...state('expired'), endDate: new Date(Date.now() - 1000).toISOString() },
 });
-const failedEvent = { type: 'subscription.renewal-failed', providerId: 'discord', providerSubId: 'nope', guildId: 'g-none', reason: 'card' };
+const failedEvent = { type: 'subscription.renewal-failed', providerId: 'discord', providerSubId: 'nope', holder: 'guild:70000000000009001', reason: 'card' };
 const normal = (pm: Manager) => vi.waitFor(() => expect(pm.cacheState()).toBe('normal'), { timeout: 5000, interval: 10 });
 
 /** Stops the cache when the replay waits for the `at`-th time; `before` runs first. */
@@ -102,10 +103,10 @@ afterAll(() => {
 describe("the replay's audit lines after the exit drain", () => {
   it('land in premium-tiers.audit.jsonl as whole lines, one per event', async () => {
     writePremium({
-      g1: { active: paidSub('sA', 'ps0', 'low', 'discord'), paused: [] },
-      g2: { active: paidSub('sB', 'ps9', 'low', 'discord'), paused: [] },
+      'guild:70000000000000001': { active: paidSub('sA', 'ps0', 'low', 'discord'), paused: [] },
+      'guild:70000000000000002': { active: paidSub('sB', 'ps9', 'low', 'discord'), paused: [] },
     });
-    fs.writeFileSync(JOURNAL, journalLine('w1', 1, expired('ps0', 'g1')) + journalLine('w1', 2, expired('ps9', 'g2')));
+    fs.writeFileSync(JOURNAL, journalLine('w1', 1, expired('ps0', '70000000000000001')) + journalLine('w1', 2, expired('ps9', '70000000000000002')));
     // The watch for the marks' save is still waiting when the exit drain lands it.
     hooks.confirm = () => new Promise<string>(() => undefined);
     const pm = getPremiumManager();
@@ -115,13 +116,13 @@ describe("the replay's audit lines after the exit drain", () => {
     expect(pm.afterDrain()).toBe(true);
     await settleQueue();
     const lines = (rawOf(AUDIT) ?? '').split('\n').filter(l => l !== '');
-    expect(lines.map(l => JSON.parse(l)).map(e => `${e.action}:${e.guildId}`)).toEqual(['subscription.expire.paid:g1', 'subscription.expire.paid:g2']);
+    expect(lines.map(l => JSON.parse(l)).map(e => `${e.action}:${e.holder}`)).toEqual(['subscription.expire.paid:guild:70000000000000001', 'subscription.expire.paid:guild:70000000000000002']);
   });
 });
 
 describe('a replay dropped at the stop', () => {
   async function secondReplayStoppedAt(at: number): Promise<Manager> {
-    writePremium({ g1: { active: paidSub('sA', 'ps0', 'low', 'discord'), paused: [] } });
+    writePremium({ 'guild:70000000000000001': { active: paidSub('sA', 'ps0', 'low', 'discord'), paused: [] } });
     fs.writeFileSync(JOURNAL, journalLine('w1', 1, failedEvent));
     const pm = getPremiumManager();
     startPremiumTickers();
@@ -130,7 +131,7 @@ describe('a replay dropped at the stop', () => {
     await vi.waitFor(() => expect(rawOf(JOURNAL)).toBeNull(), { timeout: 5000, interval: 10 });
     // The journal's delete leaves the queue after its unlink's callback; a load before that reads the new journal as deleted.
     await settleQueue();
-    fs.writeFileSync(JOURNAL, journalLine('w2', 1, expired('ps0', 'g1')));
+    fs.writeFileSync(JOURNAL, journalLine('w2', 1, expired('ps0', '70000000000000001')));
     const calls = stopAtWait(pm, at);
     invalidatePremiumCache();
     pm.getFullConfig();
@@ -157,10 +158,10 @@ describe('a replay dropped at the stop', () => {
   });
 
   it("keeps another op's install line for a subscription its lines name, and the exit log reports that line's loss", async () => {
-    writePremium({ g1: { active: paidSub('sA', 'ps0', 'high', 'discord'), paused: [] } });
+    writePremium({ 'guild:70000000000000001': { active: paidSub('sA', 'ps0', 'high', 'discord'), paused: [] } });
     const pause = gate();
     getPaymentRegistry().register({
-      id: 'slow', displayName: 'Slow', capabilities: { supportsPause: true }, isConfigured: () => true,
+      id: 'slow', displayName: 'Slow', capabilities: { sells: ['guild'], supportsPause: true }, isConfigured: () => true,
       pauseSubscription: () => pause.promise,
       resumeSubscription: async () => undefined,
     } as any);
@@ -169,8 +170,8 @@ describe('a replay dropped at the stop', () => {
     const never = { kind: 'file', path: AUDIT, seq: 1, record: { landed: 0 } };
     hooks.append = file => (file === 'premium-tiers.audit.jsonl' ? { outcome: 'appended', ticket: never } : undefined);
     // A lower tier bought while High is active waits in the queue; its install line is written after the provider's pause.
-    getPaymentRegistry().emitEvent({ type: 'subscription.created', providerId: 'slow', providerSubId: 'ps1', guildId: 'g1', tierId: 'low', offeringId: 'o1', state: state() } as any);
-    fs.writeFileSync(JOURNAL, journalLine('w2', 1, expired('ps0', 'g1')));
+    getPaymentRegistry().emitEvent({ type: 'subscription.created', buyerId: '80000000000000001', providerId: 'slow', providerSubId: 'ps1', holder: 'guild:70000000000000001', tierId: 'low', offeringId: 'o1', state: state() } as any);
+    fs.writeFileSync(JOURNAL, journalLine('w2', 1, expired('ps0', '70000000000000001')));
     const calls = stopAtWait(pm, 1, async real => {
       pause.open();
       await real(undefined);
@@ -184,7 +185,7 @@ describe('a replay dropped at the stop', () => {
     pm.logLossesAtExit();
     const lost = logged(spies.error).filter(l => l.includes('did not reach the disk'));
     expect(lost).toHaveLength(1);
-    expect(lost[0]).toMatch(/^\[PremiumManager\] The audit line subscription\.install\.paid \(guild g1, subscription ps1\) did not reach the disk before this stop and is lost: \{/);
+    expect(lost[0]).toMatch(/^\[PremiumManager\] The audit line subscription\.install\.paid \(guild 70000000000000001, subscription ps1\) did not reach the disk before this stop and is lost: \{/);
   });
 });
 

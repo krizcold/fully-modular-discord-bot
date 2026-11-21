@@ -61,7 +61,7 @@ export const state = (status: 'active' | 'paused' | 'expired' = 'active', days =
 /** A paid subscription record as premium-tiers.json stores it. */
 export function paidSub(id: string, providerSubId: string, tierId = 'low', providerId = 'fake'): Record<string, unknown> {
   return {
-    id, tierId, source: 'paid', offeringId: tierId === 'low' ? 'o1' : 'o2', providerId, providerSubId,
+    id, tierId, source: 'paid', buyerId: '80000000000000001', offeringId: tierId === 'low' ? 'o1' : 'o2', providerId, providerSubId,
     purchasedSnapshot: { offeringLabel: '', variantLabel: '', amount: 0, currency: '', durationDays: 30, tierDisplayName: tierId, tierPriority: 1, purchasedAt: new Date().toISOString() },
     ...state(), createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
   };

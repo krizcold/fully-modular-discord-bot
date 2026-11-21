@@ -112,8 +112,8 @@ export async function startWebUI(botManager: BotManager): Promise<void> {
   // PremiumManager (running in this process too) needs a way to deliver
   // notifications via the bot. Register a thin IPC bridge; PremiumManager
   // will call `dispatchPremiumNotification(...)` and not care about routing.
-  setNotificationIPCDispatcher((guildId, kind, payload) =>
-    botManager.dispatchNotification(guildId, kind, payload)
+  setNotificationIPCDispatcher((holder, kind, payload) =>
+    botManager.dispatchNotification(holder, kind, payload)
   );
   const queueEventMap: Record<string, 'queued' | 'started' | 'completed' | 'failed' | 'cancelled'> = {
     enqueued: 'queued',

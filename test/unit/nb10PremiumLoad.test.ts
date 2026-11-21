@@ -57,13 +57,13 @@ describe.each([['the web UI', false], ['the bot', true]])('premium-tiers.json th
     asBot(bot);
     fs.writeFileSync(PREMIUM, '{"tiers": {');
     const pm = getPremiumManager();
-    for (let i = 0; i < 3; i++) expect(pm.resolveActiveTier('g1').tierId).toBe('free');
+    for (let i = 0; i < 3; i++) expect(pm.resolveActiveTier('70000000000000001').tierId).toBe('free');
     expect(logged(spies.error).filter(l => l.includes('premium-tiers.json cannot be read (invalid JSON'))).toHaveLength(1);
     const reply = await applySharedOp({ op: 'premium.setTier', args: { args: ['gold', gold] } });
     expect(reply).toMatchObject({ ok: false, code: 'failed' });
     expect((reply as any).error).toMatch(/^premium-tiers\.json cannot be read \(invalid JSON.*nothing was saved\. Fix or restore the file, then try again\.$/);
     const command = await runSealed('interaction', null, 'mod', async ledger => {
-      const saved = await pm.grantManual('g1', 'free', 3);
+      const saved = await pm.grantManual('guild:70000000000000001', 'free', 3);
       return { saved, verdict: await verdictOf([ledger]) };
     });
     expect(command.saved).toBe(false);
@@ -76,7 +76,7 @@ describe.each([['the web UI', false], ['the bot', true]])('premium-tiers.json th
     asBot(bot);
     fs.mkdirSync(PREMIUM);
     const pm = getPremiumManager();
-    expect(pm.resolveActiveTier('g1').tierId).toBe('free');
+    expect(pm.resolveActiveTier('70000000000000001').tierId).toBe('free');
     const reply = await applySharedOp({ op: 'premium.setMessages', args: { args: [{ moduleBlocked: 'x' }] } });
     expect((reply as any).error).toMatch(/^premium-tiers\.json cannot be read \(E[A-Z]+\)/);
     expect(fs.statSync(PREMIUM).isDirectory()).toBe(true);
@@ -96,11 +96,11 @@ describe('an absent premium-tiers.json', () => {
 
 describe('the journal that cannot be read, beside a premium-tiers.json that parses', () => {
   it('the bot names the journal and its errno, never premium-tiers.json, and does not say to restore a file', async () => {
-    writePremium({ g1: { active: { id: 's1', tierId: 'high', source: 'manual', startDate: new Date().toISOString(), endDate: null, autoRenew: false, status: 'active', createdAt: '', updatedAt: '' }, paused: [] } });
+    writePremium({ 'guild:70000000000000001': { active: { id: 's1', tierId: 'high', source: 'manual', startDate: new Date().toISOString(), endDate: null, autoRenew: false, status: 'active', createdAt: '', updatedAt: '' }, paused: [] } });
     fs.mkdirSync(JOURNAL);
     asBot(true);
     const pm = getPremiumManager();
-    expect(pm.resolveActiveTier('g1').tierId).toBe('free');
+    expect(pm.resolveActiveTier('70000000000000001').tierId).toBe('free');
     const lines = logged(spies.error).filter(l => l.includes('cannot be read'));
     expect(lines).toHaveLength(1);
     expect(lines[0]).toMatch(/^\[PremiumManager\] premium-tiers\.events\.jsonl cannot be read \(E[A-Z]+\)/);
@@ -110,9 +110,9 @@ describe('the journal that cannot be read, beside a premium-tiers.json that pars
   });
 
   it('the web UI reads the same files into a working cache', async () => {
-    writePremium({ g1: { active: { id: 's1', tierId: 'high', source: 'manual', startDate: new Date().toISOString(), endDate: null, autoRenew: false, status: 'active', createdAt: '', updatedAt: '' }, paused: [] } });
+    writePremium({ 'guild:70000000000000001': { active: { id: 's1', tierId: 'high', source: 'manual', startDate: new Date().toISOString(), endDate: null, autoRenew: false, status: 'active', createdAt: '', updatedAt: '' }, paused: [] } });
     fs.mkdirSync(JOURNAL);
-    expect(getPremiumManager().resolveActiveTier('g1').tierId).toBe('high');
+    expect(getPremiumManager().resolveActiveTier('70000000000000001').tierId).toBe('high');
   });
 });
 

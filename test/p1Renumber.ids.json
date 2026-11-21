@@ -1,0 +1,98 @@
+{
+  "servers": {
+    "1": "70000000000009004",
+    "g-none": "70000000000009001",
+    "nobody": "70000000000009002",
+    "other": "70000000000009003",
+    "g": "70000000000009005",
+    "gA": "70000000000009011",
+    "gB": "70000000000009012",
+    "gC": "70000000000009013"
+  },
+  "users": {
+    "owner1": "80000000000000001",
+    "u42": "80000000000000002"
+  },
+  "notIds": [
+    "active",
+    "paused",
+    "manual",
+    "guildId",
+    "notificationsChannelId",
+    "dummy_1",
+    "dsub1",
+    "dsub2"
+  ],
+  "keep": {
+    "unit/bt4Console.test.ts": {
+      "555": "a valid Discord id that reaches only the server helpers",
+      "u": "a panel context's user, not a purchase's"
+    },
+    "unit/c02-1.test.ts": {
+      "u": "a panel context's user, not a purchase's"
+    },
+    "unit/c09-2.test.ts": {
+      "g-old": "the test guild of command registration, never handed to premium",
+      "g-test": "the test guild of command registration, never handed to premium"
+    },
+    "unit/c36-2.test.ts": {
+      "g": "a panel prop sent to a mocked api; no premium code runs"
+    },
+    "unit/nb25Panel.test.ts": {
+      "g": "a panel prop sent to a mocked api; no premium code runs"
+    },
+    "unit/nb12Handlers.test.ts": {
+      "web-ui-owner": "the dev page's panel user, not a purchase's"
+    },
+    "unit/ra58PanelAndWalk.test.ts": {
+      "web-ui-owner": "the dev page's panel user, not a purchase's"
+    }
+  },
+  "keepAt": {
+    "unit/nb10L5s5Premium.test.ts": {
+      "other": [
+        178,
+        298,
+        299,
+        302,
+        303
+      ]
+    },
+    "unit/nb10Gate.test.ts": {
+      "1": [
+        89
+      ]
+    }
+  },
+  "computed": [
+    {
+      "file": "unit/nb10PremiumWebhook.test.ts",
+      "from": "g${i}",
+      "to": "7${String(i).padStart(16, '0')}",
+      "count": 4
+    },
+    {
+      "file": "unit/nb6Audit.test.ts",
+      "from": "g${i}",
+      "to": "7${String(i).padStart(16, '0')}",
+      "count": 1
+    },
+    {
+      "file": "unit/nb6PremiumCarrier.test.ts",
+      "from": "g${i + 1}",
+      "to": "7${String(i + 1).padStart(16, '0')}",
+      "count": 1
+    },
+    {
+      "file": "unit/nb6PremiumLinks.test.ts",
+      "from": "v_g1",
+      "to": "v_70000000000000001",
+      "count": 1
+    }
+  ],
+  "skipFiles": [],
+  "alsoFiles": [
+    "child/nb10Scenarios.test.ts",
+    "unit/rt2AppStoreRoutes.test.ts"
+  ]
+}

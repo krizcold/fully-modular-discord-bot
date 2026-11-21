@@ -53,6 +53,7 @@ import { releaseWriterLock, writerLockDepth, writerLockPath } from '../../src/bo
 import { forks } from '../helpers/forkMock';
 import { exitChild, freshWriterLock, resetForks } from '../helpers/nb10Rig';
 import { clearGlobal, gate, paidSub, PREMIUM, quiet, settleQueue, tick, writePremium } from './nb10PremiumRig';
+import { gh } from '../helpers/p1Holder';
 
 const G = '900000000000001066';
 const H = '900000000000001067';
@@ -92,25 +93,25 @@ afterEach(async () => {
 describe('a removal that landed is judged by its own save after the stop, not by a later held one (D1, T1)', () => {
   it('answers ok while an unrelated change is held at the stop', async () => {
     process.env.BOT_PROCESS_ROLE = 'bot';
-    writePremium({ [G]: { active: paidSub('sA', 'pA', 'low', 'patreon'), paused: [] } });
+    writePremium({ [gh(G)]: { active: paidSub('sA', 'pA', 'low', 'patreon'), paused: [] } });
     const cancel = gate();
     getPaymentRegistry().register({
-      id: 'patreon', displayName: 'patreon', capabilities: { supportsCancel: true }, isConfigured: () => true,
+      id: 'patreon', displayName: 'patreon', capabilities: { sells: ['guild'], supportsCancel: true }, isConfigured: () => true,
       cancelSubscription: async () => { await cancel.promise; },
     } as any);
-    const answer = op('premium.cancelPaidSubscriptionImmediately', G);
+    const answer = op('premium.cancelPaidSubscriptionImmediately', gh(G));
     await tick();
     await runSealed('console', null, null, async () => {
       const pm = getPremiumManager() as any;
-      delete pm.config.subscriptions[G];
+      delete pm.config.subscriptions[gh(G)];
       pm.save();
     });
     await settleQueue();
-    expect(JSON.parse(fs.readFileSync(PREMIUM, 'utf8')).subscriptions[G]).toBeUndefined();
+    expect(JSON.parse(fs.readFileSync(PREMIUM, 'utf8')).subscriptions[gh(G)]).toBeUndefined();
     inject.refuse.set('premium-tiers.json', 'storage-failing');
     await runSealed('console', null, null, async () => {
       const pm = getPremiumManager() as any;
-      pm.config.subscriptions[H] = { active: paidSub('sH', 'pH', 'low', 'patreon'), paused: [] };
+      pm.config.subscriptions[gh(H)] = { active: paidSub('sH', 'pH', 'low', 'patreon'), paused: [] };
       pm.save();
     });
     const pm = getPremiumManager() as any;
@@ -121,7 +122,7 @@ describe('a removal that landed is judged by its own save after the stop, not by
     const reply: any = await answer;
     pm.stopped = null;
     expect(reply).toMatchObject({ ok: true });
-    expect(JSON.parse(fs.readFileSync(PREMIUM, 'utf8')).subscriptions[G]).toBeUndefined();
+    expect(JSON.parse(fs.readFileSync(PREMIUM, 'utf8')).subscriptions[gh(G)]).toBeUndefined();
   });
 });
 

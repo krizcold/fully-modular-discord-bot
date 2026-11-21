@@ -92,6 +92,7 @@ import { markPaymentLedger, runSealed } from '../../src/bot/internalSetup/utils/
 import { JOURNAL_KEY } from '../../src/bot/internalSetup/utils/sharedLines';
 import { setBackendKind } from '../helpers/backendKind';
 import { clearGlobal, gate, paidSub, quiet, state, tick, TIERS, writePremium } from './nb10PremiumRig';
+import { gh } from '../helpers/p1Holder';
 
 const PREMIUM_KEY = 'global/premium-tiers.json';
 const AUDIT_KEY = 'global/premium-tiers.audit.jsonl';
@@ -103,7 +104,7 @@ let cancelGate = gate<unknown>();
 
 function manager(): PremiumManager {
   getPaymentRegistry().register({
-    id: 'fake', displayName: 'Fake', capabilities: { supportsPause: true, supportsCancel: true }, isConfigured: () => true,
+    id: 'fake', displayName: 'Fake', capabilities: { sells: ['guild'], supportsPause: true, supportsCancel: true }, isConfigured: () => true,
     pauseSubscription: async () => undefined,
     cancelSubscription: () => cancelGate.promise,
   } as any);
@@ -116,7 +117,7 @@ function manager(): PremiumManager {
 const script = (...answers: Answer[]) => { h.script = answers; };
 const emit = (event: object) => getPaymentRegistry().emitEvent(event as any);
 const expired = (subId: string, guildId: string) => ({
-  type: 'subscription.expired', providerId: 'fake', providerSubId: subId, guildId,
+  type: 'subscription.expired', providerId: 'fake', providerSubId: subId, holder: gh(guildId),
   state: { ...state('expired'), endDate: new Date(Date.now() - 1000).toISOString() },
 });
 const label = (pm: PremiumManager) => pm.getMessages().upgradeButtonLabel;
@@ -138,7 +139,7 @@ beforeEach(() => {
   reg.current = null;
   cancelGate = gate<unknown>();
   clearGlobal();
-  writePremium({ g2: { active: paidSub('s2', 'e1', 'low'), paused: [] } });
+  writePremium({ 'guild:70000000000000002': { active: paidSub('s2', 'e1', 'low'), paused: [] } });
 });
 afterEach(async () => {
   h.auto = 'landed';
@@ -165,8 +166,8 @@ describe("the shared pass's journal read", () => {
   });
 
   it('a load whose marks cover every replayable journal line deletes those lines', async () => {
-    writePremium({ g2: { active: paidSub('s2', 'e1', 'low'), paused: [] } }, { eventsApplied: { 'old-proc': 3 } });
-    h.journal = [{ id: 'j1', line: JSON.stringify({ writer: 'old-proc', node: 'another-node', n: 2, event: { type: 'subscription.renewed', providerId: 'fake', providerSubId: 'e1', guildId: 'g2', state: state() } }) }];
+    writePremium({ 'guild:70000000000000002': { active: paidSub('s2', 'e1', 'low'), paused: [] } }, { eventsApplied: { 'old-proc': 3 } });
+    h.journal = [{ id: 'j1', line: JSON.stringify({ writer: 'old-proc', node: 'another-node', n: 2, event: { type: 'subscription.renewed', providerId: 'fake', providerSubId: 'e1', holder: 'guild:70000000000000002', state: state() } }) }];
     const pm = manager();
     expect(await pm.readSharedJournal(false)).toEqual({ ok: true });
     expect(h.deleted).toEqual([]);
@@ -235,7 +236,7 @@ describe('an event handed outside every op whose save was held', () => {
   it('is handed again when the save that took its list is refused changed-elsewhere', async () => {
     const pm = manager();
     script({ refused: 'storage-failing' }, 'saved', 'saved');
-    emit(expired('e1', 'g2'));
+    emit(expired('e1', '70000000000000002'));
     expect(h.saves).toHaveLength(1);
     expect(pm.setMessages({ upgradeButtonLabel: 'Takes the list' })).toBe(true);
     expect(h.gates).toHaveLength(1);
@@ -249,7 +250,7 @@ describe('an event handed outside every op whose save was held', () => {
     const pm = manager();
     script('saved', { refused: 'storage-failing' }, 'saved');
     expect(pm.setMessages({ upgradeButtonLabel: 'Earlier' })).toBe(true);
-    emit(expired('e1', 'g2'));
+    emit(expired('e1', '70000000000000002'));
     expect(h.saves).toHaveLength(2);
     openRow(0, { refused: { cause: 'changed-elsewhere' } });
     await until(() => h.saves.length >= 3);
@@ -261,7 +262,7 @@ describe('an event handed outside every op whose save was held', () => {
     const pm = manager();
     script('saved', { refused: 'storage-failing' }, { refused: 'unstorable' }, 'saved');
     expect(pm.setMessages({ upgradeButtonLabel: 'Earlier' })).toBe(true);
-    emit(expired('e1', 'g2'));
+    emit(expired('e1', '70000000000000002'));
     expect(pm.setMessages({ upgradeButtonLabel: 'Too large' })).toBe(false);
     expect(h.saves).toHaveLength(3);
     openRow(0, { refused: { cause: 'changed-elsewhere' } });
@@ -273,10 +274,10 @@ describe('an event handed outside every op whose save was held', () => {
 
 describe('a change refused while kept provider events wait', () => {
   it("writes the change's audit line marked not saved, in an op that locks premium-tiers.json", async () => {
-    writePremium({ g1: { active: paidSub('s1', 'ps1', 'low'), paused: [] } });
-    h.journal = [{ id: 'j1', line: JSON.stringify({ writer: 'old-proc', node: 'another-node', n: 1, event: { type: 'subscription.renewed', providerId: 'fake', providerSubId: 'zz', guildId: 'g9', state: state() } }) }];
+    writePremium({ 'guild:70000000000000001': { active: paidSub('s1', 'ps1', 'low'), paused: [] } });
+    h.journal = [{ id: 'j1', line: JSON.stringify({ writer: 'old-proc', node: 'another-node', n: 1, event: { type: 'subscription.renewed', providerId: 'fake', providerSubId: 'zz', holder: 'guild:70000000000000009', state: state() } }) }];
     const pm = manager();
-    const cancelled = pm.cancelPaidSubscriptionImmediately('g1');
+    const cancelled = pm.cancelPaidSubscriptionImmediately('guild:70000000000000001');
     await tick(2);
     expect(await pm.readSharedJournal(true)).toEqual({ ok: true });
     await until(() => pm.cacheState() === 'replaying');
@@ -288,7 +289,7 @@ describe('a change refused while kept provider events wait', () => {
     expect(h.carried[0].opts).toEqual({ lockKey: PREMIUM_KEY });
     expect(h.carried[0].lines).toHaveLength(1);
     expect(JSON.parse(h.carried[0].lines[0].line)).toMatchObject({
-      action: 'subscription.cancel.paid', guildId: 'g1', subscriptionId: 's1',
+      action: 'subscription.cancel.paid', holder: 'guild:70000000000000001', subscriptionId: 's1',
       metadata: { immediately: true, notSaved: { cause: 'not-ready' } },
     });
   });
@@ -300,12 +301,12 @@ describe("the Dummy tick's walk batch on a cache with no stored row", () => {
     const pm = manager();
     script({ refused: 'unstorable' }, 'saved');
     expect(pm.setFullConfig({
-      tiers: JSON.parse(JSON.stringify(TIERS)), subscriptions: { g2: { active: paidSub('s2', 'e1', 'low'), paused: [] } } as any,
+      tiers: JSON.parse(JSON.stringify(TIERS)), subscriptions: { 'guild:70000000000000002': { active: paidSub('s2', 'e1', 'low'), paused: [] } } as any,
       messages: {} as any, providerAccountLinks: {}, activatedProviders: {}, migrations: [], migrationSilencePolicy: 'cancel',
     })).toBe(false);
     getPaymentRegistry().emitWalkBatch({
       premiumSha: null,
-      events: [{ type: 'subscription.renewed', providerId: 'fake', providerSubId: 'e1', guildId: 'g2', state: state() }],
+      events: [{ type: 'subscription.renewed', providerId: 'fake', providerSubId: 'e1', holder: 'guild:70000000000000002', state: state() }],
     } as any);
     expect(h.saves).toHaveLength(2);
     expect(h.saves[1].opts.baseSha).toBe('absent');
@@ -314,13 +315,13 @@ describe("the Dummy tick's walk batch on a cache with no stored row", () => {
 
 describe('a redelivery whose audit lines cannot be read', () => {
   it('answers the audit file as refused io and writes no install line', async () => {
-    writePremium({ g1: { active: paidSub('s1', 'ps1', 'low'), paused: [] } });
+    writePremium({ 'guild:70000000000000001': { active: paidSub('s1', 'ps1', 'low'), paused: [] } });
     h.auto = 'landed';
     h.readLines = () => Promise.resolve({ ok: false, cause: 'the database did not answer' });
     const pm = manager();
     const refused = await runSealed('console', null, 'premium', async ledger => {
       markPaymentLedger(ledger, 'payment.webhook');
-      emit({ type: 'subscription.created', providerId: 'fake', providerSubId: 'ps1', guildId: 'g1', tierId: 'low', offeringId: 'o1', state: state() });
+      emit({ type: 'subscription.created', buyerId: '80000000000000001', providerId: 'fake', providerSubId: 'ps1', holder: 'guild:70000000000000001', tierId: 'low', offeringId: 'o1', state: state() });
       await pm.settled(ledger);
       return ledger.refusedDocs().filter(r => r.doc === AUDIT_DOC);
     });

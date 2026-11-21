@@ -207,7 +207,7 @@ describe('the bot keeps its cache until the writer lock is taken', () => {
 
 describe('a save that meets a stop or an unreadable file between the check and the save writes nothing', () => {
   const purchase = (dummy: DummyProvider) => dummy.initiatePurchase({
-    guildId: '900000000000000001', tierId: 'low', offeringId: 'o1', variantId: 'dummy_monthly_999', couponCode: 'TEST20',
+    holder: 'guild:900000000000000001', buyerId: '80000000000000001', tierId: 'low', offeringId: 'o1', variantId: 'dummy_monthly_999', couponCode: 'TEST20',
   });
 
   it('stopped while the coupon is checked: state.json stays absent', async () => {

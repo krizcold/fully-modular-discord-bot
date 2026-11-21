@@ -64,7 +64,7 @@ let logs: string[];
 
 function stateWith(fields: Record<string, unknown>): string {
   const r = {
-    providerSubId: 'dummy_1', guildId: 'g1', tierId: 'gold', offeringId: 'o1', variantId: MONTHLY, durationDays: 30,
+    providerSubId: 'dummy_1', guildId: '70000000000000001', tierId: 'gold', offeringId: 'o1', variantId: MONTHLY, durationDays: 30,
     startDate: PAST, endDate: FUTURE, autoRenew: true, status: 'active', createdAt: PAST, updatedAt: PAST, ...fields,
   };
   return JSON.stringify({ variants: VARIANTS, products: {}, coupons: {}, subscriptions: { dummy_1: r }, nextId: 10 }, null, 2);

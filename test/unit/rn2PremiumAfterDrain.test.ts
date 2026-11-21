@@ -34,6 +34,7 @@ import { setBackendKind } from '../helpers/backendKind';
 import { stubAppendHandles, type AppendStub, type Hold } from '../helpers/fileHandleStub';
 import { freshWriterLock } from '../helpers/nb10Rig';
 import { AUDIT, clearGlobal, JOURNAL, logged, paidSub, rawOf, settleQueue, state, writePremium } from './nb10PremiumRig';
+import { gh } from '../helpers/p1Holder';
 
 type Manager = ReturnType<typeof getPremiumManager>;
 const role = process.env.BOT_PROCESS_ROLE;
@@ -80,14 +81,14 @@ afterEach(async () => {
 });
 
 const expired = (providerSubId: string, guildId: string) => ({
-  type: 'subscription.expired', providerId: 'discord', providerSubId, guildId,
+  type: 'subscription.expired', providerId: 'discord', providerSubId, holder: gh(guildId),
   state: { ...state('expired'), endDate: new Date(Date.now() - 1000).toISOString() },
 });
 
 /** A replay whose marks' save landed while its watch still waits: afterDrain queues its audit line. */
 async function replayAwaitingAfterDrain(): Promise<Manager> {
-  writePremium({ g1: { active: paidSub('sA', 'ps0', 'low', 'discord'), paused: [] } });
-  fs.writeFileSync(JOURNAL, `${JSON.stringify({ writer: 'w1', n: 1, event: expired('ps0', 'g1') })}\n`);
+  writePremium({ 'guild:70000000000000001': { active: paidSub('sA', 'ps0', 'low', 'discord'), paused: [] } });
+  fs.writeFileSync(JOURNAL, `${JSON.stringify({ writer: 'w1', n: 1, event: expired('ps0', '70000000000000001') })}\n`);
   hooks.confirm = () => new Promise<string>(() => undefined);
   const pm = getPremiumManager();
   startPremiumTickers();
@@ -116,7 +117,7 @@ describe("the exit line of an audit line queued after the exit drain", () => {
     await settleQueue();
     const lines = exitLines(pm);
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toMatch(/^\[PremiumManager\] The audit line subscription\.expire\.paid \(guild g1, [^)]+\) is in the file, but the disk did not confirm its sync; can't confirm whether it is stored: \{/);
+    expect(lines[0]).toMatch(/^\[PremiumManager\] The audit line subscription\.expire\.paid \(guild 70000000000000001, [^)]+\) is in the file, but the disk did not confirm its sync; can't confirm whether it is stored: \{/);
     expect(lines[0].endsWith(`stored: ${auditLine()}`)).toBe(true);
   });
 
@@ -127,7 +128,7 @@ describe("the exit line of an audit line queued after the exit drain", () => {
     await hold.reached;
     const lines = exitLines(pm);
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toMatch(/^\[PremiumManager\] The audit line subscription\.expire\.paid \(guild g1, [^)]+\) was being written before this stop; can't confirm whether it is stored: \{/);
+    expect(lines[0]).toMatch(/^\[PremiumManager\] The audit line subscription\.expire\.paid \(guild 70000000000000001, [^)]+\) was being written before this stop; can't confirm whether it is stored: \{/);
     hold.release();
     await settleQueue();
     expect(lines[0].endsWith(`stored: ${auditLine()}`)).toBe(true);

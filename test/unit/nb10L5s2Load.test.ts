@@ -33,7 +33,7 @@ const asBot = (bot: boolean) => {
   if (bot) process.env.BOT_PROCESS_ROLE = 'bot';
   else delete process.env.BOT_PROCESS_ROLE;
 };
-const journalLine = (writer: string, n: number) => `${JSON.stringify({ writer, n, event: { type: 'subscription.renewed', providerId: 'fake', providerSubId: 'p1', guildId: 'g1' } })}\n`;
+const journalLine = (writer: string, n: number) => `${JSON.stringify({ writer, n, event: { type: 'subscription.renewed', providerId: 'fake', providerSubId: 'p1', holder: 'guild:70000000000000001' } })}\n`;
 const NOT_OBJECT = 'premium-tiers.json cannot be read (invalid JSON: not a JSON object); nothing was saved. Fix or restore the file, then try again.';
 
 let spies: ReturnType<typeof quiet>;
@@ -180,7 +180,7 @@ describe('the refusal text of an entry check', () => {
     const pm = manager();
     pm.load();
     pm.markStopped('stopping');
-    await expect(pm.initiatePaidSubscription('g1', 'low', 'o1', { providerId: 'fake', variantId: 'v1' })).rejects.toThrowError(/^Nothing was saved: the bot is stopping\.$/);
+    await expect(pm.initiatePaidSubscription('guild:70000000000000001', 'low', 'o1', { buyerId: '80000000000000001', providerId: 'fake', variantId: 'v1' })).rejects.toThrowError(/^Nothing was saved: the bot is stopping\.$/);
   });
 
   it('a file fixed between the entry check and the text answers the general refusal', async () => {
@@ -191,6 +191,6 @@ describe('the refusal text of an entry check', () => {
     const pm = manager();
     pm.load();
     writePremium();
-    await expect(pm.initiatePaidSubscription('g1', 'low', 'o1', { providerId: 'fake', variantId: 'v1' })).rejects.toThrowError(/^Premium cannot take changes right now; nothing was saved\.$/);
+    await expect(pm.initiatePaidSubscription('guild:70000000000000001', 'low', 'o1', { buyerId: '80000000000000001', providerId: 'fake', variantId: 'v1' })).rejects.toThrowError(/^Premium cannot take changes right now; nothing was saved\.$/);
   });
 });

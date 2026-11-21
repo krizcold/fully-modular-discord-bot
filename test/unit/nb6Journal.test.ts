@@ -23,17 +23,17 @@ vi.mock('../../src/bot/internalSetup/utils/premiumNotifications', () => ({
 const r = premiumRig();
 const paused = (n: number, writer: string, node: string, nodeName: string) => JSON.stringify({
   writer, node, nodeName, n,
-  event: { type: 'subscription.paused', providerId: 'nb6p', providerSubId: 'ps1', guildId: 'g1', resumesAt: '2027-01-01T00:00:00.000Z' },
+  event: { type: 'subscription.paused', providerId: 'nb6p', providerSubId: 'ps1', holder: 'guild:70000000000000001', resumesAt: '2027-01-01T00:00:00.000Z' },
 });
 
 /** A stored premium-tiers.json holding guild g1's paid sub ps1, as the facade stores it. */
 async function storedWithSub(): Promise<void> {
   const pm = r.pm();
   pm.setTier('low', tier('Low', 1));
-  await pm.grantManual('g1', 'low', 30);
+  await pm.grantManual('guild:70000000000000001', 'low', 30);
   await r.settle();
   const config = r.row();
-  config.subscriptions.g1.active = { ...config.subscriptions.g1.active, source: 'paid', providerId: 'nb6p', providerSubId: 'ps1' };
+  config.subscriptions['guild:70000000000000001'].active = { ...config.subscriptions['guild:70000000000000001'].active, source: 'paid', buyerId: '80000000000000001', providerId: 'nb6p', providerSubId: 'ps1' };
   r.m.state.rows.put(PREMIUM_KEY, JSON.stringify(config, null, 2));
   await runSharedPass();
 }
@@ -83,7 +83,7 @@ describe('rows 120 and 180: the pass finds pending lines of a writer that is not
       await r.settle();
       const row = r.row();
       expect(row.eventsApplied).toEqual({ 'p-dead': 1 });
-      expect(row.subscriptions.g1.active.resumesAtHint).toBe('2027-01-01T00:00:00.000Z');
+      expect(row.subscriptions['guild:70000000000000001'].active.resumesAtHint).toBe('2027-01-01T00:00:00.000Z');
     }, { timeout: 5000 });
     await vi.waitFor(async () => {
       await r.settle();

@@ -382,7 +382,7 @@ export class ModuleLoader {
     // Load panels
     const panelsPath = path.join(modulePath, 'panels');
     if (fs.existsSync(panelsPath)) {
-      module.panels = await this.loadPanels(panelsPath, module.importedFiles);
+      module.panels = await this.loadPanels(panelsPath, manifest.name, module.importedFiles);
     }
 
     // Load exports
@@ -504,9 +504,10 @@ export class ModuleLoader {
   /**
    * Load panels from a panels directory
    * @param panelsPath - Path to panels directory
+   * @param moduleName - The module's manifest name, stamped on each panel as `_moduleName`
    * @returns Array of panel definitions
    */
-  private async loadPanels(panelsPath: string, importedFiles?: string[]): Promise<any[]> {
+  private async loadPanels(panelsPath: string, moduleName: string, importedFiles?: string[]): Promise<any[]> {
     const panels: any[] = [];
 
     const fileExtension = this.isProd ? '.js' : '.ts';
@@ -520,6 +521,8 @@ export class ModuleLoader {
 
         // Only register if it has an 'id' property (panel definition)
         if (panelDef && typeof panelDef === 'object' && 'id' in panelDef) {
+          // The panel gates name the module by this, as getLocalCommands stamps commands.
+          panelDef._moduleName = moduleName;
           panels.push(panelDef);
         }
       } catch (error) {

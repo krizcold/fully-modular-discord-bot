@@ -10,7 +10,7 @@ afterEach(() => {
 
 const sub = (over: Record<string, unknown> = {}) => ({
   id: 'sub_sa2', status: 'active', cancel_at_period_end: false, current_period_start: 1762000000, current_period_end: 1764000000,
-  start_date: 1762000000, pause_collection: null, metadata: { guildId: 'g1', tierId: 't', offeringId: 'o' }, ...over,
+  start_date: 1762000000, pause_collection: null, metadata: { guildId: '70000000000000001', tierId: 't', offeringId: 'o' }, ...over,
 });
 
 function stub(answer: (url: string) => unknown) {
@@ -24,7 +24,7 @@ function stub(answer: (url: string) => unknown) {
 
 const listed = async (s: Record<string, unknown>) => {
   stub(url => (url.includes('/search') ? { data: [s], has_more: false } : { data: [] }));
-  const refs = await new StripeProvider().listSubscriptionsForGuild('g1');
+  const refs = await new StripeProvider().listSubscriptionsFor('guild:70000000000000001');
   expect(refs).toHaveLength(1);
   return refs[0];
 };
@@ -38,7 +38,7 @@ const stateOf = async (s: Record<string, unknown>) => {
 
 describe('metadata[pausedDaysLeft] read back from a listed subscription', () => {
   it.each(['20@1762732800x', '20@1762732800 ', '20@1762732800@5'])("'%s' with text after the pause time gives neither field", async value => {
-    const ref = await listed(sub({ metadata: { guildId: 'g1', tierId: 't', offeringId: 'o', pausedDaysLeft: value } }));
+    const ref = await listed(sub({ metadata: { guildId: '70000000000000001', tierId: 't', offeringId: 'o', pausedDaysLeft: value } }));
     expect(ref.metadata.pausedDaysLeft).toBeUndefined();
     expect(ref.metadata.pausedAt).toBeUndefined();
   });
@@ -46,7 +46,7 @@ describe('metadata[pausedDaysLeft] read back from a listed subscription', () => 
 
 describe('the metadata of a listed subscription', () => {
   const priced = (metadata: Record<string, string>) => sub({
-    metadata: { guildId: 'g1', tierId: 't', offeringId: 'o', ...metadata },
+    metadata: { guildId: '70000000000000001', tierId: 't', offeringId: 'o', ...metadata },
     items: { data: [{ id: 'si_1', price: { id: 'price_live', active: true, currency: 'usd', unit_amount: 500, type: 'recurring', recurring: { interval: 'month', interval_count: 1 }, product: 'prod_1' } }] },
   });
 
@@ -60,13 +60,13 @@ describe('the metadata of a listed subscription', () => {
     expect(ref.metadata.variantId).toBe('price_meta');
   });
 
-  it('couponCode and userId in metadata are carried; empty ones are left out', async () => {
-    const ref = await listed(priced({ couponCode: 'SAVE10', userId: 'u42' }));
+  it('couponCode, and userId as buyerId, in metadata are carried; empty ones are left out', async () => {
+    const ref = await listed(priced({ couponCode: 'SAVE10', userId: '80000000000000002' }));
     expect(ref.metadata.couponCode).toBe('SAVE10');
-    expect(ref.metadata.userId).toBe('u42');
+    expect(ref.metadata.buyerId).toBe('80000000000000002');
     const empty = await listed(priced({ couponCode: '', userId: '' }));
     expect(empty.metadata.couponCode).toBeUndefined();
-    expect(empty.metadata.userId).toBeUndefined();
+    expect(empty.metadata.buyerId).toBeUndefined();
   });
 });
 

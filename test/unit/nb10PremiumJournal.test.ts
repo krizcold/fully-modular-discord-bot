@@ -14,8 +14,8 @@ vi.mock('../../src/bot/internalSetup/utils/payment/paymentRegistry', async orig 
 });
 const notices = vi.hoisted(() => ({ sent: [] as string[] }));
 vi.mock('../../src/bot/internalSetup/utils/premiumNotifications', () => ({
-  dispatchPremiumNotification: async (guildId: string, kind: string) => {
-    notices.sent.push(`${kind}:${guildId}`);
+  dispatchPremiumNotification: async (holder: string, kind: string) => {
+    notices.sent.push(`${kind}:${holder}`);
     return { delivered: true, via: 'dm' };
   },
 }));
@@ -34,6 +34,7 @@ import { getPaymentRegistry } from '../../src/bot/internalSetup/utils/payment/pa
 import { applySharedOp } from '../../src/bot/internalSetup/utils/sharedOps';
 import { markMaintenanceBoot } from '../../src/bot/internalSetup/utils/maintenanceGate';
 import { AUDIT, clearGlobal, gate, JOURNAL, jsonOf, linesOf, logged, paidSub, PREMIUM, quiet, rawOf, settleQueue, state, tick, writePremium } from './nb10PremiumRig';
+import { gh } from '../helpers/p1Holder';
 
 const role = process.env.BOT_PROCESS_ROLE;
 const asBot = (bot: boolean) => {
@@ -41,12 +42,12 @@ const asBot = (bot: boolean) => {
   else delete process.env.BOT_PROCESS_ROLE;
 };
 const later = new Date(Date.now() + 90 * 86_400_000).toISOString();
-const expired = (providerSubId: string, guildId: string, providerId = 'discord') => ({ type: 'subscription.expired', providerId, providerSubId, guildId, state: { ...state('expired'), endDate: new Date(Date.now() - 1000).toISOString() } });
-const renewed = (providerSubId: string, guildId: string, providerId = 'dummy') => ({ type: 'subscription.renewed', providerId, providerSubId, guildId, state: { ...state(), endDate: later } });
-const createdEvent = (providerSubId: string, guildId: string, providerId = 'fake') => ({ type: 'subscription.created', providerId, providerSubId, guildId, tierId: 'low', offeringId: 'o1', state: state() });
+const expired = (providerSubId: string, guildId: string, providerId = 'discord') => ({ type: 'subscription.expired', providerId, providerSubId, holder: gh(guildId), state: { ...state('expired'), endDate: new Date(Date.now() - 1000).toISOString() } });
+const renewed = (providerSubId: string, guildId: string, providerId = 'dummy') => ({ type: 'subscription.renewed', providerId, providerSubId, holder: gh(guildId), state: { ...state(), endDate: later } });
+const createdEvent = (providerSubId: string, guildId: string, providerId = 'fake') => ({ type: 'subscription.created', buyerId: '80000000000000001', providerId, providerSubId, holder: gh(guildId), tierId: 'low', offeringId: 'o1', state: state() });
 const subs = () => ({
-  g1: { active: paidSub('s1', 'd1', 'low', 'discord'), paused: [] },
-  g2: { active: paidSub('s2', 'dm1', 'low', 'dummy'), paused: [] },
+  'guild:70000000000000001': { active: paidSub('s1', 'd1', 'low', 'discord'), paused: [] },
+  'guild:70000000000000002': { active: paidSub('s2', 'dm1', 'low', 'dummy'), paused: [] },
 });
 const journalLine = (writer: string, n: number, event: object) => `${JSON.stringify({ writer, n, event })}\n`;
 const manualHigh = () => ({ id: 'm1', tierId: 'high', source: 'manual', startDate: new Date().toISOString(), endDate: null, autoRenew: false, status: 'active', createdAt: '', updatedAt: '' });
@@ -54,7 +55,7 @@ const manualHigh = () => ({ id: 'm1', tierId: 'high', source: 'manual', startDat
 let pause = gate();
 function registerFake(): void {
   getPaymentRegistry().register({
-    id: 'fake', displayName: 'Fake', capabilities: { supportsPause: true }, isConfigured: () => true,
+    id: 'fake', displayName: 'Fake', capabilities: { sells: ['guild'], supportsPause: true }, isConfigured: () => true,
     handleWebhook: async (body: Buffer) => { getPaymentRegistry().emitEvent(JSON.parse(body.toString())); },
     pauseSubscription: () => pause.promise,
     cancelSubscription: vi.fn(async () => undefined),
@@ -117,7 +118,7 @@ async function journalWhileBroken(events: object[]): Promise<string> {
 
 describe('the journal and its replay', () => {
   it('two events kept while the file was unreadable are applied once after the fix, the marks cover them and the journal goes', async () => {
-    const writer = await journalWhileBroken([expired('d1', 'g1'), renewed('dm1', 'g2')]);
+    const writer = await journalWhileBroken([expired('d1', '70000000000000001'), renewed('dm1', '70000000000000002')]);
     expect(logged(spies.warn).filter(l => l.includes('it is kept in premium-tiers.events.jsonl'))).toHaveLength(2);
     writePremium(subs());
     const pm = newProcess();
@@ -129,15 +130,15 @@ describe('the journal and its replay', () => {
     await replayed(pm);
     const saved = jsonOf(PREMIUM);
     expect(saved.eventsApplied).toEqual({ [writer]: 2 });
-    expect(saved.subscriptions.g1.active).toBeUndefined();
-    expect(saved.subscriptions.g2.active.endDate).toBe(later);
-    expect(notices.sent).toEqual(['paid.sub.expired:g1']);
+    expect(saved.subscriptions['guild:70000000000000001'].active).toBeUndefined();
+    expect(saved.subscriptions['guild:70000000000000002'].active.endDate).toBe(later);
+    expect(notices.sent).toEqual(['paid.sub.expired:guild:70000000000000001']);
     expect(await applySharedOp({ op: 'premium.setMessages', args: { args: [{ moduleBlocked: 'x' }] } })).toMatchObject({ ok: true });
   });
 
   it('a journal its marks cover (a crash after the save, before the delete) applies nothing and is deleted', async () => {
-    writePremium({ g2: { active: { ...paidSub('s2', 'dm1', 'low', 'dummy'), endDate: later }, paused: [] } }, { eventsApplied: { w1: 2 } });
-    fs.writeFileSync(JOURNAL, journalLine('w1', 1, expired('d1', 'g1')) + journalLine('w1', 2, renewed('dm1', 'g2')));
+    writePremium({ 'guild:70000000000000002': { active: { ...paidSub('s2', 'dm1', 'low', 'dummy'), endDate: later }, paused: [] } }, { eventsApplied: { w1: 2 } });
+    fs.writeFileSync(JOURNAL, journalLine('w1', 1, expired('d1', '70000000000000001')) + journalLine('w1', 2, renewed('dm1', '70000000000000002')));
     const pm = newProcess();
     expect(pm.cacheState()).toBe('normal');
     startPremiumTickers();
@@ -148,61 +149,61 @@ describe('the journal and its replay', () => {
 
   it('a cut last line is logged and skipped; a repeated line is handed once; a second writer has its own mark', async () => {
     writePremium(subs(), { eventsApplied: { w1: 1 } });
-    fs.writeFileSync(JOURNAL, journalLine('w1', 1, renewed('dm1', 'g2')) + journalLine('w2', 1, expired('d1', 'g1')) + journalLine('w2', 1, expired('d1', 'g1')) + '{"writer":"w2","n":2,"ev');
+    fs.writeFileSync(JOURNAL, journalLine('w1', 1, renewed('dm1', '70000000000000002')) + journalLine('w2', 1, expired('d1', '70000000000000001')) + journalLine('w2', 1, expired('d1', '70000000000000001')) + '{"writer":"w2","n":2,"ev');
     const pm = newProcess();
     startPremiumTickers();
     await replayed(pm);
     expect(logged(spies.warn).filter(l => l.startsWith('[PremiumManager] Skipped a line of premium-tiers.events.jsonl that cannot be read'))).toHaveLength(1);
-    expect(notices.sent).toEqual(['paid.sub.expired:g1']);
+    expect(notices.sent).toEqual(['paid.sub.expired:guild:70000000000000001']);
     const saved = jsonOf(PREMIUM);
     expect(saved.eventsApplied).toEqual({ w1: 1, w2: 1 });
-    expect(saved.subscriptions.g2.active.endDate).not.toBe(later);
+    expect(saved.subscriptions['guild:70000000000000002'].active.endDate).not.toBe(later);
   });
 
   it('a second episode: new events under a new writer are applied once', async () => {
-    const first = await journalWhileBroken([expired('d1', 'g1')]);
+    const first = await journalWhileBroken([expired('d1', '70000000000000001')]);
     writePremium(subs());
     let pm = newProcess();
     startPremiumTickers();
     await replayed(pm);
     const kept = rawOf(PREMIUM)!;
-    const second = await journalWhileBroken([renewed('dm1', 'g2')]);
+    const second = await journalWhileBroken([renewed('dm1', '70000000000000002')]);
     expect(second).not.toBe(first);
     fs.writeFileSync(PREMIUM, kept);
     pm = newProcess();
     startPremiumTickers();
     await replayed(pm);
     expect(jsonOf(PREMIUM).eventsApplied).toEqual({ [first]: 1, [second]: 1 });
-    expect(jsonOf(PREMIUM).subscriptions.g2.active.endDate).toBe(later);
-    expect(notices.sent).toEqual(['paid.sub.expired:g1']);
+    expect(jsonOf(PREMIUM).subscriptions['guild:70000000000000002'].active.endDate).toBe(later);
+    expect(notices.sent).toEqual(['paid.sub.expired:guild:70000000000000001']);
   });
 
   it('an entry that throws is logged with its JSON and skipped; the others are applied and premium runs normally', async () => {
     writePremium(subs());
-    const bad = { type: 'subscription.renewed', providerId: 'dummy', providerSubId: 'dm1', guildId: 'g2' };
-    fs.writeFileSync(JOURNAL, journalLine('w1', 1, expired('d1', 'g1')) + journalLine('w1', 2, bad) + journalLine('w1', 3, renewed('dm1', 'g2')));
+    const bad = { type: 'subscription.renewed', providerId: 'dummy', providerSubId: 'dm1', holder: 'guild:70000000000000002' };
+    fs.writeFileSync(JOURNAL, journalLine('w1', 1, expired('d1', '70000000000000001')) + journalLine('w1', 2, bad) + journalLine('w1', 3, renewed('dm1', '70000000000000002')));
     const pm = newProcess();
     startPremiumTickers();
     await replayed(pm);
-    expect(logged(spies.error).some(l => l.startsWith('[PremiumManager] The journaled subscription.renewed event from dummy (subscription dm1, guild g2) could not be applied (') && l.includes('and is skipped: {'))).toBe(true);
-    expect(jsonOf(PREMIUM).subscriptions.g2.active.endDate).toBe(later);
+    expect(logged(spies.error).some(l => l.startsWith('[PremiumManager] The journaled subscription.renewed event from dummy (subscription dm1, guild 70000000000000002) could not be applied (') && l.includes('and is skipped: {'))).toBe(true);
+    expect(jsonOf(PREMIUM).subscriptions['guild:70000000000000002'].active.endDate).toBe(later);
     expect(jsonOf(PREMIUM).eventsApplied).toEqual({ w1: 3 });
   });
 
   it('an event that arrives during the replay is journaled and applied after the entries before it', async () => {
-    writePremium({ g3: { active: manualHigh(), paused: [] } });
-    fs.writeFileSync(JOURNAL, journalLine('w1', 1, createdEvent('c1', 'g3')));
+    writePremium({ 'guild:70000000000000003': { active: manualHigh(), paused: [] } });
+    fs.writeFileSync(JOURNAL, journalLine('w1', 1, createdEvent('c1', '70000000000000003')));
     pause = gate();
     const pm = newProcess();
     startPremiumTickers();
     await tick(30);
     expect(pm.cacheState()).toBe('replaying');
-    getPaymentRegistry().emitEvent(renewed('c1', 'g3', 'fake') as any);
+    getPaymentRegistry().emitEvent(renewed('c1', '70000000000000003', 'fake') as any);
     expect(logged(spies.warn).some(l => l.includes('arrived while premium applies the provider events it kept'))).toBe(true);
     expect(await applySharedOp({ op: 'premium.setMessages', args: { args: [{ moduleBlocked: 'x' }] } })).toMatchObject({ ok: false, error: expect.stringMatching(/^Premium is applying provider events/) });
     pause.open();
     await replayed(pm);
-    const paused = jsonOf(PREMIUM).subscriptions.g3.paused;
+    const paused = jsonOf(PREMIUM).subscriptions['guild:70000000000000003'].paused;
     expect(paused).toHaveLength(1);
     expect(paused[0].endDate).toBe(later);
     expect(linesOf(AUDIT).filter(l => l.action === 'subscription.install.paid')).toHaveLength(1);
@@ -211,8 +212,8 @@ describe('the journal and its replay', () => {
 
 describe('a stop during the replay', () => {
   it('hands nothing more, logs one line that the journal keeps them, and the next start applies each once', async () => {
-    writePremium({ ...subs(), g3: { active: manualHigh(), paused: [] } });
-    fs.writeFileSync(JOURNAL, journalLine('w1', 1, createdEvent('c1', 'g3')) + journalLine('w1', 2, renewed('dm1', 'g2')) + journalLine('w1', 3, expired('d1', 'g1')));
+    writePremium({ ...subs(), 'guild:70000000000000003': { active: manualHigh(), paused: [] } });
+    fs.writeFileSync(JOURNAL, journalLine('w1', 1, createdEvent('c1', '70000000000000003')) + journalLine('w1', 2, renewed('dm1', '70000000000000002')) + journalLine('w1', 3, expired('d1', '70000000000000001')));
     const journal = rawOf(JOURNAL);
     const before = rawOf(PREMIUM);
     pause = gate();
@@ -237,9 +238,9 @@ describe('a stop during the replay', () => {
     startPremiumTickers();
     await replayed(pm);
     const saved = jsonOf(PREMIUM);
-    expect(saved.subscriptions.g3.paused).toHaveLength(1);
-    expect(saved.subscriptions.g2.active.endDate).toBe(later);
-    expect(saved.subscriptions.g1.active).toBeUndefined();
+    expect(saved.subscriptions['guild:70000000000000003'].paused).toHaveLength(1);
+    expect(saved.subscriptions['guild:70000000000000002'].active.endDate).toBe(later);
+    expect(saved.subscriptions['guild:70000000000000001'].active).toBeUndefined();
     expect(linesOf(AUDIT).filter(l => l.action === 'subscription.install.paid')).toHaveLength(1);
   });
 });
@@ -260,7 +261,7 @@ describe("the replay's audit lines wait for a save carrying its marks", () => {
   /** Replays J1 (an install) while premium-tiers.json's flushes fail with EIO, so the replay's save stays queued. */
   async function replayWithSaveQueued(): Promise<ReturnType<typeof getPremiumManager>> {
     writePremium();
-    fs.writeFileSync(JOURNAL, journalLine('w1', 1, createdEvent('j1', 'g4')));
+    fs.writeFileSync(JOURNAL, journalLine('w1', 1, createdEvent('j1', '70000000000000004')));
     const pm = newProcess();
     flush.failing = true;
     startPremiumTickers();
@@ -272,7 +273,7 @@ describe("the replay's audit lines wait for a save carrying its marks", () => {
 
   it('a redelivery meanwhile answers not ok and appends nothing; once the save lands the line is appended once', async () => {
     const pm = await replayWithSaveQueued();
-    expect(await deliver(createdEvent('j1', 'g4'))).toMatchObject({ ok: false, code: 'unconfirmed', answer: 'held' });
+    expect(await deliver(createdEvent('j1', '70000000000000004'))).toMatchObject({ ok: false, code: 'unconfirmed', answer: 'held' });
     await settleQueue();
     expect(rawOf(AUDIT)).toBeNull();
     queued.ops = [];
@@ -284,7 +285,7 @@ describe("the replay's audit lines wait for a save carrying its marks", () => {
     expect(install).toBeGreaterThanOrEqual(0);
     expect(journalDelete).toBeGreaterThan(install);
     expect(queued.ops.filter(o => o.startsWith(`append ${AUDIT} `) && o.includes('subscription.install.paid'))).toHaveLength(1);
-    expect(await deliver(createdEvent('j1', 'g4'))).toMatchObject({ ok: true });
+    expect(await deliver(createdEvent('j1', '70000000000000004'))).toMatchObject({ ok: true });
     expect(linesOf(AUDIT).filter(l => l.action === 'subscription.install.paid')).toHaveLength(1);
     expect(pm.cacheState()).toBe('normal');
   });
@@ -322,14 +323,14 @@ describe('the web UI and the journal', () => {
 
   it('a pending line refuses premium and payment ops with no provider call; a covered journal does not; an unreadable one names its errno', async () => {
     writePremium(subs(), { eventsApplied: { w1: 1 } });
-    fs.writeFileSync(JOURNAL, journalLine('w1', 1, expired('d1', 'g1')) + journalLine('w1', 2, renewed('dm1', 'g2')));
+    fs.writeFileSync(JOURNAL, journalLine('w1', 1, expired('d1', '70000000000000001')) + journalLine('w1', 2, renewed('dm1', '70000000000000002')));
     const pm = newProcess();
-    const refused: any = await applySharedOp({ op: 'premium.cancelPaidSubscription', args: { args: ['g1'] } });
+    const refused: any = await applySharedOp({ op: 'premium.cancelPaidSubscription', args: { args: ['guild:70000000000000001'] } });
     expect(refused).toMatchObject({ ok: false, code: 'failed', error: 'Premium holds provider events the bot has not applied yet (premium-tiers.events.jsonl); nothing was saved. Start the bot to apply them, then try again.' });
-    expect(await deliver(createdEvent('x1', 'g9'))).toMatchObject({ ok: false, code: 'failed' });
+    expect(await deliver(createdEvent('x1', '70000000000000009'))).toMatchObject({ ok: false, code: 'failed' });
     expect(notices.sent).toEqual([]);
     expect(pm.cacheState()).toBe('normal');
-    fs.writeFileSync(JOURNAL, journalLine('w1', 1, expired('d1', 'g1')));
+    fs.writeFileSync(JOURNAL, journalLine('w1', 1, expired('d1', '70000000000000001')));
     expect(await applySharedOp({ op: 'premium.setMessages', args: { args: [{ moduleBlocked: 'x' }] } })).toMatchObject({ ok: true });
     await settleQueue();
     expect(rawOf(JOURNAL)).not.toBeNull();
@@ -343,12 +344,12 @@ describe('the web UI and the journal', () => {
 
   it('loads a fixed file beside a journal without a replay: no handler, notice or journal write', async () => {
     writePremium(subs());
-    const line = journalLine('w1', 1, expired('d1', 'g1'));
+    const line = journalLine('w1', 1, expired('d1', '70000000000000001'));
     fs.writeFileSync(JOURNAL, line);
     const pm = newProcess();
     await tick(30);
     expect(pm.cacheState()).toBe('normal');
-    expect(pm.resolveActiveTier('g1').tierId).toBe('low');
+    expect(pm.resolveActiveTier('70000000000000001').tierId).toBe('low');
     expect(notices.sent).toEqual([]);
     expect(rawOf(JOURNAL)).toBe(line);
   });
@@ -359,13 +360,13 @@ describe('a maintenance boot', () => {
   it('a covered journal is deleted and changes are taken; a pending one waits for the next normal boot', async () => {
     markMaintenanceBoot();
     writePremium(subs(), { eventsApplied: { w1: 1 } });
-    fs.writeFileSync(JOURNAL, journalLine('w1', 1, expired('d1', 'g1')));
+    fs.writeFileSync(JOURNAL, journalLine('w1', 1, expired('d1', '70000000000000001')));
     let pm = newProcess();
     startPremiumTickers();
     expect(pm.cacheState()).toBe('normal');
     await vi.waitFor(() => expect(rawOf(JOURNAL)).toBeNull(), { timeout: 5000, interval: 20 });
     expect(await applySharedOp({ op: 'premium.setMessages', args: { args: [{ moduleBlocked: 'x' }] } })).toMatchObject({ ok: true });
-    fs.writeFileSync(JOURNAL, journalLine('w1', 2, renewed('dm1', 'g2')));
+    fs.writeFileSync(JOURNAL, journalLine('w1', 2, renewed('dm1', '70000000000000002')));
     pm = newProcess();
     startPremiumTickers();
     await tick(30);

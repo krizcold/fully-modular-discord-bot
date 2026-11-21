@@ -18,8 +18,9 @@ vi.mock('../../src/bot/internalSetup/utils/payment/paymentRegistry', async orig 
   const patreon = {
     id: 'patreon',
     displayName: 'Patreon',
+    capabilities: { sells: ['guild'] },
     handleOAuthCallback: async (query: Record<string, string>) => ({
-      externalAccountId: query.code === 'other' ? 'acct-2' : 'acct-1', guildId: query.state, tierId: 'gold', offeringId: 'o1', variantId: 'v1', state: 'active',
+      externalAccountId: query.code === 'other' ? 'acct-2' : 'acct-1', holder: `guild:${query.state}`, buyerId: '80000000000000001', tierId: 'gold', offeringId: 'o1', variantId: 'v1', state: 'active',
     }),
   };
   return {
@@ -42,6 +43,7 @@ import { dataPath } from '../../src/utils/dataRoot';
 import { forks } from '../helpers/forkMock';
 import { put, readJson, startApp } from '../helpers/configRig';
 import { answering, exitChild, freshWriterLock, quiet, resetForks, sentTo, startedWith } from '../helpers/nb10Rig';
+import { gh, linkOf } from '../helpers/p1Holder';
 
 const G = '123456789012345678';
 const TIERS = () => dataPath('global', 'premium-tiers.json');
@@ -76,7 +78,7 @@ describe('the Patreon callback with a child at shared', () => {
   it('sends one payment.oauthCallback, raises no event here, and redirects on an ok answer', async () => {
     const before = fs.readFileSync(TIERS(), 'utf8');
     const { manager, child } = await startedWith([{ stage: 'shared' }]);
-    answering(child, m => (m.type === 'shared:op' ? { ok: true, result: { linked: G } } : undefined));
+    answering(child, m => (m.type === 'shared:op' ? { ok: true, result: { linked: gh(G) } } : undefined));
     const reply = await callback(manager);
     expect(reply.status).toBe(302);
     expect(reply.location).toBe(`/guild/${G}/subscription?subscribe=success`);
@@ -90,10 +92,11 @@ describe('the Patreon callback with a child at shared', () => {
 
   it('linkedElsewhere renders the 409 page', async () => {
     const { manager, child } = await startedWith([{ stage: 'shared' }]);
-    answering(child, () => ({ ok: true, result: { linkedElsewhere: '999999999999999999' } }));
+    answering(child, () => ({ ok: true, result: { linkedElsewhere: 'guild:999999999999999999' } }));
     const reply = await callback(manager);
     expect(reply.status).toBe(409);
-    expect(reply.text).toContain('999999999999999999');
+    expect(reply.text).toContain('<code>999999999999999999</code>');
+    expect(reply.text).toContain('<a href="/guild/999999999999999999/subscription">');
     expect(reply.location).toBe(null);
   });
 
@@ -112,8 +115,8 @@ describe('the Patreon callback with no child', () => {
     const reply = await callback(new BotManager());
     const stored = readJson(TIERS());
     expect(reply.status).toBe(302);
-    expect(stored.providerAccountLinks?.patreon).toEqual({ 'acct-1': G });
-    expect(JSON.stringify(stored.subscriptions?.[G] ?? stored.subscriptions)).toContain(`patreon:acct-1:${G}`);
+    expect(stored.providerAccountLinks?.patreon).toEqual({ 'acct-1': linkOf(G) });
+    expect(JSON.stringify(stored.subscriptions?.[gh(G)] ?? stored.subscriptions)).toContain(`patreon:acct-1:${G}`);
     expect(fs.existsSync(dataPath('.writer.lock'))).toBe(false);
   });
 });

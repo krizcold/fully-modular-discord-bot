@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const h = vi.hoisted(() => (process.env.GUILD_ID = 'g-test', {
-  dispatch: [] as Array<{ guildId: string; kind: string }>,
-  deliver: (_guildId: string): any => ({ delivered: true, via: 'dm' }),
+  dispatch: [] as Array<{ holder: string; kind: string }>,
+  deliver: (_holder: string): any => ({ delivered: true, via: 'dm' }),
   provider: null as any,
   lastTestGuild: 'g-old' as string | null,
   savedTestGuild: [] as string[],
@@ -39,6 +39,7 @@ import registerCommands from '../../src/bot/internalSetup/events/clientReady/reg
 import { deleteModuleCommandsFromDiscord } from '../../src/bot/internalSetup/utils/moduleReloader';
 import { postAccessLog } from '../../src/bot/internalSetup/utils/accessLogChannel';
 import { toggleCommand } from '../../src/bot/internalSetup/utils/ipcToggleHandler';
+import { gh } from '../helpers/p1Holder';
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -65,7 +66,7 @@ describe('notify answers its real delivery (R35-J2)', () => {
   it('says dropped with a cause when the guild is unreachable', async () => {
     const n = new SubscriptionNotifier();
     n.setClient({ guilds: { fetch: async () => { throw new Error('Unknown Guild'); } } } as any);
-    const outcome: any = await n.notify('g1', 'manual.grant.added', { tierName: 'Gold' });
+    const outcome: any = await n.notify('guild:70000000000000001', 'manual.grant.added', { tierName: 'Gold' });
     expect(outcome.delivered).toBe(false);
     expect(String(outcome.cause)).toMatch(/Unknown Guild/);
   });
@@ -74,12 +75,12 @@ describe('notify answers its real delivery (R35-J2)', () => {
     const n = new SubscriptionNotifier();
     const guild = { fetchOwner: async () => ({ send: async () => ({}) }) };
     n.setClient({ guilds: { fetch: async () => guild } } as any);
-    const outcome: any = await n.notify('g1', 'manual.grant.added', { tierName: 'Gold' });
+    const outcome: any = await n.notify('guild:70000000000000001', 'manual.grant.added', { tierName: 'Gold' });
     expect(outcome).toEqual({ delivered: true, via: 'dm' });
   });
 
   it('reports dropped when no bot process can deliver it', async () => {
-    const outcome: any = await notifications.dispatchPremiumNotification('g1', 'manual.grant.added', {});
+    const outcome: any = await notifications.dispatchPremiumNotification('guild:70000000000000001', 'manual.grant.added', {});
     expect(outcome?.delivered).toBe(false);
   });
 });
@@ -103,7 +104,7 @@ const link = (providerId: string, ...variantIds: string[]) => ({
 });
 
 function paidSub(id: string): any {
-  return { id, source: 'paid', providerId: 'p', providerSubId: `ps-${id}`, variantId: 'v1', tierId: 'a', offeringId: 'o1' };
+  return { id, source: 'paid', buyerId: '80000000000000001', providerId: 'p', providerSubId: `ps-${id}`, variantId: 'v1', tierId: 'a', offeringId: 'o1' };
 }
 
 describe('migration requests are stamped only on delivery (R35-J2)', () => {
@@ -116,14 +117,14 @@ describe('migration requests are stamped only on delivery (R35-J2)', () => {
   });
 
   it('stamps notifiedAt for the delivered guild and leaves the undelivered one unstamped', async () => {
-    vi.spyOn(notifications, 'dispatchPremiumNotification').mockImplementation(async (guildId: string) =>
-      (guildId === 'g1' ? { delivered: true, via: 'dm' } : { delivered: false, cause: 'guild not reachable' }) as any);
+    vi.spyOn(notifications, 'dispatchPremiumNotification').mockImplementation(async (holder: string) =>
+      (holder === 'guild:70000000000000001' ? { delivered: true, via: 'dm' } : { delivered: false, cause: 'guild not reachable' }) as any);
     const pm = premiumWith({
       tiers: {
         a: { displayName: 'A', offerings: [{ id: 'o1', providerLinks: [link('p', 'v1')] }] },
         b: { displayName: 'B', offerings: [{ id: 'o2', providerLinks: [link('p', 'v2')] }] },
       },
-      subscriptions: { g1: { active: paidSub('s1'), paused: [] }, g2: { active: paidSub('s2'), paused: [] } },
+      subscriptions: { 'guild:70000000000000001': { active: paidSub('s1'), paused: [] }, 'guild:70000000000000002': { active: paidSub('s2'), paused: [] } },
       migrations: [],
       migrationSilencePolicy: 'continue',
     });
@@ -132,12 +133,12 @@ describe('migration requests are stamped only on delivery (R35-J2)', () => {
       targetTierId: 'b', targetOfferingId: 'o2', targetVariantId: 'v2',
       effectiveDate: new Date(Date.now() + 86400000).toISOString(), message: '',
     });
-    const stamped = (guildId: string) => !!(pm as any).config.migrations[0].decisions.find((d: any) => d.guildId === guildId).notifiedAt;
+    const stamped = (guildId: string) => !!(pm as any).config.migrations[0].decisions.find((d: any) => d.holder === gh(guildId)).notifiedAt;
     const deadline = Date.now() + 5_000;
-    while (!stamped('g1') && Date.now() < deadline) await new Promise(r => setTimeout(r, 2));
+    while (!stamped('70000000000000001') && Date.now() < deadline) await new Promise(r => setTimeout(r, 2));
     const decisions = (pm as any).config.migrations[0].decisions;
-    expect(decisions.find((d: any) => d.guildId === 'g1').notifiedAt).toBeTruthy();
-    expect(decisions.find((d: any) => d.guildId === 'g2').notifiedAt).toBeUndefined();
+    expect(decisions.find((d: any) => d.holder === 'guild:70000000000000001').notifiedAt).toBeTruthy();
+    expect(decisions.find((d: any) => d.holder === 'guild:70000000000000002').notifiedAt).toBeUndefined();
   });
 
   it('does not apply the silence policy to a request that never reached the owner', async () => {
@@ -147,13 +148,13 @@ describe('migration requests are stamped only on delivery (R35-J2)', () => {
       targetTierId: 'b', targetOfferingId: 'o2', targetVariantId: 'v2', status: 'pending',
       effectiveDate: new Date(Date.now() - 1000).toISOString(),
       decisions: [
-        { guildId: 'g1', subscriptionId: 's1', providerSubId: 'ps-s1', decision: 'pending' },
-        { guildId: 'g2', subscriptionId: 's2', providerSubId: 'ps-s2', decision: 'pending', notifiedAt: '2026-10-01T00:00:00.000Z' },
+        { holder: 'guild:70000000000000001', subscriptionId: 's1', providerSubId: 'ps-s1', decision: 'pending' },
+        { holder: 'guild:70000000000000002', subscriptionId: 's2', providerSubId: 'ps-s2', decision: 'pending', notifiedAt: '2026-10-01T00:00:00.000Z' },
       ],
     };
     const pm = premiumWith({
       tiers: { a: { displayName: 'A', offerings: [{ id: 'o1' }] }, b: { displayName: 'B', offerings: [{ id: 'o2' }] } },
-      subscriptions: { g1: { active: paidSub('s1'), paused: [] }, g2: { active: paidSub('s2'), paused: [] } },
+      subscriptions: { 'guild:70000000000000001': { active: paidSub('s1'), paused: [] }, 'guild:70000000000000002': { active: paidSub('s2'), paused: [] } },
       migrations: [migration],
       migrationSilencePolicy: 'continue',
     });
@@ -234,7 +235,7 @@ describe('review round rows (C09-2)', () => {
     vi.spyOn(notifications, 'dispatchPremiumNotification').mockResolvedValue({ delivered: true, via: 'dm' } as any);
     const pm = premiumWith({
       tiers: { a: { displayName: 'A', offerings: [{ id: 'o1', providerLinks: [link('p', 'v1')] }] }, b: { displayName: 'B', offerings: [{ id: 'o2', providerLinks: [link('p', 'v2')] }] } },
-      subscriptions: { g1: { active: paidSub('s1'), paused: [paidSub('s2')] } },
+      subscriptions: { 'guild:70000000000000001': { active: paidSub('s1'), paused: [paidSub('s2')] } },
       migrations: [],
       migrationSilencePolicy: 'continue',
     });
@@ -254,8 +255,8 @@ describe('review round rows (C09-2)', () => {
     const fetch = vi.fn(async () => { throw new Error('Unknown Guild'); });
     const n = new SubscriptionNotifier();
     n.setClient({ guilds: { fetch } } as any);
-    await n.notify('g1', 'manual.grant.added', { tierName: 'Gold' });
-    expect(fetch).toHaveBeenCalledWith({ guild: 'g1', cache: false });
+    await n.notify('guild:70000000000000001', 'manual.grant.added', { tierName: 'Gold' });
+    expect(fetch).toHaveBeenCalledWith({ guild: '70000000000000001', cache: false });
   });
 
   it('deletes a test-only command through the application with GUILD_ID when the guild is not cached', async () => {

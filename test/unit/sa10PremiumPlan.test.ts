@@ -7,7 +7,7 @@ const DAY_MS = 86_400_000;
 const NOW = Date.parse('2026-11-10T00:00:00.000Z');
 const ref = (metadata: Record<string, unknown>, endDate: string | null = new Date(NOW + 3 * DAY_MS).toISOString()) => ({
   providerSubId: 'orph',
-  metadata: { guildId: 'g1', tierId: 'low', offeringId: 'o1', ...metadata },
+  metadata: { holder: 'guild:70000000000000001', buyerId: '80000000000000001', tierId: 'low', offeringId: 'o1', ...metadata },
   state: { status: 'paused', startDate: new Date(NOW).toISOString(), endDate, autoRenew: true },
   display: { amountLabel: '', periodLabel: '', statusLabel: 'paused' },
 }) as any;

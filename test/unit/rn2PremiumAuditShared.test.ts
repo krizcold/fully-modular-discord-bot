@@ -95,6 +95,7 @@ import { markPaymentLedger, openLedger, runInLedger, runSealed, writesOf } from 
 import { processId } from '../../src/bot/internalSetup/fleet/processId';
 import { setBackendKind } from '../helpers/backendKind';
 import { clearGlobal, logged, paidSub, PREMIUM, quiet, state, tick, writePremium } from './nb10PremiumRig';
+import { gh } from '../helpers/p1Holder';
 
 const role = process.env.BOT_PROCESS_ROLE;
 const AUDIT_DOC = 'global:/premium-tiers.audit.jsonl';
@@ -103,7 +104,7 @@ let spies: ReturnType<typeof quiet>;
 const managers: PremiumManager[] = [];
 
 function manager(): PremiumManager {
-  getPaymentRegistry().register({ id: 'fake', displayName: 'Fake', capabilities: {}, isConfigured: () => true } as any);
+  getPaymentRegistry().register({ id: 'fake', displayName: 'Fake', capabilities: { sells: ['guild'] }, isConfigured: () => true } as any);
   const pm = new PremiumManager();
   managers.push(pm);
   pm.load();
@@ -111,15 +112,15 @@ function manager(): PremiumManager {
 }
 
 const emit = (event: object) => getPaymentRegistry().emitEvent(event as any);
-const created = (providerSubId: string, guildId = 'g1') => ({
-  type: 'subscription.created', providerId: 'fake', providerSubId, guildId, tierId: 'low', offeringId: 'o1', state: state(),
+const created = (providerSubId: string, guildId = '70000000000000001') => ({
+  type: 'subscription.created', buyerId: '80000000000000001', providerId: 'fake', providerSubId, holder: gh(guildId), tierId: 'low', offeringId: 'o1', state: state(),
 });
 const expired = (subId: string, guildId: string) => ({
-  type: 'subscription.expired', providerId: 'fake', providerSubId: subId, guildId,
+  type: 'subscription.expired', providerId: 'fake', providerSubId: subId, holder: gh(guildId),
   state: { ...state('expired'), endDate: new Date(Date.now() - 1000).toISOString() },
 });
 const install = (extra: Partial<AuditEntry> = {}): AuditEntry => ({
-  timestamp: TS, actor: 'admin', action: 'subscription.install.paid', guildId: 'g1', tierId: 'low', offeringId: 'o1',
+  timestamp: TS, actor: 'admin', action: 'subscription.install.paid', holder: 'guild:70000000000000001', tierId: 'low', offeringId: 'o1',
   providerId: 'fake', subscriptionId: 's1', metadata: { variantId: 'v1' }, ...extra,
 });
 const writeAudit = (pm: PremiumManager, entry: AuditEntry, link: object, providerSubId?: string): void =>
@@ -153,7 +154,7 @@ beforeEach(() => {
   });
   reg.current = null;
   clearGlobal();
-  writePremium({ g2: { active: paidSub('s2', 'e1', 'low'), paused: [] } });
+  writePremium({ 'guild:70000000000000002': { active: paidSub('s2', 'e1', 'low'), paused: [] } });
 });
 afterEach(async () => {
   h.auto = 'landed';
@@ -189,7 +190,7 @@ describe('an audit line made after the stop', () => {
     const entry = install();
     const { errors } = afterStop(entry);
     expect(errors).toEqual([
-      `[PremiumManager] The audit line subscription.install.paid (guild g1, subscription ps1) was not written before this stop and is lost: ${JSON.stringify(entry)}`,
+      `[PremiumManager] The audit line subscription.install.paid (guild 70000000000000001, subscription ps1) was not written before this stop and is lost: ${JSON.stringify(entry)}`,
     ]);
   });
 
@@ -197,14 +198,14 @@ describe('an audit line made after the stop', () => {
     const entry = install();
     const { errors } = afterStop(entry, true);
     expect(errors).toEqual([
-      `[PremiumManager] The audit line subscription.install.paid (guild g1, subscription ps1) was not written before this stop; the webhook was answered 503, and the provider's next delivery of it writes this line, or, when the subscription's own save was lost too, installs the subscription again under a new id with its own line: ${JSON.stringify(entry)}`,
+      `[PremiumManager] The audit line subscription.install.paid (guild 70000000000000001, subscription ps1) was not written before this stop; the webhook was answered 503, and the provider's next delivery of it writes this line, or, when the subscription's own save was lost too, installs the subscription again under a new id with its own line: ${JSON.stringify(entry)}`,
     ]);
   });
 
   it('an install line with no subscription id is logged as a plain line', () => {
     const entry = install({ subscriptionId: undefined });
     const { errors } = afterStop(entry);
-    expect(errors).toEqual([`[PremiumManager] The audit line subscription.install.paid (guild g1, ${TS}) was not written: the bot is stopping; it is lost`]);
+    expect(errors).toEqual([`[PremiumManager] The audit line subscription.install.paid (guild 70000000000000001, ${TS}) was not written: the bot is stopping; it is lost`]);
   });
 });
 
@@ -255,7 +256,7 @@ describe("an install line's entry follows its op", () => {
     const pm = manager();
     h.auto = { refused: { cause: 'io' } };
     emit(created('c1'));
-    await until(() => logged(spies.warn).some(l => l.includes('paid.sub.started notice for guild g1 was not sent')));
+    await until(() => logged(spies.warn).some(l => l.includes('paid.sub.started notice for guild 70000000000000001 was not sent')));
     expect(savedLines(0).map(l => l.action)).toEqual(['subscription.install.paid']);
     await runSealed('console', null, 'premium', async ledger => {
       markPaymentLedger(ledger, 'payment.webhook');
@@ -265,14 +266,14 @@ describe("an install line's entry follows its op", () => {
     expect(h.saves).toHaveLength(2);
     const again = savedLines(1);
     expect(again).toHaveLength(1);
-    expect(again[0]).toMatchObject({ action: 'subscription.install.paid', guildId: 'g1', subscriptionId: savedLines(0)[0].subscriptionId, metadata: { redelivered: true } });
+    expect(again[0]).toMatchObject({ action: 'subscription.install.paid', holder: 'guild:70000000000000001', subscriptionId: savedLines(0)[0].subscriptionId, metadata: { redelivered: true } });
   });
 
   it('a refused op leaves no install line for the exit to name', async () => {
     const pm = manager();
     h.auto = { refused: { cause: 'io' } };
     emit(created('c1'));
-    await until(() => logged(spies.warn).some(l => l.includes('paid.sub.started notice for guild g1 was not sent')));
+    await until(() => logged(spies.warn).some(l => l.includes('paid.sub.started notice for guild 70000000000000001 was not sent')));
     expect(exitErrors(pm).filter(l => l.includes('subscription.install.paid'))).toEqual([]);
   });
 
@@ -288,14 +289,14 @@ describe("an install line's entry follows its op", () => {
     forgetItems(first.items);
     const lines = exitErrors(pm).filter(l => l.includes('subscription psX)'));
     expect(lines).toEqual([
-      `[PremiumManager] The audit line subscription.install.paid (guild g1, subscription psX) did not reach the disk before this stop and is lost: ${JSON.stringify(newer)}`,
+      `[PremiumManager] The audit line subscription.install.paid (guild 70000000000000001, subscription psX) did not reach the disk before this stop and is lost: ${JSON.stringify(newer)}`,
     ]);
   });
 
   it("an install line with no guild whose op ended unconfirmed is named can't confirm, ending with its line", () => {
     const pm = manager();
     const carry = newCarry();
-    const entry = install({ guildId: undefined, subscriptionId: 'sY' });
+    const entry = install({ holder: undefined, subscriptionId: 'sY' });
     writeAudit(pm, entry, { carry }, 'psY');
     saveCarry(pm, carry);
     h.tickets[0].op.state = 'unconfirmed';
@@ -309,14 +310,14 @@ describe("an install line's entry follows its op", () => {
 describe('the exit lines of a landed row op', () => {
   it('name neither its audit line nor a notice as lost, and the open notice is named not sent', () => {
     const pm = manager();
-    emit(expired('e1', 'g2'));
+    emit(expired('e1', '70000000000000002'));
     expect(h.tickets).toHaveLength(1);
     expect(savedLines(0).map(l => l.action)).toEqual(['subscription.expire.paid']);
     h.tickets[0].op.state = 'landed';
     spies.warn.mockClear();
     const errors = exitErrors(pm);
     expect(errors.filter(l => l.includes('The audit line subscription.expire.paid'))).toEqual([]);
-    expect(logged(spies.warn)).toContain('[PremiumManager] The paid.sub.expired notice for guild g2 was not sent: the bot is stopping');
+    expect(logged(spies.warn)).toContain('[PremiumManager] The paid.sub.expired notice for guild 70000000000000002 was not sent: the bot is stopping');
   });
 });
 
@@ -331,7 +332,7 @@ describe('a provider event while premium-tiers.json cannot be read', () => {
     expect(h.appended[0].key).toBe('global/premium-tiers.events.jsonl');
     expect(JSON.parse(h.appended[0].line)).toMatchObject({ writer: processId(), n: expect.any(Number), event });
     expect(logged(spies.warn).filter(l => l.includes('premium-tiers.events.jsonl'))).toEqual([
-      '[PremiumManager] A subscription.created event from fake (subscription j1, guild g1) arrived while premium-tiers.json cannot be read; it is kept in premium-tiers.events.jsonl and applied once premium runs normally',
+      '[PremiumManager] A subscription.created event from fake (subscription j1, guild 70000000000000001) arrived while premium-tiers.json cannot be read; it is kept in premium-tiers.events.jsonl and applied once premium runs normally',
     ]);
   });
 });

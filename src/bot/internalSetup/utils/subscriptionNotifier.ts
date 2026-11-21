@@ -14,11 +14,14 @@
  * the guild's system channel. Each step that fails just falls through to
  * the next; if everything fails we log and move on (a missed notification
  * never blocks a state change).
+ *
+ * A user holder gets one direct message and has no channel to fall back to.
  */
 
 import { Client, TextBasedChannel } from 'discord.js';
 import { getPremiumManager } from './premiumManager';
 import { discordTimestamp } from './discordTimestamp';
+import { notHolderText, parseHolder, type HolderKey, type HolderKind } from './premiumHolder';
 
 export type NotificationType =
   | 'manual.grant.added'
@@ -67,13 +70,31 @@ export class SubscriptionNotifier {
     return !!this.client;
   }
 
-  async notify(guildId: string, type: NotificationType, payload: NotificationPayload): Promise<NotifyOutcome> {
+  async notify(holder: HolderKey, type: NotificationType, payload: NotificationPayload): Promise<NotifyOutcome> {
+    const parsed = parseHolder(holder);
+    if (!parsed) {
+      const cause = notHolderText(holder);
+      console.warn(`[SubscriptionNotifier] ${type} was not delivered: ${cause}`);
+      return { delivered: false, cause };
+    }
+    const guildId = parsed.id;
     if (!this.client) {
-      console.warn(`[SubscriptionNotifier] notify(${type}, ${guildId}) called before client was set`);
+      console.warn(`[SubscriptionNotifier] notify(${type}, ${parsed.kind === 'user' ? holder : guildId}) called before client was set`);
       return { delivered: false, cause: 'the Discord client is not set up yet' };
     }
-    const message = this.formatMessage(type, payload);
+    const message = this.formatMessage(type, payload, parsed.kind);
     if (!message) return { delivered: false, cause: `no message text for ${type}` };
+
+    if (parsed.kind === 'user') {
+      try {
+        await this.client.users.send(parsed.id, message);
+        return { delivered: true, via: 'dm' };
+      } catch (err) {
+        const cause = `the user's direct messages could not be reached (${err instanceof Error ? err.message : String(err)})`;
+        console.warn(`[SubscriptionNotifier] ${type} for user ${parsed.id} was not delivered: ${cause}`);
+        return { delivered: false, cause };
+      }
+    }
 
     let guild;
     let guildError: unknown = null;
@@ -91,7 +112,7 @@ export class SubscriptionNotifier {
 
     if (await this.tryDmOwner(guild, message)) return { delivered: true, via: 'dm' };
 
-    const subs = getPremiumManager().getGuildSubscriptions(guildId);
+    const subs = getPremiumManager().getHolderSubscriptions(holder);
     if (subs?.notificationsChannelId) {
       const ch = await this.client.channels.fetch(subs.notificationsChannelId, { allowUnknownGuild: true }).catch(() => null);
       if (ch && this.isWritableTextChannel(ch)) {
@@ -134,7 +155,7 @@ export class SubscriptionNotifier {
     return true;
   }
 
-  private formatMessage(type: NotificationType, p: NotificationPayload): string {
+  private formatMessage(type: NotificationType, p: NotificationPayload, kind: HolderKind = 'guild'): string {
     const tier = p.tierName || 'a tier';
     const provider = p.providerName ? ` (${p.providerName})` : '';
     const remaining = p.remainingDays != null ? ` ${p.remainingDays} day${p.remainingDays === 1 ? '' : 's'} remaining.` : '';
@@ -146,7 +167,7 @@ export class SubscriptionNotifier {
 
     switch (type) {
       case 'manual.grant.added':
-        return `**Premium granted:** Your server now has **${tier}**.${ends}${notes}`;
+        return `**Premium granted:** ${kind === 'user' ? 'You now have' : 'Your server now has'} **${tier}**.${ends}${notes}`;
       case 'manual.grant.ending-soon':
         return `**Premium ending soon:** Your **${tier}** grant expires in 24 hours.${ends}`;
       case 'manual.grant.ended':
@@ -154,7 +175,7 @@ export class SubscriptionNotifier {
       case 'manual.grant.revoked':
         return `**Premium revoked:** Your **${tier}** grant was removed by an administrator.${reason}`;
       case 'paid.sub.started':
-        return `**Subscription active:** **${tier}**${provider} is now active for your server.${ends}`;
+        return `**Subscription active:** **${tier}**${provider} is now active for ${kind === 'user' ? 'you' : 'your server'}.${ends}`;
       case 'paid.sub.paused-by-stacking':
         return `**Subscription paused:** Your **${tier}**${provider} subscription is queued behind a higher-tier plan and won't be billed until it resumes.${remaining}`;
       case 'paid.sub.resumed-from-queue':

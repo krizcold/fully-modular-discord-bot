@@ -42,6 +42,7 @@
 import type { Client } from 'discord.js';
 import { providerCredentials } from '@/utils/envLoader';
 import { getPaymentRegistry } from './paymentRegistry';
+import { guildIdFor, holderFromWire, type HolderKey } from '../premiumHolder';
 import { isMaintenanceGateClosed, runAcceptedOp } from '../maintenanceGate';
 import type {
   PaymentProvider,
@@ -69,6 +70,7 @@ const CAPABILITIES: ProviderCapabilities = {
   mechanism: 'verify_only',
   variantIdLabel: 'Variant id - use "boost"',
   productIdLabel: '',
+  sells: ['guild'],
 };
 
 const POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
@@ -128,7 +130,8 @@ export class ServerBoostingProvider implements PaymentProvider {
     return ['GuildMembers'];
   }
 
-  async initiatePurchase(_opts: InitiateOpts): Promise<InitiateResult> {
+  async initiatePurchase(opts: InitiateOpts): Promise<InitiateResult> {
+    guildIdFor(opts.holder as HolderKey, this.displayName);
     const c = providerCredentials('boost');
     const targetMention = c.BOOST_TARGET_GUILD_ID ? ` (server id: ${c.BOOST_TARGET_GUILD_ID})` : '';
     return {
@@ -156,7 +159,7 @@ export class ServerBoostingProvider implements PaymentProvider {
     return null;
   }
 
-  async listSubscriptionsForGuild(_guildId: string): Promise<ProviderSubscriptionRef[]> {
+  async listSubscriptionsFor(_holder: HolderKey): Promise<ProviderSubscriptionRef[]> {
     return [];
   }
 
@@ -181,6 +184,12 @@ export class ServerBoostingProvider implements PaymentProvider {
     }
   }
 
+  private premium(): { getAllTiers(kind: 'guild'): Record<string, any> } {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { getPremiumManager } = require('../premiumManager');
+    return getPremiumManager();
+  }
+
   /**
    * Walk the configured target guild's boosters and grant the wired
    * boost variant on each guild those boosters own.
@@ -195,10 +204,7 @@ export class ServerBoostingProvider implements PaymentProvider {
     const targetId = c.BOOST_TARGET_GUILD_ID;
     if (!targetId) return;
 
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const { getPremiumManager } = require('../premiumManager');
-    const mgr = getPremiumManager();
-    const tiers = mgr.getAllTiers();
+    const tiers = this.premium().getAllTiers('guild');
 
     interface WiredVariant { variantId: string; tierId: string; offeringId: string; }
     const wired: WiredVariant[] = [];
@@ -234,6 +240,8 @@ export class ServerBoostingProvider implements PaymentProvider {
     const registry = getPaymentRegistry();
     const guilds = this.client.guilds.cache;
     for (const [ownedGuildId, ownedGuild] of guilds) {
+      const holder = holderFromWire(ownedGuildId);
+      if (!holder) continue;
       const ownerId = (ownedGuild as any).ownerId;
       const eligible = !!ownerId && boosters.has(ownerId);
       const qualifying = eligible ? variantToGrant : undefined;
@@ -247,7 +255,7 @@ export class ServerBoostingProvider implements PaymentProvider {
               type: 'subscription.expired',
               providerId: this.id,
               providerSubId: previousSubId,
-              guildId: ownedGuildId,
+              holder,
               state: this.expiredState(),
             });
           }
@@ -255,7 +263,8 @@ export class ServerBoostingProvider implements PaymentProvider {
             type: 'subscription.created',
             providerId: this.id,
             providerSubId: subId,
-            guildId: ownedGuildId,
+            holder,
+            buyerId: ownerId,
             tierId: qualifying.tierId,
             offeringId: qualifying.offeringId,
             variantId: qualifying.variantId,
@@ -268,7 +277,7 @@ export class ServerBoostingProvider implements PaymentProvider {
           type: 'subscription.expired',
           providerId: this.id,
           providerSubId: previousSubId,
-          guildId: ownedGuildId,
+          holder,
           state: this.expiredState(),
         });
         this.installed.delete(ownedGuildId);
@@ -306,11 +315,13 @@ export class ServerBoostingProvider implements PaymentProvider {
     if (this.installed.size === 0) return;
     const registry = getPaymentRegistry();
     for (const [guildId, subId] of this.installed) {
+      const holder = holderFromWire(guildId);
+      if (!holder) continue;
       registry.emitEvent({
         type: 'subscription.expired',
         providerId: this.id,
         providerSubId: subId,
-        guildId,
+        holder,
         state: this.expiredState(),
       });
     }

@@ -3,6 +3,7 @@
 import { Router, Request, Response } from 'express';
 import { requireOAuth, requireGuildAccess } from '../auth/oauthMiddleware';
 import { getPremiumManager } from '../../bot/internalSetup/utils/premiumManager';
+import { guildHolder, parseHolder } from '../../bot/internalSetup/utils/premiumHolder';
 import { getPaymentRegistry } from '../../bot/internalSetup/utils/payment/paymentRegistry';
 import type { BotManager } from '../botManager';
 import { SharedOpAnswered, sharedOpFailure, sharedOpRunner } from './hopFailure';
@@ -13,7 +14,7 @@ export function createGuildSubscriptionRoutes(botManager: BotManager): Router {
 
   function validateGuildId(guildId: string): boolean {
     return typeof guildId === 'string' &&
-           /^[0-9]+$/.test(guildId) &&
+           /^[1-9][0-9]+$/.test(guildId) &&
            guildId.length >= 17 &&
            guildId.length <= 19;
   }
@@ -54,8 +55,12 @@ export function createGuildSubscriptionRoutes(botManager: BotManager): Router {
         `<p><a href="/guild">Back to the server page</a></p>`
       );
     }
-    const existing: string | undefined = reply.result?.linkedElsewhere;
-    const result = { guildId: reply.result?.linked as string };
+    const serverOf = (holder: unknown): string | undefined => {
+      const parsed = parseHolder(holder);
+      return parsed?.kind === 'guild' ? parsed.id : undefined;
+    };
+    const existing = serverOf(reply.result?.linkedElsewhere);
+    const linked = serverOf(reply.result?.linked);
 
     // Anti-duplicate: one Patreon account can't link to multiple guilds.
     // If a previous link exists on a different guild, surface the conflicting
@@ -71,9 +76,16 @@ export function createGuildSubscriptionRoutes(botManager: BotManager): Router {
         `<p><a href="${unlinkPath}">Open the other server's subscription page</a></p>`
       );
     }
+    if (!linked) {
+      return res.status(502).type('html').send(
+        `<h2>Patreon link not confirmed</h2><p>Can't confirm whether your Patreon account was linked: the bot's answer named no server. ` +
+        `Open the server's subscription page to see whether the subscription is there before you start the link again.</p>` +
+        `<p><a href="/guild">Back to the server page</a></p>`
+      );
+    }
     // Redirect back to the guild's subscription page; the ?subscribe=success
     // query triggers the neutral-processing-page poll from Stage 3 polish.
-    res.redirect(`/guild/${encodeURIComponent(result.guildId)}/subscription?subscribe=success`);
+    res.redirect(`/guild/${encodeURIComponent(linked)}/subscription?subscribe=success`);
   });
 
   /**
@@ -88,9 +100,9 @@ export function createGuildSubscriptionRoutes(botManager: BotManager): Router {
         return res.status(400).json({ success: false, error: 'Invalid guild ID' });
       }
       const mgr = getPremiumManager();
-      const subscriptions = mgr.getSubscriptions(guildId);
+      const subscriptions = mgr.getSubscriptions(guildHolder(guildId));
       const resolved = mgr.resolveActiveTier(guildId);
-      const tiers = mgr.getAllTiers();
+      const tiers = mgr.getAllTiers('guild');
       const activated = mgr.getActivatedProviders();
       const registry = getPaymentRegistry();
       // Only surface providers that are activated system-wide AND configured.
@@ -181,18 +193,18 @@ export function createGuildSubscriptionRoutes(botManager: BotManager): Router {
         return res.status(400).json({ success: false, error: 'variantId is required' });
       }
       const mgr = getPremiumManager();
-      const userId = (req.user as any)?.id;
-      const result = await shared(res, 'premium.initiatePaidSubscription', [guildId, tierId, offeringId, {
+      const buyerId = (req.user as any)?.id;
+      const result = await shared(res, 'premium.initiatePaidSubscription', [guildHolder(guildId), tierId, offeringId, {
         providerId,
         variantId,
         couponCode,
-        userId,
+        buyerId,
         autoRenewOptOut: !!autoRenewOptOut,
       }]);
       res.json({
         success: true,
         result,
-        subscriptions: mgr.getSubscriptions(guildId),
+        subscriptions: mgr.getSubscriptions(guildHolder(guildId)),
       });
     } catch (error) {
       if (error instanceof SharedOpAnswered) return;
@@ -212,8 +224,8 @@ export function createGuildSubscriptionRoutes(botManager: BotManager): Router {
         return res.status(400).json({ success: false, error: 'Invalid guild ID' });
       }
       const mgr = getPremiumManager();
-      const success = await shared(res, 'premium.cancelPaidSubscription', [guildId]);
-      res.json({ success, subscriptions: mgr.getSubscriptions(guildId) });
+      const success = await shared(res, 'premium.cancelPaidSubscription', [guildHolder(guildId)]);
+      res.json({ success, subscriptions: mgr.getSubscriptions(guildHolder(guildId)) });
     } catch (error) {
       if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -232,8 +244,8 @@ export function createGuildSubscriptionRoutes(botManager: BotManager): Router {
         return res.status(400).json({ success: false, error: 'Invalid guild ID' });
       }
       const mgr = getPremiumManager();
-      const success = await shared(res, 'premium.reactivatePaidSubscription', [guildId]);
-      res.json({ success, subscriptions: mgr.getSubscriptions(guildId) });
+      const success = await shared(res, 'premium.reactivatePaidSubscription', [guildHolder(guildId)]);
+      res.json({ success, subscriptions: mgr.getSubscriptions(guildHolder(guildId)) });
     } catch (error) {
       if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -254,11 +266,11 @@ export function createGuildSubscriptionRoutes(botManager: BotManager): Router {
         return res.status(400).json({ success: false, error: 'Invalid guild ID' });
       }
       const mgr = getPremiumManager();
-      const success = await shared(res, 'premium.cancelPaidSubscriptionImmediately', [guildId]);
+      const success = await shared(res, 'premium.cancelPaidSubscriptionImmediately', [guildHolder(guildId)]);
       if (!success) {
         return res.status(404).json({ success: false, error: 'No active paid subscription to expire' });
       }
-      res.json({ success, subscriptions: mgr.getSubscriptions(guildId) });
+      res.json({ success, subscriptions: mgr.getSubscriptions(guildHolder(guildId)) });
     } catch (error) {
       if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -278,7 +290,7 @@ export function createGuildSubscriptionRoutes(botManager: BotManager): Router {
         return res.status(400).json({ success: false, error: 'Invalid guild ID' });
       }
       const mgr = getPremiumManager();
-      const orphans = await mgr.findOrphansForGuild(guildId);
+      const orphans = await mgr.findOrphansFor(guildHolder(guildId));
       res.json({ success: true, orphans });
     } catch (error) {
       if (error instanceof SharedOpAnswered) return;
@@ -299,8 +311,8 @@ export function createGuildSubscriptionRoutes(botManager: BotManager): Router {
         return res.status(400).json({ success: false, error: 'Invalid guild ID' });
       }
       const mgr = getPremiumManager();
-      await shared(res, 'premium.adoptOrphan', [guildId, providerId, providerSubId, req.body?.plan]);
-      res.json({ success: true, subscriptions: mgr.getSubscriptions(guildId) });
+      await shared(res, 'premium.adoptOrphan', [guildHolder(guildId), providerId, providerSubId, req.body?.plan]);
+      res.json({ success: true, subscriptions: mgr.getSubscriptions(guildHolder(guildId)) });
     } catch (error) {
       if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -341,7 +353,7 @@ export function createGuildSubscriptionRoutes(botManager: BotManager): Router {
         return res.status(400).json({ success: false, error: 'Invalid guild ID' });
       }
       const mgr = getPremiumManager();
-      const subs = mgr.getSubscriptions(guildId);
+      const subs = mgr.getSubscriptions(guildHolder(guildId));
       const active = subs.active;
       if (!active || active.source !== 'paid' || !active.providerId || !active.providerSubId) {
         return res.status(404).json({ success: false, error: 'No active paid subscription on this guild' });
@@ -378,11 +390,11 @@ export function createGuildSubscriptionRoutes(botManager: BotManager): Router {
         return res.status(400).json({ success: false, error: 'subscriptionId is required' });
       }
       const mgr = getPremiumManager();
-      const success = await shared(res, 'premium.cancelAndRemovePausedSubscription', [guildId, subscriptionId]);
+      const success = await shared(res, 'premium.cancelAndRemovePausedSubscription', [guildHolder(guildId), subscriptionId]);
       if (!success) {
         return res.status(404).json({ success: false, error: 'No paused subscription matched that id' });
       }
-      res.json({ success, subscriptions: mgr.getSubscriptions(guildId) });
+      res.json({ success, subscriptions: mgr.getSubscriptions(guildHolder(guildId)) });
     } catch (error) {
       if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -405,7 +417,7 @@ export function createGuildSubscriptionRoutes(botManager: BotManager): Router {
       if (!validateGuildId(guildId)) {
         return res.status(400).json({ success: false, error: 'Invalid guild ID' });
       }
-      const unlinked = await shared(res, 'premium.unlinkProviderAccount', [guildId, providerId]);
+      const unlinked = await shared(res, 'premium.unlinkProviderAccount', [guildHolder(guildId), providerId]);
       if (!unlinked) {
         return res.status(404).json({ success: false, error: `No ${providerId} link on this guild` });
       }
@@ -429,12 +441,13 @@ export function createGuildSubscriptionRoutes(botManager: BotManager): Router {
         return res.status(400).json({ success: false, error: 'Invalid guild ID' });
       }
       const mgr = getPremiumManager();
-      const all = mgr.getPendingMigrationsForGuild(guildId);
+      const holder = guildHolder(guildId);
+      const all = mgr.getPendingMigrationsFor(holder);
       // Strip other-guild decisions before returning so we don't leak the
       // affected-guild list to one guild owner.
       const filtered = all.map(m => ({
         ...m,
-        decisions: m.decisions.filter(d => d.guildId === guildId),
+        decisions: m.decisions.filter(d => d.holder === holder),
       }));
       res.json({ success: true, migrations: filtered });
     } catch (error) {
@@ -459,7 +472,7 @@ export function createGuildSubscriptionRoutes(botManager: BotManager): Router {
         return res.status(400).json({ success: false, error: 'decision must be "accepted" or "declined"' });
       }
       const mgr = getPremiumManager();
-      const ok = await shared(res, 'premium.recordMigrationDecision', [migrationId, guildId, decision]);
+      const ok = await shared(res, 'premium.recordMigrationDecision', [migrationId, guildHolder(guildId), decision]);
       if (!ok) return res.status(404).json({ success: false, error: 'No matching pending migration for this guild' });
       res.json({ success: true });
     } catch (error) {
@@ -490,8 +503,8 @@ export function createGuildSubscriptionRoutes(botManager: BotManager): Router {
         return res.status(400).json({ success: false, error: 'channelId must be a Discord channel id (17-20 digits) or null/empty to clear' });
       }
       const mgr = getPremiumManager();
-      await shared(res, 'premium.setNotificationsChannelId', [guildId, channelId]);
-      res.json({ success: true, subscriptions: mgr.getSubscriptions(guildId) });
+      await shared(res, 'premium.setNotificationsChannelId', [guildHolder(guildId), channelId]);
+      res.json({ success: true, subscriptions: mgr.getSubscriptions(guildHolder(guildId)) });
     } catch (error) {
       if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';

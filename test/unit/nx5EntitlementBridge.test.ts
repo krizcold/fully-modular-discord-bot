@@ -30,7 +30,7 @@ import { clearGlobal, jsonOf, paidSub, PREMIUM, quiet, settleQueue, writePremium
 
 const m = maintenance as any;
 const role = process.env.BOT_PROCESS_ROLE;
-const ended = { id: 'd1', sku_id: 'sku-1', guild_id: 'g1', starts_at: new Date(Date.now() - 86_400_000).toISOString(), ends_at: new Date(Date.now() - 1000).toISOString() };
+const ended = { id: 'd1', sku_id: 'sku-1', guild_id: '70000000000000001', starts_at: new Date(Date.now() - 86_400_000).toISOString(), ends_at: new Date(Date.now() - 1000).toISOString() };
 
 beforeEach(async () => {
   quiet();
@@ -38,10 +38,10 @@ beforeEach(async () => {
   resetPremiumManager();
   reg.current = null;
   clearGlobal();
-  writePremium({ g1: { active: paidSub('s1', 'd1', 'low', 'discord'), paused: [] } });
+  writePremium({ 'guild:70000000000000001': { active: paidSub('s1', 'd1', 'low', 'discord'), paused: [] } });
   process.env.BOT_PROCESS_ROLE = 'bot';
   getPaymentRegistry().register(new DiscordProvider());
-  expect(getPremiumManager().resolveActiveTier('g1').tierId).toBe('low');
+  expect(getPremiumManager().resolveActiveTier('70000000000000001').tierId).toBe('low');
   maintenance._setMaintenanceSender(() => undefined);
   maintenance._setMaintenanceTiming({ filePollMs: 600_000 });
   writeMaintenanceFile('running', 'The last message.');
@@ -69,7 +69,7 @@ describe('decision 10: an entitlement event through the attached bridge during a
     expect(isMaintenanceGateClosed() && orderRefusesSharedOps()).toBe(true);
     client.emit('entitlementDelete', ended as any);
     await settleQueue();
-    expect(jsonOf(PREMIUM).subscriptions.g1?.active).toBeUndefined();
+    expect(jsonOf(PREMIUM).subscriptions['guild:70000000000000001']?.active).toBeUndefined();
     expect((getPremiumManager() as any).saveHeld).toBe(false);
     m.attachSaveOrderSource(null);
     maintenance._resetMaintenance();
@@ -84,7 +84,7 @@ describe('decision 10: an entitlement event through the attached bridge during a
     expect(isMaintenanceGateClosed() && orderRefusesSharedOps()).toBe(true);
     client!.emit('entitlementDelete', ended as any);
     await settleQueue();
-    expect(jsonOf(PREMIUM).subscriptions.g1?.active).toBeUndefined();
+    expect(jsonOf(PREMIUM).subscriptions['guild:70000000000000001']?.active).toBeUndefined();
     expect((getPremiumManager() as any).saveHeld).toBe(false);
   });
 });

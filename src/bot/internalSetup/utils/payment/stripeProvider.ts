@@ -15,6 +15,7 @@ import * as crypto from 'crypto';
 import { PROVIDER_FETCH_MS } from './paymentTypes';
 import { providerCredentials } from '@/utils/envLoader';
 import { getPaymentRegistry } from './paymentRegistry';
+import { guildIdFor, holderFromWire, parseHolder, type HolderKey } from '../premiumHolder';
 import type {
   PaymentProvider,
   ProviderCapabilities,
@@ -62,6 +63,7 @@ const CAPABILITIES: ProviderCapabilities = {
   mechanism: 'redirect',
   variantIdLabel: 'Stripe Price ID',
   productIdLabel: 'Stripe Product ID',
+  sells: ['guild'],
 };
 
 interface StripeSession {
@@ -154,6 +156,7 @@ export class StripeProvider implements PaymentProvider {
   // ============================================================================
 
   async initiatePurchase(opts: InitiateOpts): Promise<InitiateResult> {
+    const guildId = guildIdFor(opts.holder as HolderKey, this.displayName);
     if (!opts.variantId) throw new Error('Stripe initiatePurchase requires variantId.');
 
     // Look up the price upfront so we can return a variantSnapshot AND
@@ -177,23 +180,24 @@ export class StripeProvider implements PaymentProvider {
       mode: isSubscription ? 'subscription' : 'payment',
       'line_items[0][price]': opts.variantId,
       'line_items[0][quantity]': '1',
-      success_url: `${successBase}/guild/${encodeURIComponent(opts.guildId)}/subscription?subscribe=success&session={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${successBase}/guild/${encodeURIComponent(opts.guildId)}/subscription?subscribe=cancel`,
-      client_reference_id: `${opts.guildId}:${opts.tierId}:${opts.offeringId}`,
-      'metadata[guildId]': opts.guildId,
+      success_url: `${successBase}/guild/${encodeURIComponent(guildId)}/subscription?subscribe=success&session={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${successBase}/guild/${encodeURIComponent(guildId)}/subscription?subscribe=cancel`,
+      client_reference_id: `${guildId}:${opts.tierId}:${opts.offeringId}`,
+      'metadata[guildId]': guildId,
       'metadata[tierId]': opts.tierId,
       'metadata[offeringId]': opts.offeringId,
       'metadata[variantId]': opts.variantId,
       'metadata[couponCode]': opts.couponCode || '',
-      'metadata[userId]': opts.userId || '',
+      'metadata[userId]': opts.buyerId || '',
     };
 
     if (isSubscription) {
-      params['subscription_data[metadata][guildId]'] = opts.guildId;
+      params['subscription_data[metadata][guildId]'] = guildId;
       params['subscription_data[metadata][tierId]'] = opts.tierId;
       params['subscription_data[metadata][offeringId]'] = opts.offeringId;
       params['subscription_data[metadata][variantId]'] = opts.variantId;
       params['subscription_data[metadata][couponCode]'] = opts.couponCode || '';
+      params['subscription_data[metadata][userId]'] = opts.buyerId || '';
       if (!wantAutoRenew) {
         params['subscription_data[cancel_at_period_end]'] = 'true';
       }
@@ -307,6 +311,9 @@ export class StripeProvider implements PaymentProvider {
           console.warn('[StripeProvider] checkout.session.completed missing required metadata; ignoring.');
           return;
         }
+        const holder = holderFromWire(guildId);
+        if (!holder) return;
+        const buyerId = meta.userId || undefined;
 
         if (session.subscription) {
           const sub = await this.fetchSubscription(session.subscription);
@@ -321,7 +328,8 @@ export class StripeProvider implements PaymentProvider {
             type: 'subscription.created',
             providerId: this.id,
             providerSubId: sub.id,
-            guildId,
+            holder,
+            buyerId,
             tierId,
             offeringId,
             variantId,
@@ -337,7 +345,8 @@ export class StripeProvider implements PaymentProvider {
             type: 'subscription.created',
             providerId: this.id,
             providerSubId: session.id,
-            guildId,
+            holder,
+            buyerId,
             tierId,
             offeringId,
             variantId,
@@ -357,11 +366,13 @@ export class StripeProvider implements PaymentProvider {
 
       case 'customer.subscription.updated': {
         const sub = obj as StripeSubscription;
+        const holder = holderFromWire(sub.metadata?.guildId);
+        if (!holder) return;
         registry.emitEvent({
           type: 'subscription.updated',
           providerId: this.id,
           providerSubId: sub.id,
-          guildId: sub.metadata?.guildId || '',
+          holder,
           state: this.stateFromSubscription(sub),
         });
         return;
@@ -369,11 +380,13 @@ export class StripeProvider implements PaymentProvider {
 
       case 'customer.subscription.deleted': {
         const sub = obj as StripeSubscription;
+        const holder = holderFromWire(sub.metadata?.guildId);
+        if (!holder) return;
         registry.emitEvent({
           type: 'subscription.expired',
           providerId: this.id,
           providerSubId: sub.id,
-          guildId: sub.metadata?.guildId || '',
+          holder,
           state: { ...this.stateFromSubscription(sub), status: 'expired' },
         });
         return;
@@ -384,11 +397,13 @@ export class StripeProvider implements PaymentProvider {
         if (!inv.subscription) return;
         const sub = await this.fetchSubscription(inv.subscription);
         if (!sub) return;
+        const holder = holderFromWire(sub.metadata?.guildId);
+        if (!holder) return;
         registry.emitEvent({
           type: 'subscription.renewed',
           providerId: this.id,
           providerSubId: sub.id,
-          guildId: sub.metadata?.guildId || '',
+          holder,
           state: this.stateFromSubscription(sub),
         });
         return;
@@ -403,11 +418,13 @@ export class StripeProvider implements PaymentProvider {
         if (!inv.subscription) return;
         const sub = await this.fetchSubscription(inv.subscription);
         if (!sub) return;
+        const holder = holderFromWire(sub.metadata?.guildId);
+        if (!holder) return;
         registry.emitEvent({
           type: 'subscription.renewal-failed',
           providerId: this.id,
           providerSubId: sub.id,
-          guildId: sub.metadata?.guildId || '',
+          holder,
           reason: inv.last_finalization_error?.message,
         });
         return;
@@ -551,8 +568,10 @@ export class StripeProvider implements PaymentProvider {
   // ORPHAN DETECTION + CUSTOMER PORTAL
   // ============================================================================
 
-  async listSubscriptionsForGuild(guildId: string): Promise<ProviderSubscriptionRef[]> {
-    if (!guildId) return [];
+  async listSubscriptionsFor(holder: HolderKey): Promise<ProviderSubscriptionRef[]> {
+    const parsed = parseHolder(holder);
+    if (!parsed || parsed.kind !== 'guild') return [];
+    const guildId = parsed.id;
     const matching = new Map<string, StripeSubscription>();
     let searchCount = 0;
     let listTotal = 0;
@@ -683,12 +702,12 @@ export class StripeProvider implements PaymentProvider {
       providerSubId: sub.id,
       state: this.stateFromSubscription(sub),
       metadata: {
-        guildId: sub.metadata?.guildId,
+        holder: holderFromWire(sub.metadata?.guildId) ?? undefined,
         tierId: sub.metadata?.tierId,
         offeringId: sub.metadata?.offeringId,
         variantId: sub.metadata?.variantId || price?.id,
         couponCode: sub.metadata?.couponCode || undefined,
-        userId: sub.metadata?.userId || undefined,
+        buyerId: sub.metadata?.userId || undefined,
         ...pausedDaysLeftOf(sub.metadata?.pausedDaysLeft),
       },
       display: { amountLabel, periodLabel, statusLabel },

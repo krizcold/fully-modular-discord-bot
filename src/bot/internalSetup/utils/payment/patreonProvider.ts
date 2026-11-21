@@ -27,6 +27,7 @@
 import * as crypto from 'crypto';
 import { PROVIDER_FETCH_MS } from './paymentTypes';
 import { providerCredentials } from '@/utils/envLoader';
+import { guildIdFor, type HolderKey } from '../premiumHolder';
 import type {
   PaymentProvider,
   ProviderCapabilities,
@@ -53,6 +54,7 @@ const CAPABILITIES: ProviderCapabilities = {
   mechanism: 'oauth_link',
   variantIdLabel: 'Patreon Tier ID (e.g. "tier:12345")',
   productIdLabel: '',
+  sells: ['guild'],
 };
 
 const VARIANT_PREFIX = 'tier:';
@@ -115,11 +117,13 @@ export class PatreonProvider implements PaymentProvider {
   }
 
   async initiatePurchase(opts: InitiateOpts): Promise<InitiateResult> {
+    const guildId = guildIdFor(opts.holder as HolderKey, this.displayName);
     const c = providerCredentials('patreon');
     if (!this.isConfigured()) throw new Error('Patreon not configured');
     const redirectUri = `${c.WEBUI_BASE_URL}/guild/api/subscriptions/patreon/callback`;
     const state = this.signState({
-      guildId: opts.guildId,
+      guildId,
+      userId: opts.buyerId,
       tierId: opts.tierId,
       offeringId: opts.offeringId,
       variantId: opts.variantId,
@@ -197,7 +201,7 @@ export class PatreonProvider implements PaymentProvider {
     return null;
   }
 
-  async listSubscriptionsForGuild(_guildId: string): Promise<ProviderSubscriptionRef[]> {
+  async listSubscriptionsFor(_holder: HolderKey): Promise<ProviderSubscriptionRef[]> {
     // Patreon doesn't index by guildId. We rely on the OAuth-link flow's
     // callback to install the sub directly; no orphan adoption path.
     return [];
@@ -212,7 +216,8 @@ export class PatreonProvider implements PaymentProvider {
    */
   async handleOAuthCallback(query: Record<string, string>): Promise<{
     externalAccountId: string;
-    guildId: string;
+    holder: HolderKey;
+    buyerId: string;
     tierId: string;
     offeringId: string;
     variantId: string;
@@ -277,7 +282,8 @@ export class PatreonProvider implements PaymentProvider {
 
     return {
       externalAccountId: String(userId),
-      guildId: String(parsedState.guildId),
+      holder: `guild:${String(parsedState.guildId)}` as HolderKey,
+      buyerId: typeof parsedState.userId === 'string' ? parsedState.userId : '',
       tierId: String(parsedState.tierId),
       offeringId: String(parsedState.offeringId || ''),
       variantId: String(parsedState.variantId || ''),

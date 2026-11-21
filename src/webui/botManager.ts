@@ -29,6 +29,7 @@ import { STOPPED_SERVING_TEXT } from '../bot/internalSetup/utils/servingGate';
 import type { ApplyResult } from '../bot/internalSetup/utils/moduleApply';
 import { acceptAddressList, hookListInUse } from '../utils/databaseAddress';
 import type { NotifyOutcome } from '../bot/internalSetup/utils/subscriptionNotifier';
+import type { HolderKey } from '../bot/internalSetup/utils/premiumHolder';
 import { readMaintenanceFile } from '../utils/maintenanceFile';
 import { heldClauses } from '../bot/internalSetup/utils/heldWords';
 import type { RunningMigration } from '../bot/internalSetup/utils/dataMigration';
@@ -3008,10 +3009,10 @@ export class BotManager {
    * webhook installs) reach the user this way. Best-effort - failures log
    * but never block the originating action.
    */
-  async dispatchNotification(guildId: string, kind: string, payload: Record<string, any>): Promise<NotifyOutcome> {
+  async dispatchNotification(holder: HolderKey, kind: string, payload: Record<string, any>): Promise<NotifyOutcome> {
     if (!this.isRunning()) return { delivered: false, cause: 'the bot is not running' };
     try {
-      const reply = await this.sendIPCMessage('notification:dispatch', { guildId, kind, payload });
+      const reply = await this.sendIPCMessage('notification:dispatch', { holder, kind, payload });
       const outcome = reply?.outcome;
       if (outcome && typeof outcome.delivered === 'boolean') return outcome as NotifyOutcome;
       return { delivered: false, cause: reply?.error || 'the bot gave no delivery outcome' };

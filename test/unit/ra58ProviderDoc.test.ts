@@ -88,7 +88,7 @@ describe('Lemon Squeezy', () => {
     vi.stubEnv('LEMONSQUEEZY_STORE_ID', '111');
     doc = { lemonsqueezy: { LEMONSQUEEZY_API_KEY: 'ls-key-doc', LEMONSQUEEZY_STORE_ID: '222' } };
     stubFetch(() => json({ data: { attributes: { url: 'https://pay.example/checkout/1' } } }));
-    const result = await new LemonSqueezyProvider().initiatePurchase({ guildId: 'g1', tierId: 't1', offeringId: 'o1', variantId: '9' } as any);
+    const result = await new LemonSqueezyProvider().initiatePurchase({ holder: 'guild:70000000000000001', buyerId: '80000000000000001', tierId: 't1', offeringId: 'o1', variantId: '9' } as any);
     expect(result).toEqual({ redirectUrl: 'https://pay.example/checkout/1' });
     expect(calls).toHaveLength(1);
     expect(JSON.parse(calls[0].init.body).data.relationships.store.data.id).toBe('222');
@@ -122,7 +122,7 @@ describe('Patreon', () => {
   };
 
   it("the link's state is signed with the doc's client secret", async () => {
-    const result = await new PatreonProvider().initiatePurchase({ guildId: 'g1', tierId: 't1', offeringId: 'o1', variantId: 'tier:5' } as any);
+    const result = await new PatreonProvider().initiatePurchase({ holder: 'guild:70000000000000001', buyerId: '80000000000000001', tierId: 't1', offeringId: 'o1', variantId: 'tier:5' } as any);
     const params = new URL(result.oauthUrl!).searchParams;
     expect(params.get('client_id')).toBe('cid-doc');
     const state = params.get('state')!;
@@ -184,7 +184,7 @@ describe('Stripe', () => {
       unreadable = 'the doc went unreadable mid-purchase';
       return json({ id: 'price_1', active: true, unit_amount: 500, currency: 'usd', type: 'one_time', product: 'prod_1' });
     });
-    await expect(new StripeProvider().initiatePurchase({ guildId: 'g1', tierId: 't1', offeringId: 'o1', variantId: 'price_1' } as any))
+    await expect(new StripeProvider().initiatePurchase({ holder: 'guild:70000000000000001', buyerId: '80000000000000001', tierId: 't1', offeringId: 'o1', variantId: 'price_1' } as any))
       .rejects.toThrow('STRIPE: OAUTH_CALLBACK_URL is not set');
     expect(calls).toHaveLength(1);
     expect(console.error).toHaveBeenCalledWith(

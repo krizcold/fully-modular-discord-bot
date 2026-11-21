@@ -15,7 +15,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-const provider = (id: string, start: () => void): PaymentProvider => ({ id, start, stop: () => undefined } as unknown as PaymentProvider);
+const provider = (id: string, start: () => void): PaymentProvider => ({ id, capabilities: { sells: ['guild'] }, start, stop: () => undefined } as unknown as PaymentProvider);
 
 describe('the payment registry tickers', () => {
   it('startTickers outside the bot process arms nothing: a provider registered after it, once the role reads bot, does not start', () => {

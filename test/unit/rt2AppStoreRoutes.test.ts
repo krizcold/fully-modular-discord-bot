@@ -223,11 +223,11 @@ describe('rt2 GET /premium/audit', () => {
     h.pm = { readAuditEntries: async (opts: unknown) => { asked.push(opts); return { entries: [{ action: 'grant' }], total: 1 }; } };
     const sent = await run('get', '/premium/audit', {}, {}, {
       from: '2026-11-01T00:00:00.000Z', to: '2026-11-02T00:00:00.000Z', action: 'grant', tierId: 'gold',
-      providerId: 'rt2pay', guildId: 'g1', subscriptionId: 's1', limit: '25',
+      providerId: 'rt2pay', guildId: '70000000000000001', subscriptionId: 's1', limit: '25',
     });
     expect(asked).toEqual([{
       from: '2026-11-01T00:00:00.000Z', to: '2026-11-02T00:00:00.000Z', action: 'grant', tierId: 'gold',
-      providerId: 'rt2pay', guildId: 'g1', subscriptionId: 's1', limit: 25,
+      providerId: 'rt2pay', holder: 'guild:70000000000000001', subscriptionId: 's1', limit: 25,
     }]);
     expect(sent).toEqual([{ status: 200, body: { success: true, entries: [{ action: 'grant' }], total: 1 } }]);
   });

@@ -65,20 +65,20 @@ describe("the child's own answers (NB10 test 29)", () => {
     writePremium();
     inject.refuse.set('premium-tiers.json', 'storage-failing');
     inject.refuse.set('premium-tiers.audit.jsonl', 'storage-failing');
-    const reply: any = await applySharedOp({ op: 'premium.grantManual', args: { args: ['g1', 'high', 30] } });
+    const reply: any = await applySharedOp({ op: 'premium.grantManual', args: { args: ['guild:70000000000000001', 'high', 30] } });
     expect(reply).toMatchObject({ ok: false, code: 'unconfirmed', answer: 'held' });
     expect(reply.error).toBe(`${truthText('held', false)} ${PROVIDER_SENTENCE}`);
   });
 
   it('a premium.cancelPaidSubscriptionImmediately refused node-stopping after its provider call ends with the provider sentence', async () => {
-    writePremium({ g2: { active: paidSub('s2', 'ps2', 'low', 'quick'), paused: [] } });
+    writePremium({ 'guild:70000000000000002': { active: paidSub('s2', 'ps2', 'low', 'quick'), paused: [] } });
     getPaymentRegistry().register({
-      id: 'quick', displayName: 'Quick', capabilities: { supportsCancel: true }, isConfigured: () => true,
+      id: 'quick', displayName: 'Quick', capabilities: { sells: ['guild'], supportsCancel: true }, isConfigured: () => true,
       cancelSubscription: async () => undefined,
     } as any);
     inject.refuse.set('premium-tiers.json', 'node-stopping');
     inject.refuse.set('premium-tiers.audit.jsonl', 'node-stopping');
-    const reply: any = await applySharedOp({ op: 'premium.cancelPaidSubscriptionImmediately', args: { args: ['g2'] } });
+    const reply: any = await applySharedOp({ op: 'premium.cancelPaidSubscriptionImmediately', args: { args: ['guild:70000000000000002'] } });
     expect(reply).toMatchObject({ ok: false, code: 'unconfirmed', answer: 'node-stopping' });
     expect(reply.error.endsWith(` ${PROVIDER_SENTENCE}`)).toBe(true);
     expect(reply.error.startsWith(truthText('node-stopping', false))).toBe(true);

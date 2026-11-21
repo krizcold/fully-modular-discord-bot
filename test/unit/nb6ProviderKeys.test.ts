@@ -157,7 +157,7 @@ describe('the built-in providers read their keys through providerCredentials', (
     saveDoc({ patreon: { PATREON_CLIENT_ID: 'pc_doc_made_up', PATREON_CLIENT_SECRET: 'pcs_doc_made_up', PATREON_CAMPAIGN_ID: '77' } });
     const patreon = new PatreonProvider();
     expect(patreon.isConfigured()).toBe(true);
-    const answer = await patreon.initiatePurchase({ guildId: 'g1', tierId: 't1', offeringId: 'o1', variantId: 'tier:5' } as any);
+    const answer = await patreon.initiatePurchase({ holder: 'guild:70000000000000001', buyerId: '80000000000000001', tierId: 't1', offeringId: 'o1', variantId: 'tier:5' } as any);
     const url = new URL(answer.oauthUrl!);
     expect(url.searchParams.get('client_id') === 'pc_doc_made_up').toBe(true);
     expect(url.searchParams.get('redirect_uri')).toBe('https://bot.example/guild/api/subscriptions/patreon/callback');
@@ -219,7 +219,7 @@ describe('the second half of the built-in providers read their keys through prov
     const boost = new ServerBoostingProvider();
     boost.setClient({} as any);
     expect(boost.isConfigured()).toBe(true);
-    const answer = await boost.initiatePurchase({ guildId: 'g1', tierId: 't1', offeringId: 'o1', variantId: 'boost' } as any);
+    const answer = await boost.initiatePurchase({ holder: 'guild:70000000000000001', buyerId: '80000000000000001', tierId: 't1', offeringId: 'o1', variantId: 'boost' } as any);
     const instruction = (answer.clientHandoff as any).instruction as string;
     expect(instruction.includes('(server id: 200000000000000002)')).toBe(true);
     expect(instruction.includes('200000000000000001')).toBe(false);

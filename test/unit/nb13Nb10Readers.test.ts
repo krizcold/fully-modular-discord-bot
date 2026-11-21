@@ -39,6 +39,7 @@ import { setBackendKind } from '../helpers/backendKind';
 import { stubAppendHandles, type AppendStub, type Hold } from '../helpers/fileHandleStub';
 import { freshWriterLock } from '../helpers/nb10Rig';
 import { AUDIT, clearGlobal, JOURNAL, linesOf, logged, paidSub, PREMIUM, settleQueue, state, writePremium } from './nb10PremiumRig';
+import { gh } from '../helpers/p1Holder';
 
 // NB13 C6 to C9 and D1 to D4, D8, D10: every reader of a file ticket reads fileTicketState, and a ledger lists every
 // earlier ticket not landed, so no reply or log names a line the disk did not confirm as saved or as lost.
@@ -212,17 +213,17 @@ describe("8.1 to 8.6 and 8.12: the bot's exit and deposition lines read each lin
     resetPremiumManager();
     reg.current = null;
     getPaymentRegistry().register({
-      id: 'fake', displayName: 'Fake', capabilities: { supportsCancel: true }, isConfigured: () => true,
+      id: 'fake', displayName: 'Fake', capabilities: { sells: ['guild'], supportsCancel: true }, isConfigured: () => true,
       handleWebhook: async (body: Buffer) => { getPaymentRegistry().emitEvent(JSON.parse(body.toString())); },
       cancelSubscription: async () => undefined,
     } as any);
     return getPremiumManager();
   }
-  const created = (providerSubId: string, guildId = 'g1') => ({
-    type: 'subscription.created', providerId: 'fake', providerSubId, guildId, tierId: 'low', offeringId: 'o1', state: state(),
+  const created = (providerSubId: string, guildId = '70000000000000001') => ({
+    type: 'subscription.created', buyerId: '80000000000000001', providerId: 'fake', providerSubId, holder: gh(guildId), tierId: 'low', offeringId: 'o1', state: state(),
   });
   const expired = (providerSubId: string, guildId: string) => ({
-    type: 'subscription.expired', providerId: 'discord', providerSubId, guildId,
+    type: 'subscription.expired', providerId: 'discord', providerSubId, holder: gh(guildId),
     state: { ...state('expired'), endDate: new Date(Date.now() - 1000).toISOString() },
   });
   const deliver = (event: object) => applySharedOp({ op: 'payment.webhook', args: { providerId: 'fake', body: Buffer.from(JSON.stringify(event)).toString('base64'), signature: '' } });
@@ -231,8 +232,8 @@ describe("8.1 to 8.6 and 8.12: the bot's exit and deposition lines read each lin
     pm.logLossesAtExit();
     return errors();
   };
-  const journalHead = (event: { type: string; providerId: string; providerSubId: string; guildId: string }) =>
-    `[PremiumManager] A ${event.type} event from ${event.providerId} (subscription ${event.providerSubId}, guild ${event.guildId}) was received while premium-tiers.json could not be read`;
+  const journalHead = (event: { type: string; providerId: string; providerSubId: string; holder: string }) =>
+    `[PremiumManager] A ${event.type} event from ${event.providerId} (subscription ${event.providerSubId}, ${event.holder.replace(':', ' ')}) was received while premium-tiers.json could not be read`;
 
   /** A bot whose premium-tiers.json cannot be read: each event it gets is journaled. */
   function brokenProcess(): Manager {
@@ -244,8 +245,8 @@ describe("8.1 to 8.6 and 8.12: the bot's exit and deposition lines read each lin
 
   /** A replay whose marks' save landed while its watch still waits: afterDrain queues its audit line. */
   async function replayAwaitingAfterDrain(): Promise<Manager> {
-    writePremium({ g1: { active: paidSub('sA', 'ps0', 'low', 'discord'), paused: [] } });
-    fs.writeFileSync(JOURNAL, `${JSON.stringify({ writer: 'w1', n: 1, event: expired('ps0', 'g1') })}\n`);
+    writePremium({ 'guild:70000000000000001': { active: paidSub('sA', 'ps0', 'low', 'discord'), paused: [] } });
+    fs.writeFileSync(JOURNAL, `${JSON.stringify({ writer: 'w1', n: 1, event: expired('ps0', '70000000000000001') })}\n`);
     hooks.confirm = () => new Promise<string>(() => undefined);
     const pm = getPremiumManager();
     startPremiumTickers();
@@ -253,7 +254,7 @@ describe("8.1 to 8.6 and 8.12: the bot's exit and deposition lines read each lin
     await flushAll();
     return pm;
   }
-  const afterDrainHead = /^\[PremiumManager\] The audit line subscription\.expire\.paid \(guild g1, [^)]+\) /;
+  const afterDrainHead = /^\[PremiumManager\] The audit line subscription\.expire\.paid \(guild 70000000000000001, [^)]+\) /;
 
   it('8.1 a journal line whose fsync failed, with no tail: the exit says it cannot confirm, not that it is lost', async () => {
     const pm = brokenProcess();
@@ -271,7 +272,7 @@ describe("8.1 to 8.6 and 8.12: the bot's exit and deposition lines read each lin
     const pm = brokenProcess();
     const hold = stub.holdSync(JOURNAL, 'EIO');
     const first = created('ps1');
-    const second = created('ps2', 'g2');
+    const second = created('ps2', '70000000000000002');
     getPaymentRegistry().emitEvent(first as any);
     await hold.reached;
     getPaymentRegistry().emitEvent(second as any);
@@ -291,18 +292,18 @@ describe("8.1 to 8.6 and 8.12: the bot's exit and deposition lines read each lin
     const firstReply = deliver(created('ps1'));
     await hold.reached;
     // A later line to the audit file joins the entry as its tail and lands, so the record's landed passes the first.
-    getPaymentRegistry().emitEvent(created('ps2', 'g2') as any);
-    await vi.waitFor(() => expect(getPending(AUDIT)?.op === 'append' && (getPending(AUDIT) as { content: string }).content.includes('"guildId":"g2"')).toBe(true), { timeout: 5000, interval: 5 });
+    getPaymentRegistry().emitEvent(created('ps2', '70000000000000002') as any);
+    await vi.waitFor(() => expect(getPending(AUDIT)?.op === 'append' && (getPending(AUDIT) as { content: string }).content.includes('"holder":"guild:70000000000000002"')).toBe(true), { timeout: 5000, interval: 5 });
     hold.release();
     expect(webhookAnswer(await firstReply).status).toBe(503);
     await settleQueue();
-    expect(linesOf(AUDIT).filter(l => l.action === 'subscription.install.paid').map(l => l.guildId)).toEqual(['g1', 'g2']);
+    expect(linesOf(AUDIT).filter(l => l.action === 'subscription.install.paid').map(l => l.holder)).toEqual(['guild:70000000000000001', 'guild:70000000000000002']);
     const again = await deliver(created('ps1'));
     expect(again).toMatchObject({ ok: false, code: 'unconfirmed', answer: 'unavailable' });
     expect(webhookAnswer(again).status).toBe(503);
     const install = exitLines(pm).filter(l => l.includes('subscription.install.paid'));
     expect(install).toHaveLength(1);
-    expect(install[0].startsWith("[PremiumManager] The audit line subscription.install.paid (guild g1, subscription ps1) is in the file, but the disk did not confirm its sync; can't confirm whether it is stored; the webhook was answered 503")).toBe(true);
+    expect(install[0].startsWith("[PremiumManager] The audit line subscription.install.paid (guild 70000000000000001, subscription ps1) is in the file, but the disk did not confirm its sync; can't confirm whether it is stored; the webhook was answered 503")).toBe(true);
   });
 
   it('8.4 an after-drain audit line whose fsync failed: the exit logs its unconfirmed line, not "did not reach the disk"', async () => {
@@ -346,8 +347,8 @@ describe("8.1 to 8.6 and 8.12: the bot's exit and deposition lines read each lin
       const install = exitLines(pm).filter(l => l.includes('subscription.install.paid'));
       expect(install).toHaveLength(1);
       expect(install[0].startsWith(atWrite
-        ? "[PremiumManager] The audit line subscription.install.paid (guild g1, subscription psA) was being written before this stop; can't confirm whether it is stored: {"
-        : '[PremiumManager] The audit line subscription.install.paid (guild g1, subscription psA) did not reach the disk before this stop and is lost: {')).toBe(true);
+        ? "[PremiumManager] The audit line subscription.install.paid (guild 70000000000000001, subscription psA) was being written before this stop; can't confirm whether it is stored: {"
+        : '[PremiumManager] The audit line subscription.install.paid (guild 70000000000000001, subscription psA) did not reach the disk before this stop and is lost: {')).toBe(true);
       hold.release();
       await settleQueue();
     });
@@ -431,7 +432,7 @@ describe("8.1 to 8.6 and 8.12: the bot's exit and deposition lines read each lin
       const lines = exitLines(pm);
       const install = lines.filter(l => l.includes('subscription.install.paid'));
       expect(install).toHaveLength(1);
-      expect(install[0].startsWith("[PremiumManager] The audit line subscription.install.paid (guild g1, subscription psA) was being written before another process took the data files; can't confirm whether it is stored: {")).toBe(true);
+      expect(install[0].startsWith("[PremiumManager] The audit line subscription.install.paid (guild 70000000000000001, subscription psA) was being written before another process took the data files; can't confirm whether it is stored: {")).toBe(true);
       noInTheFile(lines);
     });
 

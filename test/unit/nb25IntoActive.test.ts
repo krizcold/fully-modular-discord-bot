@@ -25,7 +25,7 @@ beforeEach(async () => {
   await d.setup();
   calls.length = 0;
   getPaymentRegistry().register({
-    id: 'fake', displayName: 'Fake', capabilities: { supportsPause: true }, isConfigured: () => true,
+    id: 'fake', displayName: 'Fake', capabilities: { sells: ['guild'], supportsPause: true }, isConfigured: () => true,
     resumeSubscription: async (id: string) => { calls.push(`resume:${id}`); },
     pauseSubscription: async (id: string) => { calls.push(`pause:${id}`); },
   } as any);
@@ -38,12 +38,12 @@ afterEach(async () => {
 describe('decision 7: intoActiveSlot stays as it is', () => {
   it("a paused non-Dummy sub created by an event goes into the active slot paused, with no provider call", async () => {
     getPaymentRegistry().emitEvent({
-      type: 'subscription.created', providerId: 'fake', providerSubId: 'ev1', guildId: 'g1', tierId: 'silver', offeringId: 'o2',
+      type: 'subscription.created', buyerId: '80000000000000001', providerId: 'fake', providerSubId: 'ev1', holder: 'guild:70000000000000001', tierId: 'silver', offeringId: 'o2',
       state: { status: 'paused', startDate: new Date().toISOString(), endDate: new Date(Date.now() + 10 * DAY_MS).toISOString(), autoRenew: true },
     } as any);
-    await vi.waitFor(() => expect(r.row()?.subscriptions?.g1?.active?.providerSubId).toBe('ev1'), { timeout: 5000, interval: 10 });
+    await vi.waitFor(() => expect(r.row()?.subscriptions?.['guild:70000000000000001']?.active?.providerSubId).toBe('ev1'), { timeout: 5000, interval: 10 });
     await d.settle();
-    expect(r.row().subscriptions.g1.active.status).toBe('paused');
+    expect(r.row().subscriptions['guild:70000000000000001'].active.status).toBe('paused');
     expect(calls).toEqual([]);
   });
 });

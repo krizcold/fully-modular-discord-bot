@@ -56,10 +56,10 @@ describe("the replay's install line and the bot's real stop", () => {
     }) as typeof process.exit);
 
     writePremium();
-    fs.writeFileSync(JOURNAL, `${JSON.stringify({ writer: 'w1', n: 1, event: { type: 'subscription.created', providerId: 'fake', providerSubId: 'j1', guildId: 'g4', tierId: 'low', offeringId: 'o1', state: state() } })}\n`);
+    fs.writeFileSync(JOURNAL, `${JSON.stringify({ writer: 'w1', n: 1, event: { type: 'subscription.created', buyerId: '80000000000000001', providerId: 'fake', providerSubId: 'j1', holder: 'guild:70000000000000004', tierId: 'low', offeringId: 'o1', state: state() } })}\n`);
     reg.current = null;
     getPaymentRegistry().register({
-      id: 'fake', displayName: 'Fake', capabilities: { supportsPause: true }, isConfigured: () => true,
+      id: 'fake', displayName: 'Fake', capabilities: { sells: ['guild'], supportsPause: true }, isConfigured: () => true,
       handleWebhook: async () => undefined, cancelSubscription: async () => undefined,
     } as any);
     installStopHandler();
@@ -77,10 +77,10 @@ describe("the replay's install line and the bot's real stop", () => {
     expect(exitCode).toBe(0);
     expect(pm.isStopped()).toBe(true);
     expect(jsonOf(PREMIUM).eventsApplied).toEqual({ w1: 1 });
-    expect(jsonOf(PREMIUM).subscriptions.g4.active).toMatchObject({ providerSubId: 'j1', tierId: 'low' });
+    expect(jsonOf(PREMIUM).subscriptions['guild:70000000000000004'].active).toMatchObject({ providerSubId: 'j1', tierId: 'low' });
     const installs = (atExit as unknown as any[]).filter(l => l.action === 'subscription.install.paid');
     expect(installs).toHaveLength(1);
-    expect(installs[0].guildId).toBe('g4');
+    expect(installs[0].holder).toBe('guild:70000000000000004');
     expect(linesOf(AUDIT).filter(l => l.action === 'subscription.install.paid')).toHaveLength(1);
     spies.error.mockClear();
     pm.logLossesAtExit();

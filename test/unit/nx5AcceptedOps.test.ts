@@ -28,6 +28,7 @@ import configEditorGlobalPanel from '../../src/bot/internalSetup/panels/configEd
 import { writeMaintenanceFile } from '../../src/utils/maintenanceFile';
 import { ME, OrderStore, order, settle } from '../helpers/nx5Rig';
 import { clearGlobal, gate, jsonOf, paidSub, PREMIUM, quiet, settleQueue, writePremium } from './nb10PremiumRig';
+import { gh } from '../helpers/p1Holder';
 
 const m = maintenance as any;
 const role = process.env.BOT_PROCESS_ROLE;
@@ -116,7 +117,7 @@ function slowCancel() {
   const call = gate<ReturnType<typeof providerState>>();
   const seen: string[] = [];
   getPaymentRegistry().register({
-    id: 'fake', displayName: 'Fake', capabilities: { supportsCancel: true }, isConfigured: () => true,
+    id: 'fake', displayName: 'Fake', capabilities: { sells: ['guild'], supportsCancel: true }, isConfigured: () => true,
     cancelSubscription: async (subId: string) => { seen.push(subId); return call.promise; },
   } as any);
   return { call, seen };
@@ -146,28 +147,28 @@ async function answerOnceSettled(store: OrderStore): Promise<void> {
 
 describe('G8-12: the review\'s case, a shared op whose provider call resolves after the answer would have been written', () => {
   it('premium.cancelPaidSubscription over shared:op: the answer is not saved true while Stripe has not answered, and is saved true once the op settled with autoRenew off on the store', async () => {
-    writePremium({ g1: { active: paidSub('s1', 'sub1', 'high'), paused: [] } });
+    writePremium({ 'guild:70000000000000001': { active: paidSub('s1', 'sub1', 'high'), paused: [] } });
     const { call, seen } = slowCancel();
-    const reply = ask({ op: 'premium.cancelPaidSubscription', args: { args: ['g1'] } });
+    const reply = ask({ op: 'premium.cancelPaidSubscription', args: { args: ['guild:70000000000000001'] } });
     await vi.waitFor(() => expect(seen).toEqual(['sub1']));
     const store = await answerWhileRunning();
 
     call.open(providerState(false));
     expect(await reply).toBeDefined();
     await answerOnceSettled(store);
-    expect(jsonOf(PREMIUM).subscriptions.g1.active.autoRenew).toBe(false);
+    expect(jsonOf(PREMIUM).subscriptions['guild:70000000000000001'].active.autoRenew).toBe(false);
   });
 
   it('a payment webhook over shared:op, counted by the listener alone: not saved true while its handler runs, saved true once its event is on the store', async () => {
-    writePremium({ g1: { active: paidSub('s1', 'sub1', 'high'), paused: [] } });
+    writePremium({ 'guild:70000000000000001': { active: paidSub('s1', 'sub1', 'high'), paused: [] } });
     const handled = gate<void>();
     let entered = false;
     getPaymentRegistry().register({
-      id: 'hooked', displayName: 'Hooked', capabilities: {}, isConfigured: () => true,
+      id: 'hooked', displayName: 'Hooked', capabilities: { sells: ['guild'] }, isConfigured: () => true,
       handleWebhook: async () => {
         entered = true;
         await handled.promise;
-        getPaymentRegistry().emitEvent({ type: 'subscription.paused', providerId: 'fake', providerSubId: 'sub1', guildId: 'g1', resumesAt: END } as any);
+        getPaymentRegistry().emitEvent({ type: 'subscription.paused', providerId: 'fake', providerSubId: 'sub1', holder: 'guild:70000000000000001', resumesAt: END } as any);
       },
     } as any);
     const reply = ask({ op: 'payment.webhook', args: { providerId: 'hooked', body: '', signature: '' } });
@@ -177,22 +178,22 @@ describe('G8-12: the review\'s case, a shared op whose provider call resolves af
     handled.open();
     expect(await reply).toBeDefined();
     await answerOnceSettled(store);
-    expect(jsonOf(PREMIUM).subscriptions.g1.active.resumesAtHint).toBe(END);
+    expect(jsonOf(PREMIUM).subscriptions['guild:70000000000000001'].active.resumesAtHint).toBe(END);
   });
 });
 
 describe('G8-12: a premium mutator a module timer calls, awaiting its provider', () => {
   it('a direct cancelPaidSubscription that passed its entry check before the order: not saved true while it runs, saved true once its change is on the store', async () => {
-    writePremium({ g1: { active: paidSub('s1', 'sub1', 'high'), paused: [] } });
+    writePremium({ 'guild:70000000000000001': { active: paidSub('s1', 'sub1', 'high'), paused: [] } });
     const { call, seen } = slowCancel();
-    const running = getPremiumManager().cancelPaidSubscription('g1');
+    const running = getPremiumManager().cancelPaidSubscription('guild:70000000000000001');
     await vi.waitFor(() => expect(seen).toEqual(['sub1']));
     const store = await answerWhileRunning();
 
     call.open(providerState(false));
     await running;
     await answerOnceSettled(store);
-    expect(jsonOf(PREMIUM).subscriptions.g1.active.autoRenew).toBe(false);
+    expect(jsonOf(PREMIUM).subscriptions['guild:70000000000000001'].active.autoRenew).toBe(false);
   });
 });
 
@@ -228,19 +229,19 @@ const migration = (decisions: Array<Record<string, unknown>>) => ({
   createdAt: new Date().toISOString(), decisions,
 });
 const decision = (guildId: string, subscriptionId: string, providerSubId: string, over: Record<string, unknown> = {}) => ({
-  guildId, subscriptionId, providerSubId, decision: 'accepted', ...over,
+  holder: gh(guildId), subscriptionId, providerSubId, decision: 'accepted', ...over,
 });
 
 describe('G8-11: a premium migration while the order holds', () => {
   it('two due decisions, the order arriving during the first: the second stays pending and is applied after the order ends', async () => {
     writePremium(
-      { g1: { active: subOn('s1', 'sub1'), paused: [] }, g2: { active: subOn('s2', 'sub2'), paused: [] } },
-      { migrations: [migration([decision('g1', 's1', 'sub1'), decision('g2', 's2', 'sub2')])] },
+      { 'guild:70000000000000001': { active: subOn('s1', 'sub1'), paused: [] }, 'guild:70000000000000002': { active: subOn('s2', 'sub2'), paused: [] } },
+      { migrations: [migration([decision('70000000000000001', 's1', 'sub1'), decision('70000000000000002', 's2', 'sub2')])] },
     );
     const first = gate<void>();
     const calls: string[] = [];
     getPaymentRegistry().register({
-      id: 'fake', displayName: 'Fake', capabilities: { supportsCancel: true }, isConfigured: () => true,
+      id: 'fake', displayName: 'Fake', capabilities: { sells: ['guild'], supportsCancel: true }, isConfigured: () => true,
       migrateSubscriptionPrice: async (subId: string) => {
         calls.push(subId);
         if (subId === 'sub1') await first.promise;
@@ -272,11 +273,11 @@ describe('G8-11: a premium migration while the order holds', () => {
 
   it('a decision whose provider call is refused with cause maintenance stays pending, its silent decision kept, not failed', async () => {
     writePremium(
-      { g1: { active: subOn('s1', 'sub1'), paused: [] } },
-      { migrations: [migration([decision('g1', 's1', 'sub1', { decision: 'pending', notifiedAt: new Date().toISOString() })])], migrationSilencePolicy: 'continue' },
+      { 'guild:70000000000000001': { active: subOn('s1', 'sub1'), paused: [] } },
+      { migrations: [migration([decision('70000000000000001', 's1', 'sub1', { decision: 'pending', notifiedAt: new Date().toISOString() })])], migrationSilencePolicy: 'continue' },
     );
     getPaymentRegistry().register({
-      id: 'fake', displayName: 'Fake', capabilities: { supportsCancel: true }, isConfigured: () => true,
+      id: 'fake', displayName: 'Fake', capabilities: { sells: ['guild'], supportsCancel: true }, isConfigured: () => true,
       migrateSubscriptionPrice: async () => { throw new MaintenanceRefusal('The Dummy provider changed nothing: the bot is in maintenance.'); },
     } as any);
     const pm = getPremiumManager();

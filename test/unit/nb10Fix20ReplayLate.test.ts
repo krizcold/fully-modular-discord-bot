@@ -34,18 +34,18 @@ type Late = { atResume?: () => void; wait?: () => Promise<unknown>; beforeEmit?:
 
 function setup(delayMs: number, late: Late = {}): void {
   const paused = { ...paidSub('sB', 'ps1', 'low', 'slow'), status: 'paused', pausedAt: new Date().toISOString(), remainingDaysAtPause: 10 };
-  writePremium({ g1: { active: paidSub('sA', 'ps0', 'high', 'discord'), paused: [paused] } });
-  const expired = { type: 'subscription.expired', providerId: 'discord', providerSubId: 'ps0', guildId: 'g1', state: { ...state('expired'), endDate: new Date(Date.now() - 1000).toISOString() } };
+  writePremium({ 'guild:70000000000000001': { active: paidSub('sA', 'ps0', 'high', 'discord'), paused: [paused] } });
+  const expired = { type: 'subscription.expired', providerId: 'discord', providerSubId: 'ps0', holder: 'guild:70000000000000001', state: { ...state('expired'), endDate: new Date(Date.now() - 1000).toISOString() } };
   fs.writeFileSync(JOURNAL, `${JSON.stringify({ writer: 'w1', n: 1, event: expired })}\n`);
   getPaymentRegistry().register({
-    id: 'slow', displayName: 'Slow', capabilities: { supportsPause: true }, isConfigured: () => true,
+    id: 'slow', displayName: 'Slow', capabilities: { sells: ['guild'], supportsPause: true }, isConfigured: () => true,
     pauseSubscription: async () => undefined,
     resumeSubscription: async (providerSubId: string) => {
       late.atResume?.();
       if (delayMs > 0) await tick(delayMs);
       if (late.wait) await late.wait();
       late.beforeEmit?.();
-      getPaymentRegistry().emitEvent(late.event?.(providerSubId) ?? { type: 'subscription.renewed', providerId: 'slow', providerSubId, guildId: 'g1', state: { ...state(), endDate: LATER } } as any);
+      getPaymentRegistry().emitEvent(late.event?.(providerSubId) ?? { type: 'subscription.renewed', providerId: 'slow', providerSubId, holder: 'guild:70000000000000001', state: { ...state(), endDate: LATER } } as any);
       late.emitted = true;
     },
   } as any);
@@ -56,7 +56,7 @@ function spySave(pm: ReturnType<typeof getPremiumManager>, inner?: (file: string
   const answers: Array<{ answer: boolean; wrote: string | undefined }> = [];
   let wrote: string | undefined;
   hooks.save = (file, data) => {
-    if (file === 'premium-tiers.json') wrote = data?.subscriptions?.g1?.active?.endDate;
+    if (file === 'premium-tiers.json') wrote = data?.subscriptions?.['guild:70000000000000001']?.active?.endDate;
     return inner?.(file);
   };
   const real = (pm as any).save.bind(pm);
@@ -98,10 +98,10 @@ describe('a provider event the replay caused', () => {
     const answers = spySave(pm);
     startPremiumTickers();
     await vi.waitFor(() => expect(pm.cacheState()).toBe('normal'), { timeout: 5000, interval: 2 });
-    await vi.waitFor(() => expect(pm.getFullConfig().subscriptions.g1.active?.endDate).toBe(LATER), { timeout: 5000, interval: 5 });
+    await vi.waitFor(() => expect(pm.getFullConfig().subscriptions['guild:70000000000000001'].active?.endDate).toBe(LATER), { timeout: 5000, interval: 5 });
     await settleQueue();
-    expect(jsonOf(PREMIUM).subscriptions.g1.active.id).toBe('sB');
-    expect(jsonOf(PREMIUM).subscriptions.g1.active.endDate).toBe(LATER);
+    expect(jsonOf(PREMIUM).subscriptions['guild:70000000000000001'].active.id).toBe('sB');
+    expect(jsonOf(PREMIUM).subscriptions['guild:70000000000000001'].active.endDate).toBe(LATER);
     const last = answers[answers.length - 1];
     expect(last).toEqual({ answer: true, wrote: LATER });
   });
@@ -119,8 +119,8 @@ describe('a provider event the replay caused', () => {
     await settleQueue();
     expect(whileReplaying).toBe(0);
     const disk = jsonOf(PREMIUM);
-    expect(disk.subscriptions.g1.active.id).toBe('sB');
-    expect(disk.subscriptions.g1.active.endDate).toBe(LATER);
+    expect(disk.subscriptions['guild:70000000000000001'].active.id).toBe('sB');
+    expect(disk.subscriptions['guild:70000000000000001'].active.endDate).toBe(LATER);
     expect(disk.eventsApplied).toEqual({ w1: 1 });
   });
 
@@ -137,7 +137,7 @@ describe('a provider event the replay caused', () => {
     startPremiumTickers();
     await vi.waitFor(() => expect(late.emitted).toBe(true), { timeout: 5000, interval: 2 });
     await settleQueue();
-    expect(pm.getFullConfig().subscriptions.g1.active?.endDate).not.toBe(LATER);
+    expect(pm.getFullConfig().subscriptions['guild:70000000000000001'].active?.endDate).not.toBe(LATER);
     expect(rawOf(PREMIUM)).toBe(before);
     expect(answers.slice(mark).filter(a => a.answer)).toEqual([]);
     const lines = logged(error);
@@ -188,7 +188,7 @@ describe('a provider event the replay caused', () => {
   it('writing an audit line after the replay ended appends it, and the replay buffer holds nothing of it', async () => {
     const late: Late = {};
     setup(20, late);
-    late.event = providerSubId => ({ type: 'subscription.expired', providerId: 'slow', providerSubId, guildId: 'g1', state: { ...state('expired'), endDate: new Date(Date.now() - 1000).toISOString() } });
+    late.event = providerSubId => ({ type: 'subscription.expired', providerId: 'slow', providerSubId, holder: 'guild:70000000000000001', state: { ...state('expired'), endDate: new Date(Date.now() - 1000).toISOString() } });
     const pm = getPremiumManager();
     let afterEmit: any[] | null = null;
     const emit = getPaymentRegistry().emitEvent.bind(getPaymentRegistry());
@@ -227,7 +227,7 @@ describe('a provider event the replay caused', () => {
     await settleQueue();
     const disk = jsonOf(PREMIUM);
     expect(disk.eventsApplied).toEqual({ w1: 1 });
-    expect(disk.subscriptions.g1.active.endDate).toBe(LATER);
+    expect(disk.subscriptions['guild:70000000000000001'].active.endDate).toBe(LATER);
     await vi.waitFor(() => expect(linesOf(AUDIT).filter(l => l.action === 'subscription.expire.paid' && l.subscriptionId === 'sA')).toHaveLength(1), { timeout: 5000, interval: 5 });
     expect((pm as any).replayBuffer).toEqual([]);
   });

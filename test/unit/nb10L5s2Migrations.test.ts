@@ -24,6 +24,7 @@ vi.mock('../../src/utils/updateSafety', () => ({ getSafetyManager: () => safety 
 import { PremiumManager } from '../../src/bot/internalSetup/utils/premiumManager';
 import { getPaymentRegistry } from '../../src/bot/internalSetup/utils/payment/paymentRegistry';
 import { clearGlobal, gate, jsonOf, logged, paidSub, PREMIUM, quiet, settleQueue, tick, TIERS, writePremium } from './nb10PremiumRig';
+import { gh } from '../helpers/p1Holder';
 
 const G = '900000000000000801';
 const G2 = '900000000000000802';
@@ -49,14 +50,14 @@ function migration(id: string, effectiveMs: number, decisions: Array<Record<stri
   };
 }
 const decision = (guildId: string, subscriptionId: string, providerSubId: string, d: string, extra: Record<string, unknown> = {}) =>
-  ({ guildId, subscriptionId, providerSubId, decision: d, ...extra });
+  ({ holder: gh(guildId), subscriptionId, providerSubId, decision: d, ...extra });
 
 /** The provider 'fake': each call is recorded and then waits for hold, when one is set. */
 function provider(): { migrates: string[]; cancels: string[]; hold: Promise<void> | null } {
   const p = { migrates: [] as string[], cancels: [] as string[], hold: null as Promise<void> | null };
   getPaymentRegistry().register({
     id: 'fake', displayName: 'Fake Pay', isConfigured: () => true,
-    capabilities: { supportsCancel: true, supportsPriceMigration: true },
+    capabilities: { sells: ['guild'], supportsCancel: true, supportsPriceMigration: true },
     migrateSubscriptionPrice: async (id: string) => { p.migrates.push(id); if (p.hold) await p.hold; },
     cancelSubscription: async (id: string) => { p.cancels.push(id); if (p.hold) await p.hold; },
   } as any);
@@ -105,7 +106,7 @@ afterEach(async () => {
 describe('due migrations', () => {
   it('a second run started while one applies leaves the next due migration to the first run', async () => {
     writePremium(
-      { [G]: { active: sub('s1', 'p1'), paused: [] }, [G2]: { active: sub('s2', 'p2'), paused: [] } },
+      { [gh(G)]: { active: sub('s1', 'p1'), paused: [] }, [gh(G2)]: { active: sub('s2', 'p2'), paused: [] } },
       { migrations: [
         migration('m1', Date.now() - 1000, [decision(G, 's1', 'p1', 'accepted')]),
         migration('m2', Date.now() - 1000, [decision(G2, 's2', 'p2', 'accepted')]),
@@ -130,7 +131,7 @@ describe('due migrations', () => {
 
   it('a pending migration whose date has not come is not applied', async () => {
     writePremium(
-      { [G]: { active: sub('s1', 'p1'), paused: [] } },
+      { [gh(G)]: { active: sub('s1', 'p1'), paused: [] } },
       { migrations: [migration('mf', Date.now() + DAY, [decision(G, 's1', 'p1', 'accepted')])] },
     );
     const pm = manager();
@@ -149,7 +150,7 @@ describe('due migrations', () => {
     const now = Date.parse('2026-11-04T12:00:00.000Z');
     vi.setSystemTime(now);
     writePremium(
-      { [G]: { active: sub('s1', 'p1'), paused: [] } },
+      { [gh(G)]: { active: sub('s1', 'p1'), paused: [] } },
       { migrations: [migration('m1', now, [decision(G, 's1', 'p1', 'accepted')])] },
     );
     const pm = manager();
@@ -161,7 +162,7 @@ describe('due migrations', () => {
 
   it('a later run applies a migration that came due after an earlier run ended', async () => {
     writePremium(
-      { [G]: { active: sub('s1', 'p1'), paused: [] }, [G2]: { active: sub('s2', 'p2'), paused: [] } },
+      { [gh(G)]: { active: sub('s1', 'p1'), paused: [] }, [gh(G2)]: { active: sub('s2', 'p2'), paused: [] } },
       { migrations: [migration('m1', Date.now() - 1000, [decision(G, 's1', 'p1', 'accepted')])] },
     );
     const pm = manager();
@@ -179,7 +180,7 @@ describe('due migrations', () => {
 
   it('a migration replaced by a config save during its run is not applied again, and takes a decision after the run', async () => {
     writePremium(
-      { [G]: { active: sub('s1', 'p1'), paused: [] } },
+      { [gh(G)]: { active: sub('s1', 'p1'), paused: [] } },
       { migrations: [migration('m1', Date.now() - 1000, [decision(G, 's1', 'p1', 'accepted')])] },
     );
     const pm = manager();
@@ -195,14 +196,14 @@ describe('due migrations', () => {
     await run;
     expect(p.migrates).toEqual(['p1']);
     expect(pm.getMigration('m1')!.status).toBe('pending');
-    expect(pm.recordMigrationDecision('m1', G, 'declined')).toBe(true);
+    expect(pm.recordMigrationDecision('m1', gh(G), 'declined')).toBe(true);
     await settleQueue();
     expect(storedMigration('m1').decisions[0].decision).toBe('declined');
   });
 
   it('a migration whose provider call ends after the stop is not marked applied, and no audit line is reported lost', async () => {
     writePremium(
-      { [G]: { active: sub('s1', 'p1'), paused: [] } },
+      { [gh(G)]: { active: sub('s1', 'p1'), paused: [] } },
       { migrations: [migration('m1', Date.now() - 1000, [decision(G, 's1', 'p1', 'accepted')])] },
     );
     const pm = manager();
@@ -224,19 +225,19 @@ describe('due migrations', () => {
 describe('migration notices', () => {
   it('an accepted decision sends migration.applied with the target tier and the provider name', async () => {
     writePremium(
-      { [G]: { active: sub('s1', 'p1'), paused: [] } },
+      { [gh(G)]: { active: sub('s1', 'p1'), paused: [] } },
       { migrations: [migration('m1', Date.now() - 1000, [decision(G, 's1', 'p1', 'accepted')])] },
     );
     const pm = manager();
     provider();
     await pm.processDueMigrations();
     const sent = notes.calls.filter(c => c.kind === 'migration.applied');
-    expect(sent).toEqual([{ guildId: G, kind: 'migration.applied', payload: { tierName: 'High', providerName: 'Fake Pay' } }]);
+    expect(sent).toEqual([{ guildId: `guild:${G}`, kind: 'migration.applied', payload: { tierName: 'High', providerName: 'Fake Pay' } }]);
   });
 
   it('a silent decision under the cancel policy sends migration.silence-applied saying it cancels at period end', async () => {
     writePremium(
-      { [G]: { active: sub('s1', 'p1'), paused: [] } },
+      { [gh(G)]: { active: sub('s1', 'p1'), paused: [] } },
       { migrations: [migration('m1', Date.now() - 1000, [decision(G, 's1', 'p1', 'pending', { notifiedAt: new Date().toISOString() })])] },
     );
     const pm = manager();
@@ -244,29 +245,29 @@ describe('migration notices', () => {
     await pm.processDueMigrations();
     expect(p.cancels).toEqual(['p1']);
     const sent = notes.calls.filter(c => c.kind === 'migration.silence-applied');
-    expect(sent).toEqual([{ guildId: G, kind: 'migration.silence-applied', payload: { tierName: 'High', details: 'Set to cancel at period end.' } }]);
+    expect(sent).toEqual([{ guildId: `guild:${G}`, kind: 'migration.silence-applied', payload: { tierName: 'High', details: 'Set to cancel at period end.' } }]);
   });
 
   it('an owner who accepts gets migration.accepted with the target tier and the date', () => {
     const eff = Date.now() + DAY;
     writePremium(
-      { [G]: { active: sub('s1', 'p1'), paused: [] } },
+      { [gh(G)]: { active: sub('s1', 'p1'), paused: [] } },
       { migrations: [migration('m1', eff, [decision(G, 's1', 'p1', 'pending')])] },
     );
     const pm = manager();
-    expect(pm.recordMigrationDecision('m1', G, 'accepted')).toBe(true);
-    expect(notes.calls).toEqual([{ guildId: G, kind: 'migration.accepted', payload: { tierName: 'High', endDate: new Date(eff).toISOString() } }]);
+    expect(pm.recordMigrationDecision('m1', gh(G), 'accepted')).toBe(true);
+    expect(notes.calls).toEqual([{ guildId: `guild:${G}`, kind: 'migration.accepted', payload: { tierName: 'High', endDate: new Date(eff).toISOString() } }]);
   });
 
   it('an owner who declines gets migration.declined', () => {
     const eff = Date.now() + DAY;
     writePremium(
-      { [G]: { active: sub('s1', 'p1'), paused: [] } },
+      { [gh(G)]: { active: sub('s1', 'p1'), paused: [] } },
       { migrations: [migration('m1', eff, [decision(G, 's1', 'p1', 'pending')])] },
     );
     const pm = manager();
-    expect(pm.recordMigrationDecision('m1', G, 'declined')).toBe(true);
-    expect(notes.calls).toEqual([{ guildId: G, kind: 'migration.declined', payload: { tierName: 'High', endDate: new Date(eff).toISOString() } }]);
+    expect(pm.recordMigrationDecision('m1', gh(G), 'declined')).toBe(true);
+    expect(notes.calls).toEqual([{ guildId: `guild:${G}`, kind: 'migration.declined', payload: { tierName: 'High', endDate: new Date(eff).toISOString() } }]);
   });
 
   it('a request delivered after the stop is not stamped as delivered', async () => {
@@ -274,7 +275,7 @@ describe('migration notices', () => {
     const link = (variantId: string) => ({ providerId: 'fake', enabled: true, mode: 'price', priceConfig: { entries: [{ variantId }] }, cache: { syncedAt: '', variants: [{ variantId, label: variantId }] } });
     tiers.low.offerings[0].providerLinks = [link('v1')];
     tiers.high.offerings[0].providerLinks = [link('v2')];
-    writePremium({ [G]: { active: sub('s1', 'p1'), paused: [] } }, { tiers });
+    writePremium({ [gh(G)]: { active: sub('s1', 'p1'), paused: [] } }, { tiers });
     const pm = manager();
     provider();
     const held = gate();
@@ -297,7 +298,7 @@ describe('migration notices', () => {
 describe('admin changes after the stop', () => {
   const setup = (): PremiumManager => {
     writePremium(
-      { [G]: { active: sub('s1', 'p1'), paused: [] } },
+      { [gh(G)]: { active: sub('s1', 'p1'), paused: [] } },
       { messages: { moduleBlocked: 'custom block' }, migrations: [migration('m1', Date.now() + DAY, [decision(G, 's1', 'p1', 'pending')])] },
     );
     const pm = manager();
@@ -319,7 +320,7 @@ describe('admin changes after the stop', () => {
 
   it('recording a decision is refused and keeps it pending', () => {
     const pm = setup();
-    expect(pm.recordMigrationDecision('m1', G, 'accepted')).toBe(false);
+    expect(pm.recordMigrationDecision('m1', gh(G), 'accepted')).toBe(false);
     expect(pm.getMigration('m1')!.decisions[0].decision).toBe('pending');
   });
 

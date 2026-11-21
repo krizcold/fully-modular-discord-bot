@@ -22,7 +22,7 @@ vi.mock('child_process', async orig => {
 vi.mock('../../src/utils/updateSafety', () => ({ getSafetyManager: () => safety }));
 vi.mock('../../src/webui/auth/oauthMiddleware', async orig => ({
   ...(await orig<any>()),
-  requireOAuth: (req: any, _res: any, next: () => void) => { req.user = { id: 'owner1' }; next(); },
+  requireOAuth: (req: any, _res: any, next: () => void) => { req.user = { id: '80000000000000001' }; next(); },
   requireGuildAccess: (_req: any, _res: any, next: () => void) => next(),
 }));
 vi.mock('../../src/bot/internalSetup/utils/payment/paymentRegistry', async orig => ({
@@ -42,6 +42,10 @@ import { dataPath } from '../../src/utils/dataRoot';
 import { forks } from '../helpers/forkMock';
 import { call, put, readJson, startApp } from '../helpers/configRig';
 import { answering, exitChild, freshWriterLock, quiet, resetForks, sentTo, startedWith } from '../helpers/nb10Rig';
+import { gh } from '../helpers/p1Holder';
+
+/** The buyer the dev purchase names in its body: not the signed-in user of the server page rows. */
+const DEV_BUYER = '80000000000000077';
 
 const G = '123456789012345678';
 const TIERS = () => dataPath('global', 'premium-tiers.json');
@@ -57,8 +61,8 @@ const rows: Row[] = [
   ['delete a tier', 'DELETE', '/premium/tiers/gold', undefined, 'premium.deleteTier', ['gold']],
   ['set messages', 'PUT', '/premium/messages', { moduleBlocked: 'nb10 blocked' }, 'premium.setMessages', [{ moduleBlocked: 'nb10 blocked' }]],
   ['reset messages', 'POST', '/premium/messages/reset', {}, 'premium.resetMessages', []],
-  ['grant a manual subscription', 'POST', `/premium/subscriptions/${G}/manual`, { tierId: 'gold', durationDays: 30 }, 'premium.grantManual', [G, 'gold', 30, undefined]],
-  ['revoke a manual subscription', 'DELETE', `/premium/subscriptions/${G}/manual`, undefined, 'premium.revokeManual', [G]],
+  ['grant a manual subscription', 'POST', `/premium/subscriptions/${G}/manual`, { tierId: 'gold', durationDays: 30 }, 'premium.grantManual', [gh(G), 'gold', 30, undefined]],
+  ['revoke a manual subscription', 'DELETE', `/premium/subscriptions/${G}/manual`, undefined, 'premium.revokeManual', [gh(G)]],
   ['set a Dummy variant', 'PUT', '/premium/providers/dummy/variants/v1', { label: 'V1', amount: 5, currency: 'USD' }, 'dummy.adminSetVariant', [expect.objectContaining({ variantId: 'v1', label: 'V1', amount: 5, currency: 'USD' })]],
   ['delete a Dummy variant', 'DELETE', '/premium/providers/dummy/variants/v1', undefined, 'dummy.adminDeleteVariant', ['v1']],
   ['activate a provider', 'PUT', '/premium/providers/dummy/activation', { activated: true }, 'premium.setProviderActivation', ['dummy', true, false]],
@@ -66,26 +70,26 @@ const rows: Row[] = [
   ['delete a Dummy product', 'DELETE', '/premium/providers/dummy/products/p1', undefined, 'dummy.adminDeleteProduct', ['p1']],
   ['set a Dummy coupon', 'PUT', '/premium/providers/dummy/coupons/C1', { percentOff: 10 }, 'dummy.adminSetCoupon', [expect.objectContaining({ code: 'C1', percentOff: 10, usedCount: 0 })]],
   ['delete a Dummy coupon', 'DELETE', '/premium/providers/dummy/coupons/C1', undefined, 'dummy.adminDeleteCoupon', ['C1']],
-  ['extend a manual subscription', 'POST', `/premium/subscriptions/${G}/manual/extend`, { addDays: 5 }, 'premium.extendManual', [G, 5]],
-  ['start a paid subscription', 'POST', `/premium/subscriptions/${G}/paid`, { tierId: 'gold', offeringId: 'o1', providerId: 'dummy', variantId: 'v1' }, 'premium.initiatePaidSubscription', [G, 'gold', 'o1', { providerId: 'dummy', variantId: 'v1' }]],
-  ['cancel a paid subscription', 'DELETE', `/premium/subscriptions/${G}/paid`, undefined, 'premium.cancelPaidSubscription', [G]],
-  ['reactivate a paid subscription', 'POST', `/premium/subscriptions/${G}/paid/reactivate`, {}, 'premium.reactivatePaidSubscription', [G]],
+  ['extend a manual subscription', 'POST', `/premium/subscriptions/${G}/manual/extend`, { addDays: 5 }, 'premium.extendManual', [gh(G), 5]],
+  ['start a paid subscription', 'POST', `/premium/subscriptions/${G}/paid`, { tierId: 'gold', offeringId: 'o1', providerId: 'dummy', variantId: 'v1', buyerId: DEV_BUYER }, 'premium.initiatePaidSubscription', [gh(G), 'gold', 'o1', { providerId: 'dummy', variantId: 'v1', buyerId: DEV_BUYER }]],
+  ['cancel a paid subscription', 'DELETE', `/premium/subscriptions/${G}/paid`, undefined, 'premium.cancelPaidSubscription', [gh(G)]],
+  ['reactivate a paid subscription', 'POST', `/premium/subscriptions/${G}/paid/reactivate`, {}, 'premium.reactivatePaidSubscription', [gh(G)]],
   ['schedule a migration', 'POST', '/premium/migrations', MIGRATION, 'premium.scheduleMigration', [{ ...MIGRATION, message: '', scheduledBy: 'admin' }]],
   ['cancel a migration', 'DELETE', '/premium/migrations/m1', undefined, 'premium.cancelMigration', ['m1']],
   ['set the migration silence policy', 'PUT', '/premium/migration-silence-policy', { policy: 'continue' }, 'premium.setMigrationSilencePolicy', ['continue']],
 ];
 
 const guildRows: Row[] = [
-  ['start a paid subscription', 'POST', `/${G}/paid`, { tierId: 'gold', offeringId: 'o1', providerId: 'dummy', variantId: 'v1' }, 'premium.initiatePaidSubscription', [G, 'gold', 'o1', { providerId: 'dummy', variantId: 'v1', userId: 'owner1', autoRenewOptOut: false }]],
-  ['cancel a paid subscription', 'DELETE', `/${G}/paid`, undefined, 'premium.cancelPaidSubscription', [G]],
-  ['reactivate a paid subscription', 'POST', `/${G}/paid/reactivate`, {}, 'premium.reactivatePaidSubscription', [G]],
-  ['expire a paid subscription now', 'POST', `/${G}/paid/expire-now`, {}, 'premium.cancelPaidSubscriptionImmediately', [G]],
-  ['adopt an orphan', 'POST', `/${G}/orphans/dummy/os1/adopt`, { plan: { kind: 'install' } }, 'premium.adoptOrphan', [G, 'dummy', 'os1', { kind: 'install' }]],
+  ['start a paid subscription', 'POST', `/${G}/paid`, { tierId: 'gold', offeringId: 'o1', providerId: 'dummy', variantId: 'v1' }, 'premium.initiatePaidSubscription', [gh(G), 'gold', 'o1', { providerId: 'dummy', variantId: 'v1', buyerId: '80000000000000001', autoRenewOptOut: false }]],
+  ['cancel a paid subscription', 'DELETE', `/${G}/paid`, undefined, 'premium.cancelPaidSubscription', [gh(G)]],
+  ['reactivate a paid subscription', 'POST', `/${G}/paid/reactivate`, {}, 'premium.reactivatePaidSubscription', [gh(G)]],
+  ['expire a paid subscription now', 'POST', `/${G}/paid/expire-now`, {}, 'premium.cancelPaidSubscriptionImmediately', [gh(G)]],
+  ['adopt an orphan', 'POST', `/${G}/orphans/dummy/os1/adopt`, { plan: { kind: 'install' } }, 'premium.adoptOrphan', [gh(G), 'dummy', 'os1', { kind: 'install' }]],
   ['cancel an orphan', 'DELETE', `/${G}/orphans/dummy/os1`, undefined, 'premium.cancelOrphan', ['dummy', 'os1']],
-  ['remove a paused subscription', 'DELETE', `/${G}/paused/s1`, undefined, 'premium.cancelAndRemovePausedSubscription', [G, 's1']],
-  ['unlink a provider account', 'DELETE', `/${G}/provider-links/patreon`, undefined, 'premium.unlinkProviderAccount', [G, 'patreon']],
-  ['record a migration decision', 'PUT', `/${G}/migrations/m1`, { decision: 'accepted' }, 'premium.recordMigrationDecision', ['m1', G, 'accepted']],
-  ['set the notifications channel', 'PUT', `/${G}/notifications-channel`, { channelId: '223456789012345678' }, 'premium.setNotificationsChannelId', [G, '223456789012345678']],
+  ['remove a paused subscription', 'DELETE', `/${G}/paused/s1`, undefined, 'premium.cancelAndRemovePausedSubscription', [gh(G), 's1']],
+  ['unlink a provider account', 'DELETE', `/${G}/provider-links/patreon`, undefined, 'premium.unlinkProviderAccount', [gh(G), 'patreon']],
+  ['record a migration decision', 'PUT', `/${G}/migrations/m1`, { decision: 'accepted' }, 'premium.recordMigrationDecision', ['m1', gh(G), 'accepted']],
+  ['set the notifications channel', 'PUT', `/${G}/notifications-channel`, { channelId: '223456789012345678' }, 'premium.setNotificationsChannelId', [gh(G), '223456789012345678']],
 ];
 
 let app: { url: string; close: () => Promise<void> } | null = null;

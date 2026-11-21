@@ -44,7 +44,7 @@ import { DummyProvider } from '../../src/bot/internalSetup/utils/payment/dummyPr
 // The Dummy provider's stop and deposition: what it refuses, what it records, and its rechecks of state.json.
 
 const DOC = 'global:payment-providers/dummy/state.json';
-const PURCHASE = { guildId: 'g1', tierId: 't', offeringId: 'o', variantId: 'dummy_monthly_999' } as any;
+const PURCHASE = { holder: 'guild:70000000000000001', guildId: '70000000000000001', tierId: 't', offeringId: 'o', variantId: 'dummy_monthly_999' } as any;
 let providers: DummyProvider[];
 
 function make(): DummyProvider {
@@ -93,7 +93,7 @@ describe('in the bot process', () => {
     p.markStopped('deposed');
     await expect(p.initiatePurchase(PURCHASE)).rejects.toThrow('The Dummy provider changed nothing: stop words deposed.');
     expect(h.saves).toEqual([]);
-    expect(await p.listSubscriptionsForGuild('g1')).toEqual([]);
+    expect(await p.listSubscriptionsFor('guild:70000000000000001')).toEqual([]);
   });
 
   it('adminSetProduct after a deposition refuses and stores nothing', () => {

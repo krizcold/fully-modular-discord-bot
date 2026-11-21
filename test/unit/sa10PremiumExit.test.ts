@@ -41,6 +41,7 @@ import { releaseWriterLock, takeWriterLock, writerLockDepth, writerLockPath } fr
 import { reopenSharedWrites } from '../../src/bot/internalSetup/utils/dataManager';
 import { freshWriterLock } from '../helpers/nb10Rig';
 import { AUDIT, clearGlobal, JOURNAL, linesOf, logged, paidSub, PREMIUM, settleQueue, state, writePremium } from './nb10PremiumRig';
+import { gh } from '../helpers/p1Holder';
 
 // NB19 T23 on any platform: premium's exit line for a line whose folder sync failed says the line is in the file and
 // synced, then the clause of that failure, and quotes the line without its newline.
@@ -82,14 +83,14 @@ function newProcess(): Manager {
   resetPremiumManager();
   reg.current = null;
   getPaymentRegistry().register({
-    id: 'fake', displayName: 'Fake', capabilities: { supportsCancel: true }, isConfigured: () => true,
+    id: 'fake', displayName: 'Fake', capabilities: { sells: ['guild'], supportsCancel: true }, isConfigured: () => true,
     handleWebhook: async (body: Buffer) => { getPaymentRegistry().emitEvent(JSON.parse(body.toString())); },
     cancelSubscription: async () => undefined,
   } as any);
   return getPremiumManager();
 }
-const created = (providerSubId: string, guildId = 'g1') => ({
-  type: 'subscription.created', providerId: 'fake', providerSubId, guildId, tierId: 'low', offeringId: 'o1', state: state(),
+const created = (providerSubId: string, guildId = '70000000000000001') => ({
+  type: 'subscription.created', buyerId: '80000000000000001', providerId: 'fake', providerSubId, holder: gh(guildId), tierId: 'low', offeringId: 'o1', state: state(),
 });
 const deliver = (event: object) => applySharedOp({ op: 'payment.webhook', args: { providerId: 'fake', body: Buffer.from(JSON.stringify(event)).toString('base64'), signature: '' } });
 const exitLines = (pm: Manager): string[] => {
@@ -112,7 +113,7 @@ describe("premium's exit lines when a folder sync failed", () => {
     await settleQueue();
     expect(linesOf(JOURNAL)).toHaveLength(1);
     expect(chain.dirs).toContain(GLOBAL_DIR);
-    const head = '[PremiumManager] A subscription.created event from fake (subscription ps1, guild g1) was received while premium-tiers.json could not be read';
+    const head = '[PremiumManager] A subscription.created event from fake (subscription ps1, guild 70000000000000001) was received while premium-tiers.json could not be read';
     expect(exitLines(pm)).toEqual([`${head}; its journal line is in the file and synced, but ${why()}, so can't confirm whether it is stored: ${JSON.stringify(event)}`]);
   });
 
@@ -122,18 +123,18 @@ describe("premium's exit lines when a folder sync failed", () => {
     const pm = newProcess();
     await deliver(created('ps1'));
     await settleQueue();
-    expect(linesOf(AUDIT).filter(l => l.action === 'subscription.install.paid').map(l => l.guildId)).toEqual(['g1']);
+    expect(linesOf(AUDIT).filter(l => l.action === 'subscription.install.paid').map(l => l.holder)).toEqual(['guild:70000000000000001']);
     const install = exitLines(pm).filter(l => l.includes('subscription.install.paid'));
     expect(install).toHaveLength(1);
-    expect(install[0].startsWith(`[PremiumManager] The audit line subscription.install.paid (guild g1, subscription ps1) is in the file and synced, but ${why()}; can't confirm whether it is stored`)).toBe(true);
+    expect(install[0].startsWith(`[PremiumManager] The audit line subscription.install.paid (guild 70000000000000001, subscription ps1) is in the file and synced, but ${why()}; can't confirm whether it is stored`)).toBe(true);
   });
 
   it('an after-drain audit line: in the file and synced, the clause, and the stored line without its newline', async () => {
     const expired = {
-      type: 'subscription.expired', providerId: 'discord', providerSubId: 'ps0', guildId: 'g1',
+      type: 'subscription.expired', providerId: 'discord', providerSubId: 'ps0', holder: 'guild:70000000000000001',
       state: { ...state('expired'), endDate: new Date(Date.now() - 1000).toISOString() },
     };
-    writePremium({ g1: { active: paidSub('sA', 'ps0', 'low', 'discord'), paused: [] } });
+    writePremium({ 'guild:70000000000000001': { active: paidSub('sA', 'ps0', 'low', 'discord'), paused: [] } });
     fs.writeFileSync(JOURNAL, `${JSON.stringify({ writer: 'w1', n: 1, event: expired })}\n`);
     hooks.confirm = () => new Promise<string>(() => undefined);
     const pm = newProcess();
@@ -147,10 +148,10 @@ describe("premium's exit lines when a folder sync failed", () => {
     await settleQueue();
     const lines = exitLines(pm);
     expect(lines).toHaveLength(1);
-    const head = /^(\[PremiumManager\] The audit line subscription\.expire\.paid \(guild g1, [^)]+\)) /.exec(lines[0]);
+    const head = /^(\[PremiumManager\] The audit line subscription\.expire\.paid \(guild 70000000000000001, [^)]+\)) /.exec(lines[0]);
     expect(head, lines[0]).not.toBeNull();
     const stored = fs.readFileSync(AUDIT, 'utf8').trimEnd().split('\n').pop()!;
-    expect(JSON.parse(stored)).toMatchObject({ action: 'subscription.expire.paid', guildId: 'g1' });
+    expect(JSON.parse(stored)).toMatchObject({ action: 'subscription.expire.paid', holder: 'guild:70000000000000001' });
     expect(lines[0]).toBe(`${head![1]} is in the file and synced, but ${why()}; can't confirm whether it is stored: ${stored}`);
   });
 });

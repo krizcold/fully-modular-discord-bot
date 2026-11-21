@@ -56,10 +56,10 @@ describe("the replay's install line and the bot's real stop", () => {
     }) as typeof process.exit);
 
     writePremium();
-    fs.writeFileSync(JOURNAL, `${JSON.stringify({ writer: 'w1', n: 1, event: { type: 'subscription.created', providerId: 'fake', providerSubId: 'j1', guildId: 'g4', tierId: 'low', offeringId: 'o1', state: state() } })}\n`);
+    fs.writeFileSync(JOURNAL, `${JSON.stringify({ writer: 'w1', n: 1, event: { type: 'subscription.created', buyerId: '80000000000000001', providerId: 'fake', providerSubId: 'j1', holder: 'guild:70000000000000004', tierId: 'low', offeringId: 'o1', state: state() } })}\n`);
     reg.current = null;
     getPaymentRegistry().register({
-      id: 'fake', displayName: 'Fake', capabilities: { supportsPause: true }, isConfigured: () => true,
+      id: 'fake', displayName: 'Fake', capabilities: { sells: ['guild'], supportsPause: true }, isConfigured: () => true,
       handleWebhook: async () => undefined, cancelSubscription: async () => undefined,
     } as any);
     installStopHandler();
@@ -68,6 +68,8 @@ describe("the replay's install line and the bot's real stop", () => {
     startPremiumTickers();
     await vi.waitFor(() => expect(pm.cacheState()).toBe('normal'), { timeout: 5000, interval: 20 });
     await settleQueue();
+    expect(logged(spies.error).filter(l => l.includes('installAsyncSubscription failed'))).toEqual([]);
+    expect(pm.getAllSubscriptions()['guild:70000000000000004']?.active?.providerSubId).toBe('j1');
     expect(rawOf(AUDIT)).toBeNull();
     expect(jsonOf(PREMIUM).eventsApplied ?? {}).toEqual({});
 

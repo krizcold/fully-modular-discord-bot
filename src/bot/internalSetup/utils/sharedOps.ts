@@ -14,6 +14,7 @@ import { carryWrites, landed, markPaymentLedger, NO_WRITES, runSealed, writesOf,
 import { truthText, verdictOf, type TruthAnswer } from './dataBackends/replyGate';
 import { checkWriterLock, deposedText } from './writerLock';
 export { deposedText } from './writerLock';
+import { notHolderText, parseHolder } from './premiumHolder';
 import { getPremiumManager, invalidatePremiumCache, MigrationBusy, settlePremiumInstalls } from './premiumManager';
 import { getPaymentRegistry } from './payment/paymentRegistry';
 import { invalidateDummyCaches } from './payment/dummyProvider';
@@ -142,21 +143,29 @@ async function paymentOAuthCallback(args: { providerId?: unknown; query?: unknow
   } catch (error) {
     throw new WebhookRejected(error instanceof Error ? error.message : String(error));
   }
+  const parsed = parseHolder(result.holder);
+  if (!parsed) throw new OpRefusal('invalid', notHolderText(result.holder));
+  if (parsed.kind !== 'guild') {
+    throw new OpRefusal('invalid', `${provider.displayName} links accounts to servers only; it answered for user ${parsed.id}, and nothing was linked.`);
+  }
+  const holder = parsed.key;
   const mgr = getPremiumManager();
   const existing = mgr.getAccountLink(provider.id, result.externalAccountId);
-  if (existing && existing !== result.guildId) return { linkedElsewhere: existing };
-  mgr.linkAccount(provider.id, result.externalAccountId, result.guildId);
+  if (existing && existing.holder !== holder) return { linkedElsewhere: existing.holder };
+  // linkAccount throws when the callback named no buyer: nothing is linked and no event is raised.
+  mgr.linkAccount(provider.id, result.externalAccountId, holder, result.buyerId as string);
   getPaymentRegistry().emitEvent({
     type: 'subscription.created',
     providerId: provider.id,
-    providerSubId: `${provider.id}:${result.externalAccountId}:${result.guildId}`,
-    guildId: result.guildId,
+    providerSubId: `${provider.id}:${result.externalAccountId}:${parsed.id}`,
+    holder,
+    buyerId: existing ? existing.buyerId : result.buyerId,
     tierId: result.tierId,
     offeringId: result.offeringId,
     variantId: result.variantId,
     state: result.state,
   });
-  return { linked: result.guildId };
+  return { linked: holder };
 }
 
 function setGlobalModuleConfig(args: { moduleName?: unknown; partial?: unknown; expectSha?: unknown; rel?: unknown }): unknown {

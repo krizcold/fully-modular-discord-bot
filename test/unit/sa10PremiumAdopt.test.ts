@@ -6,7 +6,7 @@ import { freshWriterLock } from '../helpers/nb10Rig';
 import { getPaymentRegistry } from '../../src/bot/internalSetup/utils/payment/paymentRegistry';
 import { releaseWriterLock, takeWriterLock, writerLockDepth, writerLockPath } from '../../src/bot/internalSetup/utils/writerLock';
 
-// NB25 decisions 1 and 2 on a Postgres bot: the plan findOrphansForGuild shows for a paused orphan, by the server's
+// NB25 decisions 1 and 2 on a Postgres bot: the plan findOrphansFor shows for a paused orphan, by the server's
 // live active subscription, and an adoption whose tier is deleted during the resume (T7).
 
 vi.mock('../../src/bot/internalSetup/utils/payment/paymentRegistry', async orig => {
@@ -39,8 +39,8 @@ const fake = {
 
 function register(): void {
   getPaymentRegistry().register({
-    id: 'fake', displayName: 'Fake', capabilities: { supportsPause: true }, isConfigured: () => true,
-    listSubscriptionsForGuild: async (guildId: string) => fake.refs.filter(ref => ref.metadata.guildId === guildId).map(ref => JSON.parse(JSON.stringify(ref))),
+    id: 'fake', displayName: 'Fake', capabilities: { sells: ['guild'], supportsPause: true }, isConfigured: () => true,
+    listSubscriptionsFor: async (holder: string) => fake.refs.filter(ref => ref.metadata.holder === holder).map(ref => JSON.parse(JSON.stringify(ref))),
     resumeSubscription: async (subId: string) => {
       fake.resumes.push(subId);
       if (fake.holdResumes) {
@@ -58,7 +58,7 @@ function register(): void {
 const pausedRef = (over: { tierId?: string; offeringId?: string | null; days?: number } = {}) => ({
   providerSubId: 'orph',
   metadata: {
-    guildId: 'g1', tierId: over.tierId ?? 'silver',
+    holder: 'guild:70000000000000001', buyerId: '80000000000000001', tierId: over.tierId ?? 'silver',
     ...(over.offeringId === null ? {} : { offeringId: over.offeringId ?? (over.tierId === 'gold' ? 'o1' : 'o2') }),
     pausedDaysLeft: over.days ?? 12, pausedAt: AT,
   },
@@ -67,7 +67,7 @@ const pausedRef = (over: { tierId?: string; offeringId?: string | null; days?: n
 });
 
 const paid = (providerSubId: string, tierId: string, endMs = 20 * DAY_MS) => ({
-  id: `s_${providerSubId}`, tierId, source: 'paid', offeringId: tierId === 'gold' ? 'o1' : 'o2', providerId: 'fake', providerSubId,
+  id: `s_${providerSubId}`, tierId, source: 'paid', buyerId: '80000000000000001', offeringId: tierId === 'gold' ? 'o1' : 'o2', providerId: 'fake', providerSubId,
   purchasedSnapshot: { offeringLabel: '', variantLabel: '', amount: 0, currency: '', durationDays: 30, tierDisplayName: tierId, tierPriority: 1, purchasedAt: new Date().toISOString() },
   startDate: new Date().toISOString(), endDate: new Date(Date.now() + endMs).toISOString(), autoRenew: true, status: 'active',
   createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
@@ -75,12 +75,12 @@ const paid = (providerSubId: string, tierId: string, endMs = 20 * DAY_MS) => ({
 
 async function seed(subs: { active?: unknown; paused?: unknown[] }, tiers: Record<string, unknown> = {}): Promise<void> {
   await d.otherPremium(config => {
-    config.subscriptions.g1 = { paused: [], ...subs };
+    config.subscriptions['guild:70000000000000001'] = { paused: [], ...subs };
     Object.assign(config.tiers, tiers);
   });
 }
 
-const listed = async () => (await r.pm().findOrphansForGuild('g1')).find(o => o.ref.providerSubId === 'orph');
+const listed = async () => (await r.pm().findOrphansFor('guild:70000000000000001')).find(o => o.ref.providerSubId === 'orph');
 const planOf = async () => (await listed())?.plan;
 const RESUME_12 = 'Adopting resumes this paused subscription at Fake; its next charge is in 12 days. The days are the ones the bot recorded when it paused it on 2026-11-01.';
 const TIE_SILVER = "It cannot be adopted: the server already has a 'Silver' subscription of the same priority; cancel one of them or let it end first.";
@@ -105,7 +105,7 @@ afterEach(async () => {
   await d.teardown();
 });
 
-describe("findOrphansForGuild's plan for a paused orphan", () => {
+describe("findOrphansFor's plan for a paused orphan", () => {
   it('one recorded day reads "1 day"', async () => {
     fake.refs = [pausedRef({ days: 1 })];
     expect((await planOf())?.line).toBe('Adopting resumes this paused subscription at Fake; its next charge is in 1 day. The days are the ones the bot recorded when it paused it on 2026-11-01.');
@@ -120,8 +120,8 @@ describe("findOrphansForGuild's plan for a paused orphan", () => {
 
   it('an active sub of the same priority whose status is not active leaves the slot free: resume', async () => {
     await seed({ active: { ...paid('same1', 'silver'), status: 'expired' } });
-    expect(r.pm().getGuildSubscriptions('g1')?.active).toMatchObject({ providerSubId: 'same1', tierId: 'silver', status: 'expired' });
-    expect(Date.parse(r.pm().getGuildSubscriptions('g1')!.active!.endDate!)).toBeGreaterThan(Date.now());
+    expect(r.pm().getHolderSubscriptions('guild:70000000000000001')?.active).toMatchObject({ providerSubId: 'same1', tierId: 'silver', status: 'expired' });
+    expect(Date.parse(r.pm().getHolderSubscriptions('guild:70000000000000001')!.active!.endDate!)).toBeGreaterThan(Date.now());
     expect(await planOf()).toMatchObject({ kind: 'resume', days: 12, line: RESUME_12 });
   });
 
@@ -136,7 +136,7 @@ describe("findOrphansForGuild's plan for a paused orphan", () => {
 
   it('a live active sub whose tier is gone counts as priority 0: a higher orphan resumes', async () => {
     await seed({ active: paid('ghost1', 'ghost') });
-    expect(r.pm().getGuildSubscriptions('g1')?.active).toMatchObject({ providerSubId: 'ghost1', tierId: 'ghost', status: 'active' });
+    expect(r.pm().getHolderSubscriptions('guild:70000000000000001')?.active).toMatchObject({ providerSubId: 'ghost1', tierId: 'ghost', status: 'active' });
     expect(await planOf()).toMatchObject({ kind: 'resume', days: 12, line: RESUME_12 });
   });
 
@@ -160,7 +160,7 @@ describe('an adoption whose tier is deleted during the resume', () => {
     const plan = await planOf();
     expect(plan).toMatchObject({ kind: 'resume', days: 12 });
     fake.holdResumes = true;
-    const run = r.pm().adoptOrphan('g1', 'fake', 'orph', plan);
+    const run = r.pm().adoptOrphan('guild:70000000000000001', 'fake', 'orph', plan);
     await vi.waitFor(() => expect(fake.resumeGates).toHaveLength(1), { timeout: 5000, interval: 5 });
     await d.otherPremium(config => { delete config.tiers.gold; }, false);
     fake.resumeGates[0].open();

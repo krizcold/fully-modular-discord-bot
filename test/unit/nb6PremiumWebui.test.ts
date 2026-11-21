@@ -98,11 +98,11 @@ describe('row 286: an op whose item settles after 8 s in the web UI', () => {
       return held === 1 ? gate : undefined;
     };
     const started = Date.now();
-    const reply = manager.runSharedOp('premium.grantManual', { args: ['g1', 'low', 30] });
+    const reply = manager.runSharedOp('premium.grantManual', { args: ['guild:70000000000000001', 'low', 30] });
     setTimeout(open, 8_500);
     expect(await reply).toMatchObject({ ok: true, result: true });
     expect(Date.now() - started).toBeGreaterThanOrEqual(8_400);
-    expect(notices.sent).toEqual([{ notice: 'manual.grant.added:g1', lockHeld: true }]);
+    expect(notices.sent).toEqual([{ notice: 'manual.grant.added:guild:70000000000000001', lockHeld: true }]);
     expect(fs.existsSync(writerLockPath())).toBe(false);
     expect(await manager.runLocalOp('next', async () => ({ ok: true, result: notices.sent.length }))).toEqual({ ok: true, result: 1 });
     expect(notices.sent).toHaveLength(1);

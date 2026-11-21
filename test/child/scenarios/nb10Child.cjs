@@ -155,11 +155,11 @@ function prepareLosses(dataManager) {
   fs.writeFileSync(dataPath('global', 'premium-tiers.json'), '{ broken');
   failing.append = 'premium-tiers.events.jsonl';
   premium.getPremiumManager();
-  getPaymentRegistry().emitEvent({ type: 'subscription.expired', providerId: 'discord', providerSubId: 'd1', guildId: 'g1', state: state('expired', -1) });
+  getPaymentRegistry().emitEvent({ type: 'subscription.expired', providerId: 'discord', providerSubId: 'd1', holder: 'guild:70000000000000001', state: state('expired', -1) });
 
   dataManager.addStopStep(async () => {
     console.log('[nb10Child] gateway close step started');
-    getPaymentRegistry().emitEvent({ type: 'subscription.created', providerId: 'discord', providerSubId: 'ent9', guildId: 'g9', tierId: 'low', offeringId: 'o1', state: state('active', 30) });
+    getPaymentRegistry().emitEvent({ type: 'subscription.created', providerId: 'discord', providerSubId: 'ent9', holder: 'guild:70000000000000009', buyerId: '80000000000000001', tierId: 'low', offeringId: 'o1', state: state('active', 30) });
     await sleep(3000);
     console.log('[nb10Child] gateway close step ended');
   });

@@ -60,11 +60,11 @@ const fake = {
 
 function register(): void {
   getPaymentRegistry().register({
-    id: 'fake', displayName: 'Fake', capabilities: { supportsPause: true, supportsCancel: true }, isConfigured: () => true,
-    listSubscriptionsForGuild: async (guildId: string) => {
+    id: 'fake', displayName: 'Fake', capabilities: { sells: ['guild'], supportsPause: true, supportsCancel: true }, isConfigured: () => true,
+    listSubscriptionsFor: async (holder: string) => {
       const held = fake.list;
       if (held) await held.promise;
-      return fake.refs.filter(ref => ref.metadata.guildId === guildId).map(ref => JSON.parse(JSON.stringify(ref)));
+      return fake.refs.filter(ref => ref.metadata.holder === holder).map(ref => JSON.parse(JSON.stringify(ref)));
     },
     resumeSubscription: async (subId: string, end: string | null) => {
       fake.resumes.push({ id: subId, end });
@@ -86,7 +86,7 @@ function register(): void {
 const pausedRef = (over: { tierId?: string; offeringId?: string; days?: number | null; end?: number | null; autoRenew?: boolean } = {}) => ({
   providerSubId: 'orph',
   metadata: {
-    guildId: 'g1', tierId: over.tierId ?? 'silver', offeringId: over.offeringId ?? 'o2',
+    holder: 'guild:70000000000000001', buyerId: '80000000000000001', tierId: over.tierId ?? 'silver', offeringId: over.offeringId ?? 'o2',
     ...(over.days === null ? {} : { pausedDaysLeft: over.days ?? 12, pausedAt: AT }),
   },
   state: {
@@ -99,15 +99,15 @@ const pausedRef = (over: { tierId?: string; offeringId?: string; days?: number |
 const noEnd = (autoRenew = true) => pausedRef({ days: null, end: null, autoRenew });
 
 const paid = (providerSubId: string, tierId: string) => ({
-  id: `s_${providerSubId}`, tierId, source: 'paid', offeringId: tierId === 'gold' ? 'o1' : 'o2', providerId: 'fake', providerSubId,
+  id: `s_${providerSubId}`, tierId, source: 'paid', buyerId: '80000000000000001', offeringId: tierId === 'gold' ? 'o1' : 'o2', providerId: 'fake', providerSubId,
   purchasedSnapshot: { offeringLabel: '', variantLabel: '', amount: 0, currency: '', durationDays: 30, tierDisplayName: tierId, tierPriority: 1, purchasedAt: new Date().toISOString() },
   startDate: new Date().toISOString(), endDate: new Date(Date.now() + 20 * DAY_MS).toISOString(), autoRenew: true, status: 'active',
   createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
 });
 
-const planOf = async () => (await r.pm().findOrphansForGuild('g1')).find(o => o.ref.providerSubId === 'orph')?.plan;
-const adopt = (shown: unknown) => r.pm().adoptOrphan('g1', 'fake', 'orph', shown);
-const active = () => r.row()?.subscriptions?.g1?.active;
+const planOf = async () => (await r.pm().findOrphansFor('guild:70000000000000001')).find(o => o.ref.providerSubId === 'orph')?.plan;
+const adopt = (shown: unknown) => r.pm().adoptOrphan('guild:70000000000000001', 'fake', 'orph', shown);
+const active = () => r.row()?.subscriptions?.['guild:70000000000000001']?.active;
 const logged = (text: string) => r.m.state.lines.filter(l => l.includes(text));
 const PERIOD = " The days come from Fake's current billing period, because the bot did not record them when it was paused.";
 
@@ -145,7 +145,7 @@ describe('a paused orphan with no end date', () => {
   });
 
   it('behind a live higher sub: the queue plan has no at and its line names no resume time', async () => {
-    await d.otherPremium(config => { config.subscriptions.g1 = { active: paid('hi1', 'gold'), paused: [] }; });
+    await d.otherPremium(config => { config.subscriptions['guild:70000000000000001'] = { active: paid('hi1', 'gold'), paused: [] }; });
     fake.refs = [noEnd()];
     expect(await planOf()).toStrictEqual({
       kind: 'queue', days: null, from: 'period', activeTierId: 'gold', activeTier: 'Gold',
@@ -157,8 +157,8 @@ describe('a paused orphan with no end date', () => {
     fake.refs = [noEnd()];
     const plan = await planOf();
     expect(await adopt(plan)).toBe(true);
-    expect(logged('[PremiumManager] Adoption is resuming Fake subscription orph for guild g1 with no end date.')).toHaveLength(1);
-    expect(logged('[PremiumManager] Adoption resumed Fake subscription orph for guild g1 with no end date; the bot may not have saved it yet.')).toHaveLength(1);
+    expect(logged('[PremiumManager] Adoption is resuming Fake subscription orph for guild 70000000000000001 with no end date.')).toHaveLength(1);
+    expect(logged('[PremiumManager] Adoption resumed Fake subscription orph for guild 70000000000000001 with no end date; the bot may not have saved it yet.')).toHaveLength(1);
     expect(fake.resumes).toEqual([{ id: 'orph', end: null }]);
     await d.settle();
     expect(active()).toMatchObject({ providerSubId: 'orph', status: 'active', endDate: null });

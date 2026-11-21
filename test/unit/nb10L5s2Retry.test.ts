@@ -140,10 +140,10 @@ describe('an audit line refused by the stop', () => {
   it('is lost and logged under its guild with the stop words', async () => {
     const pm = loaded();
     refuse('premium-tiers.audit.jsonl', 'node-stopping');
-    await pm.grantManual('g1', 'high', 30);
+    await pm.grantManual('guild:70000000000000001', 'high', 30);
     const lost = logged(spies.error).filter(l => l.startsWith('[PremiumManager] The audit line subscription.grant.manual'));
     expect(lost).toHaveLength(1);
-    expect(lost[0]).toMatch(/^\[PremiumManager\] The audit line subscription\.grant\.manual \(guild g1, [^)]+\) was not written: the bot is stopping; it is lost$/);
+    expect(lost[0]).toMatch(/^\[PremiumManager\] The audit line subscription\.grant\.manual \(guild 70000000000000001, [^)]+\) was not written: the bot is stopping; it is lost$/);
     recover();
     await settleQueue();
     expect(linesOf(AUDIT).filter(l => l.action === 'subscription.grant.manual')).toEqual([]);
@@ -152,7 +152,7 @@ describe('an audit line refused by the stop', () => {
   it("an orphan cancel's line, written after the stop came, is logged with guild none", async () => {
     const cancel = gate();
     getPaymentRegistry().register({
-      id: 'orph', displayName: 'Orph', capabilities: { supportsCancel: true }, isConfigured: () => true,
+      id: 'orph', displayName: 'Orph', capabilities: { sells: ['guild'], supportsCancel: true }, isConfigured: () => true,
       cancelSubscription: () => cancel.promise,
     } as any);
     const pm = loaded();

@@ -21,6 +21,7 @@ import { getPaymentRegistry } from '../../src/bot/internalSetup/utils/payment/pa
 import { DummyProvider } from '../../src/bot/internalSetup/utils/payment/dummyProvider';
 import { applySharedOp, globalTarget, invalidateSharedCaches, setOpSettler } from '../../src/bot/internalSetup/utils/sharedOps';
 import { clearGlobal, jsonOf, PREMIUM, quiet, rawOf, settleQueue, state, writePremium } from './nb10PremiumRig';
+import { LINK_BUYER, linkOf } from '../helpers/p1Holder';
 
 const role = process.env.BOT_PROCESS_ROLE;
 const STATE = dataPath('global', 'payment-providers', 'dummy', 'state.json');
@@ -124,7 +125,7 @@ describe('dummy ops while the Dummy provider is not registered', () => {
   it('a provider named dummy that has no admin methods is refused the same way, and its methods are not called', async () => {
     writePremium();
     const del = vi.fn(() => true);
-    getPaymentRegistry().register({ id: 'dummy', displayName: 'Not the Dummy', capabilities: {}, isConfigured: () => true, adminDeleteVariant: del } as any);
+    getPaymentRegistry().register({ id: 'dummy', displayName: 'Not the Dummy', capabilities: { sells: ['guild'] }, isConfigured: () => true, adminDeleteVariant: del } as any);
     const reply = await applySharedOp({ op: 'dummy.adminDeleteVariant', args: { args: ['v1'] } });
     expect(reply).toEqual({ ok: false, code: 'invalid', error: 'The Dummy provider is not registered' });
     expect(del).not.toHaveBeenCalled();
@@ -141,7 +142,7 @@ describe('payment.webhook', () => {
     writePremium();
     const seen: Array<{ body: Buffer; signature: string }> = [];
     getPaymentRegistry().register({
-      id: 'hook', displayName: 'Hook', capabilities: {}, isConfigured: () => true,
+      id: 'hook', displayName: 'Hook', capabilities: { sells: ['guild'] }, isConfigured: () => true,
       handleWebhook: async (body: Buffer, signature: string) => { seen.push({ body, signature }); },
     } as any);
     const reply = await applySharedOp({ op: 'payment.webhook', args: { providerId: 'hook', body: 42, signature: 7 } });
@@ -159,30 +160,30 @@ describe('payment.oauthCallback', () => {
   });
 
   const registerOAuth = (guildId: string) => getPaymentRegistry().register({
-    id: 'oauthy', displayName: 'OAuthy', capabilities: {}, isConfigured: () => true,
-    handleOAuthCallback: async () => ({ externalAccountId: 'ext1', guildId, tierId: 'low', offeringId: 'o1', variantId: 'v1', state: state() }),
+    id: 'oauthy', displayName: 'OAuthy', capabilities: { sells: ['guild'] }, isConfigured: () => true,
+    handleOAuthCallback: async () => ({ externalAccountId: 'ext1', holder: `guild:${guildId}`, buyerId: LINK_BUYER, tierId: 'low', offeringId: 'o1', variantId: 'v1', state: state() }),
   } as any);
 
   it('an account already linked to the same guild is linked again and announced', async () => {
-    writePremium({}, { providerAccountLinks: { oauthy: { ext1: 'g1' } } });
-    registerOAuth('g1');
+    writePremium({}, { providerAccountLinks: { oauthy: { ext1: linkOf('70000000000000001') } } });
+    registerOAuth('70000000000000001');
     const events: any[] = [];
     getPaymentRegistry().on('provider.event', (e: any) => events.push(e));
     const reply = await applySharedOp({ op: 'payment.oauthCallback', args: { providerId: 'oauthy', query: {} } });
-    expect(reply).toEqual({ ok: true, result: { linked: 'g1' } });
-    expect(events.map(e => [e.type, e.guildId, e.providerSubId])).toEqual([['subscription.created', 'g1', 'oauthy:ext1:g1']]);
+    expect(reply).toEqual({ ok: true, result: { linked: 'guild:70000000000000001' } });
+    expect(events.map(e => [e.type, e.holder, e.providerSubId])).toEqual([['subscription.created', 'guild:70000000000000001', 'oauthy:ext1:70000000000000001']]);
   });
 
   it('an account linked to another guild answers linkedElsewhere and keeps the stored link', async () => {
-    writePremium({}, { providerAccountLinks: { oauthy: { ext1: 'g2' } } });
-    registerOAuth('g1');
+    writePremium({}, { providerAccountLinks: { oauthy: { ext1: linkOf('70000000000000002') } } });
+    registerOAuth('70000000000000001');
     const events: any[] = [];
     getPaymentRegistry().on('provider.event', (e: any) => events.push(e));
     const reply = await applySharedOp({ op: 'payment.oauthCallback', args: { providerId: 'oauthy', query: {} } });
-    expect(reply).toEqual({ ok: true, result: { linkedElsewhere: 'g2' } });
+    expect(reply).toEqual({ ok: true, result: { linkedElsewhere: 'guild:70000000000000002' } });
     expect(events).toEqual([]);
     await settleQueue();
-    expect(jsonOf(PREMIUM).providerAccountLinks).toEqual({ oauthy: { ext1: 'g2' } });
+    expect(jsonOf(PREMIUM).providerAccountLinks).toEqual({ oauthy: { ext1: linkOf('70000000000000002') } });
   });
 });
 

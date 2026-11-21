@@ -11,10 +11,10 @@ vi.mock('../../src/bot/internalSetup/utils/payment/paymentRegistry', async orig 
   const real = await orig<typeof import('../../src/bot/internalSetup/utils/payment/paymentRegistry')>();
   return { ...real, getPaymentRegistry: () => (reg.current ??= new real.PaymentProviderRegistry()) };
 });
-const notices = vi.hoisted(() => ({ sent: [] as Array<{ guildId: string; kind: string }> }));
+const notices = vi.hoisted(() => ({ sent: [] as Array<{ holder: string; kind: string }> }));
 vi.mock('../../src/bot/internalSetup/utils/premiumNotifications', () => ({
-  dispatchPremiumNotification: async (guildId: string, kind: string) => {
-    notices.sent.push({ guildId, kind });
+  dispatchPremiumNotification: async (holder: string, kind: string) => {
+    notices.sent.push({ holder, kind });
     return { delivered: true, via: 'dm' };
   },
 }));
@@ -38,6 +38,7 @@ vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => {
 
 import { PremiumManager } from '../../src/bot/internalSetup/utils/premiumManager';
 import { getPaymentRegistry } from '../../src/bot/internalSetup/utils/payment/paymentRegistry';
+import type { HolderKey } from '../../src/bot/internalSetup/utils/premiumHolder';
 import { AUDIT, clearGlobal, jsonOf, linesOf, logged, paidSub, PREMIUM, quiet, settleQueue, state, writePremium } from './nb10PremiumRig';
 
 const role = process.env.BOT_PROCESS_ROLE;
@@ -50,9 +51,9 @@ const provider = {
 
 function manager(): PremiumManager {
   getPaymentRegistry().register({
-    id: 'fake', displayName: 'Fake', capabilities: { supportsPause: true }, isConfigured: () => true,
+    id: 'fake', displayName: 'Fake', capabilities: { sells: ['guild'], supportsPause: true }, isConfigured: () => true,
     pauseSubscription: () => provider.pause(),
-    listSubscriptionsForGuild: async () => provider.refs,
+    listSubscriptionsFor: async () => provider.refs,
   } as any);
   const pm = new PremiumManager();
   managers.push(pm);
@@ -61,7 +62,7 @@ function manager(): PremiumManager {
 }
 
 const emit = (event: object) => getPaymentRegistry().emitEvent(event as any);
-const read = (guildId: string, subId: string) => getPaymentRegistry().readSubscription('fake', guildId, subId);
+const read = (holder: HolderKey, subId: string) => getPaymentRegistry().readSubscription('fake', holder, subId);
 const pausedSub = (id: string, subId: string) => ({ ...paidSub(id, subId, 'low'), status: 'paused' });
 const later = (days: number) => new Date(Date.now() + days * 86_400_000).toISOString();
 
@@ -91,10 +92,10 @@ afterAll(() => {
 
 describe('a provider pause that fails with no error value', () => {
   it('is logged as the failed pause, and the install still ends', async () => {
-    writePremium({ g1: { active: paidSub('s1', 'h1', 'high'), paused: [] } });
+    writePremium({ 'guild:70000000000000001': { active: paidSub('s1', 'h1', 'high'), paused: [] } });
     const pm = manager();
     provider.pause = () => Promise.reject(undefined);
-    emit({ type: 'subscription.created', providerId: 'fake', providerSubId: 'c1', guildId: 'g1', tierId: 'low', offeringId: 'o1', state: state() });
+    emit({ type: 'subscription.created', buyerId: '80000000000000001', providerId: 'fake', providerSubId: 'c1', holder: 'guild:70000000000000001', tierId: 'low', offeringId: 'o1', state: state() });
     await pm.settled(undefined);
     expect(logged(spies.warn)).toContain("[PremiumManager] provider pauseSubscription failed for 'fake': undefined");
     expect(logged(spies.error).filter(l => l.includes('installAsyncSubscription failed'))).toEqual([]);
@@ -103,52 +104,52 @@ describe('a provider pause that fails with no error value', () => {
 
 describe('a state event on a paused subscription', () => {
   it('an expiry of a paused sub leaves the active sub in its slot', async () => {
-    writePremium({ g1: { active: paidSub('s1', 'a1', 'high'), paused: [pausedSub('p', 'p1')] } });
+    writePremium({ 'guild:70000000000000001': { active: paidSub('s1', 'a1', 'high'), paused: [pausedSub('p', 'p1')] } });
     manager();
-    emit({ type: 'subscription.expired', providerId: 'fake', providerSubId: 'p1', guildId: 'g1', state: { ...state('expired'), endDate: new Date(Date.now() - 1000).toISOString() } });
+    emit({ type: 'subscription.expired', providerId: 'fake', providerSubId: 'p1', holder: 'guild:70000000000000001', state: { ...state('expired'), endDate: new Date(Date.now() - 1000).toISOString() } });
     await settleQueue();
-    const stored = jsonOf(PREMIUM).subscriptions.g1;
+    const stored = jsonOf(PREMIUM).subscriptions['guild:70000000000000001'];
     expect(stored.active.id).toBe('s1');
     expect(stored.paused.map((s: any) => [s.id, s.status])).toEqual([['p', 'expired']]);
   });
 
   it('a provider state of paused is stored as paused', async () => {
-    writePremium({ g1: { active: paidSub('s1', 'a1', 'high'), paused: [pausedSub('p', 'p1')] } });
+    writePremium({ 'guild:70000000000000001': { active: paidSub('s1', 'a1', 'high'), paused: [pausedSub('p', 'p1')] } });
     manager();
-    emit({ type: 'subscription.updated', providerId: 'fake', providerSubId: 'p1', guildId: 'g1', state: state('paused', 40) });
+    emit({ type: 'subscription.updated', providerId: 'fake', providerSubId: 'p1', holder: 'guild:70000000000000001', state: state('paused', 40) });
     await settleQueue();
-    expect(jsonOf(PREMIUM).subscriptions.g1.paused.map((s: any) => s.status)).toEqual(['paused']);
+    expect(jsonOf(PREMIUM).subscriptions['guild:70000000000000001'].paused.map((s: any) => s.status)).toEqual(['paused']);
   });
 });
 
 describe("the Dummy tick's walk batch on a JSON bot", () => {
   it("an expiry's audit line is written and its notice sent", async () => {
-    writePremium({ g1: { active: paidSub('s1', 'a1', 'low'), paused: [] } });
+    writePremium({ 'guild:70000000000000001': { active: paidSub('s1', 'a1', 'low'), paused: [] } });
     manager();
     getPaymentRegistry().emitWalkBatch({
       premiumSha: null,
-      events: [{ type: 'subscription.expired', providerId: 'fake', providerSubId: 'a1', guildId: 'g1', state: { ...state('expired'), endDate: new Date(Date.now() - 1000).toISOString() } }],
+      events: [{ type: 'subscription.expired', providerId: 'fake', providerSubId: 'a1', holder: 'guild:70000000000000001', state: { ...state('expired'), endDate: new Date(Date.now() - 1000).toISOString() } }],
     } as any);
     await settleQueue();
-    expect(notices.sent).toEqual([{ guildId: 'g1', kind: 'paid.sub.expired' }]);
+    expect(notices.sent).toEqual([{ holder: 'guild:70000000000000001', kind: 'paid.sub.expired' }]);
     expect(linesOf(AUDIT).filter(l => l.action === 'subscription.expire.paid').map(l => l.subscriptionId)).toEqual(['s1']);
   });
 
   it('a save the disk refuses is held: the cache keeps the renewal', async () => {
-    writePremium({ g1: { active: paidSub('s1', 'a1', 'low'), paused: [] } });
+    writePremium({ 'guild:70000000000000001': { active: paidSub('s1', 'a1', 'low'), paused: [] } });
     manager();
     const end = later(90);
     inject.saves = ['io'];
     getPaymentRegistry().emitWalkBatch({
       premiumSha: null,
-      events: [{ type: 'subscription.renewed', providerId: 'fake', providerSubId: 'a1', guildId: 'g1', state: { ...state(), endDate: end } }],
+      events: [{ type: 'subscription.renewed', providerId: 'fake', providerSubId: 'a1', holder: 'guild:70000000000000001', state: { ...state(), endDate: end } }],
     } as any);
-    expect(read('g1', 'a1')?.endDate).toBe(end);
+    expect(read('guild:70000000000000001', 'a1')?.endDate).toBe(end);
   });
 
   it('a batch that arrives while premium-tiers.json could not be read is not applied', async () => {
-    writePremium({ g1: { active: paidSub('s1', 'a1', 'low'), paused: [] } });
-    const before = jsonOf(PREMIUM).subscriptions.g1.active.endDate;
+    writePremium({ 'guild:70000000000000001': { active: paidSub('s1', 'a1', 'low'), paused: [] } });
+    const before = jsonOf(PREMIUM).subscriptions['guild:70000000000000001'].active.endDate;
     inject.reads = [Object.assign(new Error('permission denied'), { code: 'EACCES' })];
     const pm = manager();
     expect(pm.unreadableText()).toContain('premium-tiers.json cannot be read (EACCES)');
@@ -156,23 +157,23 @@ describe("the Dummy tick's walk batch on a JSON bot", () => {
     vi.setSystemTime(Date.now() + 6_000);
     getPaymentRegistry().emitWalkBatch({
       premiumSha: null,
-      events: [{ type: 'subscription.renewed', providerId: 'fake', providerSubId: 'a1', guildId: 'g1', state: { ...state(), endDate: later(90) } }],
+      events: [{ type: 'subscription.renewed', providerId: 'fake', providerSubId: 'a1', holder: 'guild:70000000000000001', state: { ...state(), endDate: later(90) } }],
     } as any);
     vi.useRealTimers();
     await settleQueue();
     expect(logged(spies.warn).filter(l => l.includes('was not applied: premium-tiers.json cannot be read'))).toHaveLength(1);
-    expect(jsonOf(PREMIUM).subscriptions.g1.active.endDate).toBe(before);
+    expect(jsonOf(PREMIUM).subscriptions['guild:70000000000000001'].active.endDate).toBe(before);
   });
 });
 
 describe('a first save too large to store', () => {
   it('keeps the change in the cache when no drop was asked for', () => {
-    writePremium({ g1: { active: paidSub('s1', 'a1', 'high'), paused: [pausedSub('p', 'p1')] } });
+    writePremium({ 'guild:70000000000000001': { active: paidSub('s1', 'a1', 'high'), paused: [pausedSub('p', 'p1')] } });
     manager();
     const resumesAt = later(12);
     inject.saves = ['unstorable'];
-    emit({ type: 'subscription.paused', providerId: 'fake', providerSubId: 'p1', guildId: 'g1', resumesAt });
-    expect(read('g1', 'p1')).toMatchObject({ status: 'paused', resumesAt });
+    emit({ type: 'subscription.paused', providerId: 'fake', providerSubId: 'p1', holder: 'guild:70000000000000001', resumesAt });
+    expect(read('guild:70000000000000001', 'p1')).toMatchObject({ status: 'paused', resumesAt });
   });
 });
 
@@ -187,7 +188,7 @@ describe('an adoption of an active orphan whose offering is gone', () => {
   it('names the tier and the missing offering', async () => {
     writePremium({});
     const pm = manager();
-    provider.refs = [{ providerSubId: 'orph', state: state(), metadata: { tierId: 'low', offeringId: 'o9' } }];
-    await expect(pm.adoptOrphan('g1', 'fake', 'orph', { kind: 'install' })).rejects.toThrow("Subscription 'orph' was not adopted: tier 'low' has no offering 'o9'.");
+    provider.refs = [{ providerSubId: 'orph', state: state(), metadata: { buyerId: '80000000000000001', tierId: 'low', offeringId: 'o9' } }];
+    await expect(pm.adoptOrphan('guild:70000000000000001', 'fake', 'orph', { kind: 'install' })).rejects.toThrow("Subscription 'orph' was not adopted: tier 'low' has no offering 'o9'.");
   });
 });

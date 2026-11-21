@@ -106,12 +106,13 @@ import { writeMaintenanceFile } from '../../src/utils/maintenanceFile';
 import { setBackendKind } from '../helpers/backendKind';
 import { ME, OrderStore, order, settle } from '../helpers/nx5Rig';
 import { AUDIT, clearGlobal, linesOf, DUMMY_STATE, gate, JOURNAL, jsonOf, paidSub, PREMIUM, quiet, rawOf, settleQueue, state, writePremium } from './nb10PremiumRig';
+import { gh } from '../helpers/p1Holder';
 
 const m = maintenance as any;
 const role = process.env.BOT_PROCESS_ROLE;
 const refuse = (...files: string[]) => { for (const f of files) h.refuse.set(f, 'storage-failing'); };
 const recover = () => h.refuse.clear();
-const grant = (guildId = 'g1', tierId = 'high') => applySharedOp({ op: 'premium.grantManual', args: { args: [guildId, tierId, 30] } });
+const grant = (guildId = '70000000000000001', tierId = 'high') => applySharedOp({ op: 'premium.grantManual', args: { args: [gh(guildId), tierId, 30] } });
 const variant = { variantId: 'v9', label: 'V9', amount: 1, currency: 'USD', durationDays: 1, recurring: false, active: true };
 const savesOf = (file: string) => h.saves.filter(f => f === file).length;
 const END = new Date(Date.now() + 30 * 86_400_000).toISOString();
@@ -125,10 +126,10 @@ const migration = (decisions: Array<Record<string, unknown>>) => ({
   effectiveDate: new Date(Date.now() - 60_000).toISOString(), message: 'New price.', status: 'pending',
   createdAt: new Date().toISOString(), decisions,
 });
-const decision = (guildId: string, subscriptionId: string, providerSubId: string) => ({ guildId, subscriptionId, providerSubId, decision: 'accepted' });
+const decision = (guildId: string, subscriptionId: string, providerSubId: string) => ({ holder: gh(guildId), subscriptionId, providerSubId, decision: 'accepted' });
 const journalLine = (writer: string, n: number, event: object) => `${JSON.stringify({ writer, n, event })}\n`;
 const expired = (providerSubId: string, guildId: string) => ({
-  type: 'subscription.expired', providerId: 'discord', providerSubId, guildId, state: { ...state('expired'), endDate: new Date(Date.now() - 1000).toISOString() },
+  type: 'subscription.expired', providerId: 'discord', providerSubId, holder: gh(guildId), state: { ...state('expired'), endDate: new Date(Date.now() - 1000).toISOString() },
 });
 
 beforeAll(() => clearGlobal());
@@ -220,7 +221,7 @@ describe('the cache-stop registration', () => {
 describe("premium's held files and its save run", () => {
   it('an audit line held alone: heldFiles names the audit file, and resaveHeld appends it', async () => {
     refuse('premium-tiers.audit.jsonl');
-    await grant('g1');
+    await grant('70000000000000001');
     const pm = getPremiumManager() as any;
     expect(pm.saveHeld).toBe(false);
     expect(pm.heldFiles()).toEqual([AUDIT]);
@@ -229,12 +230,12 @@ describe("premium's held files and its save run", () => {
     pm.resaveHeld();
     expect(pm.heldFiles()).toEqual([]);
     await settleQueue();
-    expect(linesOf(AUDIT).some(l => l.guildId === 'g1')).toBe(true);
+    expect(linesOf(AUDIT).some(l => l.holder === 'guild:70000000000000001')).toBe(true);
   });
 
   it('a disposed manager reports no held file and saves nothing', async () => {
     refuse('premium-tiers.json');
-    expect(await grant('g1')).toMatchObject({ answer: 'held' });
+    expect(await grant('70000000000000001')).toMatchObject({ answer: 'held' });
     const pm = getPremiumManager() as any;
     expect(pm.heldFiles()).toEqual([PREMIUM]);
     retriesOutOfReach(pm);
@@ -248,7 +249,7 @@ describe("premium's held files and its save run", () => {
 
   it('a deposed manager with a held save writes nothing on resaveHeld', async () => {
     refuse('premium-tiers.json');
-    expect(await grant('g1')).toMatchObject({ answer: 'held' });
+    expect(await grant('70000000000000001')).toMatchObject({ answer: 'held' });
     const pm = getPremiumManager() as any;
     retriesOutOfReach(pm);
     pm.markStopped('deposed');
@@ -256,7 +257,7 @@ describe("premium's held files and its save run", () => {
     const before = savesOf('premium-tiers.json');
     pm.resaveHeld();
     expect(savesOf('premium-tiers.json')).toBe(before);
-    expect(jsonOf(PREMIUM).subscriptions.g1).toBeUndefined();
+    expect(jsonOf(PREMIUM).subscriptions['guild:70000000000000001']).toBeUndefined();
   });
 });
 
@@ -328,11 +329,11 @@ describe("premium's refusal texts", () => {
 
 describe("premium's open work in words", () => {
   it('a due migration whose provider call runs is named as a run of due price migrations', async () => {
-    writePremium({ g1: { active: subOn('s1', 'sub1'), paused: [] } }, { migrations: [migration([decision('g1', 's1', 'sub1')])] });
+    writePremium({ 'guild:70000000000000001': { active: subOn('s1', 'sub1'), paused: [] } }, { migrations: [migration([decision('70000000000000001', 's1', 'sub1')])] });
     const call = gate<void>();
     const calls: string[] = [];
     getPaymentRegistry().register({
-      id: 'fake', displayName: 'Fake', capabilities: {}, isConfigured: () => true,
+      id: 'fake', displayName: 'Fake', capabilities: { sells: ['guild'] }, isConfigured: () => true,
       migrateSubscriptionPrice: async (subId: string) => { calls.push(subId); await call.promise; return providerState(true); },
     } as any);
     const pm = getPremiumManager();
@@ -363,14 +364,14 @@ describe('a due migration stopped part way', () => {
   function provider(answer: (subId: string) => Promise<unknown>): string[] {
     const calls: string[] = [];
     getPaymentRegistry().register({
-      id: 'fake', displayName: 'Fake', capabilities: {}, isConfigured: () => true,
+      id: 'fake', displayName: 'Fake', capabilities: { sells: ['guild'] }, isConfigured: () => true,
       migrateSubscriptionPrice: async (subId: string) => { calls.push(subId); return answer(subId); },
     } as any);
     return calls;
   }
 
   it('the first decision refused as maintenance: nothing is saved', async () => {
-    writePremium({ g1: { active: subOn('s1', 'sub1'), paused: [] } }, { migrations: [migration([decision('g1', 's1', 'sub1')])] });
+    writePremium({ 'guild:70000000000000001': { active: subOn('s1', 'sub1'), paused: [] } }, { migrations: [migration([decision('70000000000000001', 's1', 'sub1')])] });
     const calls = provider(async () => { throw new MaintenanceRefusal('The Dummy provider changed nothing: the bot is in maintenance.'); });
     const pm = getPremiumManager();
     pm.getFullConfig();
@@ -384,8 +385,8 @@ describe('a due migration stopped part way', () => {
 
   it('the second decision refused as maintenance: the first one is saved', async () => {
     writePremium(
-      { g1: { active: subOn('s1', 'sub1'), paused: [] }, g2: { active: subOn('s2', 'sub2'), paused: [] } },
-      { migrations: [migration([decision('g1', 's1', 'sub1'), decision('g2', 's2', 'sub2')])] },
+      { 'guild:70000000000000001': { active: subOn('s1', 'sub1'), paused: [] }, 'guild:70000000000000002': { active: subOn('s2', 'sub2'), paused: [] } },
+      { migrations: [migration([decision('70000000000000001', 's1', 'sub1'), decision('70000000000000002', 's2', 'sub2')])] },
     );
     provider(async subId => {
       if (subId === 'sub2') throw new MaintenanceRefusal('The Dummy provider changed nothing: the bot is in maintenance.');
@@ -403,8 +404,8 @@ describe('a due migration stopped part way', () => {
 
   it('a deposition during the second decision: the first decision\'s notice is let go and no notice stays open', async () => {
     writePremium(
-      { g1: { active: subOn('s1', 'sub1'), paused: [] }, g2: { active: subOn('s2', 'sub2'), paused: [] } },
-      { migrations: [migration([decision('g1', 's1', 'sub1'), decision('g2', 's2', 'sub2')])] },
+      { 'guild:70000000000000001': { active: subOn('s1', 'sub1'), paused: [] }, 'guild:70000000000000002': { active: subOn('s2', 'sub2'), paused: [] } },
+      { migrations: [migration([decision('70000000000000001', 's1', 'sub1'), decision('70000000000000002', 's2', 'sub2')])] },
     );
     const second = gate<void>();
     const calls = provider(async subId => {
@@ -422,7 +423,7 @@ describe('a due migration stopped part way', () => {
 });
 
 describe("the replay's marks watch", () => {
-  const replaySubs = () => ({ g1: { active: paidSub('s1', 'd1', 'low', 'discord'), paused: [] } });
+  const replaySubs = () => ({ 'guild:70000000000000001': { active: paidSub('s1', 'd1', 'low', 'discord'), paused: [] } });
 
   /** Runs fn when the replay waits for the last time, after its loop handed `handed` events. */
   function atLastWait(pm: PremiumManager, handed: number, fn: () => void): void {
@@ -437,7 +438,7 @@ describe("the replay's marks watch", () => {
 
   it('a save of the marks that has not landed is named in exact words', async () => {
     writePremium(replaySubs());
-    fs.writeFileSync(JOURNAL, journalLine('w1', 1, expired('d1', 'g1')));
+    fs.writeFileSync(JOURNAL, journalLine('w1', 1, expired('d1', '70000000000000001')));
     resetPremiumManager();
     reg.current = null;
     const pm = getPremiumManager();
@@ -458,7 +459,7 @@ describe("the replay's marks watch", () => {
 
   it('once the marks landed and the journal is deleted, no work stays open', async () => {
     writePremium(replaySubs());
-    fs.writeFileSync(JOURNAL, journalLine('w1', 1, expired('d1', 'g1')));
+    fs.writeFileSync(JOURNAL, journalLine('w1', 1, expired('d1', '70000000000000001')));
     resetPremiumManager();
     reg.current = null;
     const pm = getPremiumManager();

@@ -78,7 +78,7 @@ function expiredState(autoRenew: boolean): string {
   return JSON.stringify({
     variants: {}, products: {}, coupons: {}, nextId: 2,
     subscriptions: {
-      dummy_1: { providerSubId: 'dummy_1', guildId: 'g1', tierId: 't', offeringId: 'o', variantId: 'x', durationDays: 30,
+      dummy_1: { providerSubId: 'dummy_1', guildId: '70000000000000001', tierId: 't', offeringId: 'o', variantId: 'x', durationDays: 30,
         startDate: past, endDate: past, autoRenew, status: 'active', createdAt: past, updatedAt: past },
     },
   });
@@ -346,11 +346,11 @@ describe('start and the tick', () => {
 describe('initiatePurchase', () => {
   it('saves the new subscription and answers it', async () => {
     const p = make();
-    const res = await p.initiatePurchase({ guildId: 'g1', tierId: 't', offeringId: 'o', variantId: 'dummy_monthly_999' } as any);
+    const res = await p.initiatePurchase({ holder: 'guild:70000000000000001', buyerId: '80000000000000001', tierId: 't', offeringId: 'o', variantId: 'dummy_monthly_999' } as any);
     expect(res.providerSubId).toBe('dummy_1');
     expect(res.state?.status).toBe('active');
     expect(h.saves.length).toBe(1);
-    expect(h.saves[0].subscriptions.dummy_1.guildId).toBe('g1');
+    expect(h.saves[0].subscriptions.dummy_1.guildId).toBe('70000000000000001');
   });
 });
 

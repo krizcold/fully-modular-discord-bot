@@ -82,7 +82,7 @@ describe('row 186: a carrier lands', () => {
   it('its audit line is committed with the premium row', async () => {
     const pm = getPremiumManager();
     pm.setTier('low', tier('Low', 1));
-    await pm.grantManual('g1', 'low', 30);
+    await pm.grantManual('guild:70000000000000001', 'low', 30);
     await settle();
     expect((await lines()).map(l => l.action)).toEqual(['tier.create', 'subscription.grant.manual']);
     expect(await premiumRow()).toBeDefined();
@@ -99,7 +99,7 @@ describe('row 188: a refused carrier, and the marked copy', () => {
       `UPDATE smdb_data.shared_docs SET body = $2, sha = $3, rev = nextval('smdb_data.shared_rev_seq'), updated_by = 'BRAVO/p-bravo' WHERE key = $1`,
       [PREMIUM_KEY, Buffer.from(other), sha(other)],
     );
-    await pm.grantManual('g1', 'low', 30);
+    await pm.grantManual('guild:70000000000000001', 'low', 30);
     await settle();
     const stored = await lines();
     expect(stored.map(l => l.action)).toEqual(['tier.create', 'subscription.grant.manual']);

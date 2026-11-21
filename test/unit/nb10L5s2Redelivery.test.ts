@@ -39,6 +39,7 @@ import { getPaymentRegistry } from '../../src/bot/internalSetup/utils/payment/pa
 import { markPaymentLedger, runSealed } from '../../src/bot/internalSetup/utils/dataBackends/writeLedger';
 import { AUDIT, clearGlobal, gate, linesOf, logged, paidSub, quiet, settleQueue, state, writePremium } from './nb10PremiumRig';
 import { stubAppendHandles } from '../helpers/fileHandleStub';
+import { gh } from '../helpers/p1Holder';
 
 const role = process.env.BOT_PROCESS_ROLE;
 const asBot = (bot: boolean) => {
@@ -53,14 +54,14 @@ function newProcess(): ReturnType<typeof getPremiumManager> {
   resetPremiumManager();
   reg.current = null;
   getPaymentRegistry().register({
-    id: 'fake', displayName: 'Fake', capabilities: { supportsCancel: true }, isConfigured: () => true,
+    id: 'fake', displayName: 'Fake', capabilities: { sells: ['guild'], supportsCancel: true }, isConfigured: () => true,
     cancelSubscription: async () => undefined,
   } as any);
   return getPremiumManager();
 }
 type Manager = ReturnType<typeof getPremiumManager>;
-const created = (providerSubId: string, guildId = 'g1') => ({
-  type: 'subscription.created', providerId: 'fake', providerSubId, guildId, tierId: 'low', offeringId: 'o1', state: state(),
+const created = (providerSubId: string, guildId = '70000000000000001') => ({
+  type: 'subscription.created', buyerId: '80000000000000001', providerId: 'fake', providerSubId, holder: gh(guildId), tierId: 'low', offeringId: 'o1', state: state(),
 });
 /** A webhook delivery of the event in a payment op; answers the op's refused documents. */
 function redeliver(pm: Manager, event: object) {
@@ -82,7 +83,7 @@ function inDroppedReplay(pm: Manager, fn: () => Promise<void>): Promise<void> {
 }
 const installLines = () => linesOf(AUDIT).filter(l => l?.action === 'subscription.install.paid');
 const auditLine = (entry: object) => `${JSON.stringify({ timestamp: 't', actor: 'admin', ...entry })}\n`;
-const withS1 = () => writePremium({ g1: { active: paidSub('s1', 'ps1'), paused: [] } });
+const withS1 = () => writePremium({ 'guild:70000000000000001': { active: paidSub('s1', 'ps1'), paused: [] } });
 
 let spies: ReturnType<typeof quiet>;
 beforeAll(() => clearGlobal());
@@ -112,13 +113,13 @@ afterAll(() => {
 describe('the audit file read of a redelivery', () => {
   it('a line of another action for the subscription is not its install line: the redelivery writes one, by an admin', async () => {
     withS1();
-    fs.writeFileSync(AUDIT, auditLine({ action: 'subscription.expire.paid', guildId: 'g1', subscriptionId: 's1' }));
+    fs.writeFileSync(AUDIT, auditLine({ action: 'subscription.expire.paid', holder: 'guild:70000000000000001', subscriptionId: 's1' }));
     const pm = newProcess();
     expect(await redeliver(pm, created('ps1'))).toEqual([]);
     await settleQueue();
     const lines = installLines();
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toMatchObject({ actor: 'admin', subscriptionId: 's1', guildId: 'g1', metadata: { redelivered: true } });
+    expect(lines[0]).toMatchObject({ actor: 'admin', subscriptionId: 's1', holder: 'guild:70000000000000001', metadata: { redelivered: true } });
   });
 
   it('a null line is skipped and the redelivery writes the install line', async () => {
@@ -140,7 +141,7 @@ describe('the audit file read of a redelivery', () => {
   });
 
   it('an install line queued in this process stays queued: its loss is logged at exit while it has not landed', async () => {
-    writePremium({ g2: { active: paidSub('s2', 'ps2'), paused: [] } });
+    writePremium({ 'guild:70000000000000002': { active: paidSub('s2', 'ps2'), paused: [] } });
     const pm = newProcess();
     const flush = gate();
     const stub = stubAppendHandles();
@@ -151,10 +152,10 @@ describe('the audit file read of a redelivery', () => {
       await pm.settled(undefined);
       // The line's append is held at its open, so none of its bytes is in the file at the exit.
       await opened.reached;
-      await redeliver(pm, created('ps2', 'g2'));
+      await redeliver(pm, created('ps2', '70000000000000002'));
       spies.error.mockClear();
       pm.logLossesAtExit();
-      expect(logged(spies.error).filter(l => l.includes('(guild g1, subscription psA) did not reach the disk'))).toHaveLength(1);
+      expect(logged(spies.error).filter(l => l.includes('(guild 70000000000000001, subscription psA) did not reach the disk'))).toHaveLength(1);
     } finally {
       flush.open();
     }
@@ -175,7 +176,7 @@ describe('a redelivery while the install line waits', () => {
     withS1();
     const pm = newProcess();
     // The state a replay leaves while its marks have not landed (decision 12): the line waits in its buffer.
-    (pm as any).installLines.set('s1', { state: 'buffered', webhook: false, line: auditLine({ action: 'subscription.install.paid', guildId: 'g1', subscriptionId: 's1' }), entry: { action: 'subscription.install.paid', guildId: 'g1', subscriptionId: 's1' } });
+    (pm as any).installLines.set('s1', { state: 'buffered', webhook: false, line: auditLine({ action: 'subscription.install.paid', holder: 'guild:70000000000000001', subscriptionId: 's1' }), entry: { action: 'subscription.install.paid', holder: 'guild:70000000000000001', subscriptionId: 's1' } });
     (pm as any).installLinesFilled = true;
     (pm as any).heldCause = 'storage-failing';
     expect(await redeliver(pm, created('ps1'))).toEqual([{ cause: 'io', doc: AUDIT_DOC, seq: expect.any(Number), retried: true }]);
@@ -187,22 +188,22 @@ describe('a redelivery while the install line waits', () => {
 describe('lines written in a dropped replay', () => {
   it("an install's line is dropped, and the next delivery writes it", async () => {
     const pm = newProcess();
-    await inDroppedReplay(pm, async () => { getPaymentRegistry().emitEvent(created('psX', 'g5') as any); });
+    await inDroppedReplay(pm, async () => { getPaymentRegistry().emitEvent(created('psX', '70000000000000005') as any); });
     await settleQueue();
     expect(installLines()).toEqual([]);
-    expect(await redeliver(pm, created('psX', 'g5'))).toEqual([]);
+    expect(await redeliver(pm, created('psX', '70000000000000005'))).toEqual([]);
     await settleQueue();
     const lines = installLines();
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toMatchObject({ guildId: 'g5', metadata: { redelivered: true } });
+    expect(lines[0]).toMatchObject({ holder: 'guild:70000000000000005', metadata: { redelivered: true } });
   });
 
   it("another line naming the subscription keeps its install line, so a redelivery writes none", async () => {
     withS1();
-    fs.writeFileSync(AUDIT, auditLine({ action: 'subscription.install.paid', guildId: 'g1', subscriptionId: 's1' }));
+    fs.writeFileSync(AUDIT, auditLine({ action: 'subscription.install.paid', holder: 'guild:70000000000000001', subscriptionId: 's1' }));
     const pm = newProcess();
     await redeliver(pm, created('ps1'));
-    await inDroppedReplay(pm, async () => { await pm.grantManual('g1', 'high', 30); });
+    await inDroppedReplay(pm, async () => { await pm.grantManual('guild:70000000000000001', 'high', 30); });
     await redeliver(pm, created('ps1'));
     await settleQueue();
     expect(installLines()).toHaveLength(1);
@@ -212,11 +213,11 @@ describe('lines written in a dropped replay', () => {
 describe("a refused line that is not the subscription's install line", () => {
   it('a refusal of the stop in the bot keeps the install line, so a redelivery writes none', async () => {
     withS1();
-    fs.writeFileSync(AUDIT, auditLine({ action: 'subscription.install.paid', guildId: 'g1', subscriptionId: 's1' }));
+    fs.writeFileSync(AUDIT, auditLine({ action: 'subscription.install.paid', holder: 'guild:70000000000000001', subscriptionId: 's1' }));
     const pm = newProcess();
     await redeliver(pm, created('ps1'));
     refuse('premium-tiers.audit.jsonl', 'node-stopping');
-    expect(await pm.cancelPaidSubscription('g1')).toBe(true);
+    expect(await pm.cancelPaidSubscription('guild:70000000000000001')).toBe(true);
     recover();
     await redeliver(pm, created('ps1'));
     await settleQueue();
@@ -226,11 +227,11 @@ describe("a refused line that is not the subscription's install line", () => {
   it('a refusal in the web UI keeps the install line, so a redelivery writes none', async () => {
     asBot(false);
     withS1();
-    fs.writeFileSync(AUDIT, auditLine({ action: 'subscription.install.paid', guildId: 'g1', subscriptionId: 's1' }));
+    fs.writeFileSync(AUDIT, auditLine({ action: 'subscription.install.paid', holder: 'guild:70000000000000001', subscriptionId: 's1' }));
     const pm = newProcess();
     await redeliver(pm, created('ps1'));
     refuse('premium-tiers.audit.jsonl');
-    expect(await pm.cancelPaidSubscription('g1')).toBe(true);
+    expect(await pm.cancelPaidSubscription('guild:70000000000000001')).toBe(true);
     recover();
     await redeliver(pm, created('ps1'));
     await settleQueue();

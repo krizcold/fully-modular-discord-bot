@@ -27,7 +27,7 @@ vi.mock('../../src/bot/internalSetup/utils/premiumNotifications', () => ({
 const r = premiumRig();
 const LINES = 'SELECT id, line FROM smdb_data.shared_lines WHERE key = $1 ORDER BY seq';
 const entry = (i: number, action: string, extra: Record<string, unknown> = {}) =>
-  JSON.stringify({ timestamp: `2026-11-07T10:00:0${i}.000Z`, actor: 'admin', action, guildId: `g${i}`, ...extra });
+  JSON.stringify({ timestamp: `2026-11-07T10:00:0${i}.000Z`, actor: 'admin', action, holder: `guild:7${String(i).padStart(16, '0')}`, ...extra });
 
 beforeEach(async () => {
   await r.setup();
@@ -43,7 +43,7 @@ describe('readAuditEntries on a Postgres bot', () => {
     r.m.state.rows.putLine(AUDIT_KEY, 'c', entry(3, 'tier.update', { metadata: { notSaved: { cause: 'changed-elsewhere', at: '2026-11-07T10:00:04.000Z' } } }));
     r.m.state.rows.putLine('global/other.jsonl', 'd', entry(4, 'tier.update'));
     const all = await r.pm().readAuditEntries();
-    expect(all.entries.map(e => e.guildId)).toEqual(['g3', 'g2', 'g1']);
+    expect(all.entries.map(e => e.holder)).toEqual(['guild:70000000000000003', 'guild:70000000000000002', 'guild:70000000000000001']);
     expect(all.total).toBe(3);
     expect((all.entries[0].metadata as any).notSaved.cause).toBe('changed-elsewhere');
     const some = await r.pm().readAuditEntries({ action: 'tier.update', limit: 1 });
@@ -76,14 +76,14 @@ describe('readAuditEntries on a JSON bot', () => {
     fs.mkdirSync(dataPath('global'), { recursive: true });
     fs.writeFileSync(dataPath('global', 'premium-tiers.audit.jsonl'), `${entry(1, 'tier.create')}\nnot json\n${entry(2, 'tier.update')}\n`);
     const res = await r.pm().readAuditEntries();
-    expect(res.entries.map(e => e.guildId)).toEqual(['g2', 'g1']);
+    expect(res.entries.map(e => e.holder)).toEqual(['guild:70000000000000002', 'guild:70000000000000001']);
     expect(r.m.sql()).toEqual([]);
   });
 });
 
 describe('the redelivery of a webhook (121, 194)', () => {
   const created = (providerSubId: string) => ({
-    type: 'subscription.created', providerId: 'nb6p', providerSubId, guildId: 'g1', tierId: 'low', offeringId: 'o1', variantId: 'v1',
+    type: 'subscription.created', buyerId: '80000000000000001', providerId: 'nb6p', providerSubId, holder: 'guild:70000000000000001', tierId: 'low', offeringId: 'o1', variantId: 'v1',
     state: { status: 'active', startDate: '2026-11-07T10:00:00.000Z', endDate: '2026-12-07T10:00:00.000Z', autoRenew: true, meta: {} },
   });
   async function deliver(providerSubId: string): Promise<void> {
@@ -99,7 +99,7 @@ describe('the redelivery of a webhook (121, 194)', () => {
     pm.setTier('low', { ...tier('Low', 1), offerings: [{ id: 'o1', label: 'One', providerLinks: [] }] } as any);
     await deliver('ps1');
     await vi.waitFor(() => expect(r.lines(AUDIT_KEY).map(l => l.action)).toEqual(['tier.create', 'subscription.install.paid']));
-    return r.row().subscriptions.g1.active.id;
+    return r.row().subscriptions['guild:70000000000000001'].active.id;
   }
 
   it('121: after the cache was dropped, a redelivery finds the install line in the database and writes no second line', async () => {

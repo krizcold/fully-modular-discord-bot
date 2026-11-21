@@ -12,6 +12,7 @@ import { applySharedOp } from '../../src/bot/internalSetup/utils/sharedOps';
 import { openItemsOf } from '../../src/bot/internalSetup/utils/premiumItems';
 import { startPremiumTickers } from '../../src/bot/internalSetup/utils/premiumManager';
 import { truthText } from '../../src/bot/internalSetup/utils/dataBackends/replyGate';
+import { gh } from '../helpers/p1Holder';
 
 // NB6 test 56 (wip-redesign/sheets/NB6.md decisions 47, 48, 63, 64, 73 and 75; rows 86 to 88, 183, 186 to 189, 192,
 // 193, 195, 196, 228, 232, 237 and 238; part 11, without the Dummy provider's clauses, which are part 12's): premium's
@@ -26,9 +27,9 @@ vi.mock('../../src/bot/internalSetup/utils/payment/paymentRegistry', async orig 
 });
 const notices = vi.hoisted(() => ({ sent: [] as string[], unreachable: new Set<string>() }));
 vi.mock('../../src/bot/internalSetup/utils/premiumNotifications', () => ({
-  dispatchPremiumNotification: async (guildId: string, kind: string) => {
-    if (notices.unreachable.has(guildId)) return { delivered: false, cause: 'guild not reachable' };
-    notices.sent.push(`${kind}:${guildId}`);
+  dispatchPremiumNotification: async (holder: string, kind: string) => {
+    if (notices.unreachable.has(holder)) return { delivered: false, cause: 'guild not reachable' };
+    notices.sent.push(`${kind}:${holder}`);
     return { delivered: true, via: 'dm' };
   },
 }));
@@ -95,18 +96,18 @@ describe('the op of the save carries the items (183, 186, 228)', () => {
     expect(pm.setTier('low', tier('Low', 1))).toBe(true);
     await r.settle();
     const release = hold();
-    expect(await pm.grantManual('g1', 'low', 30)).toBe(true);
+    expect(await pm.grantManual('guild:70000000000000001', 'low', 30)).toBe(true);
     await new Promise(resolve => setTimeout(resolve, 20));
     expect(notices.sent).toEqual([]);
     expect(r.lines(AUDIT_KEY).map(l => l.action)).toEqual(['tier.create']);
     release();
     await r.settle();
-    await vi.waitFor(() => expect(notices.sent).toEqual(['manual.grant.added:g1']));
+    await vi.waitFor(() => expect(notices.sent).toEqual(['manual.grant.added:guild:70000000000000001']));
     expect(r.lines(AUDIT_KEY).map(l => l.action)).toEqual(['tier.create', 'subscription.grant.manual']);
     const tx = txWith(isLineOf('subscription.grant.manual'));
     expect(tx.some(sql => sql.startsWith('INSERT INTO smdb_data.shared_docs'))).toBe(true);
     expect(tx[tx.length - 1]).toBe('COMMIT');
-    expect(r.row().subscriptions.g1.active.tierId).toBe('low');
+    expect(r.row().subscriptions['guild:70000000000000001'].active.tierId).toBe('low');
   });
 });
 
@@ -116,7 +117,7 @@ describe('a refused carrier (87, 187)', () => {
     pm.setTier('low', tier('Low', 1));
     await r.settle();
     const release = hold();
-    await pm.grantManual('g1', 'low', 30);
+    await pm.grantManual('guild:70000000000000001', 'low', 30);
     r.m.state.rows.put(PREMIUM_KEY, JSON.stringify({ tiers: { other: tier('Other', 2) } }, null, 2));
     release();
     await r.settle();
@@ -126,7 +127,7 @@ describe('a refused carrier (87, 187)', () => {
     expect(marked.metadata.notSaved.cause).toBe('changed-elsewhere');
     expect(typeof marked.metadata.notSaved.at).toBe('string');
     expect(notices.sent).toEqual([]);
-    expect(r.logged(T16a('manual.grant.added', 'g1', ELSEWHERE))).toHaveLength(1);
+    expect(r.logged(T16a('manual.grant.added', '70000000000000001', ELSEWHERE))).toHaveLength(1);
     // Decision 13: the next use loads the stored version.
     // The pass takes the stored version (decision 6: this machine now holds that version).
     await runSharedPass();
@@ -140,7 +141,7 @@ describe("an 'unconfirmed' carrier (188)", () => {
     pm.setTier('low', tier('Low', 1));
     await r.settle();
     r.m.state.rows.fault = sql => (sql === 'COMMIT' ? 'lose' : undefined);
-    await pm.grantManual('g1', 'low', 30);
+    await pm.grantManual('guild:70000000000000001', 'low', 30);
     await vi.waitFor(() => expect(r.lines(AUDIT_KEY)).toHaveLength(2));
     r.m.state.rows.fault = undefined;
     unconfirmUnansweredRows('the test ended it');
@@ -177,16 +178,16 @@ describe('a save refused at the accept', () => {
     pm.setTier('low', tier('Low', 1));
     await r.settle();
     inject.refuse = { cause: 'database-backlog', thrown: true };
-    expect(await pm.grantManual('g1', 'low', 30)).toBe(true);
+    expect(await pm.grantManual('guild:70000000000000001', 'low', 30)).toBe(true);
     await r.settle();
     expect(notices.sent).toEqual([]);
     expect(r.lines(AUDIT_KEY).map(l => l.action)).toEqual(['tier.create']);
     inject.refuse = null;
     (pm as any).retryPass();
     await r.settle();
-    await vi.waitFor(() => expect(notices.sent).toEqual(['manual.grant.added:g1']));
+    await vi.waitFor(() => expect(notices.sent).toEqual(['manual.grant.added:guild:70000000000000001']));
     expect(r.lines(AUDIT_KEY).map(l => l.action)).toEqual(['tier.create', 'subscription.grant.manual']);
-    expect(r.row().subscriptions.g1.active.tierId).toBe('low');
+    expect(r.row().subscriptions['guild:70000000000000001'].active.tierId).toBe('low');
   });
 
   it('193: a cause never retried: save() answers null, the notice is dropped with T16 (a), the line is stored marked', async () => {
@@ -194,11 +195,11 @@ describe('a save refused at the accept', () => {
     pm.setTier('low', tier('Low', 1));
     await r.settle();
     inject.refuse = { cause: 'unstorable', thrown: false };
-    await pm.grantManual('g1', 'low', 30);
+    await pm.grantManual('guild:70000000000000001', 'low', 30);
     await r.settle();
     await vi.waitFor(() => expect(r.lines(AUDIT_KEY)).toHaveLength(2));
     expect(r.lines(AUDIT_KEY)[1].metadata.notSaved.cause).toBe('unstorable');
-    expect(r.logged(T16a('manual.grant.added', 'g1', 'unstorable'))).toHaveLength(1);
+    expect(r.logged(T16a('manual.grant.added', '70000000000000001', 'unstorable'))).toHaveLength(1);
     expect(notices.sent).toEqual([]);
   });
 });
@@ -207,19 +208,19 @@ describe('standalone items (232)', () => {
   it('a renewal failure changes nothing stored: its notice goes out at once, with no save', async () => {
     const pm = r.pm();
     pm.setTier('low', tier('Low', 1));
-    await pm.grantManual('g1', 'low', 30);
+    await pm.grantManual('guild:70000000000000001', 'low', 30);
     await r.settle();
-    const sub = r.row().subscriptions.g1.active;
+    const sub = r.row().subscriptions['guild:70000000000000001'].active;
     const config = r.row();
-    config.subscriptions.g1.active = { ...sub, source: 'paid', providerId: 'nb6p', providerSubId: 'ps1' };
+    config.subscriptions['guild:70000000000000001'].active = { ...sub, source: 'paid', buyerId: '80000000000000001', providerId: 'nb6p', providerSubId: 'ps1' };
     r.m.state.rows.put(PREMIUM_KEY, JSON.stringify(config, null, 2));
     await runSharedPass();
     const historyBefore = r.m.state.rows.history.length;
     notices.sent.length = 0;
     await runSealed('console', null, null, async () => {
-      getPaymentRegistry().emitEvent({ type: 'subscription.renewal-failed', providerId: 'nb6p', providerSubId: 'ps1', guildId: 'g1', reason: 'card declined' } as any);
+      getPaymentRegistry().emitEvent({ type: 'subscription.renewal-failed', providerId: 'nb6p', providerSubId: 'ps1', holder: 'guild:70000000000000001', reason: 'card declined' } as any);
     });
-    await vi.waitFor(() => expect(notices.sent).toEqual(['paid.sub.renewal-failed:g1']));
+    await vi.waitFor(() => expect(notices.sent).toEqual(['paid.sub.renewal-failed:guild:70000000000000001']));
     await r.settle();
     expect(r.m.state.rows.history.length).toBe(historyBefore);
   });
@@ -231,11 +232,11 @@ describe('the stop (237, 238, 196)', () => {
     pm.setTier('low', tier('Low', 1));
     await r.settle();
     const release = hold();
-    await pm.grantManual('g1', 'low', 30);
+    await pm.grantManual('guild:70000000000000001', 'low', 30);
     pm.markStopped('stopping');
     release();
     await r.settle();
-    await vi.waitFor(() => expect(r.logged('The manual.grant.added notice for guild g1 was not sent: the bot is stopping')).toHaveLength(1));
+    await vi.waitFor(() => expect(r.logged('The manual.grant.added notice for guild 70000000000000001 was not sent: the bot is stopping')).toHaveLength(1));
     expect(notices.sent).toEqual([]);
     expect(r.lines(AUDIT_KEY).map(l => l.action)).toEqual(['tier.create', 'subscription.grant.manual']);
   });
@@ -245,15 +246,15 @@ describe('the stop (237, 238, 196)', () => {
     pm.setTier('low', tier('Low', 1));
     await r.settle();
     const release = hold();
-    await pm.grantManual('g1', 'low', 30);
+    await pm.grantManual('guild:70000000000000001', 'low', 30);
     pm.markStopped('stopping');
     r.m.state.rows.put(PREMIUM_KEY, JSON.stringify({ tiers: {} }, null, 2));
     release();
     await r.settle();
-    await vi.waitFor(() => expect(r.logged(T16a('manual.grant.added', 'g1', ELSEWHERE))).toHaveLength(1));
+    await vi.waitFor(() => expect(r.logged(T16a('manual.grant.added', '70000000000000001', ELSEWHERE))).toHaveLength(1));
     await r.settle();
     expect(r.lines(AUDIT_KEY).map(l => l.action)).toEqual(['tier.create']);
-    expect(r.logged('The audit line subscription.grant.manual (guild g1, ')).toHaveLength(1);
+    expect(r.logged('The audit line subscription.grant.manual (guild 70000000000000001, ')).toHaveLength(1);
     expect(r.logged('was not written: the bot is stopping; it is lost')).toHaveLength(1);
   });
 
@@ -262,9 +263,9 @@ describe('the stop (237, 238, 196)', () => {
     pm.setTier('low', tier('Low', 1));
     await r.settle();
     const release = hold();
-    await pm.grantManual('g1', 'low', 30);
+    await pm.grantManual('guild:70000000000000001', 'low', 30);
     pm.logLossesAtExit();
-    expect(r.logged('The manual.grant.added notice for guild g1 was not sent: the bot is stopping')).toHaveLength(1);
+    expect(r.logged('The manual.grant.added notice for guild 70000000000000001 was not sent: the bot is stopping')).toHaveLength(1);
     expect(r.logged('was not written: the bot is stopping; it is lost')).toHaveLength(1);
     release();
     await r.settle();
@@ -279,9 +280,9 @@ describe('a JSON bot (195, 246)', () => {
   it('195: the links change only the timing: the line is appended and the notice sent at the save', async () => {
     const pm = r.pm();
     pm.setTier('low', tier('Low', 1));
-    await pm.grantManual('g1', 'low', 30);
+    await pm.grantManual('guild:70000000000000001', 'low', 30);
     await r.settle();
-    await vi.waitFor(() => expect(notices.sent).toEqual(['manual.grant.added:g1']));
+    await vi.waitFor(() => expect(notices.sent).toEqual(['manual.grant.added:guild:70000000000000001']));
     const audit = fs.readFileSync(dataPath('global', 'premium-tiers.audit.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l).action);
     expect(audit).toEqual(['tier.create', 'subscription.grant.manual']);
   });
@@ -291,11 +292,11 @@ describe('a JSON bot (195, 246)', () => {
     pm.setTier('low', tier('Low', 1));
     await r.settle();
     inject.refuse = { cause: 'unstorable', thrown: false };
-    await pm.grantManual('g1', 'low', 30);
+    await pm.grantManual('guild:70000000000000001', 'low', 30);
     await r.settle();
-    expect(r.logged('The audit line subscription.grant.manual (guild g1, ')).toHaveLength(1);
+    expect(r.logged('The audit line subscription.grant.manual (guild 70000000000000001, ')).toHaveLength(1);
     expect(r.logged('was not written: the change it records was not saved (unstorable)')).toHaveLength(1);
-    expect(r.logged(T16a('manual.grant.added', 'g1', 'unstorable'))).toHaveLength(1);
+    expect(r.logged(T16a('manual.grant.added', '70000000000000001', 'unstorable'))).toHaveLength(1);
     expect(notices.sent).toEqual([]);
   });
 });
@@ -308,10 +309,10 @@ const LOCK_READ = 'SELECT body, sha, updated_by, updated_at FROM smdb_data.share
 async function paidSubStored(): Promise<void> {
   const pm = r.pm();
   pm.setTier('low', tier('Low', 1));
-  await pm.grantManual('g1', 'low', 30);
+  await pm.grantManual('guild:70000000000000001', 'low', 30);
   await r.settle();
   const config = r.row();
-  config.subscriptions.g1.active = { ...config.subscriptions.g1.active, source: 'paid', providerId: 'nb6p', providerSubId: 'ps1' };
+  config.subscriptions['guild:70000000000000001'].active = { ...config.subscriptions['guild:70000000000000001'].active, source: 'paid', buyerId: '80000000000000001', providerId: 'nb6p', providerSubId: 'ps1' };
   r.m.state.rows.put(PREMIUM_KEY, JSON.stringify(config, null, 2));
   await runSharedPass();
   notices.sent.length = 0;
@@ -332,7 +333,7 @@ function otherMachineWrites(times: number): () => number {
   return () => times - left;
 }
 
-const pausedEvent = () => ({ type: 'subscription.paused', providerId: 'nb6p', providerSubId: 'ps1', guildId: 'g1', resumesAt: '2027-01-01T00:00:00.000Z' });
+const pausedEvent = () => ({ type: 'subscription.paused', providerId: 'nb6p', providerSubId: 'ps1', holder: 'guild:70000000000000001', resumesAt: '2027-01-01T00:00:00.000Z' });
 
 describe('row 88: a gateway event whose save another machine refused is handed again', () => {
   it('refused once: the stored version is read, the event handed again, and its change lands on that version', async () => {
@@ -341,7 +342,7 @@ describe('row 88: a gateway event whose save another machine refused is handed a
     getPaymentRegistry().emitEvent(pausedEvent() as any);
     await vi.waitFor(async () => {
       await r.settle();
-      expect(r.row().subscriptions.g1.active.resumesAtHint).toBe('2027-01-01T00:00:00.000Z');
+      expect(r.row().subscriptions['guild:70000000000000001'].active.resumesAtHint).toBe('2027-01-01T00:00:00.000Z');
     }, { timeout: 5000 });
     expect(writes()).toBe(1);
     expect(r.row().messages.moduleBlocked).toBe('from BRAVO 1');
@@ -354,11 +355,11 @@ describe('row 88: a gateway event whose save another machine refused is handed a
     getPaymentRegistry().emitEvent(pausedEvent() as any);
     await vi.waitFor(async () => {
       await r.settle();
-      expect(r.logged('[PremiumManager] A subscription.paused event from nb6p (subscription ps1, guild g1) could not be applied: premium-tiers.json kept changing on other machines (3 tries); it is lost: {')).toHaveLength(1);
+      expect(r.logged('[PremiumManager] A subscription.paused event from nb6p (subscription ps1, guild 70000000000000001) could not be applied: premium-tiers.json kept changing on other machines (3 tries); it is lost: {')).toHaveLength(1);
     }, { timeout: 5000 });
     await r.settle();
     expect(writes()).toBe(3);
-    expect(r.row().subscriptions.g1.active.resumesAtHint).toBeUndefined();
+    expect(r.row().subscriptions['guild:70000000000000001'].active.resumesAtHint).toBeUndefined();
   });
 });
 
@@ -369,14 +370,14 @@ describe('row 235: an item still open after 8 s in the bot', () => {
     await r.settle();
     const release = hold();
     const started = Date.now();
-    const reply: any = await applySharedOp({ op: 'premium.grantManual', args: { args: ['g1', 'low', 30] } });
+    const reply: any = await applySharedOp({ op: 'premium.grantManual', args: { args: ['guild:70000000000000001', 'low', 30] } });
     expect(Date.now() - started).toBeGreaterThanOrEqual(7900);
     expect(reply).toMatchObject({ ok: false, code: 'unconfirmed', answer: 'pending' });
     expect(reply.error).toContain(truthText('pending', false));
     expect(notices.sent).toEqual([]);
     release();
     await r.settle();
-    await vi.waitFor(() => expect(notices.sent).toEqual(['manual.grant.added:g1']));
+    await vi.waitFor(() => expect(notices.sent).toEqual(['manual.grant.added:guild:70000000000000001']));
     expect(r.lines(AUDIT_KEY).map(l => l.action)).toEqual(['tier.create', 'subscription.grant.manual']);
     expect(openItemsOf(pm)).toEqual([]);
   }, 30_000);
@@ -389,7 +390,7 @@ describe('row 241: a dropped notice marks nothing', () => {
       cache: { syncedAt: '2026-01-01T00:00:00Z', variants: [{ variantId, label: variantId }] },
     });
     getPaymentRegistry().register({
-      id: 'nb6m', displayName: 'NB6M', capabilities: { supportsPriceMigration: true }, isConfigured: () => true,
+      id: 'nb6m', displayName: 'NB6M', capabilities: { sells: ['guild'], supportsPriceMigration: true }, isConfigured: () => true,
       migrateSubscriptionPrice: async () => undefined,
     } as any);
     r.m.state.rows.put(PREMIUM_KEY, JSON.stringify({
@@ -397,7 +398,7 @@ describe('row 241: a dropped notice marks nothing', () => {
         a: { displayName: 'A', priority: 1, overrides: {}, offerings: [{ id: 'o1', providerLinks: [link('v1')] }] },
         b: { displayName: 'B', priority: 2, overrides: {}, offerings: [{ id: 'o2', providerLinks: [link('v2')] }] },
       },
-      subscriptions: { g1: { active: { id: 's1', source: 'paid', providerId: 'nb6m', providerSubId: 'ms1', variantId: 'v1', tierId: 'a', offeringId: 'o1', status: 'active', startDate: new Date().toISOString(), endDate: null, autoRenew: true }, paused: [] } },
+      subscriptions: { 'guild:70000000000000001': { active: { id: 's1', source: 'paid', buyerId: '80000000000000001', providerId: 'nb6m', providerSubId: 'ms1', variantId: 'v1', tierId: 'a', offeringId: 'o1', status: 'active', startDate: new Date().toISOString(), endDate: null, autoRenew: true }, paused: [] } },
       migrations: [],
       migrationSilencePolicy: 'continue',
     }, null, 2));
@@ -411,11 +412,11 @@ describe('row 241: a dropped notice marks nothing', () => {
 
   it('the op landed and the DM was not delivered: the outcome names the cause; the decision stays unmarked', async () => {
     await migrationReady();
-    notices.unreachable.add('g1');
+    notices.unreachable.add('guild:70000000000000001');
     await schedule();
     await vi.waitFor(async () => {
       await r.settle();
-      expect(r.logged('request not delivered to guild g1: guild not reachable')).toHaveLength(1);
+      expect(r.logged('request not delivered to guild 70000000000000001: guild not reachable')).toHaveLength(1);
     }, { timeout: 5000 });
     await r.settle();
     expect(r.row().migrations[0].decisions[0].notifiedAt).toBeUndefined();
@@ -428,7 +429,7 @@ describe('row 241: a dropped notice marks nothing', () => {
     await schedule();
     await vi.waitFor(async () => {
       await r.settle();
-      expect(r.logged(`request not delivered to guild g1: the change it announces was not saved (${ELSEWHERE})`)).toHaveLength(1);
+      expect(r.logged(`request not delivered to guild 70000000000000001: the change it announces was not saved (${ELSEWHERE})`)).toHaveLength(1);
     }, { timeout: 5000 });
     await r.settle();
     expect(notices.sent).toEqual([]);
@@ -447,7 +448,7 @@ describe('row 241: a dropped notice marks nothing', () => {
 
 const expiredLine = (writer: string, n: number) => JSON.stringify({
   writer, node: 'node-alfa', nodeName: 'ALFA', n,
-  event: { type: 'subscription.expired', providerId: 'nb6p', providerSubId: 'ps1', guildId: 'g1', state: { status: 'expired', startDate: '2026-01-01T00:00:00.000Z', endDate: new Date(Date.now() - 1000).toISOString(), autoRenew: false } },
+  event: { type: 'subscription.expired', providerId: 'nb6p', providerSubId: 'ps1', holder: 'guild:70000000000000001', state: { status: 'expired', startDate: '2026-01-01T00:00:00.000Z', endDate: new Date(Date.now() - 1000).toISOString(), autoRenew: false } },
 });
 
 describe('rows 284 and 285: the replay of a stopped writer', () => {
@@ -461,8 +462,8 @@ describe('rows 284 and 285: the replay of a stopped writer', () => {
       await r.settle();
       expect(r.row().eventsApplied).toEqual({ 'p-dead': 1 });
     }, { timeout: 5000 });
-    await vi.waitFor(() => expect(notices.sent).toEqual(['paid.sub.expired:g1']));
-    expect(r.row().subscriptions.g1?.active).toBeUndefined();
+    await vi.waitFor(() => expect(notices.sent).toEqual(['paid.sub.expired:guild:70000000000000001']));
+    expect(r.row().subscriptions['guild:70000000000000001']?.active).toBeUndefined();
     const tx = txWith(isLineOf('subscription.expire.paid'));
     expect(tx.some(sql => sql.startsWith('INSERT INTO smdb_data.shared_docs'))).toBe(true);
     expect(tx[tx.length - 1]).toBe('COMMIT');
@@ -487,7 +488,7 @@ describe('rows 284 and 285: the replay of a stopped writer', () => {
     await r.settle();
     await new Promise(resolve => setTimeout(resolve, 20));
     expect(r.logged('was not written')).toEqual([]);
-    expect(r.logged('notice for guild g1 was not sent')).toEqual([]);
+    expect(r.logged('notice for guild 70000000000000001 was not sent')).toEqual([]);
     expect(notices.sent).toEqual([]);
     expect(r.lines(AUDIT_KEY).filter(l => l.action === 'subscription.expire.paid')).toEqual([]);
     expect(r.lines(JOURNAL_KEY)).toHaveLength(1);
@@ -537,7 +538,7 @@ describe("test 56's property", () => {
     };
     if (fate === 'refused-accept') inject.refuse = { cause: 'unstorable', thrown: false };
     if (fate === 'held') inject.refuse = { cause: 'database-backlog', thrown: true };
-    await pm.grantManual(guild, 'low', 30);
+    await pm.grantManual(gh(guild), 'low', 30);
     inject.refuse = null;
     if (stop) {
       pm.markStopped('stopping');
@@ -546,7 +547,7 @@ describe("test 56's property", () => {
     }
     if (fate === 'unconfirmed') {
       // The COMMIT's answer is lost; the op ends 'unconfirmed' before the landing check runs (as row 188).
-      await vi.waitFor(() => expect(r.lines(AUDIT_KEY).some(l => l.guildId === guild)).toBe(true));
+      await vi.waitFor(() => expect(r.lines(AUDIT_KEY).some(l => l.holder === gh(guild))).toBe(true));
       unconfirmUnansweredRows('the test ended it');
     }
     await r.settle();
@@ -564,7 +565,7 @@ describe("test 56's property", () => {
     for (let seed = 1; seed <= 12; seed++) {
       const next = rng(seed);
       const count = 1 + Math.floor(next() * 4);
-      const plan = Array.from({ length: count }, (_, i) => ({ guild: `g${i + 1}`, fate: FATES[Math.floor(next() * FATES.length)] }));
+      const plan = Array.from({ length: count }, (_, i) => ({ guild: `7${String(i + 1).padStart(16, '0')}`, fate: FATES[Math.floor(next() * FATES.length)] }));
       const stopAt = next() < 0.5 ? Math.floor(next() * count) : -1;
       if (stopAt >= 0 && plan[stopAt].fate !== 'landed' && plan[stopAt].fate !== 'refused-flush') plan[stopAt].fate = next() < 0.5 ? 'landed' : 'refused-flush';
       const label = `seed ${seed}: ${plan.map(p => p.fate).join(', ')}; stop at ${stopAt}`;
@@ -586,8 +587,8 @@ describe("test 56's property", () => {
       const lines = r.lines(AUDIT_KEY).filter(l => l.action === 'subscription.grant.manual');
       for (let i = 0; i < count; i++) {
         const { guild, fate } = plan[i];
-        const mine = lines.filter(l => l.guildId === guild);
-        const sent = notices.sent.filter(n => n === `manual.grant.added:${guild}`);
+        const mine = lines.filter(l => l.holder === gh(guild));
+        const sent = notices.sent.filter(n => n === `manual.grant.added:guild:${guild}`);
         if (stopAt >= 0 && i > stopAt) {
           expect(mine, label).toEqual([]);
           expect(sent, label).toEqual([]);
@@ -601,7 +602,7 @@ describe("test 56's property", () => {
         const plain = fate === 'landed' || fate === 'held' || fate === 'unconfirmed';
         expect(mine, label).toHaveLength(1);
         expect(mine[0].metadata?.notSaved?.cause, label).toBe(plain ? undefined : fate === 'refused-accept' ? 'unstorable' : 'changed-elsewhere');
-        expect(sent, label).toEqual(fate === 'landed' || fate === 'held' ? [`manual.grant.added:${guild}`] : []);
+        expect(sent, label).toEqual(fate === 'landed' || fate === 'held' ? [`manual.grant.added:guild:${guild}`] : []);
       }
       if (stoppedAt) expect(lines.filter(l => l.metadata?.notSaved && l.metadata.notSaved.at > stoppedAt!), label).toEqual([]);
       expect(openItemsOf(pm), label).toEqual([]);
@@ -644,14 +645,14 @@ describe("test 56's property, the Dummy clause", () => {
         const pm = r.pm();
         pm.setTier('gold', gold as any);
         pm.setProviderActivation('dummy', true);
-        await pm.initiatePaidSubscription('g1', 'gold', 'o1', { providerId: 'dummy', variantId: 'dummy_monthly_999' });
+        await pm.initiatePaidSubscription('guild:70000000000000001', 'gold', 'o1', { buyerId: '80000000000000001', providerId: 'dummy', variantId: 'dummy_monthly_999' });
         await r.settle();
         const next = rng(seed);
         const count = 1 + Math.floor(next() * 4);
         for (let i = 0; i < count; i++) {
           const fate = FATES[Math.floor(next() * FATES.length)];
           await r.settle();
-          const cancel = pm.getSubscriptions('g1').active!.autoRenew;
+          const cancel = pm.getSubscriptions('guild:70000000000000001').active!.autoRenew;
           const action = cancel ? 'subscription.cancel.paid' : 'subscription.reactivate.paid';
           const label = `seed ${seed}, call ${i}: ${action} ${fate}`;
           const linesBefore = r.lines(AUDIT_KEY).filter(l => l.action === action).length;
@@ -675,7 +676,7 @@ describe("test 56's property, the Dummy clause", () => {
             }
             return undefined;
           };
-          const call = (cancel ? pm.cancelPaidSubscription('g1') : pm.reactivatePaidSubscription('g1')).then(
+          const call = (cancel ? pm.cancelPaidSubscription('guild:70000000000000001') : pm.reactivatePaidSubscription('guild:70000000000000001')).then(
             ok => ({ ok, at: Date.now(), autoRenew: stored().autoRenew }),
             error => ({ error, at: Date.now() }),
           );

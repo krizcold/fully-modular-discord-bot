@@ -45,7 +45,7 @@ import { clearGlobal, PREMIUM, quiet, tick, TIERS, writePremium } from './nb10Pr
 const role = process.env.BOT_PROCESS_ROLE;
 let managers: PremiumManager[] = [];
 
-const event = { type: 'subscription.renewed', providerId: 'fake', providerSubId: 'e1', guildId: 'g1' };
+const event = { type: 'subscription.renewed', providerId: 'fake', providerSubId: 'e1', holder: 'guild:70000000000000001' };
 const line = (id: string, n: number) => ({ id, line: JSON.stringify({ writer: 'w-other', node: 'node-here', n, event }) });
 
 function bot(): PremiumManager {

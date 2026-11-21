@@ -3,6 +3,7 @@ import { applySharedOp, partialEnding } from '../../src/bot/internalSetup/utils/
 import { truthText } from '../../src/bot/internalSetup/utils/dataBackends/replyGate';
 import { AUDIT_KEY, premiumRig } from '../helpers/nb6PremiumRig';
 import { ELSEWHERE, MONTHLY, dummyRig } from '../helpers/nb6DummyRig';
+import { gh } from '../helpers/p1Holder';
 
 // NB6 code review round 1, lane D (out/NB6/review1-D.md, findings 1, 2, 3, 5 and 8): a held save keeps the cache it
 // was made from until its retry is sent; a provider call's state is copied into the subscription premium holds after
@@ -18,8 +19,8 @@ vi.mock('../../src/bot/internalSetup/utils/payment/paymentRegistry', async orig 
 });
 const notices = vi.hoisted(() => ({ sent: [] as string[] }));
 vi.mock('../../src/bot/internalSetup/utils/premiumNotifications', () => ({
-  dispatchPremiumNotification: async (guildId: string, kind: string) => {
-    notices.sent.push(`${kind}:${guildId}`);
+  dispatchPremiumNotification: async (holder: string, kind: string) => {
+    notices.sent.push(`${kind}:${holder}`);
     return { delivered: true, via: 'dm' };
   },
 }));
@@ -41,7 +42,7 @@ vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => {
 const r = premiumRig();
 const d = dummyRig(r);
 
-const premiumSub = (guild = 'g1') => r.row()?.subscriptions?.[guild]?.active;
+const premiumSub = (guild = '70000000000000001') => r.row()?.subscriptions?.[gh(guild)]?.active;
 const T20 = (words: string) => `The Dummy provider did not save this change (${words}), so nothing was changed at the provider.`;
 
 /** Holds every transaction at its BEGIN until released. */
@@ -71,7 +72,7 @@ describe('D1: a held save keeps the cache it was made from until its retry is se
   it("premium: another machine's change applied and read meanwhile; the retry is refused 'changed-elsewhere' and its carry marked", async () => {
     const pm = r.pm();
     inject.premium.push({ cause: 'database-backlog' });
-    expect(await pm.grantManual('g1', 'gold', 30)).toBe(true);
+    expect(await pm.grantManual('guild:70000000000000001', 'gold', 30)).toBe(true);
     await d.otherPremium(config => { config.messages = { ...(config.messages ?? {}), moduleBlocked: 'from BRAVO' }; });
     pm.getAllTiers();
     (pm as any).retryPass();
@@ -79,7 +80,7 @@ describe('D1: a held save keeps the cache it was made from until its retry is se
     expect(notices.sent).toEqual([]);
     const line = r.lines(AUDIT_KEY).find(l => l.action === 'subscription.grant.manual');
     expect(line?.metadata?.notSaved?.cause).toBe('changed-elsewhere');
-    expect(r.row().subscriptions?.g1).toBeUndefined();
+    expect(r.row().subscriptions?.['guild:70000000000000001']).toBeUndefined();
     expect(r.row().messages.moduleBlocked).toBe('from BRAVO');
   });
 
@@ -105,12 +106,12 @@ describe("D2: a provider call's state is copied into the subscription premium ho
     const pm = r.pm();
     await d.buy();
     if (what === 'reactivate') {
-      expect(await pm.cancelPaidSubscription('g1')).toBe(true);
+      expect(await pm.cancelPaidSubscription('guild:70000000000000001')).toBe(true);
       await d.settle();
       expect(premiumSub().autoRenew).toBe(false);
     }
     const release = hold();
-    const calling = what === 'cancel' ? pm.cancelPaidSubscription('g1') : pm.reactivatePaidSubscription('g1');
+    const calling = what === 'cancel' ? pm.cancelPaidSubscription('guild:70000000000000001') : pm.reactivatePaidSubscription('guild:70000000000000001');
     await new Promise(resolve => setTimeout(resolve, 20));
     await d.otherPremium(config => { config.messages = { ...(config.messages ?? {}), moduleBlocked: 'from BRAVO' }; });
     pm.getAllTiers();
@@ -133,11 +134,11 @@ describe('D3: the exit words a carried audit line by its op', () => {
       sent = true;
       return gate.then(() => undefined);
     };
-    await pm.grantManual('g1', 'gold', 30);
+    await pm.grantManual('guild:70000000000000001', 'gold', 30);
     void r.settle();
     await vi.waitFor(() => expect(sent).toBe(true));
     pm.logLossesAtExit();
-    expect(r.logged("(guild g1, ")).toEqual(expect.arrayContaining([expect.stringContaining("was being written before this stop; can't confirm whether it is stored: ")]));
+    expect(r.logged("(guild 70000000000000001, ")).toEqual(expect.arrayContaining([expect.stringContaining("was being written before this stop; can't confirm whether it is stored: ")]));
     expect(r.logged('was not written: the bot is stopping; it is lost')).toEqual([]);
     r.m.state.rows.fault = undefined;
     open();
@@ -147,9 +148,9 @@ describe('D3: the exit words a carried audit line by its op', () => {
   it('the op not sent yet: the line is lost with the stop', async () => {
     const pm = r.pm();
     const release = hold();
-    await pm.grantManual('g1', 'gold', 30);
+    await pm.grantManual('guild:70000000000000001', 'gold', 30);
     pm.logLossesAtExit();
-    expect(r.logged('The audit line subscription.grant.manual (guild g1, ')).toHaveLength(1);
+    expect(r.logged('The audit line subscription.grant.manual (guild 70000000000000001, ')).toHaveLength(1);
     expect(r.logged('was not written: the bot is stopping; it is lost')).toHaveLength(1);
     release();
     await d.settle();
@@ -181,7 +182,7 @@ describe('D5: T26 words a null', () => {
 describe('D8: a purchase stopped after the Dummy op landed answers partial', () => {
   it("state.json lands, the install's save is refused 'node-stopping'", async () => {
     const release = hold();
-    const answer: Promise<any> = applySharedOp({ op: 'premium.initiatePaidSubscription', args: { args: ['g1', 'gold', 'o1', { providerId: 'dummy', variantId: MONTHLY }] } });
+    const answer: Promise<any> = applySharedOp({ op: 'premium.initiatePaidSubscription', args: { args: ['guild:70000000000000001', 'gold', 'o1', { buyerId: '80000000000000001', providerId: 'dummy', variantId: MONTHLY }] } });
     await new Promise(resolve => setTimeout(resolve, 30));
     r.pm().markStopped('stopping');
     release();

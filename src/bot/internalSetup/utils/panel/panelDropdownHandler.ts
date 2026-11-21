@@ -8,6 +8,7 @@ import { getNavigationContext, storeNavigationContext, detectAccessMethodFromMes
 import { isActiveInstance } from './persistentPanelStorage';
 import { parseDropdownCustomId } from './panelCustomIds';
 import { tellLateForm, withAutoDefer } from './panelAutoDefer';
+import { refusedOnSharedPanel } from './panelUserGate';
 
 /**
  * Register the panel dropdown handler with the Discord bot
@@ -119,6 +120,8 @@ async function handleDropdownFromDropdownHandler(
     navigationStack: navContext?.navigationStack || [],
     data: navContext?.panelState ? { state: navContext.panelState } : undefined
   };
+
+  if (await refusedOnSharedPanel(panel, context, interaction)) return;
 
   // Extract values from the select menu (works for all types)
   const values = extractSelectValues(interaction);

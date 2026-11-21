@@ -71,10 +71,10 @@ vi.mock('../../src/bot/internalSetup/utils/payment/paymentRegistry', async orig 
   const real = await orig<typeof import('../../src/bot/internalSetup/utils/payment/paymentRegistry')>();
   return { ...real, getPaymentRegistry: () => (reg.current ??= new real.PaymentProviderRegistry()) };
 });
-const notices = vi.hoisted(() => ({ sent: [] as Array<{ guildId: string; kind: string }> }));
+const notices = vi.hoisted(() => ({ sent: [] as Array<{ holder: string; kind: string }> }));
 vi.mock('../../src/bot/internalSetup/utils/premiumNotifications', () => ({
-  dispatchPremiumNotification: async (guildId: string, kind: string) => {
-    notices.sent.push({ guildId, kind });
+  dispatchPremiumNotification: async (holder: string, kind: string) => {
+    notices.sent.push({ holder, kind });
     return { delivered: true, via: 'dm' };
   },
 }));
@@ -84,6 +84,7 @@ import { getPaymentRegistry } from '../../src/bot/internalSetup/utils/payment/pa
 import { runSealed } from '../../src/bot/internalSetup/utils/dataBackends/writeLedger';
 import { setBackendKind } from '../helpers/backendKind';
 import { clearGlobal, logged, paidSub, quiet, state, tick, writePremium } from './nb10PremiumRig';
+import { gh } from '../helpers/p1Holder';
 
 const role = process.env.BOT_PROCESS_ROLE;
 let spies: ReturnType<typeof quiet>;
@@ -98,7 +99,7 @@ function gateOf(): Gate {
 
 function manager(): PremiumManager {
   getPaymentRegistry().register({
-    id: 'fake', displayName: 'Fake', capabilities: { supportsPause: true }, isConfigured: () => true,
+    id: 'fake', displayName: 'Fake', capabilities: { sells: ['guild'], supportsPause: true }, isConfigured: () => true,
     pauseSubscription: () => pause.promise,
   } as any);
   const pm = new PremiumManager();
@@ -109,7 +110,7 @@ function manager(): PremiumManager {
 
 const emit = (event: object) => getPaymentRegistry().emitEvent(event as any);
 const expired = (subId: string, guildId: string) => ({
-  type: 'subscription.expired', providerId: 'fake', providerSubId: subId, guildId,
+  type: 'subscription.expired', providerId: 'fake', providerSubId: subId, holder: gh(guildId),
   state: { ...state('expired'), endDate: new Date(Date.now() - 1000).toISOString() },
 });
 
@@ -135,7 +136,7 @@ beforeEach(() => {
   reg.current = null;
   pause = gateOf();
   clearGlobal();
-  writePremium({ g2: { active: paidSub('s2', 'e1', 'low'), paused: [] } });
+  writePremium({ 'guild:70000000000000002': { active: paidSub('s2', 'e1', 'low'), paused: [] } });
 });
 afterEach(async () => {
   openRows();
@@ -154,7 +155,7 @@ describe('an event handed again after a changed-elsewhere refusal', () => {
   it('is handed again in a console ledger tagged premium, at most three times, and the loss is logged', async () => {
     manager();
     h.auto = { refused: { cause: 'changed-elsewhere' } };
-    emit(expired('e1', 'g2'));
+    emit(expired('e1', '70000000000000002'));
     await until(() => logged(spies.error).some(l => l.includes('(3 tries)')));
     expect(h.saves).toHaveLength(3);
     expect(h.refresh).toEqual([['global/premium-tiers.json'], ['global/premium-tiers.json']]);
@@ -165,7 +166,7 @@ describe('an event handed again after a changed-elsewhere refusal', () => {
     manager();
     h.auto = { refused: { cause: 'changed-elsewhere' } };
     await runSealed('console', null, 'premium', async () => {
-      emit(expired('e1', 'g2'));
+      emit(expired('e1', '70000000000000002'));
     });
     await tick(30);
     expect(h.saves).toHaveLength(1);
@@ -175,7 +176,7 @@ describe('an event handed again after a changed-elsewhere refusal', () => {
   it('a save refused for another cause is not handed again', async () => {
     manager();
     h.auto = { refused: { cause: 'io' } };
-    emit(expired('e1', 'g2'));
+    emit(expired('e1', '70000000000000002'));
     await tick(30);
     expect(h.saves).toHaveLength(1);
     expect(h.refresh).toEqual([]);
@@ -188,9 +189,9 @@ describe('an event handed again after a changed-elsewhere refusal', () => {
       pm.markStopped('stopping');
       return { ok: true };
     };
-    const event = expired('e1', 'g2');
+    const event = expired('e1', '70000000000000002');
     emit(event);
-    const line = `[PremiumManager] A subscription.expired event from fake (subscription e1, guild g2) was not applied: the bot is stopping; it is lost: ${JSON.stringify(event)}`;
+    const line = `[PremiumManager] A subscription.expired event from fake (subscription e1, guild 70000000000000002) was not applied: the bot is stopping; it is lost: ${JSON.stringify(event)}`;
     await until(() => logged(spies.error).includes(line));
     expect(logged(spies.error)).toContain(line);
     expect(h.saves).toHaveLength(1);
@@ -201,7 +202,7 @@ describe('an event handed again after a changed-elsewhere refusal', () => {
     h.auto = { refused: { cause: 'changed-elsewhere' } };
     const boom = new Error('mirror broke');
     h.refreshImpl = () => Promise.reject(boom);
-    emit(expired('e1', 'g2'));
+    emit(expired('e1', '70000000000000002'));
     const failed = () => spies.error.mock.calls.filter((c: unknown[]) => c[1] === boom);
     await until(() => failed().length > 0);
     expect(failed()).toEqual([['[PremiumManager] A provider event could not be handed again:', boom]]);
@@ -214,9 +215,9 @@ describe("the Dummy tick's walk batch on a Postgres bot", () => {
     getPaymentRegistry().emitWalkBatch({
       premiumSha: 'another-version',
       events: [
-        { type: 'subscription.renewed', providerId: 'fake', providerSubId: 'zz', guildId: 'g2', state: state() },
-        { type: 'subscription.renewed', providerId: 'fake', providerSubId: 'e1', guildId: 'g2', state: state() },
-        { type: 'subscription.renewed', providerId: 'fake', providerSubId: 'yy', guildId: 'g9', state: state() },
+        { type: 'subscription.renewed', providerId: 'fake', providerSubId: 'zz', holder: 'guild:70000000000000002', state: state() },
+        { type: 'subscription.renewed', providerId: 'fake', providerSubId: 'e1', holder: 'guild:70000000000000002', state: state() },
+        { type: 'subscription.renewed', providerId: 'fake', providerSubId: 'yy', holder: 'guild:70000000000000009', state: state() },
       ],
     } as any);
     const warned = logged(spies.warn).filter(l => l.includes('was not applied'));
@@ -230,7 +231,7 @@ describe("the Dummy tick's walk batch on a Postgres bot", () => {
     manager();
     getPaymentRegistry().emitWalkBatch({
       premiumSha: 'another-version',
-      events: [{ type: 'subscription.renewed', providerId: 'fake', providerSubId: 'zz', guildId: 'g2', state: state() }],
+      events: [{ type: 'subscription.renewed', providerId: 'fake', providerSubId: 'zz', holder: 'guild:70000000000000002', state: state() }],
     } as any);
     expect(logged(spies.warn).filter(l => l.includes('was not applied'))).toEqual([]);
   });
@@ -239,7 +240,7 @@ describe("the Dummy tick's walk batch on a Postgres bot", () => {
 describe('settled() in the bot', () => {
   it('waits for the items of an open op before it resolves', async () => {
     const pm = manager();
-    emit(expired('e1', 'g2'));
+    emit(expired('e1', '70000000000000002'));
     expect(h.gates).toHaveLength(1);
     let done = false;
     const waiting = pm.settled(undefined).then(() => { done = true; });
@@ -248,23 +249,23 @@ describe('settled() in the bot', () => {
     openRows();
     await waiting;
     expect(done).toBe(true);
-    expect(notices.sent).toEqual([{ guildId: 'g2', kind: 'paid.sub.expired' }]);
+    expect(notices.sent).toEqual([{ holder: 'guild:70000000000000002', kind: 'paid.sub.expired' }]);
   });
 
   it('waits for an install started under its ledger while it waited for items', async () => {
     writePremium({
-      g1: { active: paidSub('s1', 'h1', 'high'), paused: [] },
-      g2: { active: paidSub('s2', 'e1', 'low'), paused: [] },
+      'guild:70000000000000001': { active: paidSub('s1', 'h1', 'high'), paused: [] },
+      'guild:70000000000000002': { active: paidSub('s2', 'e1', 'low'), paused: [] },
     });
     const pm = manager();
     let done = false;
     let waiting: Promise<void> | null = null;
     await runSealed('console', null, 'premium', async ledger => {
-      emit(expired('e1', 'g2'));
+      emit(expired('e1', '70000000000000002'));
       expect(h.gates).toHaveLength(1);
       waiting = pm.settled(ledger).then(() => { done = true; });
       await tick(10);
-      emit({ type: 'subscription.created', providerId: 'fake', providerSubId: 'c1', guildId: 'g1', tierId: 'low', offeringId: 'o1', state: state() });
+      emit({ type: 'subscription.created', buyerId: '80000000000000001', providerId: 'fake', providerSubId: 'c1', holder: 'guild:70000000000000001', tierId: 'low', offeringId: 'o1', state: state() });
     });
     await tick(10);
     openRows();
@@ -280,17 +281,17 @@ describe('settled() in the bot', () => {
 describe('the exit lines of an audit line on a row op', () => {
   it('names nothing for a line whose op landed', () => {
     const pm = manager();
-    emit(expired('e1', 'g2'));
+    emit(expired('e1', '70000000000000002'));
     h.tickets[0].op.state = 'landed';
     pm.markStopped('stopping');
     pm.logLossesAtExit();
     expect(logged(spies.error).filter(l => l.includes('The audit line subscription.expire.paid'))).toEqual([]);
-    expect(logged(spies.warn)).toContain('[PremiumManager] The paid.sub.expired notice for guild g2 was not sent: the bot is stopping');
+    expect(logged(spies.warn)).toContain('[PremiumManager] The paid.sub.expired notice for guild 70000000000000002 was not sent: the bot is stopping');
   });
 
   it("names a line whose op ended unconfirmed as can't confirm", () => {
     const pm = manager();
-    emit(expired('e1', 'g2'));
+    emit(expired('e1', '70000000000000002'));
     h.tickets[0].op.state = 'unconfirmed';
     pm.markStopped('stopping');
     pm.logLossesAtExit();

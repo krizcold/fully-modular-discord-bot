@@ -62,6 +62,7 @@ import { forks } from '../helpers/forkMock';
 import { failFlushes } from '../helpers/configRig';
 import { answering, exitChild, freshWriterLock, resetForks, startedWith } from '../helpers/nb10Rig';
 import { clearGlobal, gate, paidSub, PREMIUM, quiet, settleQueue, tick, writePremium } from './nb10PremiumRig';
+import { gh } from '../helpers/p1Holder';
 
 const G = '900000000000000866';
 const role = process.env.BOT_PROCESS_ROLE;
@@ -129,10 +130,10 @@ describe("a partial answer to an op sent before a stop keeps the child's reload 
 describe('a cancel whose subscription another op removed, after the stop (D2, O-D1, T5)', () => {
   const cancelling = () => {
     process.env.BOT_PROCESS_ROLE = 'bot';
-    writePremium({ [G]: { active: paidSub('sA', 'pA', 'low', 'patreon'), paused: [] } });
+    writePremium({ [gh(G)]: { active: paidSub('sA', 'pA', 'low', 'patreon'), paused: [] } });
     const cancel = gate();
     getPaymentRegistry().register({
-      id: 'patreon', displayName: 'patreon', capabilities: { supportsCancel: true }, isConfigured: () => true,
+      id: 'patreon', displayName: 'patreon', capabilities: { sells: ['guild'], supportsCancel: true }, isConfigured: () => true,
       cancelSubscription: async () => { await cancel.promise; },
     } as any);
     return cancel;
@@ -141,20 +142,20 @@ describe('a cancel whose subscription another op removed, after the stop (D2, O-
   const stop = (pm: any) => { inject.stopping = true; pm.stopped = 'stopping'; };
   const removeElsewhere = () => runSealed('console', null, null, async () => {
     const pm = getPremiumManager() as any;
-    delete pm.config.subscriptions[G];
+    delete pm.config.subscriptions[gh(G)];
     pm.save();
   });
 
   it("answers not saved when that op's save is held at the stop", async () => {
     const cancel = cancelling();
-    const answer = op('premium.cancelPaidSubscriptionImmediately', G);
+    const answer = op('premium.cancelPaidSubscriptionImmediately', gh(G));
     await tick();
     inject.refuse.set('premium-tiers.json', 'storage-failing');
     await removeElsewhere();
     const pm = getPremiumManager() as any;
     expect(pm.saveHeld).toBe(true);
-    expect(JSON.parse(pm.lastRaw).subscriptions[G].active.id).toBe('sA');
-    expect(JSON.parse(fs.readFileSync(PREMIUM, 'utf8')).subscriptions[G].active.id).toBe('sA');
+    expect(JSON.parse(pm.lastRaw).subscriptions[gh(G)].active.id).toBe('sA');
+    expect(JSON.parse(fs.readFileSync(PREMIUM, 'utf8')).subscriptions[gh(G)].active.id).toBe('sA');
     stop(pm);
     cancel.open();
     const reply: any = await answer;
@@ -165,7 +166,7 @@ describe('a cancel whose subscription another op removed, after the stop (D2, O-
 
   it("waits on that op's queued save and does not answer ok while the disk refuses it", async () => {
     const cancel = cancelling();
-    const answer = op('premium.cancelPaidSubscriptionImmediately', G);
+    const answer = op('premium.cancelPaidSubscriptionImmediately', gh(G));
     await tick();
     const undo = failFlushes(PREMIUM);
     try {
@@ -180,7 +181,7 @@ describe('a cancel whose subscription another op removed, after the stop (D2, O-
       expect(reply.error).not.toContain('keeps retrying');
       expect(reply.error).not.toContain('was not saved.');
       expect(reply.error).toContain(PROVIDER_SENTENCE);
-      expect(JSON.parse(fs.readFileSync(PREMIUM, 'utf8')).subscriptions[G].active.id).toBe('sA');
+      expect(JSON.parse(fs.readFileSync(PREMIUM, 'utf8')).subscriptions[gh(G)].active.id).toBe('sA');
     } finally {
       undo();
     }
@@ -188,12 +189,12 @@ describe('a cancel whose subscription another op removed, after the stop (D2, O-
 
   it('answers ok when that save had landed before the stop', async () => {
     const cancel = cancelling();
-    const answer = op('premium.cancelPaidSubscriptionImmediately', G);
+    const answer = op('premium.cancelPaidSubscriptionImmediately', gh(G));
     await tick();
     await removeElsewhere();
     await settleQueue();
     expect(queuedFilePaths()).not.toContain(PREMIUM);
-    expect(JSON.parse(fs.readFileSync(PREMIUM, 'utf8')).subscriptions[G]).toBeUndefined();
+    expect(JSON.parse(fs.readFileSync(PREMIUM, 'utf8')).subscriptions[gh(G)]).toBeUndefined();
     const pm = getPremiumManager() as any;
     stop(pm);
     cancel.open();
@@ -204,7 +205,7 @@ describe('a cancel whose subscription another op removed, after the stop (D2, O-
 
   it('answers ok only once that save, still queued at the stop, landed', async () => {
     const cancel = cancelling();
-    const answer = op('premium.cancelPaidSubscriptionImmediately', G);
+    const answer = op('premium.cancelPaidSubscriptionImmediately', gh(G));
     await tick();
     const rename = fs.promises.rename.bind(fs.promises);
     vi.spyOn(fs.promises, 'rename').mockImplementation((async (from: fs.PathLike, to: fs.PathLike) => {
@@ -219,7 +220,7 @@ describe('a cancel whose subscription another op removed, after the stop (D2, O-
     const { reply, raw } = await answer.then(r => ({ reply: r as any, raw: fs.readFileSync(PREMIUM, 'utf8') }));
     pm.stopped = null;
     expect(reply).toMatchObject({ ok: true });
-    expect(JSON.parse(raw).subscriptions[G]).toBeUndefined();
+    expect(JSON.parse(raw).subscriptions[gh(G)]).toBeUndefined();
   });
 });
 

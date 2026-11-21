@@ -31,7 +31,7 @@ describe('the first load of a bot process', () => {
     clearGlobal();
     process.env.BOT_PROCESS_ROLE = 'bot';
     writePremium({});
-    const event = { type: 'subscription.renewal-failed', providerId: 'fake', providerSubId: 'nope', guildId: 'g-none', reason: 'card' };
+    const event = { type: 'subscription.renewal-failed', providerId: 'fake', providerSubId: 'nope', holder: 'guild:70000000000009001', reason: 'card' };
     fs.writeFileSync(JOURNAL, `${JSON.stringify({ writer: 'w1', n: 1, event })}\n`);
     const pm = getPremiumManager();
     expect(pm.heldEventsText()).toBe('Premium holds provider events received while premium-tiers.json could not be read; the bot applies them once it runs normally and is connected to Discord. Nothing was saved. Try again then.');

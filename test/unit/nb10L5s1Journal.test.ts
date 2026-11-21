@@ -23,7 +23,7 @@ const asBot = (bot: boolean) => {
   else delete process.env.BOT_PROCESS_ROLE;
 };
 const HOLDS = 'Premium holds provider events the bot has not applied yet (premium-tiers.events.jsonl); nothing was saved. Start the bot to apply them, then try again.';
-const event = { type: 'subscription.renewal-failed', providerId: 'fake', providerSubId: 'nope', guildId: 'g-none', reason: 'card' };
+const event = { type: 'subscription.renewal-failed', providerId: 'fake', providerSubId: 'nope', holder: 'guild:70000000000009001', reason: 'card' };
 const WRITER_NUMBER = JSON.stringify({ writer: 5, n: 1, event });
 const N_STRING = JSON.stringify({ writer: 'w1', n: '1', event });
 

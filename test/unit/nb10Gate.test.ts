@@ -56,7 +56,7 @@ describe('the web UI shared write gate', () => {
 
   it('a payment event raised outside a frame throws in the web UI process', () => {
     setSharedWriteGate(inOp);
-    expect(() => new PaymentProviderRegistry().emitEvent({ type: 'subscription.created', providerId: 'dummy', providerSubId: 'x', guildId: '1' } as any))
+    expect(() => new PaymentProviderRegistry().emitEvent({ type: 'subscription.created', buyerId: '80000000000000001', providerId: 'dummy', providerSubId: 'x', holder: 'guild:70000000000009004' } as any))
       .toThrow(/outside a change it applies/);
   });
 

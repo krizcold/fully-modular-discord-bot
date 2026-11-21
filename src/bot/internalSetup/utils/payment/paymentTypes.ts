@@ -18,6 +18,7 @@
  *     to the provider's hosted page when the provider supports it (Stripe
  *     Pricing Table, LS hosted checkout).
  */
+import type { HolderKey, HolderKind } from '../premiumHolder';
 
 // ============================================================================
 // MECHANISMS + MODES
@@ -162,6 +163,8 @@ export interface ProviderCapabilities {
   variantIdLabel: string;
   /** Admin UI label for the Product ID input in Product mode (e.g. 'Stripe Product ID'). Empty when `!supportsProductMode`. */
   productIdLabel: string;
+  /** The kinds of holder this provider sells to. */
+  sells: readonly HolderKind[];
 }
 
 // ============================================================================
@@ -233,7 +236,10 @@ export interface ProviderCouponValidation {
 
 /** Input to `initiatePurchase`. */
 export interface InitiateOpts {
-  guildId: string;
+  /** Who the subscription is for. */
+  holder: HolderKey;
+  /** The Discord user who pays. */
+  buyerId: string;
   tierId: string;
   offeringId: string;
   /** Wire-level identifier picked at subscribe time. Provider knows how to interpret. */
@@ -247,8 +253,6 @@ export interface InitiateOpts {
    */
   autoRenew?: boolean;
   couponCode?: string;
-  /** Guild owner triggering; needed for oauth_link / client_handoff flows. */
-  userId?: string;
   /**
    * When set, the new subscription starts paused. Used when stacking onto a
    * higher-priority sub: the provider freezes the new sub immediately so it
@@ -296,12 +300,13 @@ export interface ProviderSubscriptionRef {
    * existing stacking logic; orphans missing these can only be cancelled.
    */
   metadata: {
-    guildId?: string;
+    holder?: HolderKey;
+    /** The Discord user who paid, when the provider's record names one. */
+    buyerId?: string;
     tierId?: string;
     offeringId?: string;
     variantId?: string;
     couponCode?: string;
-    userId?: string;
     /** The days left the bot recorded at its pause, and when it paused (NB25 decision 1). */
     pausedDaysLeft?: number;
     pausedAt?: string;
@@ -332,7 +337,7 @@ export interface SubscriptionView {
 export interface SubscriptionReader {
   /** A reader is set and premium can answer: loaded, neither unreadable nor replaying, not stopped, nothing open or held. */
   ready(): boolean;
-  read(providerId: string, guildId: string, providerSubId: string): SubscriptionView | null;
+  read(providerId: string, holder: HolderKey, providerSubId: string): SubscriptionView | null;
   /** The sha of premium-tiers.json premium's cache holds; null when it had no row. */
   sha(): string | null;
 }
@@ -352,13 +357,13 @@ export type ProviderEvent =
    * are needed because the cache has no record yet and PremiumManager can't
    * infer them.
    */
-  | { type: 'subscription.created'; providerId: string; providerSubId: string; guildId: string; tierId: string; offeringId: string; variantId?: string; couponCode?: string; state: ProviderSubscriptionState; variantSnapshot?: OfferingVariant }
-  | { type: 'subscription.renewed'; providerId: string; providerSubId: string; guildId: string; state: ProviderSubscriptionState }
-  | { type: 'subscription.expired'; providerId: string; providerSubId: string; guildId: string; state: ProviderSubscriptionState }
-  | { type: 'subscription.cancelled'; providerId: string; providerSubId: string; guildId: string; state: ProviderSubscriptionState }
-  | { type: 'subscription.updated'; providerId: string; providerSubId: string; guildId: string; state: ProviderSubscriptionState }
-  | { type: 'subscription.paused'; providerId: string; providerSubId: string; guildId: string; resumesAt: string | null }
-  | { type: 'subscription.resumed'; providerId: string; providerSubId: string; guildId: string; state: ProviderSubscriptionState }
+  | { type: 'subscription.created'; providerId: string; providerSubId: string; holder: HolderKey; buyerId?: string; tierId: string; offeringId: string; variantId?: string; couponCode?: string; state: ProviderSubscriptionState; variantSnapshot?: OfferingVariant }
+  | { type: 'subscription.renewed'; providerId: string; providerSubId: string; holder: HolderKey; state: ProviderSubscriptionState }
+  | { type: 'subscription.expired'; providerId: string; providerSubId: string; holder: HolderKey; state: ProviderSubscriptionState }
+  | { type: 'subscription.cancelled'; providerId: string; providerSubId: string; holder: HolderKey; state: ProviderSubscriptionState }
+  | { type: 'subscription.updated'; providerId: string; providerSubId: string; holder: HolderKey; state: ProviderSubscriptionState }
+  | { type: 'subscription.paused'; providerId: string; providerSubId: string; holder: HolderKey; resumesAt: string | null }
+  | { type: 'subscription.resumed'; providerId: string; providerSubId: string; holder: HolderKey; state: ProviderSubscriptionState }
   /**
    * Renewal payment was attempted and failed. Provider's own dunning takes
    * over (Stripe sends receipts, etc.); we surface a one-shot notification
@@ -366,7 +371,7 @@ export type ProviderEvent =
    * cache state change - the sub stays active until the provider gives up
    * (which fires `subscription.expired`).
    */
-  | { type: 'subscription.renewal-failed'; providerId: string; providerSubId: string; guildId: string; reason?: string };
+  | { type: 'subscription.renewal-failed'; providerId: string; providerSubId: string; holder: HolderKey; reason?: string };
 
 // ============================================================================
 // PROVIDER INTERFACE
@@ -450,10 +455,10 @@ export interface PaymentProvider {
 
   /**
    * Optional: list active-or-pending subscriptions the provider has on
-   * file for this guild. Used to detect orphans (subs the provider has
-   * that local cache doesn't know about).
+   * file for this holder. Used to detect orphans (subs the provider has
+   * that local cache doesn't know about). Empty for a kind the provider does not sell.
    */
-  listSubscriptionsForGuild?(guildId: string): Promise<ProviderSubscriptionRef[]>;
+  listSubscriptionsFor?(holder: HolderKey): Promise<ProviderSubscriptionRef[]>;
 
   /**
    * Optional: create a hosted "manage subscription" portal session for
@@ -512,7 +517,9 @@ export interface PaymentProvider {
   /** OAuth-linked providers (Patreon) implement this. */
   handleOAuthCallback?(query: Record<string, string>): Promise<{
     externalAccountId: string;
-    guildId: string;
+    holder: HolderKey;
+    /** The Discord user who linked the account. */
+    buyerId: string;
     tierId: string;
     offeringId: string;
     variantId: string;

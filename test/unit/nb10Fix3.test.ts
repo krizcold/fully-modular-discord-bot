@@ -120,10 +120,10 @@ describe('a read error while the web UI checks premium-tiers.json for changes (D
     expect(pm.getTier('high')?.displayName).toBe('High');
     const cache = (pm as any).config;
     h.failRead.set(path.resolve(PREMIUM), 'EMFILE');
-    pm.resolveActiveTier('g1');
+    pm.resolveActiveTier('70000000000000001');
     expect((pm as any).config).toBe(cache);
     h.failRead.set(path.resolve(PREMIUM), 'EMFILE');
-    pm.resolveActiveTier('g1');
+    pm.resolveActiveTier('70000000000000001');
     expect((pm as any).config).toBe(cache);
     expect(logged(errors).filter(l => l.includes('premium-tiers.json could not be read to check for changes (EMFILE)'))).toHaveLength(1);
   });
@@ -132,12 +132,12 @@ describe('a read error while the web UI checks premium-tiers.json for changes (D
     writePremium();
     const pm = getPremiumManager();
     expect(takeWriterLock().kind).toBe('taken');
-    pm.resolveActiveTier('g1');
+    pm.resolveActiveTier('70000000000000001');
     const cache = (pm as any).config;
     h.failRead.set(path.resolve(PREMIUM), 'EIO');
-    pm.resolveActiveTier('g1');
+    pm.resolveActiveTier('70000000000000001');
     fs.writeFileSync(PREMIUM, JSON.stringify({ tiers: {} }));
-    pm.resolveActiveTier('g1');
+    pm.resolveActiveTier('70000000000000001');
     expect((pm as any).config).toBe(cache);
     releaseWriterLock();
   });
@@ -145,10 +145,10 @@ describe('a read error while the web UI checks premium-tiers.json for changes (D
   it('outside a hold, a changed file is still reloaded', () => {
     writePremium();
     const pm = getPremiumManager();
-    pm.resolveActiveTier('g1');
+    pm.resolveActiveTier('70000000000000001');
     const cache = (pm as any).config;
     writePremium({}, { messages: { moduleBlocked: 'changed' } });
-    pm.resolveActiveTier('g1');
+    pm.resolveActiveTier('70000000000000001');
     expect((pm as any).config).not.toBe(cache);
   });
 

@@ -2432,7 +2432,7 @@ function AuditLogViewer({ tiers, providers, sectionStyle }) {
     if (entry.tierId) parts.push(`tier=${entry.tierId}`);
     if (entry.offeringId) parts.push(`offering=${entry.offeringId}`);
     if (entry.providerId) parts.push(`provider=${entry.providerId}`);
-    if (entry.guildId) parts.push(`guild=${entry.guildId}`);
+    if (entry.holder) parts.push(String(entry.holder).replace(':', '='));
     if (entry.subscriptionId) parts.push(`sub=${entry.subscriptionId.slice(0, 8)}`);
     return parts.join(' · ');
   }
@@ -2949,7 +2949,7 @@ function MigrationsPanel({ tiers, providers, sectionStyle, showSuccess, setError
                     </div>
                     {m.status === 'pending' && (m.decisions || []).some(d => d.decision === 'pending' && !d.notifiedAt) && (
                       <div style={{ color: '#f5af19', fontSize: '0.78rem', marginTop: '4px' }}>
-                        Delivery not confirmed for: {(m.decisions || []).filter(d => d.decision === 'pending' && !d.notifiedAt).map(d => d.guildId).join(', ')}. A server that does not decide keeps its current plan.
+                        Delivery not confirmed for: {(m.decisions || []).filter(d => d.decision === 'pending' && !d.notifiedAt).map(d => String(d.holder || '').replace(/^guild:/, '')).join(', ')}. A server that does not decide keeps its current plan.
                       </div>
                     )}
                     {m.message && (
@@ -2984,7 +2984,7 @@ function PremiumTiersView({ tiers, subscriptions, messages, messageDefaults, onR
   const [subscriptionSearch, setSubscriptionSearch] = useState('');
 
   // Restriction messages state (local editable copy; prop provides current saved values)
-  const [msgDraft, setMsgDraft] = useState(() => messages || { moduleBlocked: '', commandBlocked: '', panelBlocked: '', upgradeButtonLabel: '' });
+  const [msgDraft, setMsgDraft] = useState(() => messages || { moduleBlocked: '', commandBlocked: '', panelBlocked: '', upgradeButtonLabel: '', userBlocked: '' });
   const [msgSaving, setMsgSaving] = useState(false);
 
   // Dummy provider settings state (variants + products + coupons live in
@@ -3371,7 +3371,8 @@ function PremiumTiersView({ tiers, subscriptions, messages, messageDefaults, onR
     (msgDraft.moduleBlocked || '') !== (messages.moduleBlocked || '') ||
     (msgDraft.commandBlocked || '') !== (messages.commandBlocked || '') ||
     (msgDraft.panelBlocked || '') !== (messages.panelBlocked || '') ||
-    (msgDraft.upgradeButtonLabel || '') !== (messages.upgradeButtonLabel || '')
+    (msgDraft.upgradeButtonLabel || '') !== (messages.upgradeButtonLabel || '') ||
+    (msgDraft.userBlocked || '') !== (messages.userBlocked || '')
   );
 
   async function handleSaveMessages() {
@@ -3733,7 +3734,8 @@ function PremiumTiersView({ tiers, subscriptions, messages, messageDefaults, onR
               { key: 'moduleBlocked', label: 'Module blocked', help: 'Command run from a module disabled for the tier.' },
               { key: 'commandBlocked', label: 'Command blocked', help: 'Specific command disabled for the guild\u2019s tier.' },
               { key: 'panelBlocked', label: 'Panel blocked', help: 'Discord panel opened from a disabled module.' },
-              { key: 'upgradeButtonLabel', label: 'Upgrade button label', help: 'Label on the link button appended to blocked replies. Only shown when WEBUI_BASE_URL is set.' },
+              { key: 'userBlocked', label: 'User gate (personal subscriptions)', help: 'Command or panel gated on a user tier, shown to a user whose own tier is below it.' },
+              { key: 'upgradeButtonLabel', label: 'Upgrade button label', help: 'Label on the link button appended to the server gate\u2019s blocked replies, never on the user gate\u2019s. Only shown when WEBUI_BASE_URL is set.' },
             ].map(({ key, label, help }) => {
               const value = msgDraft[key] ?? '';
               const defaultValue = messageDefaults && messageDefaults[key];

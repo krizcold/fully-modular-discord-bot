@@ -51,15 +51,16 @@ import { getPaymentRegistry } from '../../src/bot/internalSetup/utils/payment/pa
 import { applySharedOp } from '../../src/bot/internalSetup/utils/sharedOps';
 import { outsideLedgers } from '../../src/bot/internalSetup/utils/dataBackends/writeLedger';
 import { AUDIT, clearGlobal, JOURNAL, jsonOf, linesOf, logged, paidSub, PREMIUM, quiet, rawOf, settleQueue, state, tick, writePremium } from './nb10PremiumRig';
+import { gh } from '../helpers/p1Holder';
 
 type Manager = ReturnType<typeof getPremiumManager>;
 const role = process.env.BOT_PROCESS_ROLE;
 const later = new Date(Date.now() + 90 * 86_400_000).toISOString();
-const expired = (providerSubId: string, guildId: string, providerId = 'discord') => ({ type: 'subscription.expired', providerId, providerSubId, guildId, state: { ...state('expired'), endDate: new Date(Date.now() - 1000).toISOString() } });
-const renewed = (providerSubId: string, guildId: string, providerId = 'dummy') => ({ type: 'subscription.renewed', providerId, providerSubId, guildId, state: { ...state(), endDate: later } });
+const expired = (providerSubId: string, guildId: string, providerId = 'discord') => ({ type: 'subscription.expired', providerId, providerSubId, holder: gh(guildId), state: { ...state('expired'), endDate: new Date(Date.now() - 1000).toISOString() } });
+const renewed = (providerSubId: string, guildId: string, providerId = 'dummy') => ({ type: 'subscription.renewed', providerId, providerSubId, holder: gh(guildId), state: { ...state(), endDate: later } });
 const subs = () => ({
-  g1: { active: paidSub('s1', 'd1', 'low', 'discord'), paused: [] },
-  g2: { active: paidSub('s2', 'dm1', 'low', 'dummy'), paused: [] },
+  'guild:70000000000000001': { active: paidSub('s1', 'd1', 'low', 'discord'), paused: [] },
+  'guild:70000000000000002': { active: paidSub('s2', 'dm1', 'low', 'dummy'), paused: [] },
 });
 const journalLine = (writer: string, n: number, event: object) => `${JSON.stringify({ writer, n, event })}\n`;
 const fakeTicket = () => ({ kind: 'file' as const, path: PREMIUM, seq: 1, record: { landed: 0 } });
@@ -84,7 +85,7 @@ function atLastWait(pm: Manager, handed: number, fn: () => void): void {
 /** One journaled expiry for g1 above the marks; the save after the replay gets a ticket that never lands. */
 function replayWithLostTicket(): { pm: Manager; ticket: ReturnType<typeof fakeTicket> } {
   writePremium(subs());
-  fs.writeFileSync(JOURNAL, journalLine('w1', 1, expired('d1', 'g1')));
+  fs.writeFileSync(JOURNAL, journalLine('w1', 1, expired('d1', '70000000000000001')));
   const pm = newProcess();
   const ticket = fakeTicket();
   atLastWait(pm, 1, () => {
@@ -131,7 +132,7 @@ afterAll(() => {
 describe('the replay and its marks', () => {
   it('a writer whose lines were all covered keeps its higher mark when another writer is applied', async () => {
     writePremium(subs(), { eventsApplied: { w1: 5 } });
-    fs.writeFileSync(JOURNAL, journalLine('w1', 1, renewed('dm1', 'g2')) + journalLine('w2', 1, expired('d1', 'g1')));
+    fs.writeFileSync(JOURNAL, journalLine('w1', 1, renewed('dm1', '70000000000000002')) + journalLine('w2', 1, expired('d1', '70000000000000001')));
     const pm = newProcess();
     startPremiumTickers();
     await normal(pm);
@@ -139,12 +140,12 @@ describe('the replay and its marks', () => {
     await settleQueue();
     const saved = jsonOf(PREMIUM);
     expect(saved.eventsApplied).toEqual({ w1: 5, w2: 1 });
-    expect(saved.subscriptions.g1.active).toBeUndefined();
+    expect(saved.subscriptions['guild:70000000000000001'].active).toBeUndefined();
   });
 
   it('a stop during the last wait writes nothing and leaves the replay unfinished', async () => {
     writePremium(subs());
-    fs.writeFileSync(JOURNAL, journalLine('w1', 1, expired('d1', 'g1')));
+    fs.writeFileSync(JOURNAL, journalLine('w1', 1, expired('d1', '70000000000000001')));
     const before = rawOf(PREMIUM);
     const pm = newProcess();
     let stopped = false;
@@ -160,7 +161,7 @@ describe('the replay and its marks', () => {
 
   it('a save step that throws is logged as the save step, and premium runs normally', async () => {
     writePremium(subs());
-    fs.writeFileSync(JOURNAL, journalLine('w1', 1, expired('d1', 'g1')));
+    fs.writeFileSync(JOURNAL, journalLine('w1', 1, expired('d1', '70000000000000001')));
     const pm = newProcess();
     atLastWait(pm, 1, () => {
       vi.spyOn(pm as any, 'writeCache').mockImplementationOnce(() => { throw new Error('disk gone'); });
@@ -173,9 +174,9 @@ describe('the replay and its marks', () => {
 
   it('an event journaled after the replay read its last line keeps the journal file', async () => {
     writePremium(subs());
-    fs.writeFileSync(JOURNAL, journalLine('w1', 1, expired('d1', 'g1')));
+    fs.writeFileSync(JOURNAL, journalLine('w1', 1, expired('d1', '70000000000000001')));
     const pm = newProcess();
-    atLastWait(pm, 1, () => outsideLedgers(() => getPaymentRegistry().emitEvent(renewed('dm1', 'g2') as any)));
+    atLastWait(pm, 1, () => outsideLedgers(() => getPaymentRegistry().emitEvent(renewed('dm1', '70000000000000002') as any)));
     startPremiumTickers();
     await normal(pm);
     await vi.waitFor(() => expect(linesOf(AUDIT).some(l => l.action === 'subscription.expire.paid')).toBe(true), { timeout: 5000, interval: 10 });
@@ -187,7 +188,7 @@ describe('the replay and its marks', () => {
 
   it('an append of the replay audit lines that throws is logged as that append', async () => {
     writePremium(subs());
-    fs.writeFileSync(JOURNAL, journalLine('w1', 1, expired('d1', 'g1')));
+    fs.writeFileSync(JOURNAL, journalLine('w1', 1, expired('d1', '70000000000000001')));
     const pm = newProcess();
     atLastWait(pm, 1, () => {
       hooks.append = file => {
@@ -240,7 +241,7 @@ describe("the watch for the replay's save", () => {
 
   it('a save that lands deletes the journal without waiting for the idle pause', async () => {
     writePremium(subs());
-    fs.writeFileSync(JOURNAL, journalLine('w1', 1, expired('d1', 'g1')));
+    fs.writeFileSync(JOURNAL, journalLine('w1', 1, expired('d1', '70000000000000001')));
     const okAt: number[] = [];
     hooks.confirm = (t, ms, real) => real(t, ms).then(answer => {
       if (answer === 'ok') okAt.push(performance.now());

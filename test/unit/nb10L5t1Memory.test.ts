@@ -32,16 +32,16 @@ const LATER = new Date(Date.now() + 90 * 86_400_000).toISOString();
 
 function setup(late: { beforeEmit?: () => void; emitted?: boolean }): void {
   const paused = { ...paidSub('sB', 'ps1', 'low', 'slow'), status: 'paused', pausedAt: new Date().toISOString(), remainingDaysAtPause: 10 };
-  writePremium({ g1: { active: paidSub('sA', 'ps0', 'high', 'discord'), paused: [paused] } });
-  const expired = { type: 'subscription.expired', providerId: 'discord', providerSubId: 'ps0', guildId: 'g1', state: { ...state('expired'), endDate: new Date(Date.now() - 1000).toISOString() } };
+  writePremium({ 'guild:70000000000000001': { active: paidSub('sA', 'ps0', 'high', 'discord'), paused: [paused] } });
+  const expired = { type: 'subscription.expired', providerId: 'discord', providerSubId: 'ps0', holder: 'guild:70000000000000001', state: { ...state('expired'), endDate: new Date(Date.now() - 1000).toISOString() } };
   fs.writeFileSync(JOURNAL, `${JSON.stringify({ writer: 'w1', n: 1, event: expired })}\n`);
   getPaymentRegistry().register({
-    id: 'slow', displayName: 'Slow', capabilities: { supportsPause: true }, isConfigured: () => true,
+    id: 'slow', displayName: 'Slow', capabilities: { sells: ['guild'], supportsPause: true }, isConfigured: () => true,
     pauseSubscription: async () => undefined,
     resumeSubscription: async (providerSubId: string) => {
       await tick(20);
       late.beforeEmit?.();
-      getPaymentRegistry().emitEvent({ type: 'subscription.renewed', providerId: 'slow', providerSubId, guildId: 'g1', state: { ...state(), endDate: LATER } } as any);
+      getPaymentRegistry().emitEvent({ type: 'subscription.renewed', providerId: 'slow', providerSubId, holder: 'guild:70000000000000001', state: { ...state(), endDate: LATER } } as any);
       late.emitted = true;
     },
   } as any);
@@ -76,13 +76,13 @@ describe('a replay that applied an event kept only in this process', () => {
     const pm = getPremiumManager();
     hooks.save = file => (file === 'premium-tiers.json' ? { outcome: 'refused', cause: 'io' } : undefined);
     const { error } = quiet();
-    getPaymentRegistry().emitEvent({ type: 'subscription.renewed', providerId: 'other', providerSubId: 'nobody', guildId: 'g9', state: state() } as any);
+    getPaymentRegistry().emitEvent({ type: 'subscription.renewed', providerId: 'other', providerSubId: 'nobody', holder: 'guild:70000000000000009', state: state() } as any);
     expect(pm.cacheState()).toBe('replaying');
     late.beforeEmit = () => pm.finalStop();
     startPremiumTickers();
     await vi.waitFor(() => expect(late.emitted).toBe(true), { timeout: 5000, interval: 2 });
     await settleQueue();
-    expect(pm.getFullConfig().subscriptions.g1.active?.endDate).not.toBe(LATER);
+    expect(pm.getFullConfig().subscriptions['guild:70000000000000001'].active?.endDate).not.toBe(LATER);
     const lines = logged(error).filter(l => l.includes(', caused by applying a kept provider event, '));
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain('. If an exit line says the kept provider events stay in premium-tiers.events.jsonl, the next normal start of the bot applies that provider event again unless an exit line names it as lost; otherwise this event is lost: {');

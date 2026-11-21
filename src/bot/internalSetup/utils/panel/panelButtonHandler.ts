@@ -10,6 +10,7 @@ import { getPersistentPanel, updatePersistentPanelState, isActiveInstance } from
 import { createTitledContainer, createText, V2Colors } from './v2';
 import { parseButtonCustomId } from './panelCustomIds';
 import { tellLateForm, withAutoDefer } from './panelAutoDefer';
+import { refusedOnSharedPanel } from './panelUserGate';
 
 /**
  * Navigation context storage
@@ -255,6 +256,8 @@ async function handleButtonFromButtonHandler(
     navigationStack: navContext ? [...navContext.navigationStack, panelId] : [panelId],
     data: navContext?.panelState ? { state: navContext.panelState } : undefined
   };
+
+  if (await refusedOnSharedPanel(panel, context, interaction)) return;
 
   try {
     // A modal must be the first response, so the handler races the auto-defer instead of deferring at once.

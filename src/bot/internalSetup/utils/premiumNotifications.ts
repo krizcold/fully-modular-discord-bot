@@ -17,8 +17,9 @@
  */
 
 import { getSubscriptionNotifier, NotificationType, NotificationPayload, NotifyOutcome } from './subscriptionNotifier';
+import { holderWords, type HolderKey } from './premiumHolder';
 
-type IPCDispatcher = (guildId: string, kind: NotificationType, payload: NotificationPayload) => Promise<NotifyOutcome>;
+type IPCDispatcher = (holder: HolderKey, kind: NotificationType, payload: NotificationPayload) => Promise<NotifyOutcome>;
 
 let ipcDispatcher: IPCDispatcher | null = null;
 
@@ -35,18 +36,18 @@ export function setNotificationIPCDispatcher(fn: IPCDispatcher): void {
  * throws, so PremiumManager never sees a notification error.
  */
 export async function dispatchPremiumNotification(
-  guildId: string,
+  holder: HolderKey,
   kind: NotificationType,
   payload: NotificationPayload,
 ): Promise<NotifyOutcome> {
   try {
     if (process.env.BOT_PROCESS_ROLE === 'bot') {
-      return await getSubscriptionNotifier().notify(guildId, kind, payload);
+      return await getSubscriptionNotifier().notify(holder, kind, payload);
     }
     if (ipcDispatcher) {
-      return await ipcDispatcher(guildId, kind, payload);
+      return await ipcDispatcher(holder, kind, payload);
     }
-    console.warn(`[PremiumNotifications] ${kind} for guild ${guildId} dropped: no bot process to deliver it`);
+    console.warn(`[PremiumNotifications] ${kind} for ${holderWords(holder)} dropped: no bot process to deliver it`);
     return { delivered: false, cause: 'no bot process to deliver it' };
   } catch (err) {
     console.warn(`[PremiumNotifications] dispatch failed for ${kind}:`, err);

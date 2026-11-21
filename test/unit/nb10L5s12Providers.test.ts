@@ -62,7 +62,7 @@ describe('the Patreon requests', () => {
     const provider = new PatreonProvider();
     const state = signedState({ guildId: '123456789012345678', tierId: 'gold', offeringId: 'o1', variantId: 'tier:5' }, 'csec');
     const result = await provider.handleOAuthCallback({ code: 'c0de', state });
-    expect(result).toMatchObject({ externalAccountId: 'u1', guildId: '123456789012345678', tierId: 'gold', variantId: 'tier:5' });
+    expect(result).toMatchObject({ externalAccountId: 'u1', holder: 'guild:123456789012345678', tierId: 'gold', variantId: 'tier:5' });
     expect(calls.map(c => c.url)).toEqual([PATREON_TOKEN, PATREON_IDENTITY]);
     const [token, identity] = calls;
     expect(token.init.method).toBe('POST');

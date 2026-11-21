@@ -14,8 +14,8 @@ vi.mock('../../src/bot/internalSetup/utils/payment/paymentRegistry', async orig 
 });
 const notices = vi.hoisted(() => ({ sent: [] as string[] }));
 vi.mock('../../src/bot/internalSetup/utils/premiumNotifications', () => ({
-  dispatchPremiumNotification: async (guildId: string, kind: string) => {
-    notices.sent.push(`${kind}:${guildId}`);
+  dispatchPremiumNotification: async (holder: string, kind: string) => {
+    notices.sent.push(`${kind}:${holder}`);
     return { delivered: true, via: 'dm' };
   },
 }));
@@ -49,7 +49,7 @@ function deposeNow(): void {
 /** A provider whose cancel and pause wait for the gates the test opens. */
 function registerSlow(cancel: Promise<unknown>, pause: Promise<unknown>): void {
   getPaymentRegistry().register({
-    id: 'slow', displayName: 'Slow', capabilities: { supportsCancel: true, supportsPause: true }, isConfigured: () => true,
+    id: 'slow', displayName: 'Slow', capabilities: { sells: ['guild'], supportsCancel: true, supportsPause: true }, isConfigured: () => true,
     cancelSubscription: () => cancel,
     pauseSubscription: () => pause,
   } as any);
@@ -91,12 +91,12 @@ describe('the web UI deposed during a real premium op (NB10 test 26)', () => {
   });
 
   it('a cancel whose audit line landed and whose provider call returned before the deposition answers not saved in full', async () => {
-    writePremium({ g2: { active: paidSub('s2', 'ps2', 'low', 'slow'), paused: [] } });
+    writePremium({ 'guild:70000000000000002': { active: paidSub('s2', 'ps2', 'low', 'slow'), paused: [] } });
     const before = rawOf(PREMIUM);
     const cancel = gate();
     registerSlow(cancel.promise, Promise.resolve());
     const manager = new BotManager();
-    const reply = manager.runSharedOp('premium.cancelPaidSubscriptionImmediately', { args: ['g2'] });
+    const reply = manager.runSharedOp('premium.cancelPaidSubscriptionImmediately', { args: ['guild:70000000000000002'] });
     await tick(30);
     const undo = failFlushes(PREMIUM);
     try {
@@ -116,11 +116,11 @@ describe('the web UI deposed during a real premium op (NB10 test 26)', () => {
   }, 30_000);
 
   it('case (e): an op sent while the deposed cancel waits answers the deposed text and takes nothing; after it, a new op runs alone', async () => {
-    writePremium({ g2: { active: paidSub('s2', 'ps2', 'low', 'slow'), paused: [] } });
+    writePremium({ 'guild:70000000000000002': { active: paidSub('s2', 'ps2', 'low', 'slow'), paused: [] } });
     const cancel = gate();
     registerSlow(cancel.promise, Promise.resolve());
     const manager = new BotManager();
-    const cancelling = manager.runSharedOp('premium.cancelPaidSubscriptionImmediately', { args: ['g2'] });
+    const cancelling = manager.runSharedOp('premium.cancelPaidSubscriptionImmediately', { args: ['guild:70000000000000002'] });
     await tick(30);
     deposeNow();
     fs.unlinkSync(writerLockPath());
@@ -136,7 +136,7 @@ describe('the web UI deposed during a real premium op (NB10 test 26)', () => {
     expect(answered).toMatchObject({ ok: false, code: 'held-elsewhere' });
     expect(answered.error).toBe(`Another process took the data files (a bot process this web UI did not start, pid ${OTHER}) while your change was being saved; nothing was saved. ${PROVIDER_SENTENCE}`);
     await settleQueue();
-    expect(jsonOf(PREMIUM).subscriptions.g2.active).toBeTruthy();
+    expect(jsonOf(PREMIUM).subscriptions['guild:70000000000000002'].active).toBeTruthy();
     expect(linesOf(AUDIT)).toEqual([]);
 
     expect(await manager.runSharedOp('premium.setTier', { args: ['low', lower] })).toMatchObject({ ok: true });
@@ -155,11 +155,11 @@ describe('the bot deposed during a real premium op (NB10 test 26 case g)', () =>
     fs.rmSync(writerLockPath(), { force: true });
     configureWriterLock('bot', { pid: () => process.pid, alive: p => live.has(p), startOf: () => null, now: () => Date.now() });
     expect(takeWriterLock().kind).toBe('taken');
-    writePremium({ g1: { active: paidSub('s1', 'ps1', 'low', 'slow'), paused: [] } });
+    writePremium({ 'guild:70000000000000001': { active: paidSub('s1', 'ps1', 'low', 'slow'), paused: [] } });
     const pause = gate();
     registerSlow(Promise.resolve(), pause.promise);
-    const reply = applySharedOp({ op: 'premium.grantManual', args: { args: ['g1', 'high', 30] } });
-    await vi.waitFor(() => expect(jsonOf(PREMIUM).subscriptions.g1.active.tierId).toBe('high'), { timeout: 5000, interval: 10 });
+    const reply = applySharedOp({ op: 'premium.grantManual', args: { args: ['guild:70000000000000001', 'high', 30] } });
+    await vi.waitFor(() => expect(jsonOf(PREMIUM).subscriptions['guild:70000000000000001'].active.tierId).toBe('high'), { timeout: 5000, interval: 10 });
     await settleQueue();
     const granted = rawOf(PREMIUM);
     deposeNow();
@@ -167,13 +167,13 @@ describe('the bot deposed during a real premium op (NB10 test 26 case g)', () =>
     const answered: any = await reply;
     expect(answered).toEqual({ ok: true, result: true });
     await tick(20);
-    expect(notices.sent).toEqual(['manual.grant.added:g1', 'paid.sub.paused-by-stacking:g1']);
+    expect(notices.sent).toEqual(['manual.grant.added:guild:70000000000000001', 'paid.sub.paused-by-stacking:guild:70000000000000001']);
     const warned = [...logged(spies.warn), ...logged(spies.error)];
-    expect(warned.filter(l => l.includes('notice for guild g1 was not sent'))).toEqual([]);
+    expect(warned.filter(l => l.includes('notice for guild 70000000000000001 was not sent'))).toEqual([]);
     expect((await import('../../src/bot/internalSetup/utils/premiumManager')).getPremiumManager().isStopped()).toBe(true);
     await settleQueue();
     expect(rawOf(PREMIUM)).toBe(granted);
-    const saved = jsonOf(PREMIUM).subscriptions.g1;
+    const saved = jsonOf(PREMIUM).subscriptions['guild:70000000000000001'];
     expect(saved.active).toMatchObject({ tierId: 'high', source: 'manual' });
     expect(saved.paused.map((x: any) => x.id)).toEqual(['s1']);
     expect(linesOf(AUDIT).map(l => l.action)).toEqual(['subscription.grant.manual', 'subscription.pause']);
@@ -194,9 +194,9 @@ describe('the bot deposed during a real premium op (NB10 test 26 case g)', () =>
     getPremiumManager();
     const before = rawOf(PREMIUM);
     const fetched = gate();
-    const event = { type: 'subscription.created', providerId: 'hook', providerSubId: 'ph1', guildId: 'g1', tierId: 'low', offeringId: 'o1', state: { status: 'active', startDate: new Date().toISOString(), endDate: new Date(Date.now() + 86_400_000).toISOString(), autoRenew: true } };
+    const event = { type: 'subscription.created', buyerId: '80000000000000001', providerId: 'hook', providerSubId: 'ph1', holder: 'guild:70000000000000001', tierId: 'low', offeringId: 'o1', state: { status: 'active', startDate: new Date().toISOString(), endDate: new Date(Date.now() + 86_400_000).toISOString(), autoRenew: true } };
     getPaymentRegistry().register({
-      id: 'hook', displayName: 'Hook', capabilities: {}, isConfigured: () => true,
+      id: 'hook', displayName: 'Hook', capabilities: { sells: ['guild'] }, isConfigured: () => true,
       handleWebhook: async () => {
         await fetched.promise;
         getPaymentRegistry().emitEvent(event as any);
@@ -213,16 +213,16 @@ describe('the bot deposed during a real premium op (NB10 test 26 case g)', () =>
     expect(rawOf(PREMIUM)).toBe(before);
     expect(rawOf(AUDIT)).toBeNull();
     const lines = logged(spies.error).filter(l => l.includes('subscription ph1'));
-    expect(lines).toEqual([`[PremiumManager] A subscription.created event from hook (subscription ph1, guild g1) was not applied: another process took the data files; the request that raised it is answered as not saved, and a webhook's provider sends it again: ${JSON.stringify(event)}`]);
+    expect(lines).toEqual([`[PremiumManager] A subscription.created event from hook (subscription ph1, guild 70000000000000001) was not applied: another process took the data files; the request that raised it is answered as not saved, and a webhook's provider sends it again: ${JSON.stringify(event)}`]);
   });
 
   it("case (c): a child's cancelPaidSubscriptionImmediately whose provider call returned before the deposition answers writer-lost with the provider sentence", async () => {
     takeAsBot();
-    writePremium({ g2: { active: paidSub('s2', 'ps2', 'low', 'slow'), paused: [] } });
+    writePremium({ 'guild:70000000000000002': { active: paidSub('s2', 'ps2', 'low', 'slow'), paused: [] } });
     const before = rawOf(PREMIUM);
     const cancel = gate();
     registerSlow(cancel.promise, Promise.resolve());
-    const reply = applySharedOp({ op: 'premium.cancelPaidSubscriptionImmediately', args: { args: ['g2'] } });
+    const reply = applySharedOp({ op: 'premium.cancelPaidSubscriptionImmediately', args: { args: ['guild:70000000000000002'] } });
     await tick(30);
     const undo = failFlushes(PREMIUM);
     try {

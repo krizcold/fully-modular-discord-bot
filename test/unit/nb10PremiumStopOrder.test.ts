@@ -70,8 +70,8 @@ describe("the premium cache's place in the bot's stop", () => {
     expect(late.isStopped()).toBe(true);
     expect((late as any).retryTimer).toBeNull();
     expect((late as any).expiryTimer).toBeNull();
-    expect(await late.grantManual('g1', 'high', 30)).toBe(false);
-    expect(late.resolveActiveTier('g1').tierId).toBe('free');
+    expect(await late.grantManual('guild:70000000000000001', 'high', 30)).toBe(false);
+    expect(late.resolveActiveTier('70000000000000001').tierId).toBe('free');
     await settleQueue();
     expect(jsonOf(PREMIUM)).toEqual(before);
   }, 20_000);

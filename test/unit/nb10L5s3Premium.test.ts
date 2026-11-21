@@ -59,7 +59,7 @@ const landedTicket = (): any => ({ kind: 'file', path: 'x', seq: 1, record: { la
 const openTicket = (): any => ({ kind: 'file', path: 'x', seq: 2, record: { landed: 0 } });
 
 function pending(action = 'tier.update', guildId?: string): any {
-  const entry: any = { timestamp: TS, actor: 'admin', action, ...(guildId ? { guildId } : {}) };
+  const entry: any = { timestamp: TS, actor: 'admin', action, ...(guildId ? { holder: `guild:${guildId}` } : {}) };
   return { line: JSON.stringify(entry) + '\n', entry };
 }
 
@@ -69,7 +69,7 @@ function install(state: string, extra: Record<string, unknown> = {}): any {
 }
 
 const event = (n = 1): any => ({
-  type: 'subscription.expired', providerId: 'discord', providerSubId: `d${n}`, guildId: 'g1',
+  type: 'subscription.expired', providerId: 'discord', providerSubId: `d${n}`, holder: 'guild:70000000000000001',
   state: { status: 'expired', startDate: TS, endDate: TS, autoRenew: false },
 });
 
@@ -136,7 +136,7 @@ describe('the retry pass and its back-off', () => {
 describe('one pass: the held save, then the held lines', () => {
   it('a held save that lands lets the held lines be appended in the same pass', async () => {
     pm.saveHeld = true;
-    pm.heldLines = [pending('tier.update', 'g1')];
+    pm.heldLines = [pending('tier.update', '70000000000000001')];
     pm.runPass();
     expect(pm.saveHeld).toBe(false);
     expect(pm.heldLines).toEqual([]);
@@ -147,7 +147,7 @@ describe('one pass: the held save, then the held lines', () => {
   it('a held save refused again keeps the held lines behind it, unwritten', async () => {
     inject.refuse.set(PREMIUM_FILE, 'storage-failing');
     pm.saveHeld = true;
-    pm.heldLines = [pending('tier.update', 'g1')];
+    pm.heldLines = [pending('tier.update', '70000000000000001')];
     pm.runPass();
     expect(pm.heldLines).toHaveLength(1);
     await settleQueue();
@@ -232,7 +232,7 @@ describe('the deposition and the final stop step', () => {
 describe('after the exit drain', () => {
   function ready(): void {
     pm.marksTicket = landedTicket();
-    pm.replayBuffer = [pending('tier.update', 'g1')];
+    pm.replayBuffer = [pending('tier.update', '70000000000000001')];
   }
 
   it('an empty buffer queues nothing and answers false', () => {
@@ -280,13 +280,13 @@ describe('after the exit drain', () => {
     expect(pm.afterDrain()).toBe(true);
     expect(pm.afterDrainLines).toHaveLength(1);
     pm.logLossesAtExit();
-    const line = JSON.stringify(pending('tier.update', 'g1').entry);
-    expect(logged(spies.error)).toEqual([`[PremiumManager] The audit line tier.update (guild g1, ${TS}) did not reach the disk before this stop and is lost: ${line}`]);
+    const line = JSON.stringify(pending('tier.update', '70000000000000001').entry);
+    expect(logged(spies.error)).toEqual([`[PremiumManager] The audit line tier.update (guild 70000000000000001, ${TS}) did not reach the disk before this stop and is lost: ${line}`]);
   });
 });
 
 describe('the exit handler', () => {
-  const lostLine = (n: number) => `[PremiumManager] A subscription.expired event from discord (subscription d${n}, guild g1) was received while premium-tiers.json could not be read and is lost with this stop: ${JSON.stringify(event(n))}`;
+  const lostLine = (n: number) => `[PremiumManager] A subscription.expired event from discord (subscription d${n}, guild 70000000000000001) was received while premium-tiers.json could not be read and is lost with this stop: ${JSON.stringify(event(n))}`;
 
   it('events at or under the landed marks are covered; one above them is logged', () => {
     pm.marksTicket = landedTicket();
@@ -327,7 +327,7 @@ describe('the exit handler', () => {
 
   it('a queued plain line whose ticket landed is not logged', () => {
     pm.marksTicket = landedTicket();
-    pm.afterDrainLines = [{ ...pending('tier.update', 'g1'), ticket: landedTicket() }];
+    pm.afterDrainLines = [{ ...pending('tier.update', '70000000000000001'), ticket: landedTicket() }];
     pm.logLossesAtExit();
     expect(logged(spies.error)).toEqual([]);
   });
@@ -390,7 +390,7 @@ describe('the replay drop', () => {
     expect(pm.installLines.has('sub1')).toBe(false);
     await runSealed('console', null, 'premium', async ledger => {
       pm.replayLedgers.add(ledger);
-      pm.writeAudit(pending('tier.update', 'g1').entry, { standalone: 'written at once, as NB10 wrote every line' });
+      pm.writeAudit(pending('tier.update', '70000000000000001').entry, { standalone: 'written at once, as NB10 wrote every line' });
     });
     expect(pm.replayBuffer).toEqual([]);
   });

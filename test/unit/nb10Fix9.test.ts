@@ -34,6 +34,7 @@ import { forks } from '../helpers/forkMock';
 import { failFlushes } from '../helpers/configRig';
 import { answering, exitChild, freshWriterLock, resetForks, startedWith } from '../helpers/nb10Rig';
 import { clearGlobal, gate, jsonOf, paidSub, PREMIUM, quiet, settleQueue, tick, writePremium } from './nb10PremiumRig';
+import { gh } from '../helpers/p1Holder';
 
 const G = '900000000000000966';
 const OTHER = 5455;
@@ -59,14 +60,14 @@ function deposeNow(): void {
 function registerCancels(...gates: Promise<unknown>[]): void {
   let call = 0;
   getPaymentRegistry().register({
-    id: 'slow', displayName: 'Slow', capabilities: { supportsCancel: true }, isConfigured: () => true,
+    id: 'slow', displayName: 'Slow', capabilities: { sells: ['guild'], supportsCancel: true }, isConfigured: () => true,
     cancelSubscription: () => gates[call++] ?? Promise.resolve(),
   } as any);
 }
 
 const removeElsewhere = () => runSealed('console', null, null, async () => {
   const pm = getPremiumManager() as any;
-  delete pm.config.subscriptions[G];
+  delete pm.config.subscriptions[gh(G)];
   pm.save();
 });
 
@@ -101,10 +102,10 @@ afterAll(() => {
 describe('a cancel whose subscription another op removed, judged by the last premium save (NB10-R8-D2, NB10-R9-O1)', () => {
   it("answers writer-lost when a deposition dropped that op's unflushed save", async () => {
     takeAsBot();
-    writePremium({ [G]: { active: paidSub('sA', 'pA', 'low', 'slow'), paused: [] } });
+    writePremium({ [gh(G)]: { active: paidSub('sA', 'pA', 'low', 'slow'), paused: [] } });
     const cancel = gate();
     registerCancels(cancel.promise);
-    const reply = op('premium.cancelPaidSubscriptionImmediately', G);
+    const reply = op('premium.cancelPaidSubscriptionImmediately', gh(G));
     await tick(30);
     const undo = failFlushes(PREMIUM);
     try {
@@ -121,24 +122,24 @@ describe('a cancel whose subscription another op removed, judged by the last pre
       undo();
     }
     await settleQueue();
-    expect(jsonOf(PREMIUM).subscriptions[G].active.id).toBe('sA');
+    expect(jsonOf(PREMIUM).subscriptions[gh(G)].active.id).toBe('sA');
   }, 20_000);
 
   it('a second cancel of a subscription the first removed only in memory after the stop answers not saved', async () => {
     takeAsBot();
-    writePremium({ [G]: { active: paidSub('sA', 'pA', 'low', 'slow'), paused: [] } });
+    writePremium({ [gh(G)]: { active: paidSub('sA', 'pA', 'low', 'slow'), paused: [] } });
     const first = gate();
     const second = gate();
     registerCancels(first.promise, second.promise);
-    const one = op('premium.cancelPaidSubscriptionImmediately', G);
-    const two = op('premium.cancelPaidSubscriptionImmediately', G);
+    const one = op('premium.cancelPaidSubscriptionImmediately', gh(G));
+    const two = op('premium.cancelPaidSubscriptionImmediately', gh(G));
     await tick(30);
     const pm = getPremiumManager() as any;
     pm.stopped = 'stopping';
     try {
       first.open();
       expect(await one).toMatchObject({ ok: false, answer: 'node-stopping' });
-      expect(pm.config.subscriptions[G]).toBeUndefined();
+      expect(pm.config.subscriptions[gh(G)]).toBeUndefined();
       second.open();
       const answered: any = await two;
       expect(answered.ok).toBe(false);
@@ -147,7 +148,7 @@ describe('a cancel whose subscription another op removed, judged by the last pre
     } finally {
       pm.stopped = null;
     }
-    expect(jsonOf(PREMIUM).subscriptions[G].active.id).toBe('sA');
+    expect(jsonOf(PREMIUM).subscriptions[gh(G)].active.id).toBe('sA');
   });
 });
 

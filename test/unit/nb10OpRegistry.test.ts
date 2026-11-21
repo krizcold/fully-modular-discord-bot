@@ -26,6 +26,7 @@ import { DUMMY_METHODS, isRegisteredOp, PREMIUM_METHODS } from '../../src/bot/in
 import { dataPath } from '../../src/utils/dataRoot';
 import { put } from '../helpers/configRig';
 import { readSourceText } from '../helpers/sourceText';
+import { LINK_BUYER, gh, linkOf } from '../helpers/p1Holder';
 
 const G = '123456789012345678';
 const GP = '223456789012345678';
@@ -39,14 +40,14 @@ const TIER = { displayName: 'Gold', priority: 10, overrides: {}, offerings: [OFF
 const providerState = () => ({ status: 'active', startDate: now(), endDate: future(30), autoRenew: true });
 const manual = (id: string, status: string) => ({ id, tierId: 'gold', source: 'manual', startDate: now(), endDate: future(1), autoRenew: false, status, createdAt: '', updatedAt: '' });
 const paid = (id: string, providerSubId: string, status: string) => ({
-  id, tierId: 'gold', source: 'paid', offeringId: 'o1', variantId: 'v1', providerId: 'fake', providerSubId,
+  id, tierId: 'gold', source: 'paid', buyerId: '80000000000000001', offeringId: 'o1', variantId: 'v1', providerId: 'fake', providerSubId,
   purchasedSnapshot: { offeringLabel: '', variantLabel: '', amount: 0, currency: '', durationDays: 30, tierDisplayName: 'Gold', tierPriority: 10, purchasedAt: now() },
   startDate: now(), endDate: future(30), autoRenew: true, status, createdAt: now(), updatedAt: now(),
 });
 const migration = (id: string, effectiveDate: string) => ({
   id, providerId: 'fake', sourceTierId: 'gold', sourceOfferingId: 'o1', sourceVariantId: 'v1', targetTierId: 'gold', targetOfferingId: 'o1', targetVariantId: 'v2',
   effectiveDate, message: '', scheduledAt: now(), scheduledBy: 'admin', status: 'pending',
-  decisions: [{ guildId: GP, subscriptionId: 'p1', providerSubId: 'ps1', decision: 'pending' }],
+  decisions: [{ holder: gh(GP), subscriptionId: 'p1', providerSubId: 'ps1', decision: 'pending' }],
 });
 
 const PREMIUM_ARGS: Record<string, unknown[]> = {
@@ -55,21 +56,21 @@ const PREMIUM_ARGS: Record<string, unknown[]> = {
   setMessages: [{ moduleBlocked: 'x' }],
   resetMessages: [],
   setGlobalModuleConfig: ['mod', { moduleEnabled: false }, {}],
-  grantManual: [GN, 'gold', 30],
-  extendManual: [G, 5],
-  revokeManual: [G],
-  initiatePaidSubscription: [GN, 'gold', 'o1', { providerId: 'fake', variantId: 'v1' }],
-  cancelPaidSubscription: [GP],
-  reactivatePaidSubscription: [GP],
-  cancelPaidSubscriptionImmediately: [GP],
-  cancelAndRemovePausedSubscription: [G, 'paused1'],
-  adoptOrphan: [GO, 'fake', 'orph1', { kind: 'install' }],
+  grantManual: [gh(GN), 'gold', 30],
+  extendManual: [gh(G), 5],
+  revokeManual: [gh(G)],
+  initiatePaidSubscription: [gh(GN), 'gold', 'o1', { providerId: 'fake', variantId: 'v1', buyerId: LINK_BUYER }],
+  cancelPaidSubscription: [gh(GP)],
+  reactivatePaidSubscription: [gh(GP)],
+  cancelPaidSubscriptionImmediately: [gh(GP)],
+  cancelAndRemovePausedSubscription: [gh(G), 'paused1'],
+  adoptOrphan: [gh(GO), 'fake', 'orph1', { kind: 'install' }],
   cancelOrphan: ['fake', 'orph1'],
-  linkAccount: ['fake', 'acct2', GN],
+  linkAccount: ['fake', 'acct2', gh(GN), LINK_BUYER],
   unlinkAccount: ['patreon', 'acct'],
-  unlinkProviderAccount: [GP, 'fake'],
-  recordMigrationDecision: ['mig1', GP, 'accepted'],
-  setNotificationsChannelId: [G, 'c1'],
+  unlinkProviderAccount: [gh(GP), 'fake'],
+  recordMigrationDecision: ['mig1', gh(GP), 'accepted'],
+  setNotificationsChannelId: [gh(G), 'c1'],
   setProviderActivation: ['dummy', true, false],
   setMigrationSilencePolicy: ['continue'],
   scheduleMigration: [{ providerId: 'fake', sourceTierId: 'gold', sourceOfferingId: 'o1', sourceVariantId: 'v1', targetTierId: 'gold', targetOfferingId: 'o1', targetVariantId: 'v2', effectiveDate: future(10), message: 'm' }],
@@ -84,7 +85,7 @@ const DUMMY_ARGS: Record<string, unknown[]> = {
   adminDeleteProduct: ['dummy_product_standard'],
   adminSetCoupon: [{ code: 'C1', percentOff: 10, usedCount: 0, createdAt: now() }],
   adminDeleteCoupon: ['TEST20'],
-  initiatePurchase: [{ guildId: G, tierId: 'gold', offeringId: 'o1', variantId: 'dummy_weekly_249', autoRenew: true }],
+  initiatePurchase: [{ holder: `guild:${G}`, buyerId: '80000000000000001', tierId: 'gold', offeringId: 'o1', variantId: 'dummy_weekly_249', autoRenew: true }],
   cancelSubscription: ['dsub1', true],
   reactivateSubscription: ['dsub1'],
   pauseSubscription: ['dsub1', null],
@@ -139,7 +140,7 @@ beforeEach(async () => {
   net.raisers.clear();
   fake.provider = {
     id: 'fake', displayName: 'Fake',
-    capabilities: { canInitiatePurchase: true, supportsCancel: true, supportsReactivate: true, supportsCoupons: false, supportsPause: true, supportsPriceMigration: true, mechanism: 'immediate' },
+    capabilities: { sells: ['guild'], canInitiatePurchase: true, supportsCancel: true, supportsReactivate: true, supportsCoupons: false, supportsPause: true, supportsPriceMigration: true, mechanism: 'immediate' },
     isConfigured: () => true,
     initiatePurchase: async () => ({ providerSubId: 'new1', state: providerState() }),
     cancelSubscription: async () => undefined,
@@ -148,19 +149,19 @@ beforeEach(async () => {
     resumeSubscription: async () => undefined,
     migrateSubscriptionPrice: async () => undefined,
     fetchVariant: async () => null,
-    listSubscriptionsForGuild: async (guildId: string) => (guildId === GO
-      ? [{ providerSubId: 'orph1', metadata: { tierId: 'gold', offeringId: 'o1', variantId: 'v1' }, state: providerState() }]
+    listSubscriptionsFor: async (holder: string) => (holder === gh(GO)
+      ? [{ providerSubId: 'orph1', metadata: { buyerId: '80000000000000001', tierId: 'gold', offeringId: 'o1', variantId: 'v1' }, state: providerState() }]
       : []),
   };
   await flushAll();
   put(dataPath('global', 'premium-tiers.json'), {
     tiers: { gold: TIER, silver: { displayName: 'Silver', priority: 5, overrides: {}, offerings: [] } },
     subscriptions: {
-      [G]: { active: manual('m1', 'active'), paused: [manual('paused1', 'paused')] },
-      [GP]: { active: paid('p1', 'ps1', 'active'), paused: [paid('p2', 'ps2', 'paused')] },
+      [gh(G)]: { active: manual('m1', 'active'), paused: [manual('paused1', 'paused')] },
+      [gh(GP)]: { active: paid('p1', 'ps1', 'active'), paused: [paid('p2', 'ps2', 'paused')] },
     },
     messages: {},
-    providerAccountLinks: { fake: { acct1: GP }, patreon: { acct: G } },
+    providerAccountLinks: { fake: { acct1: linkOf(GP) }, patreon: { acct: linkOf(G) } },
     activatedProviders: { fake: { defaultEnabled: false } },
     migrations: [migration('mig1', future(10)), migration('migDue', new Date(Date.now() - 60_000).toISOString())],
     migrationSilencePolicy: 'cancel',

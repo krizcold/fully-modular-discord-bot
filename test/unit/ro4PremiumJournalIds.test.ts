@@ -65,7 +65,7 @@ beforeEach(() => {
   h.journalRows = [];
   h.premium = JSON.stringify({
     tiers: TIERS,
-    subscriptions: { g2: { active: paidSub('s2', 'e1', 'low'), paused: [] } },
+    subscriptions: { 'guild:70000000000000002': { active: paidSub('s2', 'e1', 'low'), paused: [] } },
     messages: {}, providerAccountLinks: {}, activatedProviders: {}, migrations: [], migrationSilencePolicy: 'cancel',
     eventsApplied: { 'p-old': 2 },
   }, null, 2);
@@ -84,7 +84,7 @@ afterAll(() => {
 
 describe('a load that finds journal lines covered by the marks', () => {
   it('deletes the covered lines by their ids and sends no delete for a line with an empty id', async () => {
-    const event = { type: 'subscription.expired', providerId: 'fake', providerSubId: 'e1', guildId: 'g2', state: state('expired') };
+    const event = { type: 'subscription.expired', providerId: 'fake', providerSubId: 'e1', holder: 'guild:70000000000000002', state: state('expired') };
     const line = (n: number) => JSON.stringify({ writer: 'p-old', node: getNodeId(), nodeName: 'HERE', n, event });
     h.journalRows = [
       { id: '', line: line(1) },

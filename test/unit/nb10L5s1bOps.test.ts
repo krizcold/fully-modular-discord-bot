@@ -39,6 +39,7 @@ import {
 import { getPaymentRegistry } from '../../src/bot/internalSetup/utils/payment/paymentRegistry';
 import { markPaymentLedger, runSealed } from '../../src/bot/internalSetup/utils/dataBackends/writeLedger';
 import { AUDIT, clearGlobal, gate, JOURNAL, jsonOf, linesOf, logged, paidSub, PREMIUM, quiet, rawOf, settleQueue, state, writePremium } from './nb10PremiumRig';
+import { gh } from '../helpers/p1Holder';
 
 type Manager = ReturnType<typeof getPremiumManager>;
 const role = process.env.BOT_PROCESS_ROLE;
@@ -48,9 +49,9 @@ const asBot = (bot: boolean) => {
 };
 const PREMIUM_DOC = 'global:/premium-tiers.json';
 const refusedAs = (cause: string) => () => ({ outcome: 'refused', cause });
-const failedEvent = { type: 'subscription.renewal-failed', providerId: 'fake', providerSubId: 'nope', guildId: 'g-none', reason: 'card' };
-const created = (providerSubId: string, guildId = 'g1') => ({
-  type: 'subscription.created', providerId: 'fake', providerSubId, guildId, tierId: 'low', offeringId: 'o1', state: state(),
+const failedEvent = { type: 'subscription.renewal-failed', providerId: 'fake', providerSubId: 'nope', holder: 'guild:70000000000009001', reason: 'card' };
+const created = (providerSubId: string, guildId = '70000000000000001') => ({
+  type: 'subscription.created', buyerId: '80000000000000001', providerId: 'fake', providerSubId, holder: gh(guildId), tierId: 'low', offeringId: 'o1', state: state(),
 });
 const installLines = () => linesOf(AUDIT).filter(l => l?.action === 'subscription.install.paid');
 
@@ -66,7 +67,7 @@ function redeliver(pm: Manager, event: object) {
 function slowProvider(): { open: () => void } {
   const cancel = gate();
   getPaymentRegistry().register({
-    id: 'slow', displayName: 'Slow', capabilities: { supportsCancel: true }, isConfigured: () => true,
+    id: 'slow', displayName: 'Slow', capabilities: { sells: ['guild'], supportsCancel: true }, isConfigured: () => true,
     cancelSubscription: () => cancel.promise,
   } as any);
   return { open: () => cancel.open() };
@@ -76,7 +77,7 @@ function slowProvider(): { open: () => void } {
 async function cancelAcross(pm: Manager, meanwhile: () => void): Promise<{ answer: boolean; refused: Array<{ cause: string; doc: string }> }> {
   const provider = slowProvider();
   return runSealed('console', null, 'premium', async ledger => {
-    const done = pm.cancelPaidSubscriptionImmediately('g1');
+    const done = pm.cancelPaidSubscriptionImmediately('guild:70000000000000001');
     meanwhile();
     provider.open();
     const answer = await done;
@@ -180,16 +181,16 @@ describe('an install line the disk refused', () => {
     writePremium({});
     const pm = getPremiumManager();
     hooks.append = file => (file === 'premium-tiers.audit.jsonl' ? refusedAs('storage-failing')() : undefined);
-    getPaymentRegistry().emitEvent(created('psW', 'g7') as any);
+    getPaymentRegistry().emitEvent(created('psW', '70000000000000007') as any);
     await pm.settled(undefined);
     hooks.append = null;
     await settleQueue();
     expect(installLines()).toEqual([]);
-    await redeliver(pm, created('psW', 'g7'));
+    await redeliver(pm, created('psW', '70000000000000007'));
     await settleQueue();
     const lines = installLines();
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toMatchObject({ guildId: 'g7', metadata: { redelivered: true } });
+    expect(lines[0]).toMatchObject({ holder: 'guild:70000000000000007', metadata: { redelivered: true } });
   });
 
   it('in the bot, refused by the stop, is written by the next delivery', async () => {
@@ -197,16 +198,16 @@ describe('an install line the disk refused', () => {
     writePremium({});
     const pm = getPremiumManager();
     hooks.append = file => (file === 'premium-tiers.audit.jsonl' ? refusedAs('node-stopping')() : undefined);
-    getPaymentRegistry().emitEvent(created('psS', 'g8') as any);
+    getPaymentRegistry().emitEvent(created('psS', '70000000000000008') as any);
     await pm.settled(undefined);
     hooks.append = null;
     await settleQueue();
     expect(installLines()).toEqual([]);
-    await redeliver(pm, created('psS', 'g8'));
+    await redeliver(pm, created('psS', '70000000000000008'));
     await settleQueue();
     const lines = installLines();
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toMatchObject({ guildId: 'g8', metadata: { redelivered: true } });
+    expect(lines[0]).toMatchObject({ holder: 'guild:70000000000000008', metadata: { redelivered: true } });
   });
 });
 
@@ -245,7 +246,7 @@ describe('a replay that cannot read the journal', () => {
 });
 
 describe('an immediate cancel whose save comes after the provider call', () => {
-  const withSlow = () => writePremium({ g1: { active: paidSub('s1', 'px1', 'low', 'slow'), paused: [] } });
+  const withSlow = () => writePremium({ 'guild:70000000000000001': { active: paidSub('s1', 'px1', 'low', 'slow'), paused: [] } });
 
   it('after the stop came, answers not saved, refused by the stop, and the file keeps the subscription', async () => {
     asBot(true);
@@ -255,7 +256,7 @@ describe('an immediate cancel whose save comes after the provider call', () => {
     expect(answer).toBe(false);
     expect(refused).toContainEqual({ cause: 'node-stopping', doc: PREMIUM_DOC });
     await settleQueue();
-    expect(jsonOf(PREMIUM).subscriptions.g1.active.id).toBe('s1');
+    expect(jsonOf(PREMIUM).subscriptions['guild:70000000000000001'].active.id).toBe('s1');
   });
 
   it('after premium-tiers.json became unreadable, answers not saved and leaves the file as it is', async () => {
@@ -285,6 +286,6 @@ describe('an immediate cancel whose save comes after the provider call', () => {
     expect(answer).toBe(false);
     expect(refused).toContainEqual({ cause: 'not-ready', doc: PREMIUM_DOC });
     await settleQueue();
-    expect(jsonOf(PREMIUM).subscriptions.g1.active.id).toBe('s1');
+    expect(jsonOf(PREMIUM).subscriptions['guild:70000000000000001'].active.id).toBe('s1');
   });
 });

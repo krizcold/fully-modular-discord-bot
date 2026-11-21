@@ -27,6 +27,7 @@ import { errnoOf, isBotProcess, registerCacheStop, stopCause, stopWords, unregis
 import { failItems, landItems, makeItem, newCarry, runItems, type Carry, type Item, type ItemSink, type SaveOp, type SaveOutcome } from '../premiumItems';
 import { rowOutcome, shaOf, type RowTicket } from '../sharedStore';
 import { getPaymentRegistry } from './paymentRegistry';
+import { guildIdFor, holderFromWire, parseHolder, type HolderKey } from '../premiumHolder';
 import { isMaintenanceGateClosed, MaintenanceRefusal, orderRefusesGlobalWrite, runHeldResave } from '../maintenanceGate';
 import { OpenWork } from '../openWork';
 import { writerLockDepth } from '../writerLock';
@@ -83,6 +84,8 @@ interface DummyCoupon {
 interface DummyRecord {
   providerSubId: string;
   guildId: string;
+  /** The Discord user who paid, when the purchase named one. */
+  buyerId?: string;
   tierId: string;
   offeringId: string;
   variantId: string;
@@ -216,6 +219,7 @@ const CAPABILITIES: ProviderCapabilities = {
   mechanism: 'immediate',
   variantIdLabel: 'Dummy Variant ID',
   productIdLabel: 'Dummy Product ID',
+  sells: ['guild'],
 };
 
 // ============================================================================
@@ -659,6 +663,7 @@ export class DummyProvider implements PaymentProvider {
   }
 
   private async initiatePurchaseRun(opts: InitiateOpts): Promise<InitiateResult> {
+    const guildId = guildIdFor(opts.holder as HolderKey, this.displayName);
     this.refuseCall();
     const variant = this.state.variants[opts.variantId];
     if (!variant || !variant.active) {
@@ -695,7 +700,8 @@ export class DummyProvider implements PaymentProvider {
     const providerSubId = `dummy_${this.state.nextId++}`;
     const record: DummyRecord = {
       providerSubId,
-      guildId: opts.guildId,
+      guildId,
+      ...(typeof opts.buyerId === 'string' ? { buyerId: opts.buyerId } : {}),
       tierId: opts.tierId,
       offeringId: opts.offeringId,
       variantId: opts.variantId,
@@ -818,7 +824,10 @@ export class DummyProvider implements PaymentProvider {
     return r ? this.stateFrom(r) : null;
   }
 
-  async listSubscriptionsForGuild(guildId: string): Promise<ProviderSubscriptionRef[]> {
+  async listSubscriptionsFor(holder: HolderKey): Promise<ProviderSubscriptionRef[]> {
+    const parsed = parseHolder(holder);
+    if (!parsed || parsed.kind !== 'guild') return [];
+    const guildId = parsed.id;
     this.ensureLoaded();
     const liveStatuses = new Set(['active', 'paused']);
     const out: ProviderSubscriptionRef[] = [];
@@ -834,7 +843,8 @@ export class DummyProvider implements PaymentProvider {
         providerSubId: r.providerSubId,
         state: this.stateFrom(r),
         metadata: {
-          guildId: r.guildId,
+          holder,
+          ...(r.buyerId === undefined ? {} : { buyerId: r.buyerId }),
           tierId: r.tierId,
           offeringId: r.offeringId,
           variantId: r.variantId,
@@ -954,7 +964,9 @@ export class DummyProvider implements PaymentProvider {
     const differing = new Set<string>();
     const written: Array<{ id: string; parts: string }> = [];
     for (const r of records) {
-      const answer = registry.readSubscription(this.id, r.guildId, r.providerSubId);
+      const holder = holderFromWire(r.guildId);
+      if (!holder) continue;
+      const answer = registry.readSubscription(this.id, holder, r.providerSubId);
       if (!answer) continue;
       const diff = this.differences(r, answer);
       if (diff.length === 0) continue;
@@ -972,6 +984,8 @@ export class DummyProvider implements PaymentProvider {
 
     const events: WalkEvent[] = [];
     for (const r of records) {
+      const holder = holderFromWire(r.guildId);
+      if (!holder) continue;
       if (differing.has(r.providerSubId)) continue;
       if (r.status !== 'active') continue;
       if (r.paused) continue;
@@ -982,11 +996,11 @@ export class DummyProvider implements PaymentProvider {
         const base = Date.parse(r.endDate);
         r.endDate = new Date(base + r.durationDays * DAY_MS).toISOString();
         r.updatedAt = nowIso;
-        events.push({ type: 'subscription.renewed', providerId: this.id, providerSubId: r.providerSubId, guildId: r.guildId, state: this.stateFrom(r) });
+        events.push({ type: 'subscription.renewed', providerId: this.id, providerSubId: r.providerSubId, holder, state: this.stateFrom(r) });
       } else {
         r.status = 'expired';
         r.updatedAt = nowIso;
-        events.push({ type: 'subscription.expired', providerId: this.id, providerSubId: r.providerSubId, guildId: r.guildId, state: this.stateFrom(r) });
+        events.push({ type: 'subscription.expired', providerId: this.id, providerSubId: r.providerSubId, holder, state: this.stateFrom(r) });
       }
     }
     if (written.length === 0 && events.length === 0) return;

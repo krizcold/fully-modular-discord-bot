@@ -32,6 +32,14 @@ function buildBlockedReplyComponents(guildId: string): any[] {
   return [row];
 }
 
+/** Whether the module's user gate names this command: every command, or those in its gatedCommands. */
+function userGated(commandObject: any): boolean {
+  const gate = commandObject._tierRequirement?.user;
+  if (!gate || typeof gate.minPriority !== 'number') return false;
+  const listed = Array.isArray(gate.gatedCommands) && gate.gatedCommands.length > 0;
+  return !listed || gate.gatedCommands.includes(commandObject.name);
+}
+
 const testServer = process.env.GUILD_ID || ''; // Test server ID
 
 export default async function handleCommands(client: Client, interaction: Interaction) {
@@ -138,6 +146,17 @@ export default async function handleCommands(client: Client, interaction: Intera
             });
             return;
           }
+        }
+      } catch { /* premium manager not available; allow command */ }
+    }
+
+    // The console's invoke with no user acts as the bot itself, which holds no personal tier.
+    if (commandObject._moduleName && userGated(commandObject) && interaction.user.id !== client.user?.id) {
+      try {
+        const pm = getPremiumManager();
+        if (!pm.hasUserFeatureAccess(interaction.user.id, commandObject._tierRequirement.user.minPriority)) {
+          refuse(interaction, { content: pm.getMessages().userBlocked });
+          return;
         }
       } catch { /* premium manager not available; allow command */ }
     }

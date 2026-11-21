@@ -84,10 +84,10 @@ vi.mock('../../src/bot/internalSetup/utils/payment/paymentRegistry', async orig 
   const real = await orig<typeof import('../../src/bot/internalSetup/utils/payment/paymentRegistry')>();
   return { ...real, getPaymentRegistry: () => (reg.current ??= new real.PaymentProviderRegistry()) };
 });
-const notices = vi.hoisted(() => ({ sent: [] as Array<{ guildId: string; kind: string }> }));
+const notices = vi.hoisted(() => ({ sent: [] as Array<{ holder: string; kind: string }> }));
 vi.mock('../../src/bot/internalSetup/utils/premiumNotifications', () => ({
-  dispatchPremiumNotification: async (guildId: string, kind: string) => {
-    notices.sent.push({ guildId, kind });
+  dispatchPremiumNotification: async (holder: string, kind: string) => {
+    notices.sent.push({ holder, kind });
     return { delivered: true, via: 'dm' };
   },
 }));
@@ -101,6 +101,7 @@ import { getNodeName } from '../../src/bot/internalSetup/fleet/nodeName';
 import { dataPath } from '../../src/utils/dataRoot';
 import { setBackendKind } from '../helpers/backendKind';
 import { clearGlobal, logged, paidSub, quiet, state, tick, TIERS } from './nb10PremiumRig';
+import { gh } from '../helpers/p1Holder';
 
 const JOURNAL_KEY = 'global/premium-tiers.events.jsonl';
 const role = process.env.BOT_PROCESS_ROLE;
@@ -111,12 +112,12 @@ function premiumText(subscriptions: Record<string, unknown>, extra: Record<strin
 }
 
 function registerFake(): void {
-  getPaymentRegistry().register({ id: 'fake', displayName: 'Fake', capabilities: { supportsPause: true }, isConfigured: () => true } as any);
+  getPaymentRegistry().register({ id: 'fake', displayName: 'Fake', capabilities: { sells: ['guild'], supportsPause: true }, isConfigured: () => true } as any);
 }
 
 const emit = (event: object) => getPaymentRegistry().emitEvent(event as any);
 const expired = (subId: string, guildId: string) => ({
-  type: 'subscription.expired', providerId: 'fake', providerSubId: subId, guildId,
+  type: 'subscription.expired', providerId: 'fake', providerSubId: subId, holder: gh(guildId),
   state: { ...state('expired'), endDate: new Date(Date.now() - 1000).toISOString() },
 });
 
@@ -154,8 +155,8 @@ beforeEach(() => {
   resetPremiumManager();
   Object.assign(h, { unreadable: false, saves: [], outcomes: new Map(), appends: [], deletes: [], journalRows: [], liveRows: null });
   h.premium = premiumText({
-    g2: { active: paidSub('s2', 'e1', 'low'), paused: [] },
-    g3: { active: paidSub('s3', 'e3', 'low'), paused: [] },
+    'guild:70000000000000002': { active: paidSub('s2', 'e1', 'low'), paused: [] },
+    'guild:70000000000000003': { active: paidSub('s3', 'e3', 'low'), paused: [] },
   });
   notices.sent = [];
   reg.current = null;
@@ -179,8 +180,8 @@ describe('a provider event that comes while premium-tiers.json cannot be read', 
   it('is kept as a journal line naming this process, its node and its count, with a warning', () => {
     h.unreadable = true;
     getPremiumManager();
-    const e1 = expired('e1', 'g2');
-    const e2 = expired('e3', 'g3');
+    const e1 = expired('e1', '70000000000000002');
+    const e2 = expired('e3', '70000000000000003');
     emit(e1);
     emit(e2);
     expect(h.appends.map(a => a.key)).toEqual([JOURNAL_KEY, JOURNAL_KEY]);
@@ -189,8 +190,8 @@ describe('a provider event that comes while premium-tiers.json cannot be read', 
     expect(h.appends[0].id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
     expect(h.appends[1].id).not.toBe(h.appends[0].id);
     expect(logged(spies.warn).filter(l => l.includes('arrived while'))).toEqual([
-      '[PremiumManager] A subscription.expired event from fake (subscription e1, guild g2) arrived while premium-tiers.json cannot be read; it is kept in premium-tiers.events.jsonl and applied once premium runs normally',
-      '[PremiumManager] A subscription.expired event from fake (subscription e3, guild g3) arrived while premium-tiers.json cannot be read; it is kept in premium-tiers.events.jsonl and applied once premium runs normally',
+      '[PremiumManager] A subscription.expired event from fake (subscription e1, guild 70000000000000002) arrived while premium-tiers.json cannot be read; it is kept in premium-tiers.events.jsonl and applied once premium runs normally',
+      '[PremiumManager] A subscription.expired event from fake (subscription e3, guild 70000000000000003) arrived while premium-tiers.json cannot be read; it is kept in premium-tiers.events.jsonl and applied once premium runs normally',
     ]);
     expect(h.saves).toHaveLength(0);
   });
@@ -200,7 +201,7 @@ describe('a provider event that comes while premium-tiers.json cannot be read', 
     getPremiumManager();
     let recorded: unknown[] = [];
     await runSealed('console', null, 'premium', async ledger => {
-      emit(expired('e1', 'g2'));
+      emit(expired('e1', '70000000000000002'));
       recorded = ledger.tickets().map(t => t.ticket);
     });
     expect(h.appends).toHaveLength(1);
@@ -210,34 +211,34 @@ describe('a provider event that comes while premium-tiers.json cannot be read', 
   it('is named as lost by the exit when its line had not been stored', () => {
     h.unreadable = true;
     const pm = getPremiumManager();
-    const event = expired('e1', 'g2');
+    const event = expired('e1', '70000000000000002');
     emit(event);
     pm.markStopped('stopping');
     pm.logLossesAtExit();
     const lines = logged(spies.error).filter(l => l.includes('was received while'));
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toMatch(/^\[PremiumManager\] A subscription\.expired event from fake \(subscription e1, guild g2\) was received while premium-tiers\.json could not be read and is /);
+    expect(lines[0]).toMatch(/^\[PremiumManager\] A subscription\.expired event from fake \(subscription e1, guild 70000000000000002\) was received while premium-tiers\.json could not be read and is /);
     expect(lines[0].endsWith(`: ${JSON.stringify(event)}`)).toBe(true);
   });
 
   it('that comes while kept events wait for the replay is kept with the words for that state', () => {
     h.unreadable = true;
     const pm = getPremiumManager();
-    emit(expired('e1', 'g2'));
+    emit(expired('e1', '70000000000000002'));
     readableAgain();
     expect(pm.cacheState()).toBe('replaying');
-    emit(expired('e3', 'g3'));
+    emit(expired('e3', '70000000000000003'));
     expect(h.appends).toHaveLength(2);
     expect(logged(spies.warn).filter(l => l.includes('arrived while'))[1]).toBe(
-      '[PremiumManager] A subscription.expired event from fake (subscription e3, guild g3) arrived while premium applies the provider events it kept; it is kept in premium-tiers.events.jsonl and applied once premium runs normally',
+      '[PremiumManager] A subscription.expired event from fake (subscription e3, guild 70000000000000003) arrived while premium applies the provider events it kept; it is kept in premium-tiers.events.jsonl and applied once premium runs normally',
     );
   });
 });
 
 describe('the journal lines a load finds covered by the marks', () => {
   it('are deleted once, and a pending line of a live writer on another machine still refuses premium ops', async () => {
-    h.premium = premiumText({ g2: { active: paidSub('s2', 'e1', 'low'), paused: [] } }, { eventsApplied: { 'p-old': 1 } });
-    const event = { type: 'subscription.expired', providerId: 'fake', providerSubId: 'e1', guildId: 'g2', state: state('expired') };
+    h.premium = premiumText({ 'guild:70000000000000002': { active: paidSub('s2', 'e1', 'low'), paused: [] } }, { eventsApplied: { 'p-old': 1 } });
+    const event = { type: 'subscription.expired', providerId: 'fake', providerSubId: 'e1', holder: 'guild:70000000000000002', state: state('expired') };
     h.journalRows = [
       { id: 'j-old', line: JSON.stringify({ writer: 'p-old', node: getNodeId(), nodeName: 'HERE', n: 1, event }) },
       { id: 'j-bravo', line: JSON.stringify({ writer: 'p-bravo', node: 'node-bravo', nodeName: 'BRAVO', n: 1, event }) },
@@ -271,10 +272,10 @@ describe("the replay's marks", () => {
   }
 
   it('delete only the own lines they cover once their save landed, not a line kept after them', async () => {
-    const t1 = await replayed([expired('e1', 'g2'), expired('e3', 'g3')]);
+    const t1 = await replayed([expired('e1', '70000000000000002'), expired('e3', '70000000000000003')]);
     expect(h.saves[0].data.eventsApplied).toEqual({ [processId()]: 2 });
     unreadableAgain();
-    emit(expired('e1', 'g2'));
+    emit(expired('e1', '70000000000000002'));
     expect(h.appends).toHaveLength(3);
     const [a, b] = h.appends.map(x => x.id);
     expect(h.deletes).toEqual([]);
@@ -285,7 +286,7 @@ describe("the replay's marks", () => {
   });
 
   it('delete the lines at once when their save lands', async () => {
-    const t1 = await replayed([expired('e1', 'g2')]);
+    const t1 = await replayed([expired('e1', '70000000000000002')]);
     expect(h.deletes).toEqual([]);
     settle(t1, 'landed');
     const at = Date.now();
@@ -295,7 +296,7 @@ describe("the replay's marks", () => {
   });
 
   it('ride the next save that lands when their own save was refused', async () => {
-    const t1 = await replayed([expired('e1', 'g2')]);
+    const t1 = await replayed([expired('e1', '70000000000000002')]);
     settle(t1, { refused: { cause: 'io' } });
     await tick(20);
     expect(h.deletes).toEqual([]);
@@ -308,9 +309,9 @@ describe("the replay's marks", () => {
   });
 
   it("of a later replay are kept when an earlier replay's save is refused, and delete the lines once they land", async () => {
-    const t1 = await replayed([expired('e1', 'g2')]);
+    const t1 = await replayed([expired('e1', '70000000000000002')]);
     unreadableAgain();
-    emit(expired('e3', 'g3'));
+    emit(expired('e3', '70000000000000003'));
     readableAgain();
     await until(() => h.saves.length > 1);
     expect(h.saves).toHaveLength(2);
@@ -327,12 +328,12 @@ describe("the replay's marks", () => {
 describe('a member notice whose save was refused', () => {
   it('is logged with the cause and no word of a lost answer', async () => {
     getPremiumManager();
-    emit(expired('e1', 'g2'));
+    emit(expired('e1', '70000000000000002'));
     expect(h.saves).toHaveLength(1);
     settle(h.saves[0].ticket, { refused: { cause: 'io' } });
-    const want = '[PremiumManager] The paid.sub.expired notice for guild g2 was not sent: the change it announces was not saved (io)';
-    await until(() => logged(spies.warn).some(l => l.includes('notice for guild g2')));
-    expect(logged(spies.warn).filter(l => l.includes('notice for guild g2'))).toEqual([want]);
+    const want = '[PremiumManager] The paid.sub.expired notice for guild 70000000000000002 was not sent: the change it announces was not saved (io)';
+    await until(() => logged(spies.warn).some(l => l.includes('notice for guild 70000000000000002')));
+    expect(logged(spies.warn).filter(l => l.includes('notice for guild 70000000000000002'))).toEqual([want]);
     expect(notices.sent).toEqual([]);
   });
 });
@@ -342,10 +343,10 @@ describe('a tier change that makes the tier stricter', () => {
     const tiers = { ...TIERS, low: { ...TIERS.low, overrides: { someModule: { limit: 5 } } } };
     const pausedOn = (id: string, sub: string, tierId: string) => ({ ...paidSub(id, sub, tierId), status: 'paused' });
     h.premium = premiumText({
-      g2: { active: paidSub('s2', 'e2', 'low'), paused: [] },
-      g3: { active: paidSub('s3', 'e3', 'high'), paused: [] },
-      g4: { active: paidSub('s4', 'e4', 'high'), paused: [pausedOn('s5', 'e5', 'low')] },
-      g5: { active: paidSub('s6', 'e6', 'high'), paused: [pausedOn('s7', 'e7', 'high')] },
+      'guild:70000000000000002': { active: paidSub('s2', 'e2', 'low'), paused: [] },
+      'guild:70000000000000003': { active: paidSub('s3', 'e3', 'high'), paused: [] },
+      'guild:70000000000000004': { active: paidSub('s4', 'e4', 'high'), paused: [pausedOn('s5', 'e5', 'low')] },
+      'guild:70000000000000005': { active: paidSub('s6', 'e6', 'high'), paused: [pausedOn('s7', 'e7', 'high')] },
     }, {}, tiers);
     const pm = getPremiumManager();
     expect(pm.setTier('low', { displayName: 'Low', priority: 1, overrides: {}, offerings: [] })).toBe(true);
@@ -355,7 +356,7 @@ describe('a tier change that makes the tier stricter', () => {
     settle(h.saves[0].ticket, 'landed');
     await until(() => notices.sent.length >= 2, 1000);
     await tick(20);
-    expect(notices.sent.filter(n => n.kind === 'tier.config-change-affecting-subscriber').map(n => n.guildId).sort()).toEqual(['g2', 'g4']);
+    expect(notices.sent.filter(n => n.kind === 'tier.config-change-affecting-subscriber').map(n => n.holder).sort()).toEqual(['guild:70000000000000002', 'guild:70000000000000004']);
   });
 });
 

@@ -146,8 +146,8 @@ describe('NB10 test 43: a deposed exit seen by BotManager', () => {
     expect(count(log, `Another process (a data bundle import, pid ${r.parentPid}) took the data files' lock`)).toBe(1);
     expect(count(log, 'Not saved:')).toBeGreaterThanOrEqual(1);
     expect(log.split('\n').filter(l => l.includes('Not saved:') && l.includes('nb10dep'))).toHaveLength(1);
-    expect(log.split('\n').filter(l => l.includes('subscription.expired event from discord (subscription d1, guild g1)') && l.includes('lost: another process took the data files'))).toHaveLength(1);
-    expect(log.split('\n').filter(l => l.includes('subscription.created event from discord (subscription ent9, guild g9)') && l.includes('was not applied: another process took the data files; it is lost'))).toHaveLength(1);
+    expect(log.split('\n').filter(l => l.includes('subscription.expired event from discord (subscription d1, guild 70000000000000001)') && l.includes('lost: another process took the data files'))).toHaveLength(1);
+    expect(log.split('\n').filter(l => l.includes('subscription.created event from discord (subscription ent9, guild 70000000000000009)') && l.includes('was not applied: another process took the data files; it is lost'))).toHaveLength(1);
     expect(log).not.toContain('lost with this stop');
     expect(log).not.toContain('the bot is stopping');
     expect(r.deposedLines).toEqual([`[BotManager] The bot process stopped: a data bundle import (pid ${r.parentPid}) took the data files' lock`]);

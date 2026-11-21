@@ -105,9 +105,34 @@ describe('the Patreon callback', () => {
     expect(String(sent[0].body)).toContain('The state &lt;x&gt; did not match');
   });
 
-  it('redirects on an ok reply that carries no result', async () => {
-    const sent = await callback({ ok: true });
-    expect(sent).toEqual([{ status: 302, kind: 'redirect', body: '/guild/undefined/subscription?subscribe=success' }]);
+  const NOT_CONFIRMED = "<h2>Patreon link not confirmed</h2><p>Can't confirm whether your Patreon account was linked: the bot's answer named no server. Open the server's subscription page to see whether the subscription is there before you start the link again.</p>";
+
+  it.each([
+    ['carries no result', { ok: true }],
+    ['names a linked text that is no holder key', { ok: true, result: { linked: '123456789012345678' } }],
+    ['names a user as linked', { ok: true, result: { linked: 'user:123456789012345678' } }],
+    ['names a linkedElsewhere text that is no holder key', { ok: true, result: { linkedElsewhere: '123456789012345678' } }],
+    ['names an empty linked text', { ok: true, result: { linked: '' } }],
+  ])("answers the can't confirm page and no success redirect on an ok reply that %s", async (_what, reply) => {
+    const sent = await callback(reply);
+    expect(sent).toHaveLength(1);
+    expect(sent[0].status).toBe(502);
+    expect(sent[0].kind).toBe('send');
+    expect(String(sent[0].body)).toContain(NOT_CONFIRMED);
+    expect(String(sent[0].body)).not.toContain('subscribe=success');
+  });
+
+  it('redirects to the server of a linked holder key', async () => {
+    const sent = await callback({ ok: true, result: { linked: 'guild:123456789012345678' } });
+    expect(sent).toEqual([{ status: 302, kind: 'redirect', body: '/guild/123456789012345678/subscription?subscribe=success' }]);
+  });
+
+  it('answers the 409 page for a linkedElsewhere holder key', async () => {
+    const sent = await callback({ ok: true, result: { linkedElsewhere: 'guild:123456789012345678' } });
+    expect(sent).toHaveLength(1);
+    expect(sent[0].status).toBe(409);
+    expect(String(sent[0].body)).toContain('<code>123456789012345678</code>');
+    expect(String(sent[0].body)).toContain('<a href="/guild/123456789012345678/subscription">');
   });
 
   let app: { url: string; close: () => Promise<void> } | null = null;

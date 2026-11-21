@@ -77,10 +77,10 @@ describe('an orphan listed while the journal cannot be read in the bot', () => {
   it('its plan refuses with the journal named, its errno and what to do', async () => {
     fs.mkdirSync(JOURNAL);
     getPaymentRegistry().register({
-      id: 'fake', displayName: 'Fake', capabilities: { supportsPause: true }, isConfigured: () => true,
-      listSubscriptionsForGuild: async () => [{
+      id: 'fake', displayName: 'Fake', capabilities: { sells: ['guild'], supportsPause: true }, isConfigured: () => true,
+      listSubscriptionsFor: async () => [{
         providerSubId: 'orph',
-        metadata: { guildId: 'g1', tierId: 'low', offeringId: 'o1', pausedDaysLeft: 5, pausedAt: '2026-11-01T00:00:00.000Z' },
+        metadata: { holder: 'guild:70000000000000001', buyerId: '80000000000000001', tierId: 'low', offeringId: 'o1', pausedDaysLeft: 5, pausedAt: '2026-11-01T00:00:00.000Z' },
         state: { status: 'paused', startDate: new Date().toISOString(), endDate: new Date(Date.now() + 86_400_000).toISOString(), autoRenew: true },
         display: { amountLabel: '', periodLabel: '', statusLabel: 'paused' },
       }],
@@ -89,7 +89,7 @@ describe('an orphan listed while the journal cannot be read in the bot', () => {
     } as any);
     const pm = getPremiumManager();
     expect(pm.cacheState()).toBe('unreadable');
-    const out = await pm.findOrphansForGuild('g1');
+    const out = await pm.findOrphansFor('guild:70000000000000001');
     expect(out).toHaveLength(1);
     const plan = out[0].plan as any;
     expect(plan.kind).toBe('refuse');

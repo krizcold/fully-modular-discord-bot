@@ -130,7 +130,7 @@ describe('the payment-op mark on the op ledger', () => {
 
 describe('a refusal of a provider op', () => {
   it('that is not unconfirmed carries no provider sentence', async () => {
-    const premium: any = await applySharedOp({ op: 'premium.grantManual', args: { args: ['g'] } });
+    const premium: any = await applySharedOp({ op: 'premium.grantManual', args: { args: ['guild:70000000000009005'] } });
     expect(premium).toEqual({ ok: false, code: 'invalid', error: 'unknown premium op grantManual' });
     const payment: any = await applySharedOp({ op: 'payment.webhook', args: { providerId: 'missing' } });
     expect(payment).toEqual({ ok: false, code: 'invalid', error: 'Unknown provider or no webhook handler: missing' });
@@ -157,7 +157,7 @@ describe('partialEndingIn', () => {
 describe('partialText', () => {
   it('names only the files that landed, never a guild working-set write', () => {
     const ledger = openLedger('console');
-    ledger.noteTicket({ kind: 'ws', manager: {}, set: { landedSeq: 5 }, guildId: 'g1', seq: 3 } as any, 'm');
+    ledger.noteTicket({ kind: 'ws', manager: {}, set: { landedSeq: 5 }, guildId: '70000000000000001', seq: 3 } as any, 'm');
     expect(partialText('Head.', ledger)).toBe(`Head. ${partialEnding([])}`);
     ledger.noteTicket({ kind: 'file', record: { landed: 2 }, seq: 1, path: '/d/global/x/landed.json' } as any, 'm');
     expect(partialText('Head.', ledger)).toBe(`Head. ${partialEnding(['landed.json'])}`);

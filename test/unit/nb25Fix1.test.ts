@@ -41,11 +41,11 @@ const fake = {
 
 function register(): void {
   getPaymentRegistry().register({
-    id: 'fake', displayName: 'Fake', capabilities: { supportsPause: true }, isConfigured: () => true,
-    listSubscriptionsForGuild: async (guildId: string) => {
+    id: 'fake', displayName: 'Fake', capabilities: { sells: ['guild'], supportsPause: true }, isConfigured: () => true,
+    listSubscriptionsFor: async (holder: string) => {
       fake.listed += 1;
       if (fake.list) await fake.list.promise;
-      return fake.refs.filter(ref => ref.metadata.guildId === guildId).map(ref => JSON.parse(JSON.stringify(ref)));
+      return fake.refs.filter(ref => ref.metadata.holder === holder).map(ref => JSON.parse(JSON.stringify(ref)));
     },
     resumeSubscription: async (subId: string) => {
       fake.resumes.push(subId);
@@ -61,19 +61,19 @@ function register(): void {
 
 const pausedRef = (metadata: Record<string, unknown> = { pausedDaysLeft: 12, pausedAt: AT }) => ({
   providerSubId: 'orph',
-  metadata: { guildId: 'g1', tierId: 'silver', offeringId: 'o2', ...metadata },
+  metadata: { holder: 'guild:70000000000000001', buyerId: '80000000000000001', tierId: 'silver', offeringId: 'o2', ...metadata },
   state: { status: 'paused', startDate: new Date().toISOString(), endDate: new Date(Date.now() + 2 * DAY_MS).toISOString(), autoRenew: true },
   display: { amountLabel: '', periodLabel: '', statusLabel: 'paused' },
 });
 const asActive = (ref: any) => ({ ...ref, state: { ...ref.state, status: 'active', endDate: new Date(Date.now() + 12 * DAY_MS).toISOString() } });
 const paid = (providerSubId: string, tierId: string) => ({
-  id: `s_${providerSubId}`, tierId, source: 'paid', offeringId: tierId === 'gold' ? 'o1' : 'o2', providerId: 'fake', providerSubId,
+  id: `s_${providerSubId}`, tierId, source: 'paid', buyerId: '80000000000000001', offeringId: tierId === 'gold' ? 'o1' : 'o2', providerId: 'fake', providerSubId,
   purchasedSnapshot: { offeringLabel: '', variantLabel: '', amount: 0, currency: '', durationDays: 30, tierDisplayName: tierId, tierPriority: 1, purchasedAt: new Date().toISOString() },
   startDate: new Date().toISOString(), endDate: new Date(Date.now() + 20 * DAY_MS).toISOString(), autoRenew: true, status: 'active',
   createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
 });
 
-const orphans = () => r.pm().findOrphansForGuild('g1');
+const orphans = () => r.pm().findOrphansFor('guild:70000000000000001');
 const planOf = async () => (await orphans()).find(o => o.ref.providerSubId === 'orph')?.plan;
 const until = async (fn: () => boolean) => vi.waitFor(() => expect(fn()).toBe(true), { timeout: 5000, interval: 5 });
 const RUNNING = "Subscription 'orph' was not adopted: another adoption of it is already running; reload the page when it has finished.";
@@ -99,40 +99,40 @@ describe('C1: a second adoption of the same orphan while one runs in this proces
   it('with the same resume plan: refused before any provider call; the first installs it and nothing is paused', async () => {
     const plan = await planOf();
     expect(plan).toMatchObject({ kind: 'resume' });
-    const first = r.pm().adoptOrphan('g1', 'fake', 'orph', plan);
+    const first = r.pm().adoptOrphan('guild:70000000000000001', 'fake', 'orph', plan);
     await until(() => fake.resumeGates.length === 1);
-    await expect(r.pm().adoptOrphan('g1', 'fake', 'orph', plan)).rejects.toThrow(RUNNING);
+    await expect(r.pm().adoptOrphan('guild:70000000000000001', 'fake', 'orph', plan)).rejects.toThrow(RUNNING);
     expect(fake.resumes).toEqual(['orph']);
     fake.resumeGates[0].open();
     expect(await first).toBe(true);
     await d.settle();
-    expect(r.row()?.subscriptions?.g1?.active).toMatchObject({ providerSubId: 'orph', status: 'active' });
+    expect(r.row()?.subscriptions?.['guild:70000000000000001']?.active).toMatchObject({ providerSubId: 'orph', status: 'active' });
     expect(fake.pauses).toEqual([]);
   });
 
   it('listed active after the first resume landed at the provider (an install plan): refused, and the first installs it', async () => {
     const plan = await planOf();
-    const first = r.pm().adoptOrphan('g1', 'fake', 'orph', plan);
+    const first = r.pm().adoptOrphan('guild:70000000000000001', 'fake', 'orph', plan);
     await until(() => fake.resumeGates.length === 1);
     fake.refs = [asActive(fake.refs[0])];
     const install = await planOf();
     expect(install).toMatchObject({ kind: 'install' });
-    await expect(r.pm().adoptOrphan('g1', 'fake', 'orph', install)).rejects.toThrow(RUNNING);
+    await expect(r.pm().adoptOrphan('guild:70000000000000001', 'fake', 'orph', install)).rejects.toThrow(RUNNING);
     fake.resumeGates[0].open();
     expect(await first).toBe(true);
     await d.settle();
-    expect(r.row()?.subscriptions?.g1?.active).toMatchObject({ providerSubId: 'orph', status: 'active' });
+    expect(r.row()?.subscriptions?.['guild:70000000000000001']?.active).toMatchObject({ providerSubId: 'orph', status: 'active' });
     expect(fake.pauses).toEqual([]);
   });
 
   it('after the first ends, a later adoption is no longer refused for it', async () => {
     const plan = await planOf();
-    const first = r.pm().adoptOrphan('g1', 'fake', 'orph', plan);
+    const first = r.pm().adoptOrphan('guild:70000000000000001', 'fake', 'orph', plan);
     await until(() => fake.resumeGates.length === 1);
     fake.resumeGates[0].open();
     expect(await first).toBe(true);
     await d.settle();
-    await expect(r.pm().adoptOrphan('g1', 'fake', 'orph', plan)).rejects.toThrow("Subscription 'orph' is already in the local cache.");
+    await expect(r.pm().adoptOrphan('guild:70000000000000001', 'fake', 'orph', plan)).rejects.toThrow("Subscription 'orph' is already in the local cache.");
   });
 });
 
@@ -141,7 +141,7 @@ describe('C2: a sub premium saves while the provider list is open', () => {
     fake.list = gate();
     const listing = orphans();
     await until(() => fake.listed === 1);
-    await d.otherPremium(config => { config.subscriptions.g1 = { active: paid('orph', 'silver'), paused: [] }; });
+    await d.otherPremium(config => { config.subscriptions['guild:70000000000000001'] = { active: paid('orph', 'silver'), paused: [] }; });
     fake.list.open();
     expect((await listing).map(o => o.ref.providerSubId)).toEqual([]);
   });
@@ -173,7 +173,7 @@ describe('ops-2: a recorded day count no Date can hold', () => {
     fake.refs = [pausedRef({ pausedDaysLeft: 100000000, pausedAt: AT })];
     const plan = await planOf();
     expect(plan).toMatchObject({ kind: 'resume', days: 2, from: 'period' });
-    const run = r.pm().adoptOrphan('g1', 'fake', 'orph', plan);
+    const run = r.pm().adoptOrphan('guild:70000000000000001', 'fake', 'orph', plan);
     await until(() => fake.resumeGates.length === 1);
     fake.resumeGates[0].open();
     expect(await run).toBe(true);

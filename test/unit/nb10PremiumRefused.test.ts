@@ -29,8 +29,8 @@ vi.mock('../../src/bot/internalSetup/utils/payment/paymentRegistry', async orig 
 });
 const notices = vi.hoisted(() => ({ sent: [] as string[] }));
 vi.mock('../../src/bot/internalSetup/utils/premiumNotifications', () => ({
-  dispatchPremiumNotification: async (guildId: string, kind: string) => {
-    notices.sent.push(`${kind}:${guildId}`);
+  dispatchPremiumNotification: async (holder: string, kind: string) => {
+    notices.sent.push(`${kind}:${holder}`);
     return { delivered: true, via: 'dm' };
   },
 }));
@@ -51,12 +51,13 @@ import { verdictOf } from '../../src/bot/internalSetup/utils/dataBackends/replyG
 import { reopenSharedWrites } from '../../src/bot/internalSetup/utils/dataManager';
 import { checkWriterLock, configureWriterLock, releaseWriterLock, takeWriterLock, writerLockDepth, writerLockPath } from '../../src/bot/internalSetup/utils/writerLock';
 import { AUDIT, clearGlobal, DUMMY_STATE, gate, JOURNAL, jsonOf, linesOf, logged, paidSub, PREMIUM, quiet, rawOf, settleQueue, tick, writePremium } from './nb10PremiumRig';
+import { gh } from '../helpers/p1Holder';
 
 const role = process.env.BOT_PROCESS_ROLE;
 const STORAGE = 'storage-failing';
 const refuse = (...files: string[]) => { for (const f of files) inject.refuse.set(f, STORAGE); };
 const recover = () => inject.refuse.clear();
-const grant = (guildId = 'g1', tierId = 'high') => applySharedOp({ op: 'premium.grantManual', args: { args: [guildId, tierId, 30] } });
+const grant = (guildId = '70000000000000001', tierId = 'high') => applySharedOp({ op: 'premium.grantManual', args: { args: [gh(guildId), tierId, 30] } });
 
 let spies: ReturnType<typeof quiet>;
 beforeAll(() => clearGlobal());
@@ -91,10 +92,10 @@ describe('a refused save in the bot is held and retried', () => {
     expect(reply).toMatchObject({ ok: false, code: 'unconfirmed', answer: 'held' });
     expect(reply.error).toContain('the bot keeps retrying');
     expect(reply.error.endsWith(PROVIDER_SENTENCE)).toBe(true);
-    expect(getPremiumManager().resolveActiveTier('g1').tierId).toBe('high');
-    expect(notices.sent).toContain('manual.grant.added:g1');
+    expect(getPremiumManager().resolveActiveTier('70000000000000001').tierId).toBe('high');
+    expect(notices.sent).toContain('manual.grant.added:guild:70000000000000001');
     recover();
-    await vi.waitFor(() => expect(jsonOf(PREMIUM).subscriptions.g1.active.tierId).toBe('high'), { timeout: 5000, interval: 50 });
+    await vi.waitFor(() => expect(jsonOf(PREMIUM).subscriptions['guild:70000000000000001'].active.tierId).toBe('high'), { timeout: 5000, interval: 50 });
     await vi.waitFor(() => expect(linesOf(AUDIT).map(l => l.action)).toEqual(['subscription.grant.manual']), { timeout: 5000, interval: 50 });
   });
 
@@ -121,38 +122,38 @@ describe('a refused save in the bot is held and retried', () => {
   it('the folder refusing both files: each op answers held, and the retry writes each change and its lines once, in order', async () => {
     const dummy = new DummyProvider();
     getPaymentRegistry().register(dummy);
-    const bought = await dummy.initiatePurchase({ guildId: 'g2', tierId: 'low', offeringId: 'o1', variantId: 'dummy_monthly_999' } as any);
-    writePremium({ g2: { active: paidSub('s2', bought.providerSubId!, 'low', 'dummy'), paused: [] } });
+    const bought = await dummy.initiatePurchase({ holder: 'guild:70000000000000002', buyerId: '80000000000000001', tierId: 'low', offeringId: 'o1', variantId: 'dummy_monthly_999' } as any);
+    writePremium({ 'guild:70000000000000002': { active: paidSub('s2', bought.providerSubId!, 'low', 'dummy'), paused: [] } });
     refuse('premium-tiers.json', 'premium-tiers.audit.jsonl');
-    expect(await grant('g1')).toMatchObject({ answer: 'held' });
-    expect(await applySharedOp({ op: 'premium.cancelPaidSubscriptionImmediately', args: { args: ['g2'] } })).toMatchObject({ answer: 'held' });
+    expect(await grant('70000000000000001')).toMatchObject({ answer: 'held' });
+    expect(await applySharedOp({ op: 'premium.cancelPaidSubscriptionImmediately', args: { args: ['guild:70000000000000002'] } })).toMatchObject({ answer: 'held' });
     const stricter = { ...jsonOf(PREMIUM).tiers.high, overrides: {} };
     expect(await applySharedOp({ op: 'premium.setTier', args: { args: ['high', stricter] } })).toMatchObject({ answer: 'held' });
     recover();
     await vi.waitFor(() => expect(linesOf(AUDIT)).toHaveLength(3), { timeout: 5000, interval: 50 });
     expect(linesOf(AUDIT).map(l => l.action)).toEqual(['subscription.grant.manual', 'subscription.cancel.paid', 'tier.update']);
-    await vi.waitFor(() => expect(jsonOf(PREMIUM).subscriptions.g1?.active?.tierId).toBe('high'), { timeout: 5000, interval: 50 });
+    await vi.waitFor(() => expect(jsonOf(PREMIUM).subscriptions['guild:70000000000000001']?.active?.tierId).toBe('high'), { timeout: 5000, interval: 50 });
     const saved = jsonOf(PREMIUM);
-    expect(saved.subscriptions.g1.active.tierId).toBe('high');
-    expect(saved.subscriptions.g2).toBeUndefined();
+    expect(saved.subscriptions['guild:70000000000000001'].active.tierId).toBe('high');
+    expect(saved.subscriptions['guild:70000000000000002']).toBeUndefined();
   });
 
   it('a held stricter setTier dispatches the subscriber notice at once and writes its tier.update line through the retry', async () => {
     const base = jsonOf(PREMIUM);
-    writePremium({ g1: { active: paidSub('s1', 'ps1', 'high'), paused: [] } }, {
+    writePremium({ 'guild:70000000000000001': { active: paidSub('s1', 'ps1', 'high'), paused: [] } }, {
       tiers: { ...base.tiers, high: { ...base.tiers.high, overrides: { nb10mod: { feature: true } } } },
     });
     refuse('premium-tiers.json', 'premium-tiers.audit.jsonl');
     const stricter = { ...jsonOf(PREMIUM).tiers.high, overrides: {} };
     const reply: any = await applySharedOp({ op: 'premium.setTier', args: { args: ['high', stricter] } });
     expect(reply).toMatchObject({ ok: false, code: 'unconfirmed', answer: 'held' });
-    expect(notices.sent).toEqual(['tier.config-change-affecting-subscriber:g1']);
+    expect(notices.sent).toEqual(['tier.config-change-affecting-subscriber:guild:70000000000000001']);
     expect(linesOf(AUDIT)).toEqual([]);
     recover();
     await vi.waitFor(() => expect(linesOf(AUDIT).map(l => l.action)).toEqual(['tier.update']), { timeout: 5000, interval: 50 });
     await vi.waitFor(() => expect(jsonOf(PREMIUM).tiers.high.overrides).toEqual({}), { timeout: 5000, interval: 50 });
     expect(jsonOf(PREMIUM).tiers.high.overrides).toEqual({});
-    expect(notices.sent).toEqual(['tier.config-change-affecting-subscriber:g1']);
+    expect(notices.sent).toEqual(['tier.config-change-affecting-subscriber:guild:70000000000000001']);
   });
 
   it('the Dummy state the same: held, then written by the retry', async () => {
@@ -168,68 +169,68 @@ describe('a refused save in the bot is held and retried', () => {
 
 describe('the final stop step', () => {
   it('logs a held change and each held line; then nothing is written, and later changes, lines and notices are refused', async () => {
-    writePremium({ g2: { active: paidSub('s2', 'ps2', 'low', 'slow'), paused: [] } });
+    writePremium({ 'guild:70000000000000002': { active: paidSub('s2', 'ps2', 'low', 'slow'), paused: [] } });
     const cancel = gate();
     getPaymentRegistry().register({
-      id: 'slow', displayName: 'Slow', capabilities: { supportsCancel: true }, isConfigured: () => true,
+      id: 'slow', displayName: 'Slow', capabilities: { sells: ['guild'], supportsCancel: true }, isConfigured: () => true,
       cancelSubscription: () => cancel.promise,
     } as any);
     const dummy = new DummyProvider();
     getPaymentRegistry().register(dummy);
     refuse('premium-tiers.json', 'premium-tiers.audit.jsonl');
-    expect(await grant('g1')).toMatchObject({ answer: 'held' });
+    expect(await grant('70000000000000001')).toMatchObject({ answer: 'held' });
     const pm = getPremiumManager();
     startPremiumTickers();
     expect((dummy as any).tickTimer).not.toBeNull();
     expect((pm as any).expiryTimer).not.toBeNull();
-    const resumed = applySharedOp({ op: 'premium.cancelPaidSubscriptionImmediately', args: { args: ['g2'] } });
+    const resumed = applySharedOp({ op: 'premium.cancelPaidSubscriptionImmediately', args: { args: ['guild:70000000000000002'] } });
     await tick(20);
     pm.finalStop();
     dummy.finalStop();
     expect((dummy as any).tickTimer).toBeNull();
     const errors = logged(spies.error);
     expect(errors).toContain('[PremiumManager] premium-tiers.json holds changes the disk refused; they are lost with this stop');
-    expect(errors.some(l => /^\[PremiumManager\] The audit line subscription\.grant\.manual \(guild g1, .+\) was refused by the disk and is lost with this stop$/.test(l))).toBe(true);
+    expect(errors.some(l => /^\[PremiumManager\] The audit line subscription\.grant\.manual \(guild 70000000000000001, .+\) was refused by the disk and is lost with this stop$/.test(l))).toBe(true);
     expect((pm as any).retryTimer).toBeNull();
     expect((pm as any).expiryTimer).toBeNull();
     cancel.open();
     const late: any = await resumed;
     expect(late.ok).toBe(false);
     expect(late.answer).toBe('node-stopping');
-    expect(logged(spies.error).some(l => /^\[PremiumManager\] The audit line subscription\.cancel\.paid \(guild g2, .+\) was not written: the bot is stopping; it is lost$/.test(l))).toBe(true);
-    expect(logged(spies.warn).some(l => l === '[PremiumManager] The paid.sub.cancelled-by-user notice for guild g2 was not sent: the bot is stopping')).toBe(true);
-    const before = pm.getSubscriptions('g3');
-    expect(await grant('g3')).toMatchObject({ ok: false, answer: 'node-stopping' });
-    expect(pm.getSubscriptions('g3')).toEqual(before);
+    expect(logged(spies.error).some(l => /^\[PremiumManager\] The audit line subscription\.cancel\.paid \(guild 70000000000000002, .+\) was not written: the bot is stopping; it is lost$/.test(l))).toBe(true);
+    expect(logged(spies.warn).some(l => l === '[PremiumManager] The paid.sub.cancelled-by-user notice for guild 70000000000000002 was not sent: the bot is stopping')).toBe(true);
+    const before = pm.getSubscriptions('guild:70000000000000003');
+    expect(await grant('70000000000000003')).toMatchObject({ ok: false, answer: 'node-stopping' });
+    expect(pm.getSubscriptions('guild:70000000000000003')).toEqual(before);
     recover();
     await new Promise(resolve => setTimeout(resolve, 1500));
     await settleQueue();
-    expect(jsonOf(PREMIUM).subscriptions.g1).toBeUndefined();
-    expect(jsonOf(PREMIUM).subscriptions.g2.active).toBeTruthy();
+    expect(jsonOf(PREMIUM).subscriptions['guild:70000000000000001']).toBeUndefined();
+    expect(jsonOf(PREMIUM).subscriptions['guild:70000000000000002'].active).toBeTruthy();
     expect(linesOf(AUDIT)).toEqual([]);
   });
 
   it("an event after the stop is refused: a webhook's op answers not saved and the log says its provider sends it again; a tick's is lost", async () => {
     const fetched = gate();
     getPaymentRegistry().register({
-      id: 'hook', displayName: 'Hook', capabilities: {}, isConfigured: () => true,
+      id: 'hook', displayName: 'Hook', capabilities: { sells: ['guild'] }, isConfigured: () => true,
       handleWebhook: async (body: Buffer) => {
         await fetched.promise;
         getPaymentRegistry().emitEvent(JSON.parse(body.toString()));
       },
     } as any);
-    const event = { type: 'subscription.created', providerId: 'hook', providerSubId: 'h1', guildId: 'g5', tierId: 'low', offeringId: 'o1', state: { status: 'active', startDate: new Date().toISOString(), endDate: null, autoRenew: true } };
+    const event = { type: 'subscription.created', buyerId: '80000000000000001', providerId: 'hook', providerSubId: 'h1', holder: 'guild:70000000000000005', tierId: 'low', offeringId: 'o1', state: { status: 'active', startDate: new Date().toISOString(), endDate: null, autoRenew: true } };
     const pm = getPremiumManager();
     const reply = applySharedOp({ op: 'payment.webhook', args: { providerId: 'hook', body: Buffer.from(JSON.stringify(event)).toString('base64') } });
     await tick(20);
     pm.finalStop();
     fetched.open();
     expect(await reply).toMatchObject({ ok: false, answer: 'node-stopping' });
-    expect(logged(spies.error).some(l => l.startsWith('[PremiumManager] A subscription.created event from hook (subscription h1, guild g5) was not applied: the bot is stopping; the request that raised it is answered as not saved, and a webhook\'s provider sends it again: {'))).toBe(true);
+    expect(logged(spies.error).some(l => l.startsWith('[PremiumManager] A subscription.created event from hook (subscription h1, guild 70000000000000005) was not applied: the bot is stopping; the request that raised it is answered as not saved, and a webhook\'s provider sends it again: {'))).toBe(true);
     getPaymentRegistry().emitEvent({ ...event, providerSubId: 'h2' } as any);
-    expect(logged(spies.error).some(l => l.startsWith('[PremiumManager] A subscription.created event from hook (subscription h2, guild g5) was not applied: the bot is stopping; it is lost: {'))).toBe(true);
+    expect(logged(spies.error).some(l => l.startsWith('[PremiumManager] A subscription.created event from hook (subscription h2, guild 70000000000000005) was not applied: the bot is stopping; it is lost: {'))).toBe(true);
     await settleQueue();
-    expect(jsonOf(PREMIUM).subscriptions.g5).toBeUndefined();
+    expect(jsonOf(PREMIUM).subscriptions['guild:70000000000000005']).toBeUndefined();
   });
 });
 
@@ -245,11 +246,11 @@ describe('a deposition', () => {
       expect(checkWriterLock().kind).toBe('deposed');
       expect(pm.isStopped()).toBe(true);
       const verdict = await runSealed('console', null, null, async ledger => {
-        expect(await pm.grantManual('g1', 'high', 3)).toBe(false);
+        expect(await pm.grantManual('guild:70000000000000001', 'high', 3)).toBe(false);
         return verdictOf([ledger]);
       });
       expect(verdict).toMatchObject({ ok: false, answer: 'writer-lost' });
-      expect(pm.resolveActiveTier('g1').tierId).toBe('free');
+      expect(pm.resolveActiveTier('70000000000000001').tierId).toBe('free');
       expect((pm as any).retryTimer).toBeNull();
     } finally {
       // A take from depth 0 forgets the deposition; the release leaves the lock free for the next test.
@@ -293,7 +294,7 @@ describe('a deposition', () => {
       getPaymentRegistry().register(dummy);
       await deposedAfter(async () => {
         refuse('premium-tiers.json', 'premium-tiers.audit.jsonl');
-        expect(await grant('g1')).toMatchObject({ ok: false, answer: 'held' });
+        expect(await grant('70000000000000001')).toMatchObject({ ok: false, answer: 'held' });
         startPremiumTickers();
         expect((pm as any).expiryTimer).not.toBeNull();
         expect((dummy as any).tickTimer).not.toBeNull();
@@ -307,7 +308,7 @@ describe('a deposition', () => {
       expect((dummy as any).tickTimer).toBeNull();
       const errors = logged(spies.error);
       expect(errors.filter(l => l === '[PremiumManager] premium-tiers.json holds changes the disk refused; they are lost: another process took the data files')).toHaveLength(1);
-      expect(errors.filter(l => /^\[PremiumManager\] The audit line subscription\.grant\.manual \(guild g1, [^)]+\) was refused by the disk and is lost: another process took the data files$/.test(l))).toHaveLength(1);
+      expect(errors.filter(l => /^\[PremiumManager\] The audit line subscription\.grant\.manual \(guild 70000000000000001, [^)]+\) was refused by the disk and is lost: another process took the data files$/.test(l))).toHaveLength(1);
       expect(errors.filter(l => l.includes('with this stop') || l.includes('the bot is stopping'))).toEqual([]);
       expect((pm as any).expiryTimer).toBeNull();
       expect((pm as any).retryTimer).toBeNull();
@@ -320,7 +321,7 @@ describe('a deposition', () => {
   });
 
   it('an event whose journal line has not landed is logged once at the exit, worded for the deposition', async () => {
-    const event = { type: 'subscription.expired', providerId: 'discord', providerSubId: 'd1', guildId: 'g1', state: { status: 'expired', startDate: new Date().toISOString(), endDate: new Date(Date.now() - 1000).toISOString(), autoRenew: false } };
+    const event = { type: 'subscription.expired', providerId: 'discord', providerSubId: 'd1', holder: 'guild:70000000000000001', state: { status: 'expired', startDate: new Date().toISOString(), endDate: new Date(Date.now() - 1000).toISOString(), autoRenew: false } };
     try {
       fs.writeFileSync(PREMIUM, '{ broken');
       const pm = getPremiumManager();
@@ -334,7 +335,7 @@ describe('a deposition', () => {
       pm.finalStop();
       pm.logLossesAtExit();
       const errors = logged(spies.error);
-      expect(errors).toEqual([`[PremiumManager] A subscription.expired event from discord (subscription d1, guild g1) was received while premium-tiers.json could not be read and is lost: another process took the data files: ${JSON.stringify(event)}`]);
+      expect(errors).toEqual([`[PremiumManager] A subscription.expired event from discord (subscription d1, guild 70000000000000001) was received while premium-tiers.json could not be read and is lost: another process took the data files: ${JSON.stringify(event)}`]);
       expect(rawOf(PREMIUM)).toBe('{ broken');
       expect(rawOf(JOURNAL)).toBeNull();
     } finally {
@@ -344,7 +345,7 @@ describe('a deposition', () => {
 });
 
 describe('events kept in memory while premium-tiers.json cannot be read (NB10 tests 25 and 41)', () => {
-  const event = { type: 'subscription.expired', providerId: 'discord', providerSubId: 'd1', guildId: 'g1', state: { status: 'expired', startDate: new Date().toISOString(), endDate: new Date(Date.now() - 1000).toISOString(), autoRenew: false } };
+  const event = { type: 'subscription.expired', providerId: 'discord', providerSubId: 'd1', holder: 'guild:70000000000000001', state: { status: 'expired', startDate: new Date().toISOString(), endDate: new Date(Date.now() - 1000).toISOString(), autoRenew: false } };
 
   it('the same process applies the kept event once the file can be read and the tickers run, and its mark covers its line', async () => {
     fs.writeFileSync(PREMIUM, '{ broken');
@@ -353,17 +354,17 @@ describe('events kept in memory while premium-tiers.json cannot be read (NB10 te
     getPaymentRegistry().emitEvent(event as any);
     await settleQueue();
     expect(linesOf(JOURNAL)).toHaveLength(1);
-    writePremium({ g1: { active: paidSub('s1', 'd1', 'low', 'discord'), paused: [] } });
+    writePremium({ 'guild:70000000000000001': { active: paidSub('s1', 'd1', 'low', 'discord'), paused: [] } });
     // The load is tried again at most every 5 s.
     (pm as any).lastLoadTry = -Infinity;
-    expect(pm.resolveActiveTier('g1').tierId).toBe('low');
+    expect(pm.resolveActiveTier('70000000000000001').tierId).toBe('low');
     expect(pm.cacheState()).toBe('replaying');
     startPremiumTickers();
     await vi.waitFor(() => expect(rawOf(JOURNAL)).toBeNull(), { timeout: 5000, interval: 20 });
     const saved = jsonOf(PREMIUM);
-    expect(saved.subscriptions.g1.active).toBeUndefined();
+    expect(saved.subscriptions['guild:70000000000000001'].active).toBeUndefined();
     expect(Object.values(saved.eventsApplied)).toEqual([1]);
-    expect(notices.sent).toEqual(['paid.sub.expired:g1']);
+    expect(notices.sent).toEqual(['paid.sub.expired:guild:70000000000000001']);
     pm.stopExpiryChecker();
   });
 
@@ -377,7 +378,7 @@ describe('events kept in memory while premium-tiers.json cannot be read (NB10 te
     pm.finalStop();
     spies.error.mockClear();
     pm.logLossesAtExit();
-    expect(logged(spies.error)).toEqual([`[PremiumManager] A subscription.expired event from discord (subscription d1, guild g1) was received while premium-tiers.json could not be read and is lost with this stop: ${JSON.stringify(event)}`]);
+    expect(logged(spies.error)).toEqual([`[PremiumManager] A subscription.expired event from discord (subscription d1, guild 70000000000000001) was received while premium-tiers.json could not be read and is lost with this stop: ${JSON.stringify(event)}`]);
   });
 });
 
@@ -389,7 +390,7 @@ describe('the local chain (web UI, no child)', () => {
     const undo = failFlushes(PREMIUM);
     try {
       const manager = new BotManager();
-      const first = manager.runSharedOp('premium.grantManual', { args: ['g1', 'high', 30] });
+      const first = manager.runSharedOp('premium.grantManual', { args: ['guild:70000000000000001', 'high', 30] });
       const stricter = { ...jsonOf(PREMIUM).tiers.low, displayName: 'Lower' };
       const second = manager.runSharedOp('premium.setTier', { args: ['low', stricter] });
       const one: any = await first;
@@ -400,8 +401,8 @@ describe('the local chain (web UI, no child)', () => {
       expect(await second).toMatchObject({ ok: true });
       await settleQueue();
       expect(jsonOf(PREMIUM).tiers.low.displayName).toBe('Lower');
-      expect(jsonOf(PREMIUM).subscriptions.g1).toBeUndefined();
-      expect(getPremiumManager().resolveActiveTier('g1').tierId).toBe('free');
+      expect(jsonOf(PREMIUM).subscriptions['guild:70000000000000001']).toBeUndefined();
+      expect(getPremiumManager().resolveActiveTier('70000000000000001').tierId).toBe('free');
       expect(fs.existsSync(writerLockPath())).toBe(false);
     } finally {
       undo();
@@ -412,7 +413,7 @@ describe('the local chain (web UI, no child)', () => {
   it('op 1 refused, then the caches are dropped: op 2 writes a file without op 1 change', async () => {
     delete process.env.BOT_PROCESS_ROLE;
     refuse('premium-tiers.json');
-    const first: any = await grant('g1');
+    const first: any = await grant('70000000000000001');
     expect(first).toMatchObject({ ok: false, code: 'unconfirmed', answer: STORAGE });
     expect(first.error.endsWith(PROVIDER_SENTENCE)).toBe(true);
     invalidateSharedCaches();
@@ -421,7 +422,7 @@ describe('the local chain (web UI, no child)', () => {
     expect(await applySharedOp({ op: 'premium.setTier', args: { args: ['low', stricter] } })).toMatchObject({ ok: true });
     await settleQueue();
     expect(jsonOf(PREMIUM).tiers.low.displayName).toBe('Lower');
-    expect(jsonOf(PREMIUM).subscriptions.g1).toBeUndefined();
-    expect(getPremiumManager().resolveActiveTier('g1').tierId).toBe('free');
+    expect(jsonOf(PREMIUM).subscriptions['guild:70000000000000001']).toBeUndefined();
+    expect(getPremiumManager().resolveActiveTier('70000000000000001').tierId).toBe('free');
   });
 });

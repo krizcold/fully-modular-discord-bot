@@ -7,13 +7,14 @@
  * and this handler relays them to the bot-side `SubscriptionNotifier`.
  *
  * Message shape:
- *   { type: 'notification:dispatch', requestId, data: { guildId, kind, payload } }
+ *   { type: 'notification:dispatch', requestId, data: { holder, kind, payload } }
  *
  * Owns the `notification:` prefix; coexists with the panel/reload/toggle
  * handlers (each looks at its own prefix and ignores the rest).
  */
 
 import { getSubscriptionNotifier, NotificationType, NotificationPayload } from './subscriptionNotifier';
+import { notHolderText, parseHolder } from './premiumHolder';
 
 export function setupIPCNotificationHandler(): void {
   if (process.env.BOT_PROCESS_ROLE !== 'bot') {
@@ -33,14 +34,19 @@ export function setupIPCNotificationHandler(): void {
     try {
       switch (type) {
         case 'notification:dispatch': {
-          const guildId = data?.guildId;
+          const holder = data?.holder;
           const kind = data?.kind as NotificationType | undefined;
           const payload = (data?.payload || {}) as NotificationPayload;
-          if (!guildId || !kind) {
-            process.send!({ requestId, data: { success: false, error: 'guildId and kind are required' } });
+          if (!holder || !kind) {
+            process.send!({ requestId, data: { success: false, error: 'holder and kind are required' } });
             return;
           }
-          const outcome = await getSubscriptionNotifier().notify(guildId, kind, payload);
+          const parsed = parseHolder(holder);
+          if (!parsed) {
+            process.send!({ requestId, data: { success: false, error: notHolderText(holder) } });
+            return;
+          }
+          const outcome = await getSubscriptionNotifier().notify(parsed.key, kind, payload);
           process.send!({ requestId, data: { success: outcome.delivered, outcome } });
           return;
         }

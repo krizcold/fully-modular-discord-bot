@@ -1,0 +1,240 @@
+{
+  "tiers": {
+    "free": {
+      "displayName": "Free",
+      "priority": 0,
+      "overrides": {},
+      "offerings": []
+    },
+    "gold": {
+      "displayName": "Gold",
+      "priority": 2,
+      "overrides": {},
+      "offerings": [
+        {
+          "id": "o1",
+          "label": "Gold",
+          "providerLinks": [
+            {
+              "providerId": "dummy",
+              "enabled": true,
+              "mode": "price",
+              "priceConfig": {
+                "entries": [
+                  {
+                    "variantId": "dummy_monthly_999"
+                  },
+                  {
+                    "variantId": "dummy_yearly_9999"
+                  }
+                ]
+              },
+              "cache": {
+                "syncedAt": "2026-01-01T00:00:00.000Z",
+                "variants": [
+                  {
+                    "variantId": "dummy_monthly_999",
+                    "label": "Monthly",
+                    "amount": 999,
+                    "currency": "USD",
+                    "durationDays": 30,
+                    "recurring": true,
+                    "active": true
+                  },
+                  {
+                    "variantId": "dummy_yearly_9999",
+                    "label": "Yearly (save 16%)",
+                    "amount": 9999,
+                    "currency": "USD",
+                    "durationDays": 365,
+                    "recurring": true,
+                    "active": true
+                  }
+                ]
+              }
+            }
+          ],
+          "forceAutoRenew": false
+        }
+      ]
+    },
+    "silver": {
+      "displayName": "Silver",
+      "priority": 1,
+      "overrides": {},
+      "offerings": [
+        {
+          "id": "o2",
+          "label": "Silver",
+          "providerLinks": [
+            {
+              "providerId": "dummy",
+              "enabled": true,
+              "mode": "price",
+              "priceConfig": {
+                "entries": [
+                  {
+                    "variantId": "dummy_monthly_999"
+                  },
+                  {
+                    "variantId": "dummy_yearly_9999"
+                  }
+                ]
+              },
+              "cache": {
+                "syncedAt": "2026-01-01T00:00:00.000Z",
+                "variants": [
+                  {
+                    "variantId": "dummy_monthly_999",
+                    "label": "Monthly",
+                    "amount": 999,
+                    "currency": "USD",
+                    "durationDays": 30,
+                    "recurring": true,
+                    "active": true
+                  },
+                  {
+                    "variantId": "dummy_yearly_9999",
+                    "label": "Yearly (save 16%)",
+                    "amount": 9999,
+                    "currency": "USD",
+                    "durationDays": 365,
+                    "recurring": true,
+                    "active": true
+                  }
+                ]
+              }
+            }
+          ],
+          "forceAutoRenew": false
+        }
+      ]
+    }
+  },
+  "subscriptions": {
+    "111111111111111111": {
+      "active": {
+        "id": "c9bbaba1-48c7-4553-a3a2-c2553c9c0755",
+        "tierId": "gold",
+        "source": "paid",
+        "offeringId": "o1",
+        "variantId": "dummy_monthly_999",
+        "providerId": "dummy",
+        "providerSubId": "dummy_1",
+        "purchasedSnapshot": {
+          "offeringLabel": "Gold",
+          "variantLabel": "Monthly",
+          "amount": 999,
+          "currency": "USD",
+          "durationDays": 30,
+          "tierDisplayName": "Gold",
+          "tierPriority": 2,
+          "purchasedAt": "2026-11-20T18:34:02.073Z"
+        },
+        "startDate": "2026-11-20T18:34:02.073Z",
+        "endDate": "2026-12-20T18:34:02.073Z",
+        "autoRenew": true,
+        "status": "active",
+        "createdAt": "2026-11-20T18:34:02.073Z",
+        "updatedAt": "2026-11-20T18:34:02.073Z"
+      },
+      "paused": [
+        {
+          "id": "7e46f118-5dc2-4092-8802-73cfcb2b98c2",
+          "tierId": "silver",
+          "source": "manual",
+          "purchasedSnapshot": {
+            "offeringLabel": "",
+            "variantLabel": "",
+            "amount": 0,
+            "currency": "",
+            "durationDays": 30,
+            "tierDisplayName": "Silver",
+            "tierPriority": 1,
+            "purchasedAt": "2026-11-20T18:34:02.133Z"
+          },
+          "startDate": "2026-11-20T18:34:02.133Z",
+          "endDate": "2026-12-20T18:34:02.133Z",
+          "autoRenew": false,
+          "status": "paused",
+          "pausedAt": "2026-11-20T18:34:02.133Z",
+          "remainingDaysAtPause": 30,
+          "resumesAtHint": "2026-12-20T18:34:02.073Z",
+          "createdAt": "2026-11-20T18:34:02.133Z",
+          "updatedAt": "2026-11-20T18:34:02.133Z"
+        }
+      ]
+    },
+    "222222222222222222": {
+      "active": {
+        "id": "e1028aa9-336f-4eea-9a27-e21935cf1eb8",
+        "tierId": "silver",
+        "source": "manual",
+        "purchasedSnapshot": {
+          "offeringLabel": "",
+          "variantLabel": "",
+          "amount": 0,
+          "currency": "",
+          "durationDays": null,
+          "tierDisplayName": "Silver",
+          "tierPriority": 1,
+          "purchasedAt": "2026-11-20T18:34:02.173Z"
+        },
+        "startDate": "2026-11-20T18:34:02.173Z",
+        "endDate": null,
+        "autoRenew": false,
+        "status": "active",
+        "createdAt": "2026-11-20T18:34:02.173Z",
+        "updatedAt": "2026-11-20T18:34:02.173Z"
+      },
+      "paused": [],
+      "notificationsChannelId": "333333333333333333"
+    }
+  },
+  "messages": {
+    "moduleBlocked": ":no_entry_sign: This module is not available for your server's current tier.",
+    "commandBlocked": ":no_entry_sign: This command is not available for your server's current tier.",
+    "panelBlocked": ":no_entry_sign: This module is not available for your server's current tier.",
+    "upgradeButtonLabel": "Upgrade your tier"
+  },
+  "providerAccountLinks": {
+    "patreon": {
+      "patreon-account-1": "222222222222222222"
+    }
+  },
+  "activatedProviders": {
+    "dummy": {
+      "defaultEnabled": false
+    }
+  },
+  "migrations": [
+    {
+      "id": "5f172075-8282-48f3-9c71-1a896688a0ff",
+      "providerId": "dummy",
+      "sourceTierId": "gold",
+      "sourceOfferingId": "o1",
+      "sourceVariantId": "dummy_monthly_999",
+      "targetTierId": "gold",
+      "targetOfferingId": "o1",
+      "targetVariantId": "dummy_yearly_9999",
+      "effectiveDate": "2026-12-10T18:34:02.293Z",
+      "message": "The monthly plan becomes yearly.",
+      "scheduledAt": "2026-11-20T18:34:02.293Z",
+      "scheduledBy": "admin",
+      "status": "pending",
+      "decisions": [
+        {
+          "guildId": "111111111111111111",
+          "subscriptionId": "c9bbaba1-48c7-4553-a3a2-c2553c9c0755",
+          "providerSubId": "dummy_1",
+          "decision": "pending",
+          "notifiedAt": "2026-11-20T18:34:02.293Z"
+        }
+      ]
+    }
+  ],
+  "migrationSilencePolicy": "cancel",
+  "eventsApplied": {
+    "p-old": 1
+  }
+}

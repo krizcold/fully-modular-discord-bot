@@ -79,7 +79,7 @@ const WAITING = 'Premium holds provider events received while premium-tiers.json
 const foreignText = (name: string, seconds: unknown) =>
   `Premium holds provider events that ${name} received while premium-tiers.json could not be read there; nothing was saved. The bot on ${name} applies them once it runs normally (any bot does once that one has been stopped for ${seconds} s); try again then.`;
 
-const event = { type: 'subscription.renewed', providerId: 'fake', providerSubId: 'e1', guildId: 'g1' };
+const event = { type: 'subscription.renewed', providerId: 'fake', providerSubId: 'e1', holder: 'guild:70000000000000001' };
 
 function line(id: string, fields: Record<string, unknown>): { id: string; line: string } {
   return { id, line: JSON.stringify({ n: 1, event, ...fields }) };

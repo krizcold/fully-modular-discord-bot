@@ -22,6 +22,7 @@ import * as crypto from 'crypto';
 import { PROVIDER_FETCH_MS } from './paymentTypes';
 import { providerCredentials } from '@/utils/envLoader';
 import { getPaymentRegistry } from './paymentRegistry';
+import { guildIdFor, holderFromWire, type HolderKey } from '../premiumHolder';
 import type {
   PaymentProvider,
   ProviderCapabilities,
@@ -53,6 +54,7 @@ const CAPABILITIES: ProviderCapabilities = {
   mechanism: 'redirect',
   variantIdLabel: 'Lemon Squeezy Variant ID',
   productIdLabel: 'Lemon Squeezy Product ID',
+  sells: ['guild'],
 };
 
 interface LSResource<TAttr> {
@@ -134,6 +136,7 @@ export class LemonSqueezyProvider implements PaymentProvider {
   }
 
   async initiatePurchase(opts: InitiateOpts): Promise<InitiateResult> {
+    const guildId = guildIdFor(opts.holder as HolderKey, this.displayName);
     const c = providerCredentials('lemonsqueezy');
     if (!c.LEMONSQUEEZY_API_KEY || !c.LEMONSQUEEZY_STORE_ID) {
       throw new Error('Lemon Squeezy not configured');
@@ -145,12 +148,12 @@ export class LemonSqueezyProvider implements PaymentProvider {
           checkout_data: {
             // Map our metadata onto LS custom_data; webhooks echo it back.
             custom: {
-              guildId: opts.guildId,
+              guildId,
               tierId: opts.tierId,
               offeringId: opts.offeringId,
               variantId: opts.variantId,
               ...(opts.couponCode ? { couponCode: opts.couponCode } : {}),
-              ...(opts.userId ? { userId: opts.userId } : {}),
+              ...(opts.buyerId ? { userId: opts.buyerId } : {}),
             },
             // discount_code lives inside checkout_data per LS API docs
             // (https://docs.lemonsqueezy.com/api/checkouts/create-checkout);
@@ -241,12 +244,12 @@ export class LemonSqueezyProvider implements PaymentProvider {
     return data?.data ? this.stateFromSubscription(data.data) : null;
   }
 
-  async listSubscriptionsForGuild(guildId: string): Promise<ProviderSubscriptionRef[]> {
+  async listSubscriptionsFor(holder: HolderKey): Promise<ProviderSubscriptionRef[]> {
     // LS doesn't index by our custom guildId; we'd need to list everything
     // and filter on the metadata. For now, return empty and rely on
     // webhook delivery to install subs. A future polling sweep can add
     // this if orphan adoption becomes a real need.
-    void guildId;
+    void holder;
     return [];
   }
 
@@ -280,8 +283,8 @@ export class LemonSqueezyProvider implements PaymentProvider {
     const registry = getPaymentRegistry();
     const state = this.stateFromSubscription(data);
     const subId = data.id;
-    const guildId = String(custom.guildId || '');
-    if (!guildId) return; // unknown guild - ignore (probably not our checkout)
+    const holder = holderFromWire(custom.guildId);
+    if (!holder) return;
 
     switch (eventName) {
       case 'subscription_created':
@@ -289,7 +292,8 @@ export class LemonSqueezyProvider implements PaymentProvider {
           type: 'subscription.created',
           providerId: this.id,
           providerSubId: subId,
-          guildId,
+          holder,
+          buyerId: custom.userId ? String(custom.userId) : undefined,
           tierId: String(custom.tierId || ''),
           offeringId: String(custom.offeringId || ''),
           variantId: String(custom.variantId || data.attributes.variant_id),
@@ -302,13 +306,13 @@ export class LemonSqueezyProvider implements PaymentProvider {
       case 'subscription_unpaused':
         registry.emitEvent({
           type: 'subscription.updated',
-          providerId: this.id, providerSubId: subId, guildId, state,
+          providerId: this.id, providerSubId: subId, holder, state,
         });
         return;
       case 'subscription_paused':
         registry.emitEvent({
           type: 'subscription.paused',
-          providerId: this.id, providerSubId: subId, guildId,
+          providerId: this.id, providerSubId: subId, holder,
           resumesAt: data.attributes.pause?.resumes_at ?? null,
         });
         return;
@@ -316,19 +320,19 @@ export class LemonSqueezyProvider implements PaymentProvider {
       case 'subscription_expired':
         registry.emitEvent({
           type: 'subscription.expired',
-          providerId: this.id, providerSubId: subId, guildId, state,
+          providerId: this.id, providerSubId: subId, holder, state,
         });
         return;
       case 'subscription_payment_success':
         registry.emitEvent({
           type: 'subscription.renewed',
-          providerId: this.id, providerSubId: subId, guildId, state,
+          providerId: this.id, providerSubId: subId, holder, state,
         });
         return;
       case 'subscription_payment_failed':
         registry.emitEvent({
           type: 'subscription.renewal-failed',
-          providerId: this.id, providerSubId: subId, guildId,
+          providerId: this.id, providerSubId: subId, holder,
         });
         return;
       default:

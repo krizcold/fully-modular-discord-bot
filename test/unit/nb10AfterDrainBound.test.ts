@@ -80,10 +80,10 @@ describe('the drain pass after the after-drain steps is bounded by 5 s (NB10-R11
     }) as typeof process.exit);
 
     writePremium();
-    fs.writeFileSync(JOURNAL, `${JSON.stringify({ writer: 'w1', n: 1, event: { type: 'subscription.created', providerId: 'fake', providerSubId: 'j1', guildId: 'g4', tierId: 'low', offeringId: 'o1', state: state() } })}\n`);
+    fs.writeFileSync(JOURNAL, `${JSON.stringify({ writer: 'w1', n: 1, event: { type: 'subscription.created', buyerId: '80000000000000001', providerId: 'fake', providerSubId: 'j1', holder: 'guild:70000000000000004', tierId: 'low', offeringId: 'o1', state: state() } })}\n`);
     reg.current = null;
     getPaymentRegistry().register({
-      id: 'fake', displayName: 'Fake', capabilities: { supportsPause: true }, isConfigured: () => true,
+      id: 'fake', displayName: 'Fake', capabilities: { sells: ['guild'], supportsPause: true }, isConfigured: () => true,
       handleWebhook: async () => undefined, cancelSubscription: async () => undefined,
     } as any);
     installStopHandler();
@@ -117,12 +117,12 @@ describe('the drain pass after the after-drain steps is bounded by 5 s (NB10-R11
     expect(rawOf(AUDIT)).toBeNull();
 
     const line = onTheWire[0].trim();
-    expect(JSON.parse(line)).toMatchObject({ action: 'subscription.install.paid', guildId: 'g4' });
+    expect(JSON.parse(line)).toMatchObject({ action: 'subscription.install.paid', holder: 'guild:70000000000000004' });
     spies.error.mockClear();
     pm.logLossesAtExit();
     const lost = logged(spies.error);
     expect(lost).toHaveLength(1);
-    expect(lost[0]).toMatch(/^\[PremiumManager\] The audit line subscription\.install\.paid \(guild g4, subscription j1\) did not reach the disk before this stop and is lost: /);
+    expect(lost[0]).toMatch(/^\[PremiumManager\] The audit line subscription\.install\.paid \(guild 70000000000000004, subscription j1\) did not reach the disk before this stop and is lost: /);
     expect(lost[0].endsWith(line)).toBe(true);
   }, 30_000);
 });

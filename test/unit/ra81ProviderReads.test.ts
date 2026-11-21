@@ -61,7 +61,7 @@ describe('PayPal: a purchase reads the doc for its return address and again for 
       JSON.stringify({ paypal: { PAYPAL_CLIENT_ID: 'id-doc', PAYPAL_CLIENT_SECRET: 'secret-doc', PAYPAL_WEBHOOK_ID: 'hook-doc' } }),
     ];
     await expect(new PayPalProvider().initiatePurchase({
-      guildId: '880000000000000081', tierId: 't1', offeringId: 'o1', variantId: 'P-1', autoRenew: true,
+      holder: 'guild:880000000000000081', buyerId: '80000000000000001', tierId: 't1', offeringId: 'o1', variantId: 'P-1', autoRenew: true,
     } as any)).rejects.toThrow('ra81 no network');
     expect(calls).toHaveLength(1);
     expect(calls[0]).toMatch(/\/v1\/oauth2\/token$/);

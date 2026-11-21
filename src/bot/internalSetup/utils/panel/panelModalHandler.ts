@@ -7,6 +7,7 @@ import { DISCORD_EPHEMERAL_FLAG } from '../../../constants';
 import { getNavigationContext, storeNavigationContext, detectAccessMethodFromMessage } from './panelButtonHandler';
 import { parseModalCustomId } from './panelCustomIds';
 import { withAutoDefer } from './panelAutoDefer';
+import { refusedOnSharedPanel } from './panelUserGate';
 
 /**
  * Register the panel modal handler with the Discord bot
@@ -79,6 +80,8 @@ async function handleModalFromModalHandler(
     accessMethod,
     navigationStack: navContext?.navigationStack || []
   };
+
+  if (await refusedOnSharedPanel(panels.get(panelId), context, interaction)) return;
 
   try {
     const { response, expired } = await withAutoDefer(interaction, handleModalInteraction(context, modalId));

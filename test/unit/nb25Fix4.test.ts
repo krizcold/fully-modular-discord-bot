@@ -42,9 +42,9 @@ const fake = {
 
 function register(): void {
   getPaymentRegistry().register({
-    id: 'fake', displayName: 'Fake', capabilities: { supportsPause: true, supportsCancel: true }, isConfigured: () => true,
-    listSubscriptionsForGuild: async (guildId: string) => {
-      const refs = fake.refs.filter(ref => ref.metadata.guildId === guildId).map(ref => JSON.parse(JSON.stringify(ref)));
+    id: 'fake', displayName: 'Fake', capabilities: { sells: ['guild'], supportsPause: true, supportsCancel: true }, isConfigured: () => true,
+    listSubscriptionsFor: async (holder: string) => {
+      const refs = fake.refs.filter(ref => ref.metadata.holder === holder).map(ref => JSON.parse(JSON.stringify(ref)));
       fake.listed++;
       const held = fake.listGate;
       if (held) await held.promise;
@@ -72,13 +72,13 @@ function register(): void {
 
 const pausedRef = () => ({
   providerSubId: 'orph',
-  metadata: { guildId: 'g1', tierId: 'silver', offeringId: 'o2', pausedDaysLeft: 12, pausedAt: AT },
+  metadata: { holder: 'guild:70000000000000001', buyerId: '80000000000000001', tierId: 'silver', offeringId: 'o2', pausedDaysLeft: 12, pausedAt: AT },
   state: { status: 'paused', startDate: new Date().toISOString(), endDate: new Date(Date.now() + 2 * DAY_MS).toISOString(), autoRenew: true },
   display: { amountLabel: '', periodLabel: '', statusLabel: 'paused' },
 });
 const asActive = (ref: any) => ({ ...ref, state: { ...ref.state, status: 'active', endDate: new Date(Date.now() + 12 * DAY_MS).toISOString() } });
 
-const planOf = async () => (await r.pm().findOrphansForGuild('g1')).find(o => o.ref.providerSubId === 'orph')?.plan;
+const planOf = async () => (await r.pm().findOrphansFor('guild:70000000000000001')).find(o => o.ref.providerSubId === 'orph')?.plan;
 const until = async (fn: () => boolean) => vi.waitFor(() => expect(fn()).toBe(true), { timeout: 5000, interval: 5 });
 const STALE = "Subscription 'orph' was not adopted: another adoption or cancel of it ended after this one started; reload the page.";
 const CANCEL_RUNNING = "Subscription 'orph' was not adopted: a cancel of it at the provider is running; reload the page when it has finished.";
@@ -115,12 +115,12 @@ describe('R4-ops-1: the stale-list refusal', () => {
     fake.refs = [pausedRef()];
 
     fake.resumeFails = true;
-    const first = r.pm().adoptOrphan('g1', 'fake', 'orph', resumePlan);
+    const first = r.pm().adoptOrphan('guild:70000000000000001', 'fake', 'orph', resumePlan);
     await until(() => fake.resumeGates.length === 1);
     fake.refs = [asActive(fake.refs[0])];
     const listed = fake.listed;
     fake.listGate = gate();
-    const twin = r.pm().adoptOrphan('g1', 'fake', 'orph', installPlan);
+    const twin = r.pm().adoptOrphan('guild:70000000000000001', 'fake', 'orph', installPlan);
     await until(() => fake.listed === listed + 1);
     fake.resumeGates[0].open();
     await expect(first).rejects.toThrow();
@@ -133,32 +133,32 @@ describe('R4-ops-1: the stale-list refusal', () => {
 describe('R4-ops-2: an orphan cancel and an adoption of the same sub', () => {
   it('a cancel while the adoption resumes is refused and sends no cancel', async () => {
     const plan = await planOf();
-    const first = r.pm().adoptOrphan('g1', 'fake', 'orph', plan);
+    const first = r.pm().adoptOrphan('guild:70000000000000001', 'fake', 'orph', plan);
     await until(() => fake.resumeGates.length === 1);
     await expect(r.pm().cancelOrphan('fake', 'orph')).rejects.toThrow(ADOPTION_RUNNING);
     expect(fake.cancels).toEqual([]);
     fake.resumeGates[0].open();
     expect(await first).toBe(true);
     await d.settle();
-    expect(r.row()?.subscriptions?.g1?.active).toMatchObject({ providerSubId: 'orph', status: 'active' });
+    expect(r.row()?.subscriptions?.['guild:70000000000000001']?.active).toMatchObject({ providerSubId: 'orph', status: 'active' });
   });
 
   it('an adoption while the cancel runs is refused before any provider call', async () => {
     const plan = await planOf();
     const cancel = r.pm().cancelOrphan('fake', 'orph');
     await until(() => fake.cancelGates.length === 1);
-    await expect(r.pm().adoptOrphan('g1', 'fake', 'orph', plan)).rejects.toThrow(CANCEL_RUNNING);
+    await expect(r.pm().adoptOrphan('guild:70000000000000001', 'fake', 'orph', plan)).rejects.toThrow(CANCEL_RUNNING);
     expect(fake.resumes).toEqual([]);
     fake.cancelGates[0].open();
     expect(await cancel).toBe(true);
     await d.settle();
-    expect(r.row()?.subscriptions?.g1?.active ?? null).toBeNull();
+    expect(r.row()?.subscriptions?.['guild:70000000000000001']?.active ?? null).toBeNull();
   });
 
   it('an adoption whose list was read before a cancel ended is refused as stale', async () => {
     const plan = await planOf();
     fake.listGate = gate();
-    const adoption = r.pm().adoptOrphan('g1', 'fake', 'orph', plan);
+    const adoption = r.pm().adoptOrphan('guild:70000000000000001', 'fake', 'orph', plan);
     await until(() => fake.listed >= 2);
     const cancel = r.pm().cancelOrphan('fake', 'orph');
     await until(() => fake.cancelGates.length === 1);
@@ -168,7 +168,7 @@ describe('R4-ops-2: an orphan cancel and an adoption of the same sub', () => {
     await expect(adoption).rejects.toThrow(STALE);
     expect(fake.resumes).toEqual([]);
     await d.settle();
-    expect(r.row()?.subscriptions?.g1?.active ?? null).toBeNull();
+    expect(r.row()?.subscriptions?.['guild:70000000000000001']?.active ?? null).toBeNull();
   });
 
   it('a second cancel while one runs is refused, and a cancel after it ended is sent', async () => {
@@ -197,7 +197,7 @@ describe('R4-ops-2: an orphan cancel and an adoption of the same sub', () => {
     expect(await again).toBe(true);
     expect(fake.cancels).toEqual(['orph', 'orph']);
     const plan = await planOf();
-    const adoption = r.pm().adoptOrphan('g1', 'fake', 'orph', plan);
+    const adoption = r.pm().adoptOrphan('guild:70000000000000001', 'fake', 'orph', plan);
     await until(() => fake.resumeGates.length === 1);
     fake.resumeGates[0].open();
     expect(await adoption).toBe(true);

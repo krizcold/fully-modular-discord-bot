@@ -64,29 +64,29 @@ describe('premium-tiers.json as loaded', () => {
   });
 
   it('a guild stored as null is dropped and the rest load', () => {
-    const cfg = load({ tiers: {}, subscriptions: { g0: null, g1: { active: manual('m1'), paused: [] } } });
-    expect(Object.keys(cfg.subscriptions)).toEqual(['g1']);
-    expect(cfg.subscriptions.g1.active.id).toBe('m1');
+    const cfg = load({ tiers: {}, subscriptions: { 'guild:70000000000000000': null, 'guild:70000000000000001': { active: manual('m1'), paused: [] } } });
+    expect(Object.keys(cfg.subscriptions)).toEqual(['guild:70000000000000001']);
+    expect(cfg.subscriptions['guild:70000000000000001'].active.id).toBe('m1');
   });
 
   it('paused entries that are no subscription are dropped', () => {
-    const cfg = load({ tiers: {}, subscriptions: { g1: { active: manual('m1'), paused: ['junk', null, { tierId: 5 }] } } });
-    expect(cfg.subscriptions.g1.paused).toEqual([]);
+    const cfg = load({ tiers: {}, subscriptions: { 'guild:70000000000000001': { active: manual('m1'), paused: ['junk', null, { tierId: 5 }] } } });
+    expect(cfg.subscriptions['guild:70000000000000001'].paused).toEqual([]);
   });
 
   it('a guild that holds only its notices channel keeps it', () => {
-    const cfg = load({ tiers: {}, subscriptions: { g2: { notificationsChannelId: 'c1' } } });
-    expect(cfg.subscriptions).toEqual({ g2: { paused: [], notificationsChannelId: 'c1' } });
+    const cfg = load({ tiers: {}, subscriptions: { 'guild:70000000000000002': { notificationsChannelId: 'c1' } } });
+    expect(cfg.subscriptions).toEqual({ 'guild:70000000000000002': { paused: [], notificationsChannelId: 'c1' } });
   });
 
   it('an empty guild record, or one with an empty channel, is dropped', () => {
-    const cfg = load({ tiers: {}, subscriptions: { g3: { notificationsChannelId: '' }, g5: {}, g6: { paused: [] } } });
+    const cfg = load({ tiers: {}, subscriptions: { 'guild:70000000000000003': { notificationsChannelId: '' }, 'guild:70000000000000005': {}, 'guild:70000000000000006': { paused: [] } } });
     expect(cfg.subscriptions).toEqual({});
   });
 
   it('a channel id that is not a string is not kept', () => {
-    const cfg = load({ tiers: {}, subscriptions: { g4: { active: manual('m4'), paused: [], notificationsChannelId: 5 } } });
-    expect(Object.keys(cfg.subscriptions.g4).sort()).toEqual(['active', 'paused']);
+    const cfg = load({ tiers: {}, subscriptions: { 'guild:70000000000000004': { active: manual('m4'), paused: [], notificationsChannelId: 5 } } });
+    expect(Object.keys(cfg.subscriptions['guild:70000000000000004']).sort()).toEqual(['active', 'paused']);
   });
 
   it('eventsApplied keeps only finite numbers', () => {

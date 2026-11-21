@@ -1,0 +1,94 @@
+{
+  "variants": {
+    "dummy_monthly_999": {
+      "variantId": "dummy_monthly_999",
+      "label": "Monthly",
+      "amount": 999,
+      "currency": "USD",
+      "durationDays": 30,
+      "recurring": true,
+      "active": true
+    },
+    "dummy_yearly_9999": {
+      "variantId": "dummy_yearly_9999",
+      "label": "Yearly (save 16%)",
+      "amount": 9999,
+      "currency": "USD",
+      "durationDays": 365,
+      "recurring": true,
+      "active": true
+    },
+    "dummy_lifetime_19999": {
+      "variantId": "dummy_lifetime_19999",
+      "label": "Lifetime",
+      "amount": 19999,
+      "currency": "USD",
+      "durationDays": null,
+      "recurring": false,
+      "active": true
+    },
+    "dummy_weekly_249": {
+      "variantId": "dummy_weekly_249",
+      "label": "Weekly",
+      "amount": 249,
+      "currency": "USD",
+      "durationDays": 7,
+      "recurring": true,
+      "active": true
+    }
+  },
+  "products": {
+    "dummy_product_standard": {
+      "productId": "dummy_product_standard",
+      "label": "Standard plan",
+      "description": "Pick a billing cadence; all give the same access.",
+      "variantIds": [
+        "dummy_weekly_249",
+        "dummy_monthly_999",
+        "dummy_yearly_9999",
+        "dummy_lifetime_19999"
+      ]
+    }
+  },
+  "coupons": {
+    "TEST20": {
+      "code": "TEST20",
+      "description": "20% off (built-in test coupon)",
+      "percentOff": 20,
+      "usedCount": 0,
+      "createdAt": "2026-11-20T18:34:02.073Z"
+    },
+    "FREEWEEK": {
+      "code": "FREEWEEK",
+      "description": "+7 free days (built-in test coupon)",
+      "extraDays": 7,
+      "usedCount": 0,
+      "createdAt": "2026-11-20T18:34:02.073Z"
+    },
+    "EXPIRED": {
+      "code": "EXPIRED",
+      "description": "Always-expired test coupon",
+      "percentOff": 50,
+      "usedCount": 0,
+      "createdAt": "2026-11-20T18:34:02.073Z",
+      "expiresAt": "2000-01-01T00:00:00.000Z"
+    }
+  },
+  "subscriptions": {
+    "dummy_1": {
+      "providerSubId": "dummy_1",
+      "guildId": "111111111111111111",
+      "tierId": "gold",
+      "offeringId": "o1",
+      "variantId": "dummy_monthly_999",
+      "durationDays": 30,
+      "startDate": "2026-11-20T18:34:02.073Z",
+      "endDate": "2026-12-20T18:34:02.073Z",
+      "autoRenew": true,
+      "status": "active",
+      "createdAt": "2026-11-20T18:34:02.073Z",
+      "updatedAt": "2026-11-20T18:34:02.073Z"
+    }
+  },
+  "nextId": 2
+}

@@ -30,6 +30,7 @@
 import { PROVIDER_FETCH_MS } from './paymentTypes';
 import { providerCredentials } from '@/utils/envLoader';
 import { getPaymentRegistry } from './paymentRegistry';
+import { guildIdFor, holderFromWire, type HolderKey } from '../premiumHolder';
 import type {
   PaymentProvider,
   ProviderCapabilities,
@@ -56,6 +57,7 @@ const CAPABILITIES: ProviderCapabilities = {
   mechanism: 'redirect',
   variantIdLabel: 'PayPal Plan ID',
   productIdLabel: 'PayPal Product ID',
+  sells: ['guild'],
 };
 
 function paypalApiBase(): string {
@@ -122,22 +124,23 @@ export class PayPalProvider implements PaymentProvider {
   }
 
   async initiatePurchase(opts: InitiateOpts): Promise<InitiateResult> {
+    const guildId = guildIdFor(opts.holder as HolderKey, this.displayName);
     const c = providerCredentials('paypal');
     if (!this.isConfigured()) throw new Error('PayPal not configured');
     const returnUrl = c.WEBUI_BASE_URL
-      ? `${c.WEBUI_BASE_URL}/guild/${encodeURIComponent(opts.guildId)}/subscription?subscribe=success`
+      ? `${c.WEBUI_BASE_URL}/guild/${encodeURIComponent(guildId)}/subscription?subscribe=success`
       : `https://example.invalid/subscribe-success`;
     const cancelUrl = c.WEBUI_BASE_URL
-      ? `${c.WEBUI_BASE_URL}/guild/${encodeURIComponent(opts.guildId)}/subscription?subscribe=cancel`
+      ? `${c.WEBUI_BASE_URL}/guild/${encodeURIComponent(guildId)}/subscription?subscribe=cancel`
       : `https://example.invalid/subscribe-cancel`;
 
     const body = {
       plan_id: opts.variantId,
       custom_id: JSON.stringify({
-        guildId: opts.guildId,
+        guildId,
         tierId: opts.tierId,
         offeringId: opts.offeringId,
-        ...(opts.userId ? { userId: opts.userId } : {}),
+        ...(opts.buyerId ? { userId: opts.buyerId } : {}),
       }),
       application_context: {
         brand_name: 'Discord Bot Premium',
@@ -233,7 +236,7 @@ export class PayPalProvider implements PaymentProvider {
     return sub ? this.stateFromSubscription(sub) : null;
   }
 
-  async listSubscriptionsForGuild(_guildId: string): Promise<ProviderSubscriptionRef[]> {
+  async listSubscriptionsFor(_holder: HolderKey): Promise<ProviderSubscriptionRef[]> {
     // PayPal doesn't index by our custom_id. Orphan adoption requires
     // walking ALL subs which is impractical at scale; rely on webhooks.
     return [];
@@ -265,8 +268,8 @@ export class PayPalProvider implements PaymentProvider {
     const customId = (() => {
       try { return JSON.parse(resource.custom_id || '{}'); } catch { return {}; }
     })();
-    const guildId = String(customId.guildId || '');
-    if (!guildId || !subId) return;
+    const holder = holderFromWire(customId.guildId);
+    if (!holder || !subId) return;
 
     const registry = getPaymentRegistry();
     const state = this.stateFromSubscription(resource);
@@ -277,7 +280,8 @@ export class PayPalProvider implements PaymentProvider {
           type: 'subscription.created',
           providerId: this.id,
           providerSubId: subId,
-          guildId,
+          holder,
+          buyerId: customId.userId ? String(customId.userId) : undefined,
           tierId: String(customId.tierId || ''),
           offeringId: String(customId.offeringId || ''),
           variantId: String(resource.plan_id || ''),
@@ -285,23 +289,23 @@ export class PayPalProvider implements PaymentProvider {
         });
         return;
       case 'BILLING.SUBSCRIPTION.UPDATED':
-        registry.emitEvent({ type: 'subscription.updated', providerId: this.id, providerSubId: subId, guildId, state });
+        registry.emitEvent({ type: 'subscription.updated', providerId: this.id, providerSubId: subId, holder, state });
         return;
       case 'BILLING.SUBSCRIPTION.CANCELLED':
       case 'BILLING.SUBSCRIPTION.EXPIRED':
-        registry.emitEvent({ type: 'subscription.expired', providerId: this.id, providerSubId: subId, guildId, state });
+        registry.emitEvent({ type: 'subscription.expired', providerId: this.id, providerSubId: subId, holder, state });
         return;
       case 'BILLING.SUBSCRIPTION.SUSPENDED':
         registry.emitEvent({
-          type: 'subscription.paused', providerId: this.id, providerSubId: subId, guildId, resumesAt: null,
+          type: 'subscription.paused', providerId: this.id, providerSubId: subId, holder, resumesAt: null,
         });
         return;
       case 'PAYMENT.SALE.COMPLETED':
-        registry.emitEvent({ type: 'subscription.renewed', providerId: this.id, providerSubId: subId, guildId, state });
+        registry.emitEvent({ type: 'subscription.renewed', providerId: this.id, providerSubId: subId, holder, state });
         return;
       case 'BILLING.SUBSCRIPTION.PAYMENT.FAILED':
         registry.emitEvent({
-          type: 'subscription.renewal-failed', providerId: this.id, providerSubId: subId, guildId,
+          type: 'subscription.renewal-failed', providerId: this.id, providerSubId: subId, holder,
         });
         return;
       default:

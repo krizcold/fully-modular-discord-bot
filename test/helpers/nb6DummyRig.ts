@@ -3,6 +3,7 @@ import { DummyProvider } from '../../src/bot/internalSetup/utils/payment/dummyPr
 import { getPaymentRegistry } from '../../src/bot/internalSetup/utils/payment/paymentRegistry';
 import { runSharedPass } from '../../src/bot/internalSetup/utils/sharedMirror';
 import { PREMIUM_KEY, type premiumRig } from './nb6PremiumRig';
+import { gh } from './p1Holder';
 
 // The Dummy provider on a Postgres bot (NB6 part 12): the real DummyProvider registered in the test's registry beside
 // the real PremiumManager of premiumRig, over the same scripted shared tables. Its state.json is the shared key
@@ -84,8 +85,8 @@ export function dummyRig(r: ReturnType<typeof premiumRig>) {
       vi.setSystemTime(Date.now() + days * DAY_MS);
     },
     /** A purchase through premium (the Dummy's own purchase path), settled. */
-    async buy(guild = 'g1', tierId = 'gold', offeringId = tierId === 'gold' ? 'o1' : 'o2', variantId = MONTHLY): Promise<any> {
-      const result = await r.pm().initiatePaidSubscription(guild, tierId, offeringId, { providerId: 'dummy', variantId });
+    async buy(guild = '70000000000000001', tierId = 'gold', offeringId = tierId === 'gold' ? 'o1' : 'o2', variantId = MONTHLY): Promise<any> {
+      const result = await r.pm().initiatePaidSubscription(gh(guild), tierId, offeringId, { buyerId: '80000000000000001', providerId: 'dummy', variantId });
       await rig.settle();
       return result;
     },

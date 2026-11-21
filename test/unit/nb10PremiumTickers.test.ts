@@ -22,7 +22,7 @@ import { markMaintenanceBoot } from '../../src/bot/internalSetup/utils/maintenan
 import { clearGlobal, DUMMY_STATE, quiet, settleQueue } from './nb10PremiumRig';
 
 const role = process.env.BOT_PROCESS_ROLE;
-const provider = (id: string) => ({ id, displayName: id, capabilities: {}, isConfigured: () => true, start: vi.fn(), stop: vi.fn() });
+const provider = (id: string) => ({ id, displayName: id, capabilities: { sells: ['guild'] }, isConfigured: () => true, start: vi.fn(), stop: vi.fn() });
 
 beforeEach(async () => {
   quiet();

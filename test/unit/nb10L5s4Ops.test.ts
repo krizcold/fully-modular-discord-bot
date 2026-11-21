@@ -27,7 +27,7 @@ const DAY = 86_400_000;
 
 function registerFake(extra: Record<string, unknown> = {}): void {
   getPaymentRegistry().register({
-    id: 'fake', displayName: 'Fake', capabilities: {}, isConfigured: () => true, ...extra,
+    id: 'fake', displayName: 'Fake', capabilities: { sells: ['guild'] }, isConfigured: () => true, ...extra,
   } as any);
 }
 
@@ -87,8 +87,8 @@ describe('while premium-tiers.json cannot be read, each change is refused before
 
   it('extendManual and revokeManual answer false', () => {
     const pm = getPremiumManager();
-    expect(pm.extendManual('g1', 5)).toBe(false);
-    expect(pm.revokeManual('g1')).toBe(false);
+    expect(pm.extendManual('guild:70000000000000001', 5)).toBe(false);
+    expect(pm.revokeManual('guild:70000000000000001')).toBe(false);
   });
 
   it('a saved global config says the paid tier cleanup did not save, and answers saved', () => {
@@ -100,79 +100,79 @@ describe('while premium-tiers.json cannot be read, each change is refused before
 
 describe('member notices carry the tier and its details', () => {
   it('a stricter tier tells its subscribers what changed', async () => {
-    writePremium({ g1: { active: paidSub('s1', 'p1', 'low', 'fake'), paused: [] } },
+    writePremium({ 'guild:70000000000000001': { active: paidSub('s1', 'p1', 'low', 'fake'), paused: [] } },
       { tiers: { ...TIERS, low: { ...TIERS.low, overrides: { nb10mod: { x: 1 } } } } });
     const pm = getPremiumManager();
     expect(pm.setTier('low', { displayName: 'Low', priority: 1, overrides: {}, offerings: [] })).toBe(true);
     await tick();
     expect(noticesOf('tier.config-change-affecting-subscriber')).toEqual([{
-      guildId: 'g1', kind: 'tier.config-change-affecting-subscriber',
+      guildId: 'guild:70000000000000001', kind: 'tier.config-change-affecting-subscriber',
       payload: { tierName: 'Low', details: 'Some perks or limits were reduced. Open the subscription panel to see the latest tier contents.' },
     }]);
   });
 
   it('a paid subscription paused by a higher grant is named by its tier, with its days left', async () => {
-    writePremium({ g1: { active: paidSub('s1', 'p1', 'low', 'fake'), paused: [] } });
-    expect(await getPremiumManager().grantManual('g1', 'high', null)).toBe(true);
+    writePremium({ 'guild:70000000000000001': { active: paidSub('s1', 'p1', 'low', 'fake'), paused: [] } });
+    expect(await getPremiumManager().grantManual('guild:70000000000000001', 'high', null)).toBe(true);
     await tick();
     expect(noticesOf('paid.sub.paused-by-stacking').map(n => n.payload)).toEqual([{ tierName: 'Low', providerName: 'Fake', remainingDays: 30 }]);
   });
 
   it('a paused paid subscription whose tier is gone is named by its tier id', async () => {
-    writePremium({ g1: { active: paidSub('s1', 'p1', 'ghost', 'fake'), paused: [] } });
-    expect(await getPremiumManager().grantManual('g1', 'high', null)).toBe(true);
+    writePremium({ 'guild:70000000000000001': { active: paidSub('s1', 'p1', 'ghost', 'fake'), paused: [] } });
+    expect(await getPremiumManager().grantManual('guild:70000000000000001', 'high', null)).toBe(true);
     await tick();
     expect(noticesOf('paid.sub.paused-by-stacking').map(n => n.payload.tierName)).toEqual(['ghost']);
   });
 
   it('a grant tells the guild its tier, end date and notes', async () => {
     writePremium({});
-    expect(await getPremiumManager().grantManual('g2', 'high', 10, 'thanks')).toBe(true);
+    expect(await getPremiumManager().grantManual('guild:70000000000000002', 'high', 10, 'thanks')).toBe(true);
     await tick();
     const added = noticesOf('manual.grant.added');
     expect(added).toHaveLength(1);
     await settleQueue();
-    expect(added[0].payload).toEqual({ tierName: 'High', endDate: jsonOf(PREMIUM).subscriptions.g2.active.endDate, notes: 'thanks' });
+    expect(added[0].payload).toEqual({ tierName: 'High', endDate: jsonOf(PREMIUM).subscriptions['guild:70000000000000002'].active.endDate, notes: 'thanks' });
     expect(Date.parse(added[0].payload.endDate)).toBeGreaterThan(Date.now() + 9 * DAY);
   });
 
   it('a revoke names the revoked tier', async () => {
-    writePremium({ g3: { active: manual('m3', 'low'), paused: [] } });
-    expect(getPremiumManager().revokeManual('g3')).toBe(true);
+    writePremium({ 'guild:70000000000000003': { active: manual('m3', 'low'), paused: [] } });
+    expect(getPremiumManager().revokeManual('guild:70000000000000003')).toBe(true);
     await tick();
     expect(noticesOf('manual.grant.revoked').map(n => n.payload)).toEqual([{ tierName: 'Low' }]);
   });
 
   it('a queued grant with no day left ends with its tier named, or its tier id when the tier is gone', async () => {
     writePremium({
-      g4: { active: manual('m4', 'high'), paused: [queued(manual('q4', 'low'), 0)] },
-      g5: { active: manual('m5', 'high'), paused: [queued(manual('q5', 'ghost'), 0)] },
+      'guild:70000000000000004': { active: manual('m4', 'high'), paused: [queued(manual('q4', 'low'), 0)] },
+      'guild:70000000000000005': { active: manual('m5', 'high'), paused: [queued(manual('q5', 'ghost'), 0)] },
     });
     const pm = getPremiumManager();
-    expect(pm.revokeManual('g4')).toBe(true);
-    expect(pm.revokeManual('g5')).toBe(true);
+    expect(pm.revokeManual('guild:70000000000000004')).toBe(true);
+    expect(pm.revokeManual('guild:70000000000000005')).toBe(true);
     await tick();
-    expect(noticesOf('manual.grant.ended').map(n => [n.guildId, n.payload])).toEqual([['g4', { tierName: 'Low' }], ['g5', { tierName: 'ghost' }]]);
+    expect(noticesOf('manual.grant.ended').map(n => [n.guildId, n.payload])).toEqual([['guild:70000000000000004', { tierName: 'Low' }], ['guild:70000000000000005', { tierName: 'ghost' }]]);
   });
 
   it('a queued paid subscription with no day left ends as expired, named by its tier id when the tier is gone', async () => {
-    writePremium({ g6: { active: manual('m6', 'high'), paused: [queued(paidSub('q6', 'p6', 'ghost', 'fake'), 0)] } });
-    expect(getPremiumManager().revokeManual('g6')).toBe(true);
+    writePremium({ 'guild:70000000000000006': { active: manual('m6', 'high'), paused: [queued(paidSub('q6', 'p6', 'ghost', 'fake'), 0)] } });
+    expect(getPremiumManager().revokeManual('guild:70000000000000006')).toBe(true);
     await tick();
     expect(noticesOf('paid.sub.expired').map(n => n.payload)).toEqual([{ tierName: 'ghost', providerName: 'Fake' }]);
   });
 
   it('a queued paid subscription that resumes is named by its tier, or its tier id when the tier is gone', async () => {
     writePremium({
-      g7: { active: manual('m7', 'high'), paused: [queued(paidSub('q7', 'p7', 'low', 'fake'), 10)] },
-      g8: { active: manual('m8', 'high'), paused: [queued(paidSub('q8', 'p8', 'ghost', 'fake'), 10)] },
+      'guild:70000000000000007': { active: manual('m7', 'high'), paused: [queued(paidSub('q7', 'p7', 'low', 'fake'), 10)] },
+      'guild:70000000000000008': { active: manual('m8', 'high'), paused: [queued(paidSub('q8', 'p8', 'ghost', 'fake'), 10)] },
     });
     const pm = getPremiumManager();
-    expect(pm.revokeManual('g7')).toBe(true);
-    expect(pm.revokeManual('g8')).toBe(true);
+    expect(pm.revokeManual('guild:70000000000000007')).toBe(true);
+    expect(pm.revokeManual('guild:70000000000000008')).toBe(true);
     await tick();
     const resumed = noticesOf('paid.sub.resumed-from-queue');
-    expect(resumed.map(n => [n.guildId, n.payload.tierName, n.payload.providerName])).toEqual([['g7', 'Low', 'Fake'], ['g8', 'ghost', 'Fake']]);
+    expect(resumed.map(n => [n.guildId, n.payload.tierName, n.payload.providerName])).toEqual([['guild:70000000000000007', 'Low', 'Fake'], ['guild:70000000000000008', 'ghost', 'Fake']]);
     expect(Date.parse(resumed[0].payload.endDate)).toBeGreaterThan(Date.now() + 9 * DAY);
   });
 });
@@ -183,13 +183,13 @@ describe('a due migration updates the subscription it finds again by id', () => 
       id: 'mig1', providerId: 'fake', sourceTierId: 'low', sourceOfferingId: 'o1', sourceVariantId: 'v1',
       targetTierId: 'high', targetOfferingId: 'o2', targetVariantId: 'v2', effectiveDate: new Date(Date.now() - 1000).toISOString(),
       message: '', scheduledAt: new Date().toISOString(), scheduledBy: 'admin', status: 'pending',
-      decisions: [{ guildId: 'g1', subscriptionId, providerSubId, decision: 'accepted' }],
+      decisions: [{ holder: 'guild:70000000000000001', subscriptionId, providerSubId, decision: 'accepted' }],
     }],
   });
 
   it('the second paused entry, not the active one or the first paused one, gets the new plan', async () => {
     writePremium({
-      g1: {
+      'guild:70000000000000001': {
         active: manual('m1', 'high'),
         paused: [queued({ ...paidSub('sX', 'pX', 'low', 'fake'), variantId: 'v1' }, 10), queued({ ...paidSub('sT', 'pT', 'low', 'fake'), variantId: 'v1' }, 10)],
       },
@@ -199,13 +199,13 @@ describe('a due migration updates the subscription it finds again by id', () => 
     await settleQueue();
     const stored = jsonOf(PREMIUM);
     expect(stored.migrations[0].decisions[0].outcome).toBe('migrated');
-    const subs = stored.subscriptions.g1;
+    const subs = stored.subscriptions['guild:70000000000000001'];
     expect([subs.active.id, subs.active.tierId, subs.active.variantId]).toEqual(['m1', 'high', undefined]);
     expect(subs.paused.map((p: any) => [p.id, p.tierId, p.variantId])).toEqual([['sX', 'low', 'v1'], ['sT', 'high', 'v2']]);
   });
 
   it('a guild whose subscriptions went during the provider call still records the migration as done', async () => {
-    writePremium({ g1: { active: { ...paidSub('sT', 'pT', 'low', 'fake'), variantId: 'v1' }, paused: [] } }, migration('sT', 'pT'));
+    writePremium({ 'guild:70000000000000001': { active: { ...paidSub('sT', 'pT', 'low', 'fake'), variantId: 'v1' }, paused: [] } }, migration('sT', 'pT'));
     const held = gate();
     let called = false;
     registerFake({ migrateSubscriptionPrice: async () => { called = true; await held.promise; } });
@@ -217,7 +217,7 @@ describe('a due migration updates the subscription it finds again by id', () => 
     await run;
     await settleQueue();
     const stored = jsonOf(PREMIUM);
-    expect(stored.subscriptions.g1).toBeUndefined();
+    expect(stored.subscriptions['guild:70000000000000001']).toBeUndefined();
     expect(stored.migrations[0].decisions[0]).toMatchObject({ outcome: 'migrated' });
     expect(stored.migrations[0].decisions[0].outcomeNote).toBeUndefined();
   });
@@ -226,7 +226,7 @@ describe('a due migration updates the subscription it finds again by id', () => 
 describe('a stacking pause of a subscription that has no day left', () => {
   it('replaces it outright and saves the new active subscription', async () => {
     const end = Date.now() + 60_000;
-    writePremium({ g1: { active: { ...paidSub('s1', 'p1', 'low', 'fake'), endDate: new Date(end).toISOString() }, paused: [] } });
+    writePremium({ 'guild:70000000000000001': { active: { ...paidSub('s1', 'p1', 'low', 'fake'), endDate: new Date(end).toISOString() }, paused: [] } });
     const pm = getPremiumManager();
     pm.getFullConfig();
     const realNow = Date.now.bind(Date);
@@ -238,10 +238,10 @@ describe('a stacking pause of a subscription that has no day left', () => {
       }
       return realNow();
     });
-    expect(await pm.grantManual('g1', 'high', null)).toBe(true);
+    expect(await pm.grantManual('guild:70000000000000001', 'high', null)).toBe(true);
     expect(shifted).toBe(true);
     await settleQueue();
-    const subs = jsonOf(PREMIUM).subscriptions.g1;
+    const subs = jsonOf(PREMIUM).subscriptions['guild:70000000000000001'];
     expect([subs.active.source, subs.active.tierId]).toEqual(['manual', 'high']);
     expect(subs.paused).toEqual([]);
   });

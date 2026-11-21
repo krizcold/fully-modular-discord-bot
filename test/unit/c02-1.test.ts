@@ -68,8 +68,8 @@ describe('parse and validate', () => {
 describe('stored values read by type', () => {
   it('a wrong-typed or null guild value reads as unset and falls back', () => {
     files.set('global/m', { count: 9 });
-    files.set('g1/m', { count: 'ten', name: null, tint: 'blue', roles: 'r' });
-    const merged = loadModuleSettings('m', 'g1')!;
+    files.set('70000000000000001/m', { count: 'ten', name: null, tint: 'blue', roles: 'r' });
+    const merged = loadModuleSettings('m', '70000000000000001')!;
     expect(merged.values).toEqual({ count: 9, name: 'x', tint: '0x112233', roles: [], minutes: 5 });
     expect(merged.sources.count).toBe('global');
   });
@@ -97,7 +97,7 @@ function ctx(fields: Record<string, string>, guildId: string | null) {
 
 describe('the modals', () => {
   it('a partial number in a guild edit is refused and not staged', async () => {
-    const c = ctx({ value: '10m' }, 'g1');
+    const c = ctx({ value: '10m' }, '70000000000000001');
     await handleSettingsModal(c.handler, 'edit_count');
     expect(c.state.pendingChanges).not.toHaveProperty('count');
     expect(c.sent.join(' ')).toContain('not a number');
@@ -142,7 +142,7 @@ describe('review fixes', () => {
   });
 
   it('a refused number names the allowed range', async () => {
-    const c = ctx({ value: '10m' }, 'g1');
+    const c = ctx({ value: '10m' }, '70000000000000001');
     await handleSettingsModal(c.handler, 'edit_count');
     expect(c.sent.join(' ')).toContain('allowed 1 to 100');
     const d = ctx({ value: '10m' }, null);
@@ -153,11 +153,11 @@ describe('review fixes', () => {
   it('an Upload names the keys it did not restore', async () => {
     const json = JSON.stringify({ count: 7, name: 5, _moduleEnabled: false, _hardLimits: {} });
     vi.stubGlobal('fetch', async () => ({ ok: true, text: async () => json }));
-    const c = ctx({}, 'g1');
+    const c = ctx({}, '70000000000000001');
     (c.handler.context.interaction.fields as any).getUploadedFiles = () => ({ size: 1, first: () => ({ url: 'u' }) });
     await handleSettingsModal(c.handler, 'upload');
     vi.unstubAllGlobals();
-    expect(files.get('g1/m')).toEqual({ count: 7 });
+    expect(files.get('70000000000000001/m')).toEqual({ count: 7 });
     const text = c.sent.join(' ');
     expect(text).toContain('not restored');
     for (const k of ['name', '_moduleEnabled', '_hardLimits']) expect(text).toContain(k);
@@ -166,11 +166,11 @@ describe('review fixes', () => {
   it('an Upload with no restorable key says nothing was applied', async () => {
     const json = JSON.stringify({ _moduleEnabled: false, name: 5 });
     vi.stubGlobal('fetch', async () => ({ ok: true, text: async () => json }));
-    const c = ctx({}, 'g1');
+    const c = ctx({}, '70000000000000001');
     (c.handler.context.interaction.fields as any).getUploadedFiles = () => ({ size: 1, first: () => ({ url: 'u' }) });
     await handleSettingsModal(c.handler, 'upload');
     vi.unstubAllGlobals();
-    expect(files.has('g1/m')).toBe(false);
+    expect(files.has('70000000000000001/m')).toBe(false);
     const text = c.sent.join(' ');
     expect(text).toContain('Upload not applied');
     expect(text).toContain('nothing was changed');
@@ -183,7 +183,7 @@ describe('review round 2', () => {
   it('a count or minute setting refuses a fraction, naming the field, the range and the text', async () => {
     expect(validateValue(2.5, { integer: true }, 'number').valid).toBe(false);
     expect(validateValue(3, { integer: true }, 'number').valid).toBe(true);
-    const c = ctx({ value: '2.5' }, 'g1');
+    const c = ctx({ value: '2.5' }, '70000000000000001');
     await handleSettingsModal(c.handler, 'edit_minutes');
     expect(c.state.pendingChanges).not.toHaveProperty('minutes');
     const text = c.sent.join(' ');
@@ -192,7 +192,7 @@ describe('review round 2', () => {
 
   it('an Upload of an empty object says the file holds no settings', async () => {
     vi.stubGlobal('fetch', async () => ({ ok: true, text: async () => '{}' }));
-    const c = ctx({}, 'g1');
+    const c = ctx({}, '70000000000000001');
     (c.handler.context.interaction.fields as any).getUploadedFiles = () => ({ size: 1, first: () => ({ url: 'u' }) });
     await handleSettingsModal(c.handler, 'upload');
     vi.unstubAllGlobals();
@@ -207,9 +207,9 @@ describe('review round 2', () => {
 
   it('a raw guild settings.json past a cap or of the wrong type is named', () => {
     files.set('global/m', { _hardLimits: { roles: { maxItems: 1 } } });
-    const errors = guildSettingsFileErrors('m', 'g1', { count: 500, roles: ['a', 'b'], name: 'ok', other: 1 })!;
+    const errors = guildSettingsFileErrors('m', '70000000000000001', { count: 500, roles: ['a', 'b'], name: 'ok', other: 1 })!;
     expect(errors.map(e => e.split(':')[0]).sort()).toEqual(['count', 'roles']);
-    expect(guildSettingsFileErrors('m', 'g1', { count: 5 })).toEqual([]);
+    expect(guildSettingsFileErrors('m', '70000000000000001', { count: 5 })).toEqual([]);
   });
 
   it('the JSON editor saves nothing when its check refuses', async () => {
@@ -245,8 +245,8 @@ describe('review round 3: untouched stored entries do not block a save', () => {
   });
 
   it('a Data Browser save skips keys equal to the stored file', () => {
-    expect(guildSettingsFileErrors('m', 'g1', { count: 500, name: 'new' }, { count: 500, name: 'old' })).toEqual([]);
-    expect(guildSettingsFileErrors('m', 'g1', { count: 501 }, { count: 500 })!.join()).toContain('count');
+    expect(guildSettingsFileErrors('m', '70000000000000001', { count: 500, name: 'new' }, { count: 500, name: 'old' })).toEqual([]);
+    expect(guildSettingsFileErrors('m', '70000000000000001', { count: 501 }, { count: 500 })!.join()).toContain('count');
   });
 });
 
@@ -261,6 +261,6 @@ describe('review round 4: inherited Free copies and reordered lists are unchange
     const stored = { values: { roles: ['333', '111', '222'] } };
     expect(moduleConfigErrors(schema as any, { roles: ['111', '222', '333'] }, {}, { roles: { maxItems: 2 } }, stored)).toEqual([]);
     expect(moduleConfigErrors(schema as any, { roles: ['111', '222', '444'] }, {}, { roles: { maxItems: 2 } }, stored).join()).toContain('roles');
-    expect(guildSettingsFileErrors('m', 'g1', { roles: ['111', '222', '333'] }, { roles: ['333', '111', '222'] })).toEqual([]);
+    expect(guildSettingsFileErrors('m', '70000000000000001', { roles: ['111', '222', '333'] }, { roles: ['333', '111', '222'] })).toEqual([]);
   });
 });
