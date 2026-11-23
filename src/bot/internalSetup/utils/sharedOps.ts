@@ -30,7 +30,7 @@ export type SharedOpCode = 'invalid' | 'maintenance' | 'held-elsewhere' | 'chang
 
 export type SharedOpReply =
   | { ok: true; result?: unknown }
-  | { ok: false; code: SharedOpCode; error: string; status?: number; answer?: TruthAnswer; partial?: boolean; result?: unknown; stopping?: boolean };
+  | { ok: false; code: SharedOpCode; error: string; status?: number; answer?: TruthAnswer; partial?: boolean; result?: unknown; stopping?: boolean; refreshFailed?: boolean };
 
 export const PROVIDER_SENTENCE = "A payment provider call this change made may already have taken effect; check the provider's dashboard.";
 
@@ -128,6 +128,22 @@ async function paymentWebhook(args: { providerId?: unknown; body?: unknown; sign
     throw new WebhookRejected(error instanceof Error ? error.message : String(error));
   }
   return { received: true };
+}
+
+/** P3's read-only op: the provider's billing portal for the signed-in buyer; it writes nothing. */
+async function paymentBillingPortal(args: { providerId?: unknown; providerSubId?: unknown; returnUrl?: unknown; buyerId?: unknown }): Promise<{ portalUrl: string }> {
+  const { providerId, providerSubId, returnUrl, buyerId } = args ?? {};
+  if (typeof providerId !== 'string' || typeof providerSubId !== 'string' || typeof returnUrl !== 'string' || typeof buyerId !== 'string') {
+    throw new OpRefusal('invalid', 'providerId, providerSubId, returnUrl and buyerId are required');
+  }
+  const provider = getPaymentRegistry().get(providerId);
+  if (!provider || !provider.createBillingPortalSession) throw new OpRefusal('invalid', `Provider '${providerId}' does not have a managed portal`);
+  try {
+    const { portalUrl } = await provider.createBillingPortalSession(providerSubId, returnUrl, buyerId);
+    return { portalUrl };
+  } catch (error) {
+    throw new OpRefusal('invalid', error instanceof Error ? error.message : String(error));
+  }
 }
 
 /** handleWebhook's own error: the route answers it 400 as today. */
@@ -235,6 +251,7 @@ const registry = new Map<string, OpFn>();
 registry.set('global.write', globalWrite);
 registry.set('payment.webhook', paymentWebhook);
 registry.set('payment.oauthCallback', paymentOAuthCallback);
+registry.set('payment.billingPortal', paymentBillingPortal);
 for (const method of PREMIUM_METHODS) {
   if (method === 'setGlobalModuleConfig') continue;
   registry.set(`premium.${method}`, (args: { args?: unknown[] }) => {
@@ -298,8 +315,8 @@ export function partialText(text: string, ledger: WriteLedger): string {
   return `${text.replace(/ Please [^.]*\.$/, '')} ${partialEnding(landedNames(ledger))}`;
 }
 
-/** The shared files a premium, Dummy or payment op reads: premium's and the Dummy provider's state. */
-const PREMIUM_KEYS = ['global/premium-tiers.json', 'global/payment-providers/dummy/state.json'];
+/** The shared files a premium, Dummy or payment op reads: premium's, the Dummy provider's state and Stripe's Customers. */
+const PREMIUM_KEYS = ['global/premium-tiers.json', 'global/payment-providers/dummy/state.json', 'global/payment-providers/stripe/customers.json'];
 
 const unreachableText = (cause: string): string =>
   `Can't reach the database to read the current premium settings (${cause}); nothing was saved. Try again in a moment.`;
@@ -332,7 +349,8 @@ export async function applySharedOp(req: SharedOpRequest): Promise<SharedOpReply
   if (!fn) return carryWrites({ ok: false, code: 'invalid', error: `unknown op ${op || '(none)'}` }, NO_WRITES);
   if (op.startsWith('premium.') || op.startsWith('dummy.') || op.startsWith('payment.')) {
     const unreachable = await refreshBeforeOp();
-    if (unreachable) return carryWrites({ ok: false, code: 'failed', error: unreachable }, NO_WRITES);
+    // Answered before the op's function runs, so a reader can tell it from the op's own answer.
+    if (unreachable) return carryWrites({ ok: false, code: 'failed', error: unreachable, refreshFailed: true }, NO_WRITES);
     const refusal = cacheRefusal(op);
     if (refusal) return carryWrites({ ok: false, code: 'failed', error: refusal }, NO_WRITES);
   }

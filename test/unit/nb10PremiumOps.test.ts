@@ -80,7 +80,7 @@ const rows: Row[] = [
 ];
 
 const guildRows: Row[] = [
-  ['start a paid subscription', 'POST', `/${G}/paid`, { tierId: 'gold', offeringId: 'o1', providerId: 'dummy', variantId: 'v1' }, 'premium.initiatePaidSubscription', [gh(G), 'gold', 'o1', { providerId: 'dummy', variantId: 'v1', buyerId: '80000000000000001', autoRenewOptOut: false }]],
+  ['start a paid subscription', 'POST', `/${G}/paid`, { tierId: 'gold', offeringId: 'o1', providerId: 'dummy', variantId: 'v1' }, 'premium.initiatePaidSubscription', [gh(G), 'gold', 'o1', { providerId: 'dummy', variantId: 'v1', buyerId: '80000000000000001', autoRenewOptOut: false, buyerSignedIn: true }]],
   ['cancel a paid subscription', 'DELETE', `/${G}/paid`, undefined, 'premium.cancelPaidSubscription', [gh(G)]],
   ['reactivate a paid subscription', 'POST', `/${G}/paid/reactivate`, {}, 'premium.reactivatePaidSubscription', [gh(G)]],
   ['expire a paid subscription now', 'POST', `/${G}/paid/expire-now`, {}, 'premium.cancelPaidSubscriptionImmediately', [gh(G)]],

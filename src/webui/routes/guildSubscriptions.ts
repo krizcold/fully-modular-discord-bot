@@ -200,6 +200,7 @@ export function createGuildSubscriptionRoutes(botManager: BotManager): Router {
         couponCode,
         buyerId,
         autoRenewOptOut: !!autoRenewOptOut,
+        buyerSignedIn: true,
       }]);
       res.json({
         success: true,
@@ -342,9 +343,8 @@ export function createGuildSubscriptionRoutes(botManager: BotManager): Router {
 
   /**
    * POST /guild/api/subscriptions/:guildId/paid/billing-portal
-   * Body: { returnUrl?: string }
-   * Create a hosted "manage subscription" portal session at the active
-   * sub's provider and return the redirect URL.
+   * Opens the provider's portal for the active paid subscription's payer, through the read-only op
+   * payment.billingPortal, and returns the redirect URL. The return address is always this server's page.
    */
   router.post('/:guildId/paid/billing-portal', requireOAuth, requireGuildAccess, async (req: Request, res: Response) => {
     try {
@@ -358,15 +358,26 @@ export function createGuildSubscriptionRoutes(botManager: BotManager): Router {
       if (!active || active.source !== 'paid' || !active.providerId || !active.providerSubId) {
         return res.status(404).json({ success: false, error: 'No active paid subscription on this guild' });
       }
-      const provider = getPaymentRegistry().get(active.providerId);
-      if (!provider || !provider.createBillingPortalSession) {
-        return res.status(400).json({ success: false, error: `Provider '${active.providerId}' does not have a managed portal` });
+      const buyerId = (req.user as any)?.id;
+      if (typeof buyerId !== 'string' || active.buyerId !== buyerId) {
+        return res.status(403).json({ success: false, error: 'Only the member who pays for this subscription can open its billing portal.' });
       }
-      const returnUrl = (req.body?.returnUrl && typeof req.body.returnUrl === 'string')
-        ? req.body.returnUrl
-        : `${req.protocol}://${req.get('host')}/guild?guildId=${encodeURIComponent(guildId)}`;
-      const result = await provider.createBillingPortalSession(active.providerSubId, returnUrl);
-      res.json({ success: true, portalUrl: result.portalUrl });
+      const returnUrl = `${req.protocol}://${req.get('host')}/guild/${encodeURIComponent(guildId)}/subscription`;
+      const reply = await botManager.runSharedOp('payment.billingPortal', {
+        providerId: active.providerId, providerSubId: active.providerSubId, returnUrl, buyerId,
+      });
+      if (reply?.ok && typeof reply.result?.portalUrl === 'string') {
+        return res.json({ success: true, portalUrl: reply.result.portalUrl });
+      }
+      if (reply?.noAnswer) {
+        return res.status(503).json({ success: false, error: 'The billing portal did not open: the bot did not answer in time. Try again.' });
+      }
+      if (reply?.refreshFailed) {
+        const cause = typeof reply.error === 'string' ? reply.error.trim().replace(/\.+$/, '') : 'unknown cause';
+        return res.status(503).json({ success: false, error: `The billing portal did not open: the bot could not read its record of your Stripe billing account (${cause}).` });
+      }
+      const failure = sharedOpFailure(reply) ?? { status: 500, error: 'The billing portal did not open: the bot gave no portal address.' };
+      res.status(failure.status).json({ success: false, error: failure.error });
     } catch (error) {
       if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';

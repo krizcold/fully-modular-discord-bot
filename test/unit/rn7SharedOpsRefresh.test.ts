@@ -65,7 +65,7 @@ describe('a refresh that failed while its pass still writes', () => {
     expect(reply).toBeUndefined();
     endPass();
     await pending;
-    expect(reply).toEqual({ ok: false, code: 'failed', error: unreachable('connect ECONNREFUSED 10.0.0.1:5432') });
+    expect(reply).toEqual({ ok: false, code: 'failed', error: unreachable('connect ECONNREFUSED 10.0.0.1:5432'), refreshFailed: true });
     expect(h.journalReads).toEqual([]);
   });
 });
@@ -75,7 +75,7 @@ describe('the events journal before a premium op', () => {
     h.refresh = async () => ({ ok: true });
     h.journal = { ok: false, cause: 'Connection terminated unexpectedly' };
     const reply = await applySharedOp({ op: 'premium.setTier', args: { args: [] } });
-    expect(reply).toEqual({ ok: false, code: 'failed', error: unreachable('Connection terminated unexpectedly') });
+    expect(reply).toEqual({ ok: false, code: 'failed', error: unreachable('Connection terminated unexpectedly'), refreshFailed: true });
     expect(h.journalReads).toEqual([false]);
   });
 });

@@ -15,8 +15,9 @@
  *
  *   - Product mode: host enters one Product identifier. We pull variants
  *     from the provider's API. Optional toggle hands variant selection off
- *     to the provider's hosted page when the provider supports it (Stripe
- *     Pricing Table, LS hosted checkout).
+ *     to the provider's hosted page when the provider supports it (Stripe:
+ *     one button opening a one-price Checkout, no Pricing Table; LS hosted
+ *     checkout).
  */
 import type { HolderKey, HolderKind } from '../premiumHolder';
 
@@ -150,7 +151,7 @@ export interface ProviderCapabilities {
    * can redirect subscribers to? Stripe + LS yes; PayPal no.
    */
   supportsHostedPicker: boolean;
-  /** (When `supportsHostedPicker`) Provider-imposed cap on variants visible on the hosted page; e.g. 3 for Stripe Pricing Table. */
+  /** (When `supportsHostedPicker`) Provider-imposed cap on the prices its hosted page shows. */
   hostedPickerVariantCap?: number;
   /** Hosted "manage subscription" portal available. */
   supportsCustomerPortal: boolean;
@@ -260,6 +261,8 @@ export interface InitiateOpts {
    * indefinite (lifts on explicit resume).
    */
   startPausedUntil?: string | null;
+  /** True only when the buyer is the member signed in on the member route; the dev routes leave it out. */
+  buyerSignedIn?: boolean;
 }
 
 /** Result of `initiatePurchase`. Which fields are filled depends on the mechanism. */
@@ -462,9 +465,9 @@ export interface PaymentProvider {
 
   /**
    * Optional: create a hosted "manage subscription" portal session for
-   * this provider sub. Required when `capabilities.supportsCustomerPortal`.
+   * this provider sub. Required when `capabilities.supportsCustomerPortal`. buyerId is the signed-in member who asks.
    */
-  createBillingPortalSession?(providerSubId: string, returnUrl: string): Promise<{ portalUrl: string }>;
+  createBillingPortalSession?(providerSubId: string, returnUrl: string, buyerId: string): Promise<{ portalUrl: string }>;
 
   /**
    * Optional: cancel. Required when `capabilities.supportsCancel`.
@@ -512,6 +515,8 @@ export interface PaymentProvider {
 
   /** Webhook-driven providers (Stripe, Lemon Squeezy) implement this. */
   handleWebhook?(rawBody: Buffer, signature: string, headers: Record<string, string>): Promise<void>;
+  /** The id of a delivery whose signature verifies as handleWebhook verifies it; null otherwise. */
+  webhookEventId?(rawBody: Buffer, headers: Record<string, string>): string | null;
   /** Polling-driven providers (Patreon, Server Boosting) implement this. */
   scheduledReconcile?(providerSubId: string): Promise<ProviderSubscriptionState | null>;
   /** OAuth-linked providers (Patreon) implement this. */

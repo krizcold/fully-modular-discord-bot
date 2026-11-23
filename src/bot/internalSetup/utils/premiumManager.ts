@@ -886,6 +886,8 @@ type CancelStep = 'done' | 'gone' | 'not saved';
 /** An install's outcome (decision 64's in-flight form): its save's op, its save's refusal, or why nothing was installed. */
 /** `why` says in words what a skip of the kind, the provider's kinds or the buyer found. */
 type InstallOutcome = { op: SaveOp } | { refused: string } | { skipped: string; why?: string };
+/** A provider event about a subscription already sold: every type but subscription.created. */
+type LifecycleEvent = Exclude<ProviderEvent, { type: 'subscription.created' }>;
 
 /** A change to a migration refused while that migration is being applied. */
 export class MigrationBusy extends Error {
@@ -1188,13 +1190,49 @@ export class PremiumManager {
       return promise;
     }
 
+    const waited = this.inFlight.get(event.providerSubId);
+    if (waited) return this.stateEventAfter(waited.promise, holder, event);
+    const made = this.applyLifecycleEvent(holder, event);
+    return made === 'unchanged' ? null : made;
+  }
+
+  /**
+   * Decision 20 of P3: a state event for a subscription whose install (or earlier waiting event) is in flight is
+   * applied after it, tracked in `inFlight` under the op's ledger so the op's verdict judges its save. It never
+   * rejects: a throw is recorded as a refusal of premium-tiers.json in that ledger and answered `{ refused }`.
+   */
+  private stateEventAfter(before: Promise<unknown>, holder: HolderKey, event: LifecycleEvent): Promise<InstallOutcome> {
+    const providerSubId = event.providerSubId;
+    const promise: Promise<InstallOutcome> = this.work.run(EVENT_WORK, async (): Promise<InstallOutcome> => {
+      try {
+        await before;
+        const made = this.applyLifecycleEvent(holder, event);
+        if (made === 'unchanged') return { skipped: 'unchanged' };
+        return made ? { op: made } : { refused: this.lastRefusal ?? 'io' };
+      } catch (error) {
+        const cause: LedgerCause = error instanceof DataBackendUnavailableError ? error.causeKey : 'io';
+        recordRefusal(cause, PREMIUM_DOC);
+        console.error(`[PremiumManager] The ${eventWords(event)} was not applied after the install of its subscription (${error instanceof Error ? error.message : String(error)}): ${JSON.stringify(event)}`);
+        return { refused: cause };
+      }
+    });
+    const tracked = { promise, ledger: currentLedger() };
+    this.inFlight.set(providerSubId, tracked);
+    void promise.finally(() => {
+      if (this.inFlight.get(providerSubId) === tracked) this.inFlight.delete(providerSubId);
+    });
+    return promise;
+  }
+
+  /** A state or notice event for a held subscription: the save it made, null when refused, 'unchanged' when none. */
+  private applyLifecycleEvent(holder: HolderKey, event: LifecycleEvent): SaveOp | null | 'unchanged' {
     // For lifecycle events on existing subs, find the record (active or paused)
     // by providerSubId and update in place.
     const subs = this.config.subscriptions[holder];
-    if (!subs) return null;
+    if (!subs) return 'unchanged';
 
     const matching = this.findSubscriptionByProviderSubId(subs, event.providerSubId);
-    if (!matching) return null;
+    if (!matching) return 'unchanged';
     const { sub } = matching;
 
     // Renewal failure is a notification-only event - no cache state change.
@@ -1206,7 +1244,7 @@ export class PremiumManager {
         providerName: this.providerDisplayName(event.providerId),
         details: event.reason,
       }, { standalone: 'the event changes nothing stored' });
-      return null;
+      return 'unchanged';
     }
 
     // subscription.paused is informational from the provider side: the cache
@@ -3668,7 +3706,7 @@ export class PremiumManager {
     holder: HolderKey,
     tierId: string,
     offeringId: string,
-    opts: { providerId: string; variantId: string; couponCode?: string; buyerId: string; autoRenewOptOut?: boolean },
+    opts: { providerId: string; variantId: string; couponCode?: string; buyerId: string; autoRenewOptOut?: boolean; buyerSignedIn?: boolean },
   ): Promise<InitiateResult> {
     return this.work.run(CHANGE_WORK, () => this.initiatePaidRun(holder, tierId, offeringId, opts));
   }
@@ -3677,7 +3715,7 @@ export class PremiumManager {
     holder: HolderKey,
     tierId: string,
     offeringId: string,
-    opts: { providerId: string; variantId: string; couponCode?: string; buyerId: string; autoRenewOptOut?: boolean },
+    opts: { providerId: string; variantId: string; couponCode?: string; buyerId: string; autoRenewOptOut?: boolean; buyerSignedIn?: boolean },
   ): Promise<InitiateResult> {
     const who = this.holderArg(holder);
     if (this.refusedAtEntry()) throw new Error(this.refusalText());
@@ -3713,6 +3751,11 @@ export class PremiumManager {
     const buyerId = opts.buyerId;
     if (!isDiscordId(buyerId)) throw new Error(PURCHASE_NEEDS_BUYER);
     if (who.kind === 'user' && buyerId !== who.id) throw new Error(BUYER_IS_NOT_THE_USER);
+
+    const sold = link.mode === 'product'
+      ? (link.cache?.variants ?? []).some(v => v.variantId === opts.variantId && v.active)
+      : (link.priceConfig?.entries ?? []).some(e => e.variantId === opts.variantId);
+    if (!sold) throw new Error(`Offering '${offering.label}' does not sell variant '${opts.variantId}' through ${provider.displayName}.`);
 
     // Pre-flight orphan check: refuse if the provider already has an
     // unknown sub for this holder.
@@ -3801,6 +3844,7 @@ export class PremiumManager {
       autoRenew: autoRenewIntent,
       couponCode: opts.couponCode,
       startPausedUntil,
+      ...(opts.buyerSignedIn === true ? { buyerSignedIn: true } : {}),
     });
 
     // Sync providers (Dummy) fill state and providerSubId; install inline.

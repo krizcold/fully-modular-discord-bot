@@ -15,7 +15,7 @@ afterEach(() => {
 
 const sub = (over: Record<string, unknown> = {}) => ({
   id: 'sub_1', status: 'active', cancel_at_period_end: false, current_period_start: 1762000000, current_period_end: 1764000000,
-  start_date: 1762000000, pause_collection: null, metadata: { guildId: '70000000000000001', tierId: 't', offeringId: 'o' }, ...over,
+  start_date: 1762000000, pause_collection: null, metadata: { holder: 'guild:70000000000000001', tierId: 't', offeringId: 'o' }, ...over,
 });
 
 function stub(answer: (url: string) => unknown) {
@@ -68,13 +68,13 @@ describe('a listed subscription', () => {
   };
 
   it("'20@1762732800' gives pausedDaysLeft 20 and pausedAt that time", async () => {
-    const ref = await listed(sub({ pause_collection: { behavior: 'void' }, metadata: { guildId: '70000000000000001', tierId: 't', offeringId: 'o', pausedDaysLeft: '20@1762732800' } }));
+    const ref = await listed(sub({ pause_collection: { behavior: 'void' }, metadata: { holder: 'guild:70000000000000001', tierId: 't', offeringId: 'o', pausedDaysLeft: '20@1762732800' } }));
     expect(ref.metadata.pausedDaysLeft).toBe(20);
     expect(ref.metadata.pausedAt).toBe(new Date(1762732800 * 1000).toISOString());
   });
 
   it.each(['20', 'x@1', '-1@1', 'x', ''])("'%s' gives neither field", async value => {
-    const ref = await listed(sub({ metadata: { guildId: '70000000000000001', tierId: 't', offeringId: 'o', pausedDaysLeft: value } }));
+    const ref = await listed(sub({ metadata: { holder: 'guild:70000000000000001', tierId: 't', offeringId: 'o', pausedDaysLeft: value } }));
     expect(ref.metadata.pausedDaysLeft).toBeUndefined();
     expect(ref.metadata.pausedAt).toBeUndefined();
   });

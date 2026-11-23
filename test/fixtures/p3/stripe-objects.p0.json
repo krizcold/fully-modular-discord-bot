@@ -1,0 +1,221 @@
+{
+  "counter": 10,
+  "products": {
+    "prod_gold": {
+      "id": "prod_gold",
+      "object": "product",
+      "name": "Gold",
+      "active": true
+    },
+    "prod_vip": {
+      "id": "prod_vip",
+      "object": "product",
+      "name": "VIP",
+      "active": true
+    }
+  },
+  "prices": {
+    "price_gold_month": {
+      "id": "price_gold_month",
+      "object": "price",
+      "active": true,
+      "currency": "usd",
+      "unit_amount": 500,
+      "type": "recurring",
+      "recurring": {
+        "interval": "month",
+        "interval_count": 1,
+        "trial_period_days": null
+      },
+      "product": "prod_gold",
+      "nickname": null
+    },
+    "price_gold_once": {
+      "id": "price_gold_once",
+      "object": "price",
+      "active": true,
+      "currency": "usd",
+      "unit_amount": 5000,
+      "type": "one_time",
+      "recurring": null,
+      "product": "prod_gold",
+      "nickname": null
+    },
+    "price_vip_month": {
+      "id": "price_vip_month",
+      "object": "price",
+      "active": true,
+      "currency": "usd",
+      "unit_amount": 300,
+      "type": "recurring",
+      "recurring": {
+        "interval": "month",
+        "interval_count": 1,
+        "trial_period_days": null
+      },
+      "product": "prod_vip",
+      "nickname": null
+    },
+    "price_vip_once": {
+      "id": "price_vip_once",
+      "object": "price",
+      "active": true,
+      "currency": "usd",
+      "unit_amount": 3000,
+      "type": "one_time",
+      "recurring": null,
+      "product": "prod_vip",
+      "nickname": null
+    },
+    "price_gold_other": {
+      "id": "price_gold_other",
+      "object": "price",
+      "active": true,
+      "currency": "usd",
+      "unit_amount": 900,
+      "type": "recurring",
+      "recurring": {
+        "interval": "month",
+        "interval_count": 1,
+        "trial_period_days": null
+      },
+      "product": "prod_gold",
+      "nickname": null
+    }
+  },
+  "promotionCodes": {},
+  "customers": {
+    "cus_p3000002": {
+      "id": "cus_p3000002",
+      "object": "customer",
+      "created": 1795385648,
+      "metadata": {}
+    }
+  },
+  "sessions": {
+    "cs_test_p3000001": {
+      "id": "cs_test_p3000001",
+      "object": "checkout.session",
+      "url": "https://checkout.stripe.example/c/pay/cs_test_p3000001",
+      "mode": "subscription",
+      "status": "complete",
+      "payment_status": "paid",
+      "customer": "cus_p3000002",
+      "subscription": "sub_p3000003",
+      "payment_intent": null,
+      "client_reference_id": "81000000000000001:gold:o-gold",
+      "metadata": {
+        "guildId": "81000000000000001",
+        "tierId": "gold",
+        "offeringId": "o-gold",
+        "variantId": "price_gold_month",
+        "couponCode": "",
+        "userId": "81000000000000002"
+      },
+      "success_url": "https://bot.example/guild/81000000000000001/subscription?subscribe=success&session={CHECKOUT_SESSION_ID}",
+      "cancel_url": "https://bot.example/guild/81000000000000001/subscription?subscribe=cancel",
+      "amount_total": 500,
+      "currency": "usd"
+    }
+  },
+  "sessionParams": {
+    "cs_test_p3000001": {
+      "mode": "subscription",
+      "line_items[0][price]": "price_gold_month",
+      "line_items[0][quantity]": "1",
+      "success_url": "https://bot.example/guild/81000000000000001/subscription?subscribe=success&session={CHECKOUT_SESSION_ID}",
+      "cancel_url": "https://bot.example/guild/81000000000000001/subscription?subscribe=cancel",
+      "client_reference_id": "81000000000000001:gold:o-gold",
+      "metadata[guildId]": "81000000000000001",
+      "metadata[tierId]": "gold",
+      "metadata[offeringId]": "o-gold",
+      "metadata[variantId]": "price_gold_month",
+      "metadata[couponCode]": "",
+      "metadata[userId]": "81000000000000002",
+      "subscription_data[metadata][guildId]": "81000000000000001",
+      "subscription_data[metadata][tierId]": "gold",
+      "subscription_data[metadata][offeringId]": "o-gold",
+      "subscription_data[metadata][variantId]": "price_gold_month",
+      "subscription_data[metadata][couponCode]": "",
+      "subscription_data[metadata][userId]": "81000000000000002"
+    }
+  },
+  "subscriptions": {
+    "sub_p3000003": {
+      "id": "sub_p3000003",
+      "object": "subscription",
+      "customer": "cus_p3000002",
+      "status": "active",
+      "cancel_at_period_end": false,
+      "current_period_start": 1795385648,
+      "current_period_end": 1797977648,
+      "start_date": 1795385648,
+      "trial_end": null,
+      "pause_collection": null,
+      "canceled_at": null,
+      "latest_invoice": "in_p3000005",
+      "items": {
+        "object": "list",
+        "data": [
+          {
+            "id": "si_p3000004",
+            "object": "subscription_item",
+            "price": "price_gold_month",
+            "current_period_start": 1795385648,
+            "current_period_end": 1797977648
+          }
+        ]
+      },
+      "metadata": {
+        "guildId": "81000000000000001",
+        "tierId": "gold",
+        "offeringId": "o-gold",
+        "variantId": "price_gold_month",
+        "couponCode": "",
+        "userId": "81000000000000002"
+      }
+    }
+  },
+  "invoices": {
+    "in_p3000005": {
+      "id": "in_p3000005",
+      "object": "invoice",
+      "subscription": "sub_p3000003",
+      "customer": "cus_p3000002",
+      "status": "paid",
+      "amount_due": 500,
+      "amount_paid": 500,
+      "currency": "usd",
+      "period_start": 1795385648,
+      "period_end": 1797977648,
+      "charge": "ch_p3000007",
+      "payment_intent": "pi_p3000006",
+      "last_finalization_error": null
+    }
+  },
+  "paymentIntents": {
+    "pi_p3000006": {
+      "id": "pi_p3000006",
+      "object": "payment_intent",
+      "status": "succeeded",
+      "amount": 500,
+      "currency": "usd",
+      "latest_charge": "ch_p3000007",
+      "invoice": "in_p3000005"
+    }
+  },
+  "charges": {
+    "ch_p3000007": {
+      "id": "ch_p3000007",
+      "object": "charge",
+      "amount": 500,
+      "amount_refunded": 0,
+      "refunded": false,
+      "currency": "usd",
+      "paid": true,
+      "status": "succeeded",
+      "invoice": "in_p3000005",
+      "payment_intent": "pi_p3000006"
+    }
+  }
+}

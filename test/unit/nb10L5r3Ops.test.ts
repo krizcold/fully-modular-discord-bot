@@ -8,7 +8,7 @@ import { DUMMY_METHODS, PREMIUM_METHODS, registeredOps } from '../../src/bot/int
 describe('registeredOps', () => {
   it('lists premium.setGlobalModuleConfig once, after premium.cancelMigration and before the dummy ops', () => {
     const expected = [
-      'global.write', 'payment.webhook', 'payment.oauthCallback',
+      'global.write', 'payment.webhook', 'payment.oauthCallback', 'payment.billingPortal',
       ...PREMIUM_METHODS.filter(m => m !== 'setGlobalModuleConfig').map(m => `premium.${m}`),
       'premium.setGlobalModuleConfig',
       ...DUMMY_METHODS.map(m => `dummy.${m}`),

@@ -1,0 +1,115 @@
+{
+  "tiers": {
+    "free": {
+      "displayName": "Free",
+      "priority": 0,
+      "overrides": {},
+      "offerings": []
+    },
+    "gold": {
+      "displayName": "Gold",
+      "priority": 1,
+      "overrides": {},
+      "offerings": [
+        {
+          "id": "o-gold",
+          "label": "Gold",
+          "providerLinks": [
+            {
+              "providerId": "stripe",
+              "enabled": true,
+              "mode": "price",
+              "priceConfig": {
+                "entries": [
+                  {
+                    "variantId": "price_gold_month"
+                  },
+                  {
+                    "variantId": "price_gold_once"
+                  }
+                ]
+              },
+              "cache": {
+                "syncedAt": "2026-11-22T00:00:00.000Z",
+                "variants": [
+                  {
+                    "variantId": "price_gold_month",
+                    "label": "Gold monthly",
+                    "amount": 500,
+                    "currency": "USD",
+                    "durationDays": 30,
+                    "recurring": true,
+                    "active": true
+                  },
+                  {
+                    "variantId": "price_gold_once",
+                    "label": "Gold lifetime",
+                    "amount": 5000,
+                    "currency": "USD",
+                    "durationDays": null,
+                    "recurring": false,
+                    "active": true
+                  }
+                ]
+              }
+            }
+          ],
+          "forceAutoRenew": false
+        }
+      ]
+    }
+  },
+  "subscriptions": {
+    "guild:81000000000000001": {
+      "paused": [],
+      "active": {
+        "id": "bd6bc5d6-dbf8-4ceb-a791-3bc270935c60",
+        "tierId": "gold",
+        "source": "paid",
+        "offeringId": "o-gold",
+        "variantId": "price_gold_month",
+        "providerId": "stripe",
+        "providerSubId": "sub_p3000003",
+        "providerMeta": {
+          "stripeStatus": "active",
+          "cancelAtPeriodEnd": false,
+          "pauseCollection": null,
+          "currentPeriodStart": "2026-11-22T22:14:08.000Z",
+          "trialEnd": null
+        },
+        "purchasedSnapshot": {
+          "offeringLabel": "Gold",
+          "variantLabel": "price_gold_month",
+          "amount": 500,
+          "currency": "USD",
+          "durationDays": 30,
+          "tierDisplayName": "Gold",
+          "tierPriority": 1,
+          "purchasedAt": "2026-11-22T22:14:08.462Z"
+        },
+        "buyerId": "81000000000000002",
+        "startDate": "2026-11-22T22:14:08.000Z",
+        "endDate": "2026-12-22T22:14:08.000Z",
+        "autoRenew": true,
+        "status": "active",
+        "createdAt": "2026-11-22T22:14:08.462Z",
+        "updatedAt": "2026-11-22T22:14:08.462Z"
+      }
+    }
+  },
+  "messages": {
+    "moduleBlocked": ":no_entry_sign: This module is not available for your server's current tier.",
+    "commandBlocked": ":no_entry_sign: This command is not available for your server's current tier.",
+    "panelBlocked": ":no_entry_sign: This module is not available for your server's current tier.",
+    "upgradeButtonLabel": "Upgrade your tier",
+    "userBlocked": ":no_entry_sign: This is not available for your personal subscription tier."
+  },
+  "providerAccountLinks": {},
+  "activatedProviders": {
+    "stripe": {
+      "defaultEnabled": false
+    }
+  },
+  "migrations": [],
+  "migrationSilencePolicy": "cancel"
+}

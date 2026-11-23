@@ -205,7 +205,7 @@ describe('P1 claim 19, part 3: the subscription routes', () => {
     const sent = await callServerPage('post', '/:guildId/paid', { guildId: SERVERS[1] }, { tierId: 'low', offeringId: 'o-low', providerId: SELLER_ID, variantId: SELLER_VARIANT }, { id: BUYER });
 
     expect(sent.map(s => [s.status, s.body.success])).toEqual([[200, true]]);
-    expect(ops).toEqual([{ op: 'premium.initiatePaidSubscription', args: { args: [gh(SERVERS[1]), 'low', 'o-low', { providerId: SELLER_ID, variantId: SELLER_VARIANT, couponCode: undefined, buyerId: BUYER, autoRenewOptOut: false }] } }]);
+    expect(ops).toEqual([{ op: 'premium.initiatePaidSubscription', args: { args: [gh(SERVERS[1]), 'low', 'o-low', { providerId: SELLER_ID, variantId: SELLER_VARIANT, couponCode: undefined, buyerId: BUYER, autoRenewOptOut: false, buyerSignedIn: true }] } }]);
     expect(w.recordOf(SERVERS[1]).active).toMatchObject({ tierId: 'low', source: 'paid', buyerId: BUYER });
     expect(sent[0].body.subscriptions.active.buyerId).toBe(BUYER);
   });

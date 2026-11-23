@@ -35,6 +35,7 @@ import oauthRoutes from './auth/oauthRoutes';
 import { getPaymentRegistry } from '../bot/internalSetup/utils/payment/paymentRegistry';
 import { setAccessLogDispatcher, fireAccessLog } from './utils/accessLog';
 import { webhookAnswer } from './routes/hopFailure';
+import { recordWebhookDelivery, webhookDeliveryAnswered } from './webhookDeliveries';
 
 export async function createServer(botManager: BotManager): Promise<Express> {
   const app = express();
@@ -119,14 +120,19 @@ export async function createServer(botManager: BotManager): Promise<Express> {
           || '';
         // Handled in the process that writes premium and answered once the change it made was judged. A refusal, or
         // no route within 5 s, answers 503, so the provider delivers it again.
+        const rawBody = Buffer.isBuffer(req.body) ? (req.body as Buffer) : Buffer.alloc(0);
+        let eventId: string | null = null;
+        try { eventId = provider.webhookEventId?.(rawBody, headerMap) ?? null; } catch { eventId = null; }
+        if (eventId !== null && webhookDeliveryAnswered(providerId, eventId)) return res.status(200).json({ received: true });
         const reply = await botManager.runSharedOp('payment.webhook', {
           providerId,
-          body: Buffer.isBuffer(req.body) ? (req.body as Buffer).toString('base64') : '',
+          body: rawBody.toString('base64'),
           signature,
           headers: headerMap,
         }, { routeWaitMs: 5000 });
         const answer = webhookAnswer(reply);
         if (answer.log) console.error(`[Webhook] ${providerId} ${answer.log}`);
+        if (answer.status === 200 && eventId !== null) recordWebhookDelivery(providerId, eventId);
         res.status(answer.status).json(answer.body);
       } catch (err: any) {
         // Return 400 so the provider retries (their delivery system handles

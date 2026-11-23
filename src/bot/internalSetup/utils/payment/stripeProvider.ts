@@ -1,21 +1,22 @@
 /**
- * StripeProvider - direct HTTP against Stripe REST API (no `stripe` SDK).
+ * StripeProvider - direct HTTP against Stripe REST API; the `stripe` package only verifies webhooks.
  *
  * Configuration: STRIPE_SECRET_KEY + STRIPE_WEBHOOK_SECRET env vars. Without
  * them `isConfigured()` returns false and offerings wired through Stripe
  * stay hidden in the guild subscribe UI.
  *
- * State ownership: Stripe is the source of truth. We keep no local state
- * file here; PremiumManager caches the active/paused subscription records
- * and the webhook handler emits events that mirror Stripe's lifecycle into
- * the cache.
+ * State ownership: Stripe is the source of truth for subscriptions.
+ * PremiumManager caches the active/paused subscription records and the
+ * webhook handler emits events that mirror Stripe's lifecycle into the
+ * cache. The bot's own file is payment-providers/stripe/customers.json
+ * (each member's Stripe Customer), kept by stripeCustomers.ts.
  */
 
-import * as crypto from 'crypto';
 import { PROVIDER_FETCH_MS } from './paymentTypes';
 import { providerCredentials } from '@/utils/envLoader';
 import { getPaymentRegistry } from './paymentRegistry';
-import { guildIdFor, holderFromWire, parseHolder, type HolderKey } from '../premiumHolder';
+import { holderWords, isDiscordId, notHolderText, parseHolder, type HolderKey } from '../premiumHolder';
+import { customerFor, forgetCustomer, recordedCustomer, StripeApiError, StripeNotCalled } from './stripeCustomers';
 import type {
   PaymentProvider,
   ProviderCapabilities,
@@ -33,6 +34,38 @@ import type {
 // so consumers must tolerate multiple shapes (see current_period_*).
 const STRIPE_API_VERSION = '2024-11-20.acacia';
 const STRIPE_API_BASE = 'https://api.stripe.com';
+const SIGNATURE_TOLERANCE_S = 300;
+
+let stripePackage: any = null;
+
+/** The stripe package's static webhooks, loaded at the first verification so no other path loads the package. */
+function stripeWebhooks(): { constructEvent(payload: Buffer, header: string, secret: string, tolerance: number): any } {
+  stripePackage ??= require('stripe');
+  return stripePackage.webhooks;
+}
+
+/** The verified event of a delivery; throws SW3 with no secret, SW1 when constructEvent refuses it. */
+function verifiedEvent(rawBody: Buffer, header: string | undefined): any {
+  const secret = providerCredentials('stripe').STRIPE_WEBHOOK_SECRET;
+  if (!secret) throw new Error('Stripe webhook refused: STRIPE_WEBHOOK_SECRET is not set.');
+  try {
+    return stripeWebhooks().constructEvent(rawBody, header ?? '', secret, SIGNATURE_TOLERANCE_S);
+  } catch (error) {
+    const message = (error instanceof Error ? error.message : String(error)).replace(/\s+/g, ' ').trim().replace(/\.+$/, '');
+    throw new Error(`Stripe webhook refused: ${message}.`);
+  }
+}
+
+/** The holder a Stripe object's metadata names, and its buyer; an object with no `holder` key names none. */
+function ownerOf(metadata: Record<string, string> | null | undefined): { holder: HolderKey | null; buyerId: string | undefined } {
+  return {
+    holder: parseHolder(metadata?.holder)?.key ?? null,
+    buyerId: isDiscordId(metadata?.buyerId) ? metadata!.buyerId : undefined,
+  };
+}
+
+const sentence = (text: string): string => text.trim().replace(/\.+$/, '');
+const ST8 = 'The Stripe billing account the bot recorded for you no longer exists at Stripe; the bot is removing its record. Try again in a moment to start a new one. Nothing was charged.';
 
 function safeIso(epochSeconds: number | null | undefined): string | null {
   if (typeof epochSeconds !== 'number' || !isFinite(epochSeconds) || epochSeconds <= 0) return null;
@@ -56,14 +89,13 @@ const CAPABILITIES: ProviderCapabilities = {
   supportsMultipleVariants: true,
   supportsProductMode: true,
   supportsHostedPicker: true,
-  hostedPickerVariantCap: 3, // Stripe Pricing Table caps at 3 prices per Product
   supportsCustomerPortal: true,
   supportsAnnualBilling: true,
   supportsPriceMigration: true,
   mechanism: 'redirect',
   variantIdLabel: 'Stripe Price ID',
   productIdLabel: 'Stripe Product ID',
-  sells: ['guild'],
+  sells: ['guild', 'user'],
 };
 
 interface StripeSession {
@@ -86,6 +118,7 @@ interface StripeSubscription {
   pause_collection: { behavior: 'keep_as_draft' | 'mark_uncollectible' | 'void' } | null;
   metadata?: Record<string, string>;
   customer?: string | null;
+  latest_invoice?: string | { id: string } | null;
   items?: {
     data: Array<{
       id: string;
@@ -95,6 +128,47 @@ interface StripeSubscription {
     }>;
   };
 }
+
+interface StripeCharge {
+  id: string;
+  amount: number;
+  amount_refunded: number;
+  refunded: boolean;
+  currency?: string;
+  invoice?: string | StripeInvoice | null;
+  payment_intent?: string | { id: string } | null;
+}
+
+interface StripeInvoice {
+  id: string;
+  subscription?: string | { id: string } | null;
+  last_finalization_error?: { message?: string } | null;
+}
+
+/** A Checkout Session read with `expand[]=payment_intent.latest_charge`. */
+interface StripeSessionRead {
+  id: string;
+  created?: number;
+  payment_status?: 'paid' | 'unpaid' | 'no_payment_required';
+  subscription?: string | { id: string } | null;
+  payment_intent?: string | { id: string; latest_charge?: string | StripeCharge | null } | null;
+  metadata?: Record<string, string>;
+}
+
+/** A webhook's read found no such object at Stripe: permanent, answered 200 with SL9. */
+class StripeObjectMissing extends Error {
+  constructor(readonly object: string, readonly objectId: string, readonly detail: string) {
+    super(`Stripe has no ${object} ${objectId} (${detail})`);
+  }
+}
+
+/** The id of a Stripe reference, expanded or not. */
+function idOf(ref: string | { id: string } | null | undefined): string | null {
+  if (typeof ref === 'string') return ref || null;
+  return ref && typeof ref.id === 'string' ? ref.id : null;
+}
+
+const moneyWords = (minor: number): string => (Number(minor || 0) / 100).toFixed(2);
 
 interface StripePromotionCode {
   id: string;
@@ -156,7 +230,8 @@ export class StripeProvider implements PaymentProvider {
   // ============================================================================
 
   async initiatePurchase(opts: InitiateOpts): Promise<InitiateResult> {
-    const guildId = guildIdFor(opts.holder as HolderKey, this.displayName);
+    const holder = parseHolder(opts.holder);
+    if (!holder) throw new Error(notHolderText(opts.holder));
     if (!opts.variantId) throw new Error('Stripe initiatePurchase requires variantId.');
 
     // Look up the price upfront so we can return a variantSnapshot AND
@@ -176,28 +251,34 @@ export class StripeProvider implements PaymentProvider {
     }
 
     const successBase = this.publicHostUrl();
+    let customer: string | undefined;
+    if (opts.buyerSignedIn) {
+      if (!isDiscordId(opts.buyerId)) throw new Error('Stripe checkout did not start: the signed-in buyer has no Discord id. Nothing was charged.');
+      customer = await customerFor(opts.buyerId, this.api.bind(this));
+    }
+    // A user's checkout returns to the member page's server list until the "My account" page exists.
+    const page = holder.kind === 'guild' ? `${successBase}/guild/${encodeURIComponent(holder.id)}/subscription` : `${successBase}/guild`;
+    const metadata: Record<string, string> = {
+      holder: holder.key,
+      buyerId: opts.buyerId || '',
+      tierId: opts.tierId,
+      offeringId: opts.offeringId,
+      variantId: opts.variantId,
+      couponCode: opts.couponCode || '',
+    };
     const params: Record<string, string> = {
       mode: isSubscription ? 'subscription' : 'payment',
       'line_items[0][price]': opts.variantId,
       'line_items[0][quantity]': '1',
-      success_url: `${successBase}/guild/${encodeURIComponent(guildId)}/subscription?subscribe=success&session={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${successBase}/guild/${encodeURIComponent(guildId)}/subscription?subscribe=cancel`,
-      client_reference_id: `${guildId}:${opts.tierId}:${opts.offeringId}`,
-      'metadata[guildId]': guildId,
-      'metadata[tierId]': opts.tierId,
-      'metadata[offeringId]': opts.offeringId,
-      'metadata[variantId]': opts.variantId,
-      'metadata[couponCode]': opts.couponCode || '',
-      'metadata[userId]': opts.buyerId || '',
+      success_url: `${page}?subscribe=success&session={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${page}?subscribe=cancel`,
+      ...(customer ? { customer } : {}),
+      client_reference_id: `${holder.key}:${opts.tierId}:${opts.offeringId}`,
     };
+    for (const [key, value] of Object.entries(metadata)) params[`metadata[${key}]`] = value;
 
     if (isSubscription) {
-      params['subscription_data[metadata][guildId]'] = guildId;
-      params['subscription_data[metadata][tierId]'] = opts.tierId;
-      params['subscription_data[metadata][offeringId]'] = opts.offeringId;
-      params['subscription_data[metadata][variantId]'] = opts.variantId;
-      params['subscription_data[metadata][couponCode]'] = opts.couponCode || '';
-      params['subscription_data[metadata][userId]'] = opts.buyerId || '';
+      for (const [key, value] of Object.entries(metadata)) params[`subscription_data[metadata][${key}]`] = value;
       if (!wantAutoRenew) {
         params['subscription_data[cancel_at_period_end]'] = 'true';
       }
@@ -220,7 +301,21 @@ export class StripeProvider implements PaymentProvider {
       params['discounts[0][promotion_code]'] = promotionCodeId;
     }
 
-    const session = await this.api<StripeSession>('POST', '/v1/checkout/sessions', params);
+    let session: StripeSession;
+    try {
+      session = await this.api<StripeSession>('POST', '/v1/checkout/sessions', params);
+    } catch (error) {
+      if (error instanceof StripeNotCalled) throw new Error(`Stripe did not start the checkout: ${sentence(error.message)}. Nothing was charged.`);
+      if (error instanceof StripeApiError && error.status !== null && error.status < 500) {
+        if (customer && error.code === 'resource_missing' && error.param === 'customer') {
+          await forgetCustomer(opts.buyerId!, customer);
+          throw new Error(ST8);
+        }
+        throw new Error(`Stripe did not start the checkout: ${sentence(error.message)}. Nothing was charged.`);
+      }
+      const reason = error instanceof StripeApiError && error.status !== null ? `Stripe answered ${error.status}` : sentence(error instanceof Error ? error.message : String(error));
+      throw new Error(`Can't confirm whether Stripe started a checkout (${reason}). Nothing is charged until a checkout is paid; try again.`);
+    }
     if (!session.url) {
       throw new Error('Stripe returned a checkout session without a url.');
     }
@@ -288,151 +383,290 @@ export class StripeProvider implements PaymentProvider {
   // WEBHOOK
   // ============================================================================
 
-  async handleWebhook(rawBody: Buffer, signature: string): Promise<void> {
-    if (!this.verifySignature(rawBody, signature)) {
-      throw new Error('Invalid Stripe webhook signature.');
+  webhookEventId(rawBody: Buffer, headers: Record<string, string>): string | null {
+    try {
+      const id = verifiedEvent(rawBody, headers['stripe-signature'])?.id;
+      return typeof id === 'string' && id !== '' ? id : null;
+    } catch {
+      return null;
     }
-    const event = JSON.parse(rawBody.toString('utf-8')) as { type: string; data: { object: any } };
-    const obj = event.data?.object;
-    if (!obj) return;
+  }
 
-    const registry = getPaymentRegistry();
+  /**
+   * Every handled event reads its object again from the API at the pinned version; the payload gives only the event's
+   * type and the object's id. Handlings about one subscription (or one-time purchase) run one at a time.
+   */
+  async handleWebhook(rawBody: Buffer, signature: string): Promise<void> {
+    const event = verifiedEvent(rawBody, signature) as { type: string; data?: { object?: { id?: unknown } } };
+    const objectId = event.data?.object?.id;
+    if (typeof objectId !== 'string' || objectId === '') return;
+    try {
+      switch (event.type) {
+        case 'checkout.session.completed':
+        case 'checkout.session.async_payment_succeeded':
+          return await this.onCheckoutPaid(event.type, objectId);
+        case 'checkout.session.async_payment_failed':
+          console.log(`[StripeProvider] Checkout ${objectId} ended without payment (${event.type}); nothing was installed.`);
+          return;
+        case 'customer.subscription.updated':
+        case 'customer.subscription.deleted':
+        case 'customer.subscription.paused':
+        case 'customer.subscription.resumed':
+          return await this.inChain(objectId, () => this.onSubscriptionState(event.type, objectId));
+        case 'invoice.paid':
+        case 'invoice.payment_failed':
+          return await this.onInvoice(event.type, objectId);
+        case 'charge.refunded':
+          return await this.onRefund(event.type, objectId);
+        default:
+          return;
+      }
+    } catch (error) {
+      if (!(error instanceof StripeObjectMissing)) throw error;
+      console.warn(`[StripeProvider] A ${event.type} event was not applied: Stripe has no ${error.object} ${error.objectId} (${error.detail}).`);
+    }
+  }
 
-    switch (event.type) {
-      case 'checkout.session.completed': {
-        const session = obj as StripeSession;
-        const meta = session.metadata || {};
-        const guildId = meta.guildId;
-        const tierId = meta.tierId;
-        const offeringId = meta.offeringId;
-        const variantId = meta.variantId || undefined;
-        const couponCode = meta.couponCode || undefined;
-        if (!guildId || !tierId || !offeringId) {
-          console.warn('[StripeProvider] checkout.session.completed missing required metadata; ignoring.');
+  /** The chains of handlings by Stripe subscription id (a session id for a one-time purchase). */
+  private readonly chains = new Map<string, Promise<void>>();
+  /** SL1 and SL3 are logged once per object (and price) in this process. */
+  private readonly logged = new Set<string>();
+
+  /** Runs `fn` after every earlier handling chained on `key` has ended. */
+  private async inChain<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const before = this.chains.get(key) ?? Promise.resolve();
+    let done!: () => void;
+    const mine = new Promise<void>(resolve => { done = resolve; });
+    const tail = before.then(() => mine);
+    this.chains.set(key, tail);
+    try {
+      await before;
+      return await fn();
+    } finally {
+      done();
+      if (this.chains.get(key) === tail) this.chains.delete(key);
+    }
+  }
+
+  private logOnce(key: string, line: string): void {
+    if (this.logged.has(key)) return;
+    this.logged.add(key);
+    console.warn(line);
+  }
+
+  /** The holder an object's metadata names; logs SL1 once and answers null when it names none. */
+  private holderOrSkip(type: string, object: string, id: string, metadata: Record<string, string> | null | undefined): ReturnType<typeof ownerOf> | null {
+    const owner = ownerOf(metadata);
+    if (owner.holder) return owner;
+    this.logOnce(`holder\u0000${object}\u0000${id}`, `[StripeProvider] A ${type} event for ${object} ${id} was not applied: its metadata names no holder. It was made before this version or not by this bot; the bot does not manage it.`);
+    return null;
+  }
+
+  /**
+   * One read of Stripe for a webhook. A 404 or a `resource_missing` error is permanent (StripeObjectMissing, answered
+   * 200 with SL9); any other failure throws SW2, which the op answers 400 so Stripe sends the event again.
+   */
+  private async readFor<T>(object: string, id: string, path: string, method: 'GET' | 'DELETE' = 'GET'): Promise<T> {
+    try {
+      return await this.api<T>(method, path);
+    } catch (error) {
+      if (error instanceof StripeApiError && (error.status === 404 || error.code === 'resource_missing')) {
+        throw new StripeObjectMissing(object, id, error.code ?? String(error.status));
+      }
+      const reason = error instanceof StripeApiError && error.status !== null ? `Stripe answered ${error.status}` : sentence(error instanceof Error ? error.message : String(error));
+      if (method === 'DELETE' && !(error instanceof StripeNotCalled) && (!(error instanceof StripeApiError) || error.status === null || error.status >= 500)) {
+        throw new Error(`Stripe webhook not applied: can't confirm whether Stripe cancelled ${object} ${id} (${reason}); Stripe sends the event again.`);
+      }
+      const verb = method === 'DELETE' ? 'cancel' : 'read';
+      throw new Error(`Stripe webhook not applied: the bot could not ${verb} ${object} ${id} ${method === 'DELETE' ? 'at' : 'from'} Stripe (${reason}); Stripe sends the event again.`);
+    }
+  }
+
+  private readSubscription(id: string): Promise<StripeSubscription> {
+    return this.readFor<StripeSubscription>('subscription', id, `/v1/subscriptions/${encodeURIComponent(id)}?expand[]=items.data.price`);
+  }
+
+  private readSession(id: string): Promise<StripeSessionRead> {
+    return this.readFor<StripeSessionRead>('checkout session', id, `/v1/checkout/sessions/${encodeURIComponent(id)}?expand[]=payment_intent.latest_charge`);
+  }
+
+  /** `checkout.session.completed` and `.async_payment_succeeded`: installs a paid checkout. */
+  private async onCheckoutPaid(type: string, sessionId: string): Promise<void> {
+    await this.inChain(sessionId, async () => {
+      const session = await this.readSession(sessionId);
+      if (session.payment_status === 'unpaid') return;
+      if (!this.holderOrSkip(type, 'checkout session', session.id, session.metadata)) return;
+      const subscriptionId = idOf(session.subscription);
+      if (subscriptionId) {
+        await this.inChain(subscriptionId, () => this.installSubscription(type, session, subscriptionId));
+        return;
+      }
+      const charge = typeof session.payment_intent === 'object' && session.payment_intent ? session.payment_intent.latest_charge : null;
+      if (charge && typeof charge === 'object' && charge.refunded === true) {
+        console.log(`[StripeProvider] Checkout ${session.id} completed for a one-time purchase whose payment was refunded in full; nothing was installed.`);
+        return;
+      }
+      const meta = session.metadata || {};
+      const owner = ownerOf(meta);
+      if (!meta.tierId || !meta.offeringId) {
+        console.warn(`[StripeProvider] Checkout ${session.id} names no tier or offering in its metadata; nothing was installed.`);
+        return;
+      }
+      const variantId = meta.variantId || undefined;
+      const variantSnapshot = variantId ? (await this.fetchVariant(variantId).catch(() => null)) ?? undefined : undefined;
+      getPaymentRegistry().emitEvent({
+        type: 'subscription.created',
+        providerId: this.id,
+        providerSubId: session.id,
+        holder: owner.holder!,
+        buyerId: owner.buyerId,
+        tierId: meta.tierId,
+        offeringId: meta.offeringId,
+        variantId,
+        couponCode: meta.couponCode || undefined,
+        state: {
+          status: 'active',
+          startDate: safeIso(session.created) ?? new Date().toISOString(),
+          endDate: null,
+          autoRenew: false,
+          meta: { sessionId: session.id, paymentIntent: idOf(session.payment_intent) },
+        },
+        variantSnapshot,
+      });
+    });
+  }
+
+  private async installSubscription(type: string, session: StripeSessionRead, subscriptionId: string): Promise<void> {
+    const sub = await this.readSubscription(subscriptionId);
+    const owner = this.holderOrSkip(type, 'subscription', sub.id, sub.metadata);
+    if (!owner) return;
+    const state = this.stateFromSubscription(sub);
+    if (state.status === 'expired') {
+      console.log(`[StripeProvider] Checkout ${session.id} completed for subscription ${sub.id}, which had already ended at Stripe; nothing was installed.`);
+      return;
+    }
+    const meta = sub.metadata || {};
+    if (!meta.tierId || !meta.offeringId) {
+      console.warn(`[StripeProvider] Subscription ${sub.id} names no tier or offering in its metadata; nothing was installed.`);
+      return;
+    }
+    const item = sub.items?.data?.[0];
+    getPaymentRegistry().emitEvent({
+      type: 'subscription.created',
+      providerId: this.id,
+      providerSubId: sub.id,
+      holder: owner.holder!,
+      buyerId: owner.buyerId,
+      tierId: meta.tierId,
+      offeringId: meta.offeringId,
+      variantId: meta.variantId || undefined,
+      couponCode: meta.couponCode || undefined,
+      state,
+      variantSnapshot: item?.price ? this.normalizePrice(item.price) ?? undefined : undefined,
+    });
+  }
+
+  /** A state event: the subscription's current state, expired when it maps to expired. */
+  private async onSubscriptionState(type: string, subscriptionId: string): Promise<void> {
+    const sub = await this.readSubscription(subscriptionId);
+    const owner = this.holderOrSkip(type, 'subscription', sub.id, sub.metadata);
+    if (!owner) return;
+    const price = sub.items?.data?.[0]?.price?.id;
+    const sold = sub.metadata?.variantId;
+    if (price && sold && price !== sold) {
+      this.logOnce(`price\u0000${sub.id}\u0000${price}`, `[StripeProvider] Subscription ${sub.id} now charges price ${price}, not ${sold} that the bot sold it with; the bot keeps giving tier '${sub.metadata?.tierId ?? ''}'. Turn off plan switching in the Stripe customer portal settings.`);
+    }
+    const state = this.stateFromSubscription(sub);
+    getPaymentRegistry().emitEvent({
+      type: state.status === 'expired' ? 'subscription.expired' : 'subscription.updated',
+      providerId: this.id,
+      providerSubId: sub.id,
+      holder: owner.holder!,
+      state,
+    });
+  }
+
+  /** `invoice.paid` and `invoice.payment_failed`: the invoice, then its subscription. */
+  private async onInvoice(type: string, invoiceId: string): Promise<void> {
+    const invoice = await this.readFor<StripeInvoice>('invoice', invoiceId, `/v1/invoices/${encodeURIComponent(invoiceId)}`);
+    const subscriptionId = idOf(invoice.subscription);
+    if (!subscriptionId) return;
+    await this.inChain(subscriptionId, async () => {
+      const sub = await this.readSubscription(subscriptionId);
+      const owner = this.holderOrSkip(type, 'subscription', sub.id, sub.metadata);
+      if (!owner) return;
+      if (type === 'invoice.paid') {
+        getPaymentRegistry().emitEvent({ type: 'subscription.renewed', providerId: this.id, providerSubId: sub.id, holder: owner.holder!, state: this.stateFromSubscription(sub) });
+        return;
+      }
+      // Stripe owns the dunning retries; premium only sends the notice, and Stripe's end of the subscription arrives
+      // as its own event.
+      getPaymentRegistry().emitEvent({
+        type: 'subscription.renewal-failed', providerId: this.id, providerSubId: sub.id, holder: owner.holder!, reason: invoice.last_finalization_error?.message,
+      });
+    });
+  }
+
+  /**
+   * `charge.refunded`: a full refund of a subscription's latest invoice cancels it at Stripe (unless it already maps
+   * to expired) and ends it in the bot; a full refund of a one-time purchase ends it in the bot; any other refund
+   * changes nothing.
+   */
+  private async onRefund(type: string, chargeId: string): Promise<void> {
+    const charge = await this.readFor<StripeCharge>('charge', chargeId, `/v1/charges/${encodeURIComponent(chargeId)}?expand[]=invoice`);
+    const refundWords = `${moneyWords(charge.amount_refunded)} of ${moneyWords(charge.amount)} ${String(charge.currency ?? '').toUpperCase()}`;
+    const invoice = charge.invoice && typeof charge.invoice === 'object' ? charge.invoice : null;
+    if (charge.invoice) {
+      const invoiceId = invoice ? invoice.id : String(charge.invoice);
+      const subscriptionId = idOf(invoice?.subscription);
+      if (!subscriptionId) {
+        console.warn(`[StripeProvider] Charge ${charge.id} was refunded; its invoice ${invoiceId} belongs to no subscription, so it was not made by the bot's checkout and the bot does not manage it.`);
+        return;
+      }
+      await this.inChain(subscriptionId, async () => {
+        let sub = await this.readSubscription(subscriptionId);
+        const owner = this.holderOrSkip(type, 'subscription', sub.id, sub.metadata);
+        if (!owner) return;
+        if (charge.refunded !== true || idOf(sub.latest_invoice) !== invoiceId) {
+          console.log(`[StripeProvider] Charge ${charge.id} was refunded (${refundWords}), and it is not a full refund of the latest payment of subscription ${sub.id}; the subscription stays.`);
           return;
         }
-        const holder = holderFromWire(guildId);
-        if (!holder) return;
-        const buyerId = meta.userId || undefined;
-
-        if (session.subscription) {
-          const sub = await this.fetchSubscription(session.subscription);
-          if (!sub) {
-            console.warn(`[StripeProvider] could not fetch subscription ${session.subscription} after checkout completion.`);
-            return;
-          }
-          // Build a variant snapshot from the subscription's first item.price
-          const item = sub.items?.data?.[0];
-          const variantSnapshot = item?.price ? this.normalizePrice(item.price) ?? undefined : undefined;
-          registry.emitEvent({
-            type: 'subscription.created',
-            providerId: this.id,
-            providerSubId: sub.id,
-            holder,
-            buyerId,
-            tierId,
-            offeringId,
-            variantId,
-            couponCode,
-            state: this.stateFromSubscription(sub),
-            variantSnapshot,
-          });
+        if (this.stateFromSubscription(sub).status !== 'expired') {
+          await this.readFor('subscription', sub.id, `/v1/subscriptions/${encodeURIComponent(sub.id)}`, 'DELETE');
+          console.log(`[StripeProvider] Charge ${charge.id} was refunded in full; subscription ${sub.id} (${holderWords(owner.holder!)}) was cancelled at Stripe.`);
+          sub = await this.readSubscription(sub.id);
         } else {
-          // One-time / Lifetime: synthesize using the session id.
-          // Try to fetch the price for variantSnapshot.
-          const variantSnapshot = variantId ? (await this.fetchVariant(variantId).catch(() => null)) ?? undefined : undefined;
-          registry.emitEvent({
-            type: 'subscription.created',
-            providerId: this.id,
-            providerSubId: session.id,
-            holder,
-            buyerId,
-            tierId,
-            offeringId,
-            variantId,
-            couponCode,
-            state: {
-              status: 'active',
-              startDate: new Date().toISOString(),
-              endDate: null,
-              autoRenew: false,
-              meta: { sessionId: session.id, paymentIntent: session.payment_intent || null },
-            },
-            variantSnapshot,
-          });
+          console.log(`[StripeProvider] Charge ${charge.id} was refunded in full; subscription ${sub.id} (${holderWords(owner.holder!)}) was already cancelled at Stripe.`);
         }
-        return;
-      }
-
-      case 'customer.subscription.updated': {
-        const sub = obj as StripeSubscription;
-        const holder = holderFromWire(sub.metadata?.guildId);
-        if (!holder) return;
-        registry.emitEvent({
-          type: 'subscription.updated',
-          providerId: this.id,
-          providerSubId: sub.id,
-          holder,
-          state: this.stateFromSubscription(sub),
+        getPaymentRegistry().emitEvent({
+          type: 'subscription.expired', providerId: this.id, providerSubId: sub.id, holder: owner.holder!, state: { ...this.stateFromSubscription(sub), status: 'expired' },
         });
-        return;
-      }
-
-      case 'customer.subscription.deleted': {
-        const sub = obj as StripeSubscription;
-        const holder = holderFromWire(sub.metadata?.guildId);
-        if (!holder) return;
-        registry.emitEvent({
-          type: 'subscription.expired',
-          providerId: this.id,
-          providerSubId: sub.id,
-          holder,
-          state: { ...this.stateFromSubscription(sub), status: 'expired' },
-        });
-        return;
-      }
-
-      case 'invoice.paid': {
-        const inv = obj as { subscription?: string | null };
-        if (!inv.subscription) return;
-        const sub = await this.fetchSubscription(inv.subscription);
-        if (!sub) return;
-        const holder = holderFromWire(sub.metadata?.guildId);
-        if (!holder) return;
-        registry.emitEvent({
-          type: 'subscription.renewed',
-          providerId: this.id,
-          providerSubId: sub.id,
-          holder,
-          state: this.stateFromSubscription(sub),
-        });
-        return;
-      }
-
-      case 'invoice.payment_failed': {
-        // Stripe owns the dunning retry schedule and emails the customer.
-        // We surface a heads-up event so the bot can DM/post the same news;
-        // no cache state change because the sub is still nominally active
-        // until Stripe gives up (which fires customer.subscription.deleted).
-        const inv = obj as { subscription?: string | null; last_finalization_error?: { message?: string } | null };
-        if (!inv.subscription) return;
-        const sub = await this.fetchSubscription(inv.subscription);
-        if (!sub) return;
-        const holder = holderFromWire(sub.metadata?.guildId);
-        if (!holder) return;
-        registry.emitEvent({
-          type: 'subscription.renewal-failed',
-          providerId: this.id,
-          providerSubId: sub.id,
-          holder,
-          reason: inv.last_finalization_error?.message,
-        });
-        return;
-      }
-
-      default:
-        return;
+      });
+      return;
     }
+    const paymentIntent = idOf(charge.payment_intent);
+    const listed = 'checkout sessions of payment intent';
+    if (!paymentIntent) throw new StripeObjectMissing(listed, '(none)', 'the charge names no payment intent');
+    const list = await this.readFor<{ data: StripeSessionRead[] }>(listed, paymentIntent, `/v1/checkout/sessions?payment_intent=${encodeURIComponent(paymentIntent)}&limit=1`);
+    const session = list.data?.[0];
+    if (!session) throw new StripeObjectMissing(listed, paymentIntent, 'empty list');
+    await this.inChain(session.id, async () => {
+      const owner = this.holderOrSkip(type, 'checkout session', session.id, session.metadata);
+      if (!owner) return;
+      if (charge.refunded !== true) {
+        console.log(`[StripeProvider] Charge ${charge.id} was refunded (${refundWords}), and it is not a full refund of the latest payment of checkout ${session.id}; the subscription stays.`);
+        return;
+      }
+      const now = new Date().toISOString();
+      getPaymentRegistry().emitEvent({
+        type: 'subscription.expired',
+        providerId: this.id,
+        providerSubId: session.id,
+        holder: owner.holder!,
+        state: { status: 'expired', startDate: safeIso(session.created) ?? now, endDate: now, autoRenew: false, meta: { sessionId: session.id, paymentIntent } },
+      });
+      console.log(`[StripeProvider] Charge ${charge.id} was refunded in full; the purchase ${session.id} (${holderWords(owner.holder!)}) is ended in the bot.`);
+    });
   }
 
   // ============================================================================
@@ -549,6 +783,7 @@ export class StripeProvider implements PaymentProvider {
     const params: Record<string, string> = {
       'items[0][id]': itemId,
       'items[0][price]': newVariantId,
+      'metadata[variantId]': newVariantId,
       proration_behavior: prorationBehavior,
     };
     const result = await this.api<StripeSubscription>('POST', `/v1/subscriptions/${encodeURIComponent(providerSubId)}`, params);
@@ -570,55 +805,55 @@ export class StripeProvider implements PaymentProvider {
 
   async listSubscriptionsFor(holder: HolderKey): Promise<ProviderSubscriptionRef[]> {
     const parsed = parseHolder(holder);
-    if (!parsed || parsed.kind !== 'guild') return [];
-    const guildId = parsed.id;
+    if (!parsed) return [];
+    const key = parsed.key;
     const matching = new Map<string, StripeSubscription>();
     let searchCount = 0;
     let listTotal = 0;
     let listMatching = 0;
-    const sampleNonMatch: Array<{ id: string; metaKeys: string[]; metaGuild: string | undefined }> = [];
+    const sampleNonMatch: Array<{ id: string; metaKeys: string[]; metaHolder: string | undefined }> = [];
 
     try {
-      const safeGuildId = guildId.replace(/'/g, "\\'");
-      const query = `metadata['guildId']:'${safeGuildId}'`;
+      const query = `metadata['holder']:'${key}'`;
       let page: string | undefined;
       for (let i = 0; i < 5; i++) {
         const url = `/v1/subscriptions/search?query=${encodeURIComponent(query)}&limit=100`
           + (page ? `&page=${encodeURIComponent(page)}` : '');
         const result = await this.api<{ data: StripeSubscription[]; has_more: boolean; next_page?: string }>('GET', url);
         searchCount += (result.data || []).length;
-        for (const sub of result.data || []) matching.set(sub.id, sub);
+        // A search answer is kept only when its metadata names this holder.
+        for (const sub of result.data || []) if (sub.metadata?.holder === key) matching.set(sub.id, sub);
         if (!result.has_more || !result.next_page) break;
         page = result.next_page;
       }
     } catch (err: any) {
-      console.warn(`[StripeProvider] subscriptions search failed for guild ${guildId} (continuing with list fallback): ${err?.message || err}`);
+      console.warn(`[StripeProvider] subscriptions search failed for ${key} (continuing with list fallback): ${err?.message || err}`);
     }
 
     try {
       const result = await this.api<{ data: StripeSubscription[] }>('GET', '/v1/subscriptions?limit=100');
       listTotal = (result.data || []).length;
       for (const sub of result.data || []) {
-        if (sub.metadata?.guildId === guildId) {
+        if (sub.metadata?.holder === key) {
           matching.set(sub.id, sub);
           listMatching++;
         } else if (sampleNonMatch.length < 3) {
           sampleNonMatch.push({
             id: sub.id,
             metaKeys: Object.keys(sub.metadata || {}),
-            metaGuild: sub.metadata?.guildId,
+            metaHolder: sub.metadata?.holder,
           });
         }
       }
     } catch (err: any) {
-      console.warn(`[StripeProvider] subscriptions list failed for guild ${guildId}: ${err?.message || err}`);
+      console.warn(`[StripeProvider] subscriptions list failed for ${key}: ${err?.message || err}`);
     }
 
     const liveStatuses = new Set(['active', 'trialing', 'past_due', 'unpaid', 'paused']);
     const live = Array.from(matching.values()).filter(sub => liveStatuses.has(sub.status));
     console.log(
-      `[StripeProvider] orphan-scan guild=${guildId}: `
-      + `search=${searchCount} list=${listTotal} list-matching-guildId=${listMatching} `
+      `[StripeProvider] orphan-scan holder=${key}: `
+      + `search=${searchCount} list=${listTotal} list-matching-holder=${listMatching} `
       + `dedup=${matching.size} live=${live.length}`
       + (sampleNonMatch.length > 0
         ? ` sample-non-matching=${JSON.stringify(sampleNonMatch)}`
@@ -627,21 +862,50 @@ export class StripeProvider implements PaymentProvider {
     return live.map(sub => this.refFromSubscription(sub));
   }
 
-  async createBillingPortalSession(providerSubId: string, returnUrl: string): Promise<{ portalUrl: string }> {
+  async createBillingPortalSession(providerSubId: string, returnUrl: string, buyerId: string): Promise<{ portalUrl: string }> {
     if (this.isOneTimeSubId(providerSubId)) {
       throw new Error('Stripe one-time / Lifetime purchases have no recurring portal to manage.');
     }
-    const sub = await this.fetchSubscription(providerSubId);
-    if (!sub) throw new Error(`Stripe subscription '${providerSubId}' not found.`);
-    if (!sub.customer) throw new Error(`Stripe subscription '${providerSubId}' has no customer attached.`);
-    const customerId = typeof sub.customer === 'string' ? sub.customer : (sub.customer as any).id;
-    const result = await this.api<{ url: string }>('POST', '/v1/billing_portal/sessions', {
-      customer: customerId,
-      return_url: returnUrl,
-    });
-    if (!result.url) {
-      throw new Error('Stripe billing_portal/sessions returned no url.');
+    const notAnswered = (error: unknown): Error => {
+      const message = error instanceof Error ? sentence(error.message) : String(error);
+      if (error instanceof StripeNotCalled) return new Error(`The bot did not ask Stripe (${message}), so no billing portal was opened.`);
+      if (!(error instanceof StripeApiError)) return new Error(`The bot could not read Stripe's answer (${message}), so no billing portal was opened. Try again.`);
+      if (error.status === null) return new Error(`Stripe did not answer (${message}), so no billing portal was opened. Try again.`);
+      return new Error(`Stripe answered ${error.status}, so no billing portal was opened. Try again.`);
+    };
+    let sub: StripeSubscription;
+    try {
+      sub = await this.api<StripeSubscription>('GET', `/v1/subscriptions/${encodeURIComponent(providerSubId)}`);
+    } catch (error) {
+      if (error instanceof StripeApiError && (error.status === 404 || error.code === 'resource_missing')) {
+        throw new Error(`Stripe has no record of this subscription (${sentence(error.message)}), so no billing portal was opened.`);
+      }
+      if (error instanceof StripeApiError && error.status !== null && error.status < 500) {
+        throw new Error(`Stripe refused to read this subscription: ${sentence(error.message)}. No billing portal was opened.`);
+      }
+      throw notAnswered(error);
     }
+    if (ownerOf(sub.metadata).buyerId !== buyerId) {
+      throw new Error("Stripe's record of this subscription does not name you as its payer, so no billing portal was opened.");
+    }
+    let recorded: string | null;
+    try {
+      recorded = recordedCustomer(buyerId);
+    } catch (error) {
+      throw new Error(`The billing portal did not open: the bot could not read its record of your Stripe billing account (${error instanceof Error ? sentence(error.message) : String(error)}).`);
+    }
+    const customerId = typeof sub.customer === 'string' ? sub.customer : (sub.customer as any)?.id;
+    if (!customerId || recorded !== customerId) {
+      throw new Error("This subscription is not on the Stripe billing account the bot records for you (it may have been started from the bot's dev page), so no billing portal was opened.");
+    }
+    let result: { url?: string };
+    try {
+      result = await this.api<{ url: string }>('POST', '/v1/billing_portal/sessions', { customer: customerId, return_url: returnUrl });
+    } catch (error) {
+      if (error instanceof StripeApiError && error.status !== null && error.status < 500) throw new Error(`Stripe did not open the billing portal: ${sentence(error.message)}.`);
+      throw notAnswered(error);
+    }
+    if (!result.url) throw new Error('Stripe billing_portal/sessions returned no url.');
     return { portalUrl: result.url };
   }
 
@@ -702,43 +966,16 @@ export class StripeProvider implements PaymentProvider {
       providerSubId: sub.id,
       state: this.stateFromSubscription(sub),
       metadata: {
-        holder: holderFromWire(sub.metadata?.guildId) ?? undefined,
+        holder: ownerOf(sub.metadata).holder ?? undefined,
         tierId: sub.metadata?.tierId,
         offeringId: sub.metadata?.offeringId,
         variantId: sub.metadata?.variantId || price?.id,
         couponCode: sub.metadata?.couponCode || undefined,
-        buyerId: sub.metadata?.userId || undefined,
+        buyerId: ownerOf(sub.metadata).buyerId,
         ...pausedDaysLeftOf(sub.metadata?.pausedDaysLeft),
       },
       display: { amountLabel, periodLabel, statusLabel },
     };
-  }
-
-  private verifySignature(rawBody: Buffer, header: string | undefined): boolean {
-    const secret = providerCredentials('stripe').STRIPE_WEBHOOK_SECRET;
-    if (!secret || !header) return false;
-
-    let timestamp = '';
-    const v1Sigs: string[] = [];
-    for (const part of header.split(',')) {
-      const [k, v] = part.split('=');
-      if (k === 't') timestamp = v;
-      else if (k === 'v1' && v) v1Sigs.push(v);
-    }
-    if (!timestamp || v1Sigs.length === 0) return false;
-
-    const payload = `${timestamp}.${rawBody.toString('utf-8')}`;
-    const expected = crypto.createHmac('sha256', secret).update(payload).digest('hex');
-    const expectedBuf = Buffer.from(expected, 'hex');
-
-    for (const candidate of v1Sigs) {
-      let candidateBuf: Buffer;
-      try { candidateBuf = Buffer.from(candidate, 'hex'); }
-      catch { continue; }
-      if (candidateBuf.length !== expectedBuf.length) continue;
-      if (crypto.timingSafeEqual(candidateBuf, expectedBuf)) return true;
-    }
-    return false;
   }
 
   private async fetchSubscription(id: string): Promise<StripeSubscription | null> {
@@ -802,14 +1039,16 @@ export class StripeProvider implements PaymentProvider {
     }
   }
 
-  private async api<T = any>(method: 'GET' | 'POST' | 'DELETE', path: string, formBody?: Record<string, string>): Promise<T> {
+  private async api<T = any>(method: 'GET' | 'POST' | 'DELETE', path: string, formBody?: Record<string, string>, idempotencyKey?: string): Promise<T> {
     const secret = providerCredentials('stripe').STRIPE_SECRET_KEY;
-    if (!secret) throw new Error('STRIPE_SECRET_KEY is not set.');
+    if (!secret) throw new StripeNotCalled('STRIPE_SECRET_KEY is not set.');
 
     const headers: Record<string, string> = {
       'Authorization': `Bearer ${secret}`,
       'Stripe-Version': STRIPE_API_VERSION,
     };
+
+    if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
 
     let body: string | undefined;
     if (method === 'POST') {
@@ -817,17 +1056,27 @@ export class StripeProvider implements PaymentProvider {
       body = formBody ? new URLSearchParams(formBody).toString() : '';
     }
 
-    const res = await fetch(`${STRIPE_API_BASE}${path}`, { method, headers, body, signal: AbortSignal.timeout(PROVIDER_FETCH_MS) });
-    const text = await res.text();
+    let res: Response;
+    let text: string;
+    try {
+      res = await fetch(`${STRIPE_API_BASE}${path}`, { method, headers, body, signal: AbortSignal.timeout(PROVIDER_FETCH_MS) });
+      text = await res.text();
+    } catch (error) {
+      throw new StripeApiError(error instanceof Error ? error.message : String(error), null);
+    }
     if (!res.ok) {
       let userMessage = `Stripe API ${res.status}`;
+      let code: string | undefined;
+      let param: string | undefined;
       if (text) {
         try {
           const parsed = JSON.parse(text);
           if (parsed?.error?.message) userMessage = parsed.error.message;
+          if (typeof parsed?.error?.code === 'string') code = parsed.error.code;
+          if (typeof parsed?.error?.param === 'string') param = parsed.error.param;
         } catch { /* not JSON; keep generic status */ }
       }
-      throw new Error(userMessage);
+      throw new StripeApiError(userMessage, res.status, code, param);
     }
     if (!text) {
       throw new Error(`Stripe API ${method} ${path} returned ${res.status} with an empty body.`);

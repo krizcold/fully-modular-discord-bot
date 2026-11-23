@@ -35,7 +35,7 @@ const GO = '423456789012345678';
 const now = () => new Date().toISOString();
 const future = (days: number) => new Date(Date.now() + days * 86_400_000).toISOString();
 const variant = (variantId: string) => ({ variantId, label: variantId, amount: 100, currency: 'USD', durationDays: 30, recurring: true, active: true });
-const OFFERING = { id: 'o1', label: 'Gold', providerLinks: [{ providerId: 'fake', enabled: true, mode: 'price', cache: { syncedAt: now(), variants: [variant('v1'), variant('v2')] } }] };
+const OFFERING = { id: 'o1', label: 'Gold', providerLinks: [{ providerId: 'fake', enabled: true, mode: 'price', priceConfig: { entries: [{ variantId: 'v1' }, { variantId: 'v2' }] }, cache: { syncedAt: now(), variants: [variant('v1'), variant('v2')] } }] };
 const TIER = { displayName: 'Gold', priority: 10, overrides: {}, offerings: [OFFERING] };
 const providerState = () => ({ status: 'active', startDate: now(), endDate: future(30), autoRenew: true });
 const manual = (id: string, status: string) => ({ id, tierId: 'gold', source: 'manual', startDate: now(), endDate: future(1), autoRenew: false, status, createdAt: '', updatedAt: '' });

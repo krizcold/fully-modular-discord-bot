@@ -11,7 +11,6 @@ vi.mock('../../src/bot/internalSetup/utils/premiumNotifications', async () => (a
 
 import { getPaymentRegistry } from '../../src/bot/internalSetup/utils/payment/paymentRegistry';
 import type { PaymentProvider } from '../../src/bot/internalSetup/utils/payment/paymentTypes';
-import { StripeProvider } from '../../src/bot/internalSetup/utils/payment/stripeProvider';
 import { LemonSqueezyProvider } from '../../src/bot/internalSetup/utils/payment/lemonsqueezyProvider';
 import { PayPalProvider } from '../../src/bot/internalSetup/utils/payment/paypalProvider';
 import { PatreonProvider } from '../../src/bot/internalSetup/utils/payment/patreonProvider';
@@ -193,9 +192,9 @@ describe('P1 claim 14: a provider that sells servers only', () => {
   });
 });
 
-describe('P1 claim 14 as P2 leaves it: the six providers that sell servers only, each by its own `sells`', () => {
+describe('P1 claim 14 as P3 leaves it: the five providers that sell servers only, each by its own `sells` (Stripe sells users from P3)', () => {
   it('each sells servers; a user tier linking it is refused (X8), and a user purchase and adoption through it never reach it', async () => {
-    const six: PaymentProvider[] = [new StripeProvider(), new LemonSqueezyProvider(), new PayPalProvider(), new PatreonProvider(), new ServerBoostingProvider(), new DiscordProvider()];
+    const six: PaymentProvider[] = [new LemonSqueezyProvider(), new PayPalProvider(), new PatreonProvider(), new ServerBoostingProvider(), new DiscordProvider()];
     const offering = (enabled: boolean) => ({
       id: 'o-useven', label: 'Seven monthly',
       providerLinks: six.map(p => ({ providerId: p.id, enabled, mode: 'price', priceConfig: { entries: [{ variantId: `${p.id}_v` }] } })),
@@ -225,7 +224,6 @@ describe('P1 claim 14 as P2 leaves it: the six providers that sell servers only,
     const x8 = (name: string) => `${name} does not sell user subscriptions; turn its link off on offering 'Seven monthly'.`;
     const row = (id: string, name: string) => [id, ['guild'], false, expect.stringContaining(x3(name)), 0, false, expect.stringContaining(x3(name)), false, expect.stringContaining(x8(name)), 0, 0, true];
     expect(outcomes).toEqual([
-      row('stripe', 'Stripe'),
       row('lemonsqueezy', 'Lemon Squeezy'),
       row('paypal', 'PayPal'),
       row('patreon', 'Patreon'),

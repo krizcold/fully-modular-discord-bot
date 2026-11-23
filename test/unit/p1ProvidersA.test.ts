@@ -48,7 +48,7 @@ function stubFetch(answer: (url: string, init?: RequestInit) => unknown): Call[]
 describe('Stripe', () => {
   const secret = 'whsec_p1';
   const sign = (body: string) => {
-    const t = '1762000000';
+    const t = String(Math.floor(Date.now() / 1000));
     return `t=${t},v1=${crypto.createHmac('sha256', secret).update(`${t}.${body}`).digest('hex')}`;
   };
   const sub = (metadata: Record<string, string>, id = 'sub_1') => ({
@@ -69,11 +69,11 @@ describe('Stripe', () => {
     await new StripeProvider().handleWebhook(Buffer.from(body), sign(body));
   };
 
-  it('sells servers only', () => {
-    expect(new StripeProvider().capabilities.sells).toEqual(['guild']);
+  it('sells servers and users', () => {
+    expect(new StripeProvider().capabilities.sells).toEqual(['guild', 'user']);
   });
 
-  it("a server purchase sends today's fields plus subscription_data[metadata][userId]", async () => {
+  it('a server purchase sends the holder and the buyer in metadata and in subscription_data[metadata]', async () => {
     env();
     const calls = stubFetch(url => (url.includes('/v1/prices/') ? price : { id: 'cs_1', url: 'https://checkout.example/cs_1' }));
     await new StripeProvider().initiatePurchase({ ...purchase, variantId: 'price_1' });
@@ -84,48 +84,57 @@ describe('Stripe', () => {
       'line_items[0][quantity]': '1',
       success_url: `https://bot.example/guild/${G}/subscription?subscribe=success&session={CHECKOUT_SESSION_ID}`,
       cancel_url: `https://bot.example/guild/${G}/subscription?subscribe=cancel`,
-      client_reference_id: `${G}:t1:o1`,
-      'metadata[guildId]': G,
+      client_reference_id: `guild:${G}:t1:o1`,
+      'metadata[holder]': `guild:${G}`,
+      'metadata[buyerId]': B,
       'metadata[tierId]': 't1',
       'metadata[offeringId]': 'o1',
       'metadata[variantId]': 'price_1',
       'metadata[couponCode]': '',
-      'metadata[userId]': B,
-      'subscription_data[metadata][guildId]': G,
+      'subscription_data[metadata][holder]': `guild:${G}`,
+      'subscription_data[metadata][buyerId]': B,
       'subscription_data[metadata][tierId]': 't1',
       'subscription_data[metadata][offeringId]': 'o1',
       'subscription_data[metadata][variantId]': 'price_1',
       'subscription_data[metadata][couponCode]': '',
-      'subscription_data[metadata][userId]': B,
     }).toString());
   });
 
-  it('a purchase for a user throws X3 without a request', async () => {
+  it("a purchase for a user names the user as holder and returns to the member page's server list", async () => {
     env();
-    const calls = stubFetch(() => ({}));
-    await expect(new StripeProvider().initiatePurchase({ ...purchase, holder: `user:${B}`, variantId: 'price_1' }))
-      .rejects.toThrow('Stripe does not sell user subscriptions.');
-    expect(calls).toHaveLength(0);
+    const calls = stubFetch(url => (url.includes('/v1/prices/') ? price : { id: 'cs_1', url: 'https://checkout.example/cs_1' }));
+    await new StripeProvider().initiatePurchase({ ...purchase, holder: `user:${B}`, variantId: 'price_1' });
+    const params = new URLSearchParams(String(calls.find(c => c.url.endsWith('/v1/checkout/sessions'))!.init!.body));
+    expect([params.get('metadata[holder]'), params.get('success_url'), params.get('cancel_url')]).toEqual([
+      `user:${B}`, 'https://bot.example/guild?subscribe=success&session={CHECKOUT_SESSION_ID}', 'https://bot.example/guild?subscribe=cancel',
+    ]);
   });
 
-  it('the checkout webhook emits the holder and the buyer its session held', async () => {
+  /** Stripe's answers by object: a session, the subscription `s`, and an invoice of it. */
+  const byObject = (s: Record<string, unknown>, session?: Record<string, unknown>) => (url: string) => {
+    if (url.includes('/v1/checkout/sessions/')) return session;
+    if (url.includes('/v1/invoices/')) return { id: 'in_1', subscription: 'sub_1' };
+    return s;
+  };
+
+  it('the checkout webhook emits the holder and the buyer its subscription holds', async () => {
     env();
-    stubFetch(() => sub({ guildId: G, tierId: 't1', offeringId: 'o1' }));
-    await webhook('checkout.session.completed', {
-      id: 'cs_1', subscription: 'sub_1', metadata: { guildId: G, tierId: 't1', offeringId: 'o1', variantId: 'price_1', userId: B },
-    });
+    const metadata = { holder: `guild:${G}`, tierId: 't1', offeringId: 'o1', variantId: 'price_1', buyerId: B };
+    stubFetch(byObject(sub(metadata), { id: 'cs_1', payment_status: 'paid', subscription: 'sub_1', metadata }));
+    await webhook('checkout.session.completed', { id: 'cs_1' });
     expect(emitted).toHaveLength(1);
     expect(emitted[0]).toMatchObject({ type: 'subscription.created', providerSubId: 'sub_1', holder: `guild:${G}`, buyerId: B });
   });
 
   it('the four later events carry the holder', async () => {
     env();
-    const s = sub({ guildId: G, tierId: 't1', offeringId: 'o1' });
-    stubFetch(() => s);
-    await webhook('customer.subscription.updated', s);
-    await webhook('customer.subscription.deleted', s);
-    await webhook('invoice.paid', { subscription: 'sub_1' });
-    await webhook('invoice.payment_failed', { subscription: 'sub_1' });
+    const s: Record<string, unknown> = sub({ holder: `guild:${G}`, tierId: 't1', offeringId: 'o1' });
+    stubFetch(byObject(s));
+    await webhook('customer.subscription.updated', { id: 'sub_1' });
+    s.status = 'canceled';
+    await webhook('customer.subscription.deleted', { id: 'sub_1' });
+    await webhook('invoice.paid', { id: 'in_1' });
+    await webhook('invoice.payment_failed', { id: 'in_1' });
     expect(emitted.map(e => [e.type, e.holder])).toEqual([
       ['subscription.updated', `guild:${G}`],
       ['subscription.expired', `guild:${G}`],
@@ -134,26 +143,30 @@ describe('Stripe', () => {
     ]);
   });
 
-  it('each later event for a subscription without metadata.guildId resolves, emits nothing and logs nothing', async () => {
+  it('each later event for a subscription without metadata.holder resolves, emits nothing and logs SL1 once', async () => {
     env();
     const s = sub({ tierId: 't1' });
-    stubFetch(() => s);
+    stubFetch(byObject(s));
+    const provider = new StripeProvider();
     const outcomes: string[] = [];
     for (const [type, obj] of [
-      ['customer.subscription.updated', s], ['customer.subscription.deleted', s],
-      ['invoice.paid', { subscription: 'sub_1' }], ['invoice.payment_failed', { subscription: 'sub_1' }],
+      ['customer.subscription.updated', { id: 'sub_1' }], ['customer.subscription.deleted', { id: 'sub_1' }],
+      ['invoice.paid', { id: 'in_1' }], ['invoice.payment_failed', { id: 'in_1' }],
     ] as const) {
-      outcomes.push(await webhook(type, obj).then(() => 'ok', (e: Error) => e.message));
+      const body = JSON.stringify({ type, data: { object: obj } });
+      outcomes.push(await provider.handleWebhook(Buffer.from(body), sign(body)).then(() => 'ok', (e: Error) => e.message));
     }
     expect(outcomes).toEqual(['ok', 'ok', 'ok', 'ok']);
     expect(emitted).toEqual([]);
-    expect(logs).toEqual([]);
+    expect(logs).toEqual([
+      '[StripeProvider] A customer.subscription.updated event for subscription sub_1 was not applied: its metadata names no holder. It was made before this version or not by this bot; the bot does not manage it.',
+    ]);
   });
 
-  it('the list returns the buyer of a subscription with the new key and none for one without', async () => {
+  it('the list returns the buyer of a subscription with the buyerId key and none for one without', async () => {
     env();
-    const withBuyer = sub({ guildId: G, tierId: 't1', offeringId: 'o1', userId: B }, 'sub_a');
-    const without = sub({ guildId: G, tierId: 't1', offeringId: 'o1' }, 'sub_b');
+    const withBuyer = sub({ holder: `guild:${G}`, tierId: 't1', offeringId: 'o1', buyerId: B }, 'sub_a');
+    const without = sub({ holder: `guild:${G}`, tierId: 't1', offeringId: 'o1' }, 'sub_b');
     stubFetch(url => (url.includes('/search') ? { data: [withBuyer], has_more: false } : { data: [without] }));
     const refs = await new StripeProvider().listSubscriptionsFor(`guild:${G}`);
     const byId = Object.fromEntries(refs.map(r => [r.providerSubId, r.metadata]));
@@ -162,11 +175,11 @@ describe('Stripe', () => {
     expect(byId.sub_b.buyerId).toBeUndefined();
   });
 
-  it("a user's list is empty without a request", async () => {
+  it("a user's list searches by the user's holder", async () => {
     env();
     const calls = stubFetch(() => ({ data: [] }));
     expect(await new StripeProvider().listSubscriptionsFor(`user:${B}`)).toEqual([]);
-    expect(calls).toHaveLength(0);
+    expect(new URL(calls[0].url).searchParams.get('query')).toBe(`metadata['holder']:'user:${B}'`);
   });
 });
 

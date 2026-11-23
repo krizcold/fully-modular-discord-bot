@@ -106,7 +106,7 @@ describe('registeredOps', () => {
   it('lists every op the executor applies', () => {
     const ops = registeredOps();
     const expected = [
-      'global.write', 'payment.webhook', 'payment.oauthCallback',
+      'global.write', 'payment.webhook', 'payment.oauthCallback', 'payment.billingPortal',
       ...PREMIUM_METHODS.map(m => `premium.${m}`), ...DUMMY_METHODS.map(m => `dummy.${m}`), 'provider.saveCredentials',
     ];
     expect([...ops].sort()).toEqual([...new Set(expected)].sort());

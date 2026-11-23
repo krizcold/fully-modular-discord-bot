@@ -172,7 +172,8 @@ describe('Stripe', () => {
     vi.stubEnv('STRIPE_WEBHOOK_SECRET', 'whsec-env');
     doc = { stripe: { STRIPE_WEBHOOK_SECRET: 'whsec-doc' } };
     const raw = JSON.stringify({ type: 'checkout.session.completed', data: {} });
-    const header = `t=1700000000,v1=${hmacHex('whsec-doc', `1700000000.${raw}`)}`;
+    const t = Math.floor(Date.now() / 1000);
+    const header = `t=${t},v1=${hmacHex('whsec-doc', `${t}.${raw}`)}`;
     await expect(new StripeProvider().handleWebhook(Buffer.from(raw), header)).resolves.toBeUndefined();
   });
 

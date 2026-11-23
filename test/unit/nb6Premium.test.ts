@@ -45,7 +45,7 @@ describe('row 55: the refresh before the op fails', () => {
   ])('%s: the rows cannot be listed; the op is not run', async (op, args) => {
     const setTier = vi.spyOn(getPremiumManager(), 'setTier');
     m.state.rows.fault = sql => (sql === LIST_KEYS ? lost() : undefined);
-    expect(await applySharedOp({ op, args })).toEqual({ ok: false, code: 'failed', error: text('Connection terminated unexpectedly') });
+    expect(await applySharedOp({ op, args })).toEqual({ ok: false, code: 'failed', error: text('Connection terminated unexpectedly'), refreshFailed: true });
     expect(setTier).not.toHaveBeenCalled();
     expect(rowQueue.keys()).toEqual([]);
   });
@@ -53,7 +53,7 @@ describe('row 55: the refresh before the op fails', () => {
   it('the journal lines cannot be read (decision 40): the same answer, and the op is not run', async () => {
     const setTier = vi.spyOn(getPremiumManager(), 'setTier');
     m.state.rows.fault = sql => (sql === LINES ? lost() : undefined);
-    expect(await applySharedOp({ op: 'premium.setTier', args: { args: ['low', { name: 'Low' }] } })).toEqual({ ok: false, code: 'failed', error: text('Connection terminated unexpectedly') });
+    expect(await applySharedOp({ op: 'premium.setTier', args: { args: ['low', { name: 'Low' }] } })).toEqual({ ok: false, code: 'failed', error: text('Connection terminated unexpectedly'), refreshFailed: true });
     expect(setTier).not.toHaveBeenCalled();
     expect(m.sql()).toContain(LIST_KEYS);
   });
@@ -71,7 +71,7 @@ describe('row 55: the refresh before the op fails', () => {
       return (real as (...a: unknown[]) => unknown)(p, ...rest);
     }) as typeof fs.openSync);
     expect(await applySharedOp({ op: 'premium.setTier', args: { args: ['low', { name: 'Low' }] } })).toEqual({
-      ok: false, code: 'failed',
+      ok: false, code: 'failed', refreshFailed: true,
       error: "This machine could not write its copy of the current premium settings (ENOSPC: no space left on device), so nothing was saved. Check this machine's disk, then try again.",
     });
     expect(setTier).not.toHaveBeenCalled();
