@@ -223,7 +223,7 @@ describe('a paid purchase', () => {
   it('at the same priority as an active manual grant rejects, and leaves none of its items open', async () => {
     writePremium({ [gh(G)]: { active: manualSub('ml', 'low'), paused: [] } }, buyable('fake'));
     getPaymentRegistry().register(provider('fake'));
-    await expect(m().initiatePaidSubscription(gh(G), 'low', 'o1', { buyerId: '80000000000000001', providerId: 'fake', variantId: 'v1' })).rejects.toThrow("You already have a 'Low' subscription");
+    await expect(m().initiatePaidSubscription(gh(G), 'low', 'o1', { buyerId: '80000000000000001', providerId: 'fake', variantId: 'v1' })).rejects.toThrow("You already have 'Low' as a grant from this server's staff");
     expect(openItemsOf(m())).toEqual([]);
     expect((await stored()).subscriptions[gh(G)].active.id).toBe('ml');
   });

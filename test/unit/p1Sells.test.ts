@@ -192,9 +192,13 @@ describe('P1 claim 14: a provider that sells servers only', () => {
   });
 });
 
-describe('P1 claim 14 as P3 leaves it: the five providers that sell servers only, each by its own `sells` (Stripe sells users from P3)', () => {
+describe('P1 claim 14 as P5 leaves it: the four providers that sell servers only, each by its own `sells` (Stripe sells users from P3, PayPal from P5)', () => {
+  it('PayPal sells servers and users', () => {
+    expect(new PayPalProvider().capabilities.sells).toEqual(['guild', 'user']);
+  });
+
   it('each sells servers; a user tier linking it is refused (X8), and a user purchase and adoption through it never reach it', async () => {
-    const six: PaymentProvider[] = [new LemonSqueezyProvider(), new PayPalProvider(), new PatreonProvider(), new ServerBoostingProvider(), new DiscordProvider()];
+    const six: PaymentProvider[] = [new LemonSqueezyProvider(), new PatreonProvider(), new ServerBoostingProvider(), new DiscordProvider()];
     const offering = (enabled: boolean) => ({
       id: 'o-useven', label: 'Seven monthly',
       providerLinks: six.map(p => ({ providerId: p.id, enabled, mode: 'price', priceConfig: { entries: [{ variantId: `${p.id}_v` }] } })),
@@ -225,7 +229,6 @@ describe('P1 claim 14 as P3 leaves it: the five providers that sell servers only
     const row = (id: string, name: string) => [id, ['guild'], false, expect.stringContaining(x3(name)), 0, false, expect.stringContaining(x3(name)), false, expect.stringContaining(x8(name)), 0, 0, true];
     expect(outcomes).toEqual([
       row('lemonsqueezy', 'Lemon Squeezy'),
-      row('paypal', 'PayPal'),
       row('patreon', 'Patreon'),
       row('boost', 'Server Boosting'),
       row('discord', 'Discord App Monetization'),

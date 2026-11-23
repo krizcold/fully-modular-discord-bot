@@ -110,7 +110,8 @@ describe('a state event on a paused subscription', () => {
     await settleQueue();
     const stored = jsonOf(PREMIUM).subscriptions['guild:70000000000000001'];
     expect(stored.active.id).toBe('s1');
-    expect(stored.paused.map((s: any) => [s.id, s.status])).toEqual([['p', 'expired']]);
+    // An expired queued entry leaves the queue (P5, Z8).
+    expect(stored.paused).toEqual([]);
   });
 
   it('a provider state of paused is stored as paused', async () => {

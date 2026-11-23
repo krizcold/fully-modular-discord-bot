@@ -2,13 +2,15 @@ import * as crypto from 'crypto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const emitted = vi.hoisted(() => [] as any[]);
+const held = vi.hoisted(() => ({ view: null as any }));
 vi.mock('../../src/bot/internalSetup/utils/payment/paymentRegistry', () => ({
-  getPaymentRegistry: () => ({ emitEvent: (event: unknown) => { emitted.push(event); } }),
+  getPaymentRegistry: () => ({ emitEvent: (event: unknown) => { emitted.push(event); }, readSubscription: () => held.view, subscriptionViewReady: () => true }),
 }));
 
 import { StripeProvider } from '../../src/bot/internalSetup/utils/payment/stripeProvider';
 import { LemonSqueezyProvider } from '../../src/bot/internalSetup/utils/payment/lemonsqueezyProvider';
 import { PayPalProvider } from '../../src/bot/internalSetup/utils/payment/paypalProvider';
+import { customIdFor, FakePayPal } from '../helpers/p5PayPal';
 
 // P1 sheet section 8 claim 13 (first file): Stripe, Lemon Squeezy and PayPal keep their wire for a server and speak
 // holders to premium.
@@ -22,6 +24,7 @@ const purchase = {
 let logs: string[];
 beforeEach(() => {
   emitted.length = 0;
+  held.view = null;
   logs = [];
   vi.stubEnv('MAIN_GUILD_ID', '1');
   for (const level of ['log', 'warn', 'error', 'info'] as const) {
@@ -264,32 +267,48 @@ describe('PayPal', () => {
     vi.stubEnv('PAYPAL_CLIENT_SECRET', 'secret_p1');
     vi.stubEnv('PAYPAL_WEBHOOK_ID', 'hook_p1');
     vi.stubEnv('WEBUI_BASE_URL', 'https://bot.example');
+    vi.stubEnv('CLIENT_ID', '85900000000000001');
   };
-  const answer = (url: string) => {
+  /** The custom_id of the subscription PayPal answers a read of I-1 with. */
+  let customId = '';
+  const answer = (url: string, init?: RequestInit) => {
     if (url.endsWith('/v1/oauth2/token')) return { access_token: 'tok', expires_in: 3600 };
+    if (url.includes('/v1/billing/plans/')) {
+      return { id: 'P-1', status: 'ACTIVE', billing_cycles: [{ tenure_type: 'REGULAR', sequence: 1, total_cycles: 0, frequency: { interval_unit: 'MONTH', interval_count: 1 } }] };
+    }
     if (url.endsWith('/verify-webhook-signature')) return { verification_status: 'SUCCESS' };
+    if (url.endsWith('/v1/billing/subscriptions/I-1') && (init?.method ?? 'GET') === 'GET') {
+      return {
+        id: 'I-1', plan_id: 'P-1', status: 'ACTIVE', quantity: '1', custom_id: customId, start_time: '2026-11-01T00:00:00Z',
+        billing_info: { last_payment: { time: '2026-11-01T00:00:00Z' }, next_billing_time: '2026-12-01T00:00:00Z' },
+      };
+    }
     return { id: 'I-1', links: [{ rel: 'approve', href: 'https://paypal.example/approve' }] };
   };
-  const webhook = async (eventType: string, custom: Record<string, string>) => {
-    const body = JSON.stringify({
+  const signed = (holder: string) => customIdFor({ clientId: '85900000000000001', secret: 'secret_p1', holder, buyerId: B, tierId: 't1', offeringId: 'o1' });
+  /** A delivery signed by the fake whose resource names I-1 (a sale event names it as its billing agreement); the read of I-1 answers `custom`. */
+  const webhook = async (eventType: string, custom: string, provider = new PayPalProvider()) => {
+    customId = custom;
+    const delivery = new FakePayPal().sign({
+      id: 'WH-P1-1',
       event_type: eventType,
-      resource: { id: 'I-1', plan_id: 'P-1', status: 'ACTIVE', custom_id: JSON.stringify(custom) },
-    });
-    await new PayPalProvider().handleWebhook(Buffer.from(body), '', {});
+      resource: eventType.startsWith('PAYMENT.') ? { id: 'S-1', billing_agreement_id: 'I-1' } : { id: 'I-1' },
+    } as any, 'hook_p1');
+    await provider.handleWebhook(Buffer.from(delivery.body), '', delivery.headers);
   };
 
-  it('sells servers only', () => {
-    expect(new PayPalProvider().capabilities.sells).toEqual(['guild']);
+  it('sells servers and users', () => {
+    expect(new PayPalProvider().capabilities.sells).toEqual(['guild', 'user']);
   });
 
-  it("a server purchase sends today's custom_id", async () => {
+  it('a server purchase sends the signed five-field custom_id', async () => {
     env();
     const calls = stubFetch(answer);
     await new PayPalProvider().initiatePurchase({ ...purchase, variantId: 'P-1' });
     const post = calls.find(c => c.url.endsWith('/v1/billing/subscriptions'))!;
     expect(String(post.init!.body)).toBe(JSON.stringify({
       plan_id: 'P-1',
-      custom_id: JSON.stringify({ guildId: G, tierId: 't1', offeringId: 'o1', userId: B }),
+      custom_id: customIdFor({ clientId: '85900000000000001', secret: 'secret_p1', holder: `guild:${G}`, buyerId: B, tierId: 't1', offeringId: 'o1' }),
       application_context: {
         brand_name: 'Discord Bot Premium',
         user_action: 'SUBSCRIBE_NOW',
@@ -299,33 +318,38 @@ describe('PayPal', () => {
     }));
   });
 
-  it('a purchase for a user throws X3 without a request', async () => {
+  it('a purchase for a user sends the user holder and returns to /guild', async () => {
     env();
     const calls = stubFetch(answer);
-    await expect(new PayPalProvider().initiatePurchase({ ...purchase, holder: `user:${B}`, variantId: 'P-1' }))
-      .rejects.toThrow('PayPal does not sell user subscriptions.');
-    expect(calls).toHaveLength(0);
+    await new PayPalProvider().initiatePurchase({ ...purchase, holder: `user:${B}`, variantId: 'P-1' });
+    const post = calls.find(c => c.url.endsWith('/v1/billing/subscriptions'))!;
+    expect(JSON.parse(String(post.init!.body))).toMatchObject({
+      custom_id: customIdFor({ clientId: '85900000000000001', secret: 'secret_p1', holder: `user:${B}`, buyerId: B, tierId: 't1', offeringId: 'o1' }),
+      application_context: { return_url: 'https://bot.example/guild?subscribe=success', cancel_url: 'https://bot.example/guild?subscribe=cancel' },
+    });
   });
 
-  it('webhook events carry the holder, and the created one the buyer of custom_id.userId', async () => {
+  it("webhook events carry the holder, and the created one the buyer of the custom_id's buyer field", async () => {
     env();
     stubFetch(answer);
-    await webhook('BILLING.SUBSCRIPTION.ACTIVATED', { guildId: G, tierId: 't1', offeringId: 'o1', userId: B });
-    await webhook('BILLING.SUBSCRIPTION.UPDATED', { guildId: G });
+    await webhook('BILLING.SUBSCRIPTION.ACTIVATED', signed(`guild:${G}`));
+    held.view = { status: 'active', endDate: '2026-12-02T00:00:00.000Z', autoRenew: true, variantId: 'P-1', resumesAt: null };
+    await webhook('BILLING.SUBSCRIPTION.UPDATED', signed(`guild:${G}`));
     expect(emitted[0]).toMatchObject({ type: 'subscription.created', holder: `guild:${G}`, buyerId: B, tierId: 't1' });
     expect(emitted[1]).toMatchObject({ type: 'subscription.updated', holder: `guild:${G}` });
   });
 
-  it('an id that is not a Discord id emits nothing and logs nothing', async () => {
+  it('a custom_id whose holder is not a Discord id emits nothing and logs PL1 once', async () => {
     env();
     stubFetch(answer);
     const outcomes: string[] = [];
+    const provider = new PayPalProvider();
     for (const type of ['BILLING.SUBSCRIPTION.ACTIVATED', 'BILLING.SUBSCRIPTION.UPDATED', 'PAYMENT.SALE.COMPLETED']) {
-      outcomes.push(await webhook(type, { guildId: 'not-a-server', tierId: 't1' }).then(() => 'ok', (e: Error) => e.message));
+      outcomes.push(await webhook(type, signed('guild:not-a-server'), provider).then(() => 'ok', (e: Error) => e.message));
     }
     expect(outcomes).toEqual(['ok', 'ok', 'ok']);
     expect(emitted).toEqual([]);
-    expect(logs).toEqual([]);
+    expect(logs.map(l => l.replace(/ event for subscription .*$/, ''))).toEqual(['[PayPalProvider] A BILLING.SUBSCRIPTION.ACTIVATED']);
   });
 
   it("a user's list is empty without a request", async () => {

@@ -267,11 +267,21 @@ function GuildSubscriptionPanel({ guild, subData, onRefresh }) {
   // pausedPaid: it's the paused queue as a whole. Manual paused entries also
   // appear here, so the user can see + cancel any queued entitlement.
   const pausedPaid = pausedAll;
+  const paidCaps = paid ? capabilitiesOf(paid.providerId) : null;
+  const paidMeta = paid?.providerMeta || {};
 
   // ── Helpers ──
   function getTierName(tierId) { return tiers[tierId]?.displayName || tierId; }
   function getProviderName(providerId) {
     return providers.find(p => p.id === providerId)?.displayName || providerId || '';
+  }
+  function capabilitiesOf(providerId) {
+    return providers.find(p => p.id === providerId)?.capabilities || null;
+  }
+  function cancelText(providerId) {
+    return capabilitiesOf(providerId)?.endsAtPaidEnd
+      ? `Cancel your paid subscription? ${getProviderName(providerId)} stops billing it now. You keep access until the current period ends; it cannot be restarted, so to continue after that you buy again.`
+      : null;
   }
   function formatRemaining(sub) {
     if (!sub) return '';
@@ -345,7 +355,7 @@ function GuildSubscriptionPanel({ guild, subData, onRefresh }) {
 
   // ── Actions ──
   async function handleCancel() {
-    if (!confirm('Cancel your paid subscription? You keep access until the current period ends and can reactivate any time before then.')) return;
+    if (!confirm(cancelText(paid?.providerId) || 'Cancel your paid subscription? You keep access until the current period ends and can reactivate any time before then.')) return;
     setProcessing(true); setError(null);
     try {
       const res = await guildApi.cancelPaidSubscription(guild.id);
@@ -723,9 +733,13 @@ function GuildSubscriptionPanel({ guild, subData, onRefresh }) {
                   {paid.autoRenew === false && paid.status === 'active' && (
                     <span style={{ color: '#e67e22', marginLeft: '6px' }}>(cancelled, will not renew)</span>
                   )}
-                  {paid.autoRenew === true && (
+                  {paid.autoRenew === true && (paidMeta.paymentFailing ? (
+                    <span style={{ color: '#e67e22', marginLeft: '6px' }}>({getProviderName(paid.providerId)} has not collected the latest payment; access ends {new Date(paid.endDate).toLocaleDateString()} unless it does)</span>
+                  ) : paidMeta.paypalStatus === 'SUSPENDED' ? (
+                    <span style={{ color: '#e67e22', marginLeft: '6px' }}>(suspended at {getProviderName(paid.providerId)}; access ends {new Date(paid.endDate).toLocaleDateString()})</span>
+                  ) : (
                     <span style={{ color: '#3ba55d', marginLeft: '6px' }}>(auto-renewing)</span>
-                  )}
+                  ))}
                 </div>
                 <div style={{ display: 'flex', gap: '6px', marginTop: '10px', flexWrap: 'wrap' }}>
                   {paid.autoRenew === true ? (
@@ -734,10 +748,10 @@ function GuildSubscriptionPanel({ guild, subData, onRefresh }) {
                       padding: '5px 12px', borderRadius: '5px', cursor: 'pointer', fontSize: '0.78rem',
                       ...disabledButtonStyle(processing),
                     }}
-                    title="Stop auto-renewing. You keep access until the current period ends.">
+                    title={cancelText(paid.providerId) || 'Stop auto-renewing. You keep access until the current period ends.'}>
                       {processing ? 'Cancelling…' : 'Cancel'}
                     </button>
-                  ) : paid.status === 'active' ? (
+                  ) : paid.status === 'active' && (!paidCaps || paidCaps.supportsReactivate) ? (
                     <button onClick={handleReactivate} disabled={processing} style={{
                       background: '#3ba55d', color: '#fff', border: 'none',
                       padding: '5px 12px', borderRadius: '5px', cursor: 'pointer', fontSize: '0.78rem', fontWeight: 600,
@@ -753,6 +767,7 @@ function GuildSubscriptionPanel({ guild, subData, onRefresh }) {
                   title="End this subscription right now and free the slot. Loses remaining time. If you have a queued sub, it resumes here.">
                     {processing ? 'Cancelling…' : 'Cancel & remove now'}
                   </button>
+                  {(!paidCaps || paidCaps.supportsCustomerPortal) && (
                   <button onClick={handleOpenBillingPortal} disabled={processing} style={{
                     background: 'transparent', color: '#aaa', border: '1px solid #555',
                     padding: '5px 12px', borderRadius: '5px',
@@ -762,6 +777,7 @@ function GuildSubscriptionPanel({ guild, subData, onRefresh }) {
                   title="Open the provider's hosted billing page to update payment methods or see invoices.">
                     {processing ? 'Opening…' : 'Manage at provider ↗'}
                   </button>
+                  )}
                   {paid.providerId === 'patreon' && (
                     <button onClick={handleUnlinkPatreon} disabled={processing} style={{
                       background: 'transparent', color: '#aaa', border: '1px solid #555',

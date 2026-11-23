@@ -166,6 +166,8 @@ export interface ProviderCapabilities {
   productIdLabel: string;
   /** The kinds of holder this provider sells to. */
   sells: readonly HolderKind[];
+  /** Premium's end is what was paid; premium frees the slot at the end. */
+  endsAtPaidEnd?: boolean;
 }
 
 // ============================================================================
@@ -253,6 +255,11 @@ export interface InitiateOpts {
    * actually set on the subscription state.
    */
   autoRenew?: boolean;
+  /**
+   * Set only when the member opted out of auto-renew and the offering does not force it; `autoRenew` false alone
+   * also comes from a variant premium could not read.
+   */
+  autoRenewOptOut?: true;
   couponCode?: string;
   /**
    * When set, the new subscription starts paused. Used when stacking onto a
@@ -334,12 +341,17 @@ export interface SubscriptionView {
   autoRenew: boolean;
   variantId?: string;
   resumesAt: string | null;
+  startDate?: string;
+  /** The provider's meta premium holds with it (its providerMeta). */
+  meta?: Record<string, any>;
 }
 
 /** What premium answers the Dummy provider through the registry (NB6 decisions 84, 94 and 102). */
 export interface SubscriptionReader {
   /** A reader is set and premium can answer: loaded, neither unreadable nor replaying, not stopped, nothing open or held. */
   ready(): boolean;
+  /** Premium's copy is loaded, readable and not replaying, so `read`'s null means premium does not hold it. */
+  viewReady(): boolean;
   read(providerId: string, holder: HolderKey, providerSubId: string): SubscriptionView | null;
   /** The sha of premium-tiers.json premium's cache holds; null when it had no row. */
   sha(): string | null;
@@ -360,7 +372,7 @@ export type ProviderEvent =
    * are needed because the cache has no record yet and PremiumManager can't
    * infer them.
    */
-  | { type: 'subscription.created'; providerId: string; providerSubId: string; holder: HolderKey; buyerId?: string; tierId: string; offeringId: string; variantId?: string; couponCode?: string; state: ProviderSubscriptionState; variantSnapshot?: OfferingVariant }
+  | { type: 'subscription.created'; providerId: string; providerSubId: string; holder: HolderKey; buyerId?: string; tierId: string; offeringId: string; variantId?: string; couponCode?: string; state: ProviderSubscriptionState; variantSnapshot?: OfferingVariant; soldVariantOnly?: true }
   | { type: 'subscription.renewed'; providerId: string; providerSubId: string; holder: HolderKey; state: ProviderSubscriptionState }
   | { type: 'subscription.expired'; providerId: string; providerSubId: string; holder: HolderKey; state: ProviderSubscriptionState }
   | { type: 'subscription.cancelled'; providerId: string; providerSubId: string; holder: HolderKey; state: ProviderSubscriptionState }
@@ -515,7 +527,7 @@ export interface PaymentProvider {
 
   /** Webhook-driven providers (Stripe, Lemon Squeezy) implement this. */
   handleWebhook?(rawBody: Buffer, signature: string, headers: Record<string, string>): Promise<void>;
-  /** The id of a delivery whose signature verifies as handleWebhook verifies it; null otherwise. */
+  /** The event id of a delivery, read before handleWebhook verifies it (a provider may answer an id it has not verified); null when the delivery carries none. The route only skips an id it recorded after the op answered 200. */
   webhookEventId?(rawBody: Buffer, headers: Record<string, string>): string | null;
   /** Polling-driven providers (Patreon, Server Boosting) implement this. */
   scheduledReconcile?(providerSubId: string): Promise<ProviderSubscriptionState | null>;

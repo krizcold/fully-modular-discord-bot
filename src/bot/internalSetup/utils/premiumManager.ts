@@ -450,6 +450,14 @@ let instance: PremiumManager | null = null;
 // HELPERS
 // ============================================================================
 
+/** Whether an offering's provider link sells the variant: an entry of its prices, or an active variant of its product. */
+function linkSells(link: ProviderLink | undefined, variantId: string | undefined): boolean {
+  if (!link || !variantId) return false;
+  return link.mode === 'product'
+    ? (link.cache?.variants ?? []).some(v => v.variantId === variantId && v.active)
+    : (link.priceConfig?.entries ?? []).some(e => e.variantId === variantId);
+}
+
 /** Generate a stable local id for a Subscription record. */
 function newSubscriptionId(): string {
   return crypto.randomUUID();
@@ -1273,7 +1281,28 @@ export class PremiumManager {
   ): void {
     const subs = this.config.subscriptions[holder];
     const { sub } = matching;
-    this.copyProviderState(sub, event.state);
+    this.copyProviderState(holder, sub, event.state);
+
+    if (matching.location === 'paused' && event.state.status === 'expired' && subs) {
+      const index = this.findSubscriptionByProviderSubId(subs, event.providerSubId)?.pausedIndex;
+      if (index === undefined) return;
+      subs.paused.splice(index, 1);
+      this.writeAudit({
+        timestamp: new Date().toISOString(),
+        actor: 'admin',
+        action: 'subscription.expire.paid',
+        holder,
+        subscriptionId: sub.id,
+        providerId: event.providerId,
+        metadata: { reason: 'ended-while-queued' },
+      }, { carry });
+      void this.notify(holder, 'paid.sub.expired', {
+        tierName: this.config.tiers[sub.tierId]?.displayName || sub.tierId,
+        providerName: this.providerDisplayName(event.providerId),
+      }, { carry });
+      if (this.recordEmpty(subs)) delete this.config.subscriptions[holder];
+      return;
+    }
 
     // If the active sub just expired, drop it from the slot and resume queue.
     if (matching.location === 'active' && sub.status === 'expired' && subs) {
@@ -1294,8 +1323,19 @@ export class PremiumManager {
     }
   }
 
-  /** Decision 72: a provider's state copied into premium's sub, with the status mapped to premium's three values. */
-  private copyProviderState(sub: Subscription, s: ProviderSubscriptionState): void {
+  /**
+   * Decision 72: a provider's state copied into premium's sub, with the status mapped to premium's three values. A sub
+   * in the holder's queue keeps status paused and its held dates, and takes only the state's autoRenew and meta.
+   */
+  private copyProviderState(holder: HolderKey, sub: Subscription, s: ProviderSubscriptionState): void {
+    const subs = this.config.subscriptions[holder];
+    if (subs && subs.active?.id !== sub.id && subs.paused.some(p => p.id === sub.id)) {
+      sub.autoRenew = s.autoRenew;
+      sub.providerMeta = s.meta;
+      sub.status = 'paused';
+      sub.updatedAt = new Date().toISOString();
+      return;
+    }
     sub.startDate = s.startDate;
     sub.endDate = s.endDate;
     sub.autoRenew = s.autoRenew;
@@ -1373,6 +1413,10 @@ export class PremiumManager {
       if (this.saveHeld) return false;
       return !this.premiumOpOpen();
     },
+    viewReady: (): boolean => {
+      this.ensureLoaded();
+      return !this.stopped && !this.unreadable && !this.replay && this.configLoaded;
+    },
     read: (providerId: string, holderText: string, providerSubId: string): SubscriptionView | null => {
       this.ensureLoaded();
       const holder = parseHolder(holderText)?.key ?? null;
@@ -1380,11 +1424,11 @@ export class PremiumManager {
       if (!subs) return null;
       const active = subs.active;
       if (active && active.providerId === providerId && active.providerSubId === providerSubId) {
-        return { status: 'active', endDate: active.endDate, autoRenew: active.autoRenew, variantId: active.variantId, resumesAt: null };
+        return { status: 'active', endDate: active.endDate, autoRenew: active.autoRenew, variantId: active.variantId, resumesAt: null, startDate: active.startDate, meta: active.providerMeta };
       }
       const paused = subs.paused.find(p => p.providerId === providerId && p.providerSubId === providerSubId);
       if (!paused) return null;
-      return { status: 'paused', endDate: paused.endDate, autoRenew: paused.autoRenew, variantId: paused.variantId, resumesAt: paused.resumesAtHint ?? null };
+      return { status: 'paused', endDate: paused.endDate, autoRenew: paused.autoRenew, variantId: paused.variantId, resumesAt: paused.resumesAtHint ?? null, startDate: paused.startDate, meta: paused.providerMeta };
     },
     sha: (): string | null => {
       this.ensureLoaded();
@@ -1456,10 +1500,25 @@ export class PremiumManager {
           : kind === 'user' && buyerId !== parseHolder(holder)?.id
             ? { skipped: 'buyer', why: 'its buyer is not the user it is for' }
             : null;
+    if (!notInstalled && event.soldVariantOnly && !linkSells(offering.providerLinks.find(l => l.providerId === event.providerId), event.variantId)) {
+      const name = this.providerDisplayName(event.providerId);
+      if (!opts.carry) console.warn(`[PremiumManager] subscription.created from ${name} (subscription ${event.providerSubId}, ${holderWords(holder)}) was not installed: offering '${offering.label}' does not sell variant '${event.variantId}' through ${name}. ${name} keeps billing it: cancel and refund it at ${name}.`);
+      return { skipped: 'variant', why: `offering '${offering.label}' does not sell variant '${event.variantId}'` };
+    }
     if (notInstalled) {
       // An adoption (it brings its carry) answers with these words itself; no created event came from the provider.
       if (!opts.carry) console.warn(`[PremiumManager] subscription.created from ${event.providerId} (subscription ${event.providerSubId}, ${holderWords(holder)}) was not installed: ${notInstalled.why}`);
       return notInstalled;
+    }
+    if (event.soldVariantOnly) {
+      const held = this.config.subscriptions[holder]?.active;
+      if (held && held.status === 'active' && (held.endDate === null || Date.parse(held.endDate) > Date.now())
+        && (this.config.tiers[held.tierId]?.priority ?? 0) === (tier.priority ?? 0)) {
+        const name = this.providerDisplayName(event.providerId);
+        const heldName = this.config.tiers[held.tierId]?.displayName || held.tierId;
+        if (!opts.carry) console.warn(`[PremiumManager] subscription.created from ${name} (subscription ${event.providerSubId}, ${holderWords(holder)}) was not installed: ${holderWords(holder)} already holds '${heldName}' at that priority. ${name} keeps billing it: cancel and refund it at ${name}.`);
+        return { skipped: 'priority', why: `${holderWords(holder)} already holds '${heldName}' at that priority` };
+      }
     }
 
     const variant = event.variantSnapshot
@@ -3752,10 +3811,7 @@ export class PremiumManager {
     if (!isDiscordId(buyerId)) throw new Error(PURCHASE_NEEDS_BUYER);
     if (who.kind === 'user' && buyerId !== who.id) throw new Error(BUYER_IS_NOT_THE_USER);
 
-    const sold = link.mode === 'product'
-      ? (link.cache?.variants ?? []).some(v => v.variantId === opts.variantId && v.active)
-      : (link.priceConfig?.entries ?? []).some(e => e.variantId === opts.variantId);
-    if (!sold) throw new Error(`Offering '${offering.label}' does not sell variant '${opts.variantId}' through ${provider.displayName}.`);
+    if (!linkSells(link, opts.variantId)) throw new Error(`Offering '${offering.label}' does not sell variant '${opts.variantId}' through ${provider.displayName}.`);
 
     // Pre-flight orphan check: refuse if the provider already has an
     // unknown sub for this holder.
@@ -3794,7 +3850,7 @@ export class PremiumManager {
       }
     }
 
-    // Stacking conflict check: same-priority paid is rejected.
+    // Stacking conflict check: a same-priority paid entry, or an alive manual one in the active slot (installSubscription refuses both).
     const newPriority = tier.priority;
     const guildSubs = this.config.subscriptions[holder];
     const conflictingExisting = [
@@ -3802,7 +3858,8 @@ export class PremiumManager {
       ...(guildSubs?.paused || []),
     ].find((s): s is Subscription => {
       if (!s) return false;
-      if (s.source !== 'paid') return false;
+      if (s.source !== 'paid' && !(s === guildSubs?.active && s.status === 'active'
+        && (s.endDate === null || Date.parse(s.endDate) > Date.now()))) return false;
       const exPriority = this.config.tiers[s.tierId]?.priority ?? 0;
       return exPriority === newPriority;
     });
@@ -3810,6 +3867,9 @@ export class PremiumManager {
       const existingName = this.config.tiers[conflictingExisting.tierId]?.displayName || conflictingExisting.tierId;
       const newName = tier.displayName;
       const sameTier = conflictingExisting.tierId === tierId;
+      if (conflictingExisting.source === 'manual') {
+        throw new Error(`You already have '${existingName}' as a grant from this server's staff; a purchase at the same priority can start only after it ends or staff remove it.`);
+      }
       throw new Error(
         sameTier
           ? `You already have a '${existingName}' subscription. ` +
@@ -3842,6 +3902,7 @@ export class PremiumManager {
       offeringId,
       variantId: opts.variantId,
       autoRenew: autoRenewIntent,
+      ...(opts.autoRenewOptOut === true && !offering.forceAutoRenew ? { autoRenewOptOut: true as const } : {}),
       couponCode: opts.couponCode,
       startPausedUntil,
       ...(opts.buyerSignedIn === true ? { buyerSignedIn: true } : {}),
@@ -3925,7 +3986,7 @@ export class PremiumManager {
     if (state && !current) return this.saveRemovedMeanwhile(holder, active.id) === 'done';
     const carry = newCarry();
     const link: Link = state ? { carry } : { standalone: 'the provider stored the change' };
-    if (state && current) this.copyProviderState(current, state);
+    if (state && current) this.copyProviderState(holder, current, state);
     this.writeAudit({
       timestamp: new Date().toISOString(),
       actor: 'admin',
@@ -3962,7 +4023,7 @@ export class PremiumManager {
     const current = this.subscriptionById(holder, active.id);
     if (state && !current) return this.saveRemovedMeanwhile(holder, active.id) === 'done';
     const carry = newCarry();
-    if (state && current) this.copyProviderState(current, state);
+    if (state && current) this.copyProviderState(holder, current, state);
     this.writeAudit({
       timestamp: new Date().toISOString(),
       actor: 'admin',
@@ -4787,7 +4848,30 @@ export class PremiumManager {
       const endMs = Date.parse(active.endDate);
 
       if (endMs <= now) {
-        if (active.source !== 'manual') continue; // paid expiries via webhook
+        if (active.source === 'paid' && active.providerId && active.providerSubId
+          && getPaymentRegistry().get(active.providerId)?.capabilities.endsAtPaidEnd === true
+          && !this.inFlight.has(active.providerSubId)) {
+          active.status = 'expired';
+          active.updatedAt = nowIso;
+          changed = true;
+          this.writeAudit({
+            timestamp: nowIso,
+            actor: 'admin',
+            action: 'subscription.expire.paid',
+            holder,
+            subscriptionId: active.id,
+            providerId: active.providerId,
+          }, { carry });
+          void this.notify(holder, 'paid.sub.expired', {
+            tierName: this.config.tiers[active.tierId]?.displayName || active.tierId,
+            providerName: this.providerDisplayName(active.providerId),
+          }, { carry });
+          delete subs.active;
+          if (subs.paused.length > 0) this.resumeNext(holder, carry);
+          if (this.recordEmpty(subs)) delete this.config.subscriptions[holder];
+          continue;
+        }
+        if (active.source !== 'manual') continue; // other paid expiries via their provider's events
 
         const tierName = this.config.tiers[active.tierId]?.displayName || active.tierId;
         const expiredId = active.id;
@@ -5285,7 +5369,7 @@ export class PremiumManager {
           // Update local cache to match the new variant. Provider webhooks
           // may also fire and we'll reconcile on top.
           const current = this.subscriptionById(decision.holder, sub.id);
-          if (current && state) this.copyProviderState(current, state);
+          if (current && state) this.copyProviderState(decision.holder, current, state);
           if (current) {
             current.tierId = migration.targetTierId;
             current.offeringId = migration.targetOfferingId;
@@ -5299,7 +5383,7 @@ export class PremiumManager {
             ? await provider.cancelSubscription(sub.providerSubId, false)
             : undefined;
           const current = this.subscriptionById(decision.holder, sub.id);
-          if (current && state) this.copyProviderState(current, state);
+          if (current && state) this.copyProviderState(decision.holder, current, state);
           if (current) {
             current.autoRenew = false;
             current.updatedAt = stamp;

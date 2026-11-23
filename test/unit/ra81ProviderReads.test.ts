@@ -47,11 +47,13 @@ describe('Discord: a cancel reads the doc for the application and again for the 
   });
 });
 
-describe('PayPal: a purchase reads the doc for its return address and again for its configuration', () => {
-  it('a first read that fails is logged, and the second read that answers configures the purchase', async () => {
+describe('PayPal: a purchase reads the doc for its keys, and the sign-in reads it again', () => {
+  it('a first read that fails is logged and refuses the purchase with no call; the next purchase reads the doc that answers and signs in with it', async () => {
     vi.stubEnv('PAYPAL_CLIENT_ID', undefined);
     vi.stubEnv('PAYPAL_CLIENT_SECRET', undefined);
     vi.stubEnv('PAYPAL_WEBHOOK_ID', undefined);
+    vi.stubEnv('CLIENT_ID', '85900000000000081');
+    vi.stubEnv('WEBUI_BASE_URL', 'https://bot.example');
     vi.stubGlobal('fetch', vi.fn(async (url: string) => {
       calls.push(String(url));
       throw new Error('ra81 no network');
@@ -60,9 +62,15 @@ describe('PayPal: a purchase reads the doc for its return address and again for 
       new Error('ra81 paypal first read'),
       JSON.stringify({ paypal: { PAYPAL_CLIENT_ID: 'id-doc', PAYPAL_CLIENT_SECRET: 'secret-doc', PAYPAL_WEBHOOK_ID: 'hook-doc' } }),
     ];
-    await expect(new PayPalProvider().initiatePurchase({
+    const purchase = () => new PayPalProvider().initiatePurchase({
       holder: 'guild:880000000000000081', buyerId: '80000000000000001', tierId: 't1', offeringId: 'o1', variantId: 'P-1', autoRenew: true,
-    } as any)).rejects.toThrow('ra81 no network');
+    } as any).then(() => 'resolved', (e: Error) => e.message);
+    const first = await purchase();
+    const callsAfterFirst = calls.length;
+    const second = await purchase();
+    expect(first).toBe('PayPal checkout did not start: PAYPAL_CLIENT_ID is not set. Nothing was charged.');
+    expect(callsAfterFirst).toBe(0);
+    expect(second).toBe('PayPal checkout did not start: the bot could not sign in to PayPal (PayPal did not answer: ra81 no network). Nothing was charged.');
     expect(calls).toHaveLength(1);
     expect(calls[0]).toMatch(/\/v1\/oauth2\/token$/);
     expect(errors.filter(e => e.includes('cannot be read (ra81 paypal first read)'))).toHaveLength(1);

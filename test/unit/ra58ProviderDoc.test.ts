@@ -7,6 +7,7 @@ import { LemonSqueezyProvider } from '../../src/bot/internalSetup/utils/payment/
 import { PatreonProvider } from '../../src/bot/internalSetup/utils/payment/patreonProvider';
 import { PayPalProvider } from '../../src/bot/internalSetup/utils/payment/paypalProvider';
 import { StripeProvider } from '../../src/bot/internalSetup/utils/payment/stripeProvider';
+import { FakePayPal } from '../helpers/p5PayPal';
 
 // NB6 decision 57: on a Postgres bot a built-in provider's own keys come from the credentials doc, over /data/.env
 // and the process env. Each row gives the env a different made-up value, so a read of the env alone shows.
@@ -160,8 +161,8 @@ describe('PayPal', () => {
     stubFetch(url => url.endsWith('/v1/oauth2/token')
       ? json({ access_token: 'ptok', expires_in: 3600 })
       : json({ verification_status: 'SUCCESS' }));
-    const body = Buffer.from(JSON.stringify({ event_type: 'BILLING.SUBSCRIPTION.UPDATED', resource: {} }));
-    await expect(new PayPalProvider().handleWebhook(body, '', {})).resolves.toBeUndefined();
+    const delivery = new FakePayPal().sign({ id: 'WH-DOC-1', event_type: 'BILLING.SUBSCRIPTION.UPDATED', resource: {} } as any, 'WH-DOC');
+    await expect(new PayPalProvider().handleWebhook(Buffer.from(delivery.body), '', delivery.headers)).resolves.toBeUndefined();
     const verify = calls.find(c => c.url.endsWith('/v1/notifications/verify-webhook-signature'));
     expect(JSON.parse(verify!.init.body).webhook_id).toBe('WH-DOC');
   });

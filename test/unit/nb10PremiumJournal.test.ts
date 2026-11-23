@@ -198,14 +198,17 @@ describe('the journal and its replay', () => {
     startPremiumTickers();
     await tick(30);
     expect(pm.cacheState()).toBe('replaying');
-    getPaymentRegistry().emitEvent(renewed('c1', '70000000000000003', 'fake') as any);
+    const arrived = renewed('c1', '70000000000000003', 'fake');
+    getPaymentRegistry().emitEvent({ ...arrived, state: { ...arrived.state, meta: { arrived: true } } } as any);
     expect(logged(spies.warn).some(l => l.includes('arrived while premium applies the provider events it kept'))).toBe(true);
     expect(await applySharedOp({ op: 'premium.setMessages', args: { args: [{ moduleBlocked: 'x' }] } })).toMatchObject({ ok: false, error: expect.stringMatching(/^Premium is applying provider events/) });
     pause.open();
     await replayed(pm);
     const paused = jsonOf(PREMIUM).subscriptions['guild:70000000000000003'].paused;
     expect(paused).toHaveLength(1);
-    expect(paused[0].endDate).toBe(later);
+    // A queued entry keeps its held end and takes the state's meta (P5, Z8's queued-entry guard).
+    expect(paused[0].providerMeta).toEqual({ arrived: true });
+    expect(paused[0].endDate).not.toBe(later);
     expect(linesOf(AUDIT).filter(l => l.action === 'subscription.install.paid')).toHaveLength(1);
   });
 });

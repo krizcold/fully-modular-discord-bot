@@ -108,6 +108,10 @@ export class PaymentProviderRegistry extends EventEmitter {
     return this.reader !== null && this.reader.ready();
   }
 
+  subscriptionViewReady(): boolean {
+    return this.reader !== null && this.reader.viewReady();
+  }
+
   readSubscription(providerId: string, holder: HolderKey, providerSubId: string): SubscriptionView | null {
     return this.reader?.read(providerId, holder, providerSubId) ?? null;
   }
