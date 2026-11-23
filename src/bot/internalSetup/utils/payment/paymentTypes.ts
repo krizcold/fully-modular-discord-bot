@@ -147,8 +147,8 @@ export interface ProviderCapabilities {
   /** Does this provider have a Product/grouping concept we can sync from? false for Discord. */
   supportsProductMode: boolean;
   /**
-   * (Product mode only) Does the provider host a multi-variant picker we
-   * can redirect subscribers to? Stripe + LS yes; PayPal no.
+   * (Product mode only) Can the subscribe card send the member to the
+   * provider's checkout page with one button? Stripe + LS yes; PayPal no.
    */
   supportsHostedPicker: boolean;
   /** (When `supportsHostedPicker`) Provider-imposed cap on the prices its hosted page shows. */

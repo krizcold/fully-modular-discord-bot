@@ -1304,9 +1304,8 @@ function SubscribeModal({ guildId, tierId, tier, providers, willBePaused, active
                   && !!link.productConfig?.useProviderHostedPicker
                   && provider.capabilities?.supportsHostedPicker;
                 if (useHostedPicker) {
-                  // Hand variant selection off to the provider's hosted page
-                  // by sending the FIRST active variant; the provider's
-                  // hosted page will display the full picker.
+                  // Send the FIRST active variant to the provider's checkout page: Lemon
+                  // Squeezy's page lists the Product's variants; Stripe's shows that one price.
                   const firstActive = variants[0];
                   const key = `${provider.id}:${firstActive.variantId}`;
                   const selected = selectionKey === key;
@@ -1317,7 +1316,7 @@ function SubscribeModal({ guildId, tierId, tier, providers, willBePaused, active
                     }}>
                       <div style={{ color: '#fff', fontSize: '0.92rem', fontWeight: 600 }}>{provider.displayName}</div>
                       <div style={{ color: '#aaa', fontSize: '0.78rem', marginTop: '2px' }}>
-                        Pick your billing option on {provider.displayName}'s checkout page.
+                        Continue to {provider.displayName}'s checkout page to see the price and pay.
                       </div>
                       <button onClick={() => setSelectionKey(key)}
                         style={{

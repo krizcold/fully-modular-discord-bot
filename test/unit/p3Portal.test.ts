@@ -15,6 +15,7 @@ vi.mock('../../src/bot/internalSetup/utils/appStoreManager', async orig => {
   return { ...real, getAppStoreManager: () => store };
 });
 
+import { getPremiumManager } from '../../src/bot/internalSetup/utils/premiumManager';
 import { dataPath } from '../../src/utils/dataRoot';
 import { carriedWrites } from '../../src/bot/internalSetup/utils/dataBackends/writeLedger';
 import { PROVIDER_SENTENCE } from '../../src/bot/internalSetup/utils/sharedOps';
@@ -128,6 +129,7 @@ const SP1 = 'Only the member who pays for this subscription can open its billing
 const SP2 = "Stripe's record of this subscription does not name you as its payer, so no billing portal was opened.";
 const SP4 = "This subscription is not on the Stripe billing account the bot records for you (it may have been started from the bot's dev page), so no billing portal was opened.";
 const SP5_LEAD = 'The billing portal did not open: the bot could not read its record of your Stripe billing account (';
+const REFRESH_LEAD = 'The billing portal did not open: the bot could not bring its billing records up to date (';
 const SP6 = 'The billing portal did not open: the bot did not answer in time. Try again.';
 
 function portalRoute(w: P3World, guildId: string, userId: string, body: Record<string, unknown> = {}, runSharedOp?: (name: string, args: unknown) => Promise<any>) {
@@ -297,7 +299,7 @@ describe('the portal route on the JSON files: premium-tiers.json unreadable', ()
     expect(replies[0]).toMatchObject({ ok: false });
     expect(replies[0].refreshFailed).toBeUndefined();
     expect(reply.body).toEqual({ success: false, error: replies[0].error });
-    expect(reply.body.error.startsWith(SP5_LEAD)).toBe(false);
+    expect(reply.body.error.startsWith(REFRESH_LEAD)).toBe(false);
     expect(reply.status).toBe(sharedOpFailure(replies[0])!.status);
     expect(w.fake.portalSessions).toHaveLength(0);
   }, 30_000);
@@ -349,9 +351,31 @@ describe('the portal route on the mirror rig: the doc refreshed inside the op', 
       return r;
     });
     expect(replies[0]).toMatchObject({ ok: false, refreshFailed: true });
-    expect(reply).toEqual({ status: 503, body: { success: false, error: `${SP5_LEAD}${String(replies[0].error).trim().replace(/\.+$/, '')}).` } });
+    expect(reply).toEqual({ status: 503, body: { success: false, error: `${REFRESH_LEAD}${String(replies[0].error).trim().replace(/\.+$/, '')}).` } });
     expect(w.fake.portalSessions).toHaveLength(0);
     const mirrorAfter = fs.existsSync(customersPath()) ? fs.readFileSync(customersPath(), 'utf8') : null;
     expect(mirrorAfter).toBe(mirrorBefore);
+  }, 30_000);
+  it('a Lemon Squeezy subscription whose refresh fails: 503 with the provider-neutral text, no Stripe named', async () => {
+    vi.stubEnv('LEMONSQUEEZY_API_KEY', 'ls_key');
+    getPaymentRegistry().register(new LemonSqueezyProvider());
+    const fetched = vi.fn(async () => new Response(JSON.stringify({ data: { id: '9', attributes: { urls: { customer_portal: 'https://ls.example/portal/9' } } } }), { status: 200 }));
+    vi.stubGlobal('fetch', fetched);
+    vi.spyOn(getPremiumManager(), 'getSubscriptions').mockReturnValue({ active: { source: 'paid', providerId: 'lemonsqueezy', providerSubId: '9', buyerId: A } } as any);
+    const replies: any[] = [];
+    const reply = await portalRoute(w, G, A, {}, async (name, args) => {
+      w.rig!.m.state.rows.fault = () => new Error('Connection terminated unexpectedly');
+      const r = await w.sharedOp(name, args);
+      w.rig!.m.state.rows.fault = undefined;
+      replies.push(r);
+      return r;
+    });
+    getPaymentRegistry().unregister('lemonsqueezy');
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+    expect(replies[0]).toMatchObject({ ok: false, refreshFailed: true });
+    expect(reply).toEqual({ status: 503, body: { success: false, error: `${REFRESH_LEAD}${String(replies[0].error).trim().replace(/\.+$/, '')}).` } });
+    expect(reply.body.error).not.toMatch(/Stripe|Lemon/);
+    expect(fetched).not.toHaveBeenCalled();
   }, 30_000);
 });

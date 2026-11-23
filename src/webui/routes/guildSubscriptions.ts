@@ -374,7 +374,7 @@ export function createGuildSubscriptionRoutes(botManager: BotManager): Router {
       }
       if (reply?.refreshFailed) {
         const cause = typeof reply.error === 'string' ? reply.error.trim().replace(/\.+$/, '') : 'unknown cause';
-        return res.status(503).json({ success: false, error: `The billing portal did not open: the bot could not read its record of your Stripe billing account (${cause}).` });
+        return res.status(503).json({ success: false, error: `The billing portal did not open: the bot could not bring its billing records up to date (${cause}).` });
       }
       const failure = sharedOpFailure(reply) ?? { status: 500, error: 'The billing portal did not open: the bot gave no portal address.' };
       res.status(failure.status).json({ success: false, error: failure.error });
