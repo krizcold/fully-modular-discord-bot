@@ -16,12 +16,16 @@ const KEY = Symbol.for('smdb.p1Notices');
 const holder = globalThis as Record<PropertyKey, unknown>;
 /** Every notice premium dispatched: whom it named and its kind. */
 export const notices = (holder[KEY] ??= { sent: [] }) as { sent: Array<{ to: string; kind: string }> };
+/** The payload of each notice in `notices.sent`, at the same index. */
+export const noticePayloads = ((holder[KEY] as any).payloads ??= []) as unknown[];
 
 /** The notices module: every notice is delivered and recorded. */
 export function noticeModule(): Record<string, unknown> {
   return {
-    dispatchPremiumNotification: async (to: string, kind: string) => {
+    dispatchPremiumNotification: async (to: string, kind: string, payload?: unknown) => {
       notices.sent.push({ to, kind });
+      ((holder[KEY] as any).payloads ??= []).length = notices.sent.length - 1;
+      (holder[KEY] as any).payloads.push(payload);
       return { delivered: true, via: 'dm' };
     },
   };

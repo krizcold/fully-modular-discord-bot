@@ -20,6 +20,7 @@ import { StripeProvider } from '../../src/bot/internalSetup/utils/payment/stripe
 import { loadGuildPanel, panelFlush, panelText, type Node } from '../helpers/p1PanelRig';
 import { z5End } from '../helpers/p5Model';
 import { heldPayPal, IDS, p5World, type OpReply } from '../helpers/p5World';
+import { onceKit } from '../helpers/p5pOnce';
 
 const HOLDER = `guild:${IDS[0]}`;
 const CANCEL = /\/cancel$/;
@@ -314,5 +315,80 @@ describe('P5 claim 11: the panel', () => {
     expect(Number(w.fake.subscriptions.get(id)!.billing_info.outstanding_balance.value)).toBeGreaterThan(0);
     const shown = await showPanel(heldOf(id)!.sub);
     expect([shown.text.includes('(auto-renewing)'), shown.text.includes('has not collected')]).toEqual([true, false]);
+  });
+});
+
+describe('P5P Q13: cancelling a pay-once subscription', () => {
+  const o = onceKit(w);
+  /** A pay-once subscription premium holds while PayPal keeps it ACTIVE: its first cancel answered 503. */
+  async function heldActive(): Promise<string> {
+    const id = await o.buy('guild');
+    w.fake.configure(id, { finalCycle: 'stays-active' });
+    w.fake.approve(id);
+    w.fake.fail('POST', new RegExp(`^/v1/billing/subscriptions/${id}/cancel$`), { status: 503 });
+    expect((await w.deliver(o.take('BILLING.SUBSCRIPTION.CREATED', id))).status).toBe(400);
+    w.fake.queue.length = 0;
+    return id;
+  }
+
+  it.each([['EXPIRED', 'expire-at-payment'], ['CANCELLED by the second rule', 'stays-active']] as const)('"Cancel & remove now" on one %s: one cancel call answered 422, one read, the entry removed, no error', async (_label, final) => {
+    const id = await o.owned('guild', { settings: { finalCycle: final } });
+    const [calls, reads] = [o.cancels(id), o.reads(id)];
+    const reply = await w.op('cancelPaidSubscriptionImmediately', HOLDER);
+    expect([reply.ok, reply.error]).toEqual([true, undefined]);
+    expect([o.cancels(id) - calls, o.reads(id) - reads, heldOf(id)]).toEqual([1, 1, null]);
+  });
+
+  it('"Cancel & remove now" on one ACTIVE: one cancel, the entry removed', async () => {
+    const id = await heldActive();
+    const calls = o.cancels(id);
+    const reply = await w.op('cancelPaidSubscriptionImmediately', HOLDER);
+    expect(reply.ok).toBe(true);
+    expect([o.cancels(id) - calls, heldOf(id), w.fake.subscriptions.get(id)!.status]).toEqual([1, null, 'CANCELLED']);
+  });
+
+  it("premium's soft cancel (the op) on it: one cancel call, the entry unchanged (active, its end, auto-renew off)", async () => {
+    const id = await heldActive();
+    const before = heldOf(id)!.sub;
+    const calls = o.cancels(id);
+    const reply = await w.op('cancelPaidSubscription', HOLDER);
+    expect(reply.ok).toBe(true);
+    expect(o.cancels(id) - calls).toBe(1);
+    expect(heldOf(id)!.sub).toMatchObject({ status: 'active', endDate: before.endDate, autoRenew: false, providerMeta: before.providerMeta });
+  });
+
+  it('the provider answers nothing to premium for a soft cancel of a pay-once subscription', async () => {
+    const id = await heldActive();
+    const answer = await getPaymentRegistry().get('paypal')!.cancelSubscription!(id, false);
+    expect(answer).toBeUndefined();
+    expect(w.fake.subscriptions.get(id)!.status).toBe('CANCELLED');
+  });
+});
+
+describe('P5P Q16: the panel for a pay-once subscription', () => {
+  const o = onceKit(w);
+
+  it('a pay-once card: the paid-in-full tag, no Cancel, no Reactivate, "Cancel & remove now" shown', async () => {
+    const id = await o.owned('guild', { settings: { finalCycle: 'stays-active' } });
+    const sub = heldOf(id)!.sub;
+    expect([sub.autoRenew, sub.providerMeta.payOnce]).toEqual([false, true]);
+    const shown = await showPanel(sub);
+    expect(shown.text).toContain('(paid in full, will not renew)');
+    expect(shown.text.includes('(cancelled, will not renew)')).toBe(false);
+    expect([shown.labels.includes('Cancel'), shown.has('Reactivate'), shown.labels.includes('Cancel & remove now')]).toEqual([false, false, true]);
+  });
+
+  it('a cancelled renewing PayPal card keeps (cancelled, will not renew)', async () => {
+    const id = await owned();
+    expect((await w.op('cancelPaidSubscription', HOLDER)).ok).toBe(true);
+    const sub = heldOf(id)!.sub;
+    expect(sub.autoRenew).toBe(false);
+    const shown = await showPanel(sub);
+    expect([shown.text.includes('(cancelled, will not renew)'), shown.text.includes('paid in full')]).toEqual([true, false]);
+  });
+
+  it("Stripe's card is unchanged", async () => {
+    const shown = await showPanel(paidCard('stripe', false));
+    expect([shown.text.includes('(cancelled, will not renew)'), shown.text.includes('paid in full'), shown.has('Reactivate'), shown.labels.includes('Cancel & remove now')]).toEqual([true, false, true, true]);
   });
 });

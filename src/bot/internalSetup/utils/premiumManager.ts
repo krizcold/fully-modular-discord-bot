@@ -1512,7 +1512,7 @@ export class PremiumManager {
             : null;
     if (!notInstalled && event.soldVariantOnly && !linkSells(offering.providerLinks.find(l => l.providerId === event.providerId), event.variantId)) {
       const name = this.providerDisplayName(event.providerId);
-      if (!opts.carry) console.warn(`[PremiumManager] subscription.created from ${name} (subscription ${event.providerSubId}, ${holderWords(holder)}) was not installed: offering '${offering.label}' does not sell variant '${event.variantId}' through ${name}. ${name} keeps billing it: cancel and refund it at ${name}.`);
+      if (!opts.carry) console.warn(`[PremiumManager] subscription.created from ${name} (subscription ${event.providerSubId}, ${holderWords(holder)}) was not installed: offering '${offering.label}' does not sell variant '${event.variantId}' through ${name}. If ${name} keeps billing it, cancel it there; refund it at ${name} if it was paid.`);
       return { skipped: 'variant', why: `offering '${offering.label}' does not sell variant '${event.variantId}'` };
     }
     if (notInstalled) {
@@ -1526,7 +1526,7 @@ export class PremiumManager {
         && (this.config.tiers[held.tierId]?.priority ?? 0) === (tier.priority ?? 0)) {
         const name = this.providerDisplayName(event.providerId);
         const heldName = this.config.tiers[held.tierId]?.displayName || held.tierId;
-        if (!opts.carry) console.warn(`[PremiumManager] subscription.created from ${name} (subscription ${event.providerSubId}, ${holderWords(holder)}) was not installed: ${holderWords(holder)} already holds '${heldName}' at that priority. ${name} keeps billing it: cancel and refund it at ${name}.`);
+        if (!opts.carry) console.warn(`[PremiumManager] subscription.created from ${name} (subscription ${event.providerSubId}, ${holderWords(holder)}) was not installed: ${holderWords(holder)} already holds '${heldName}' at that priority. If ${name} keeps billing it, cancel it there; refund it at ${name} if it was paid.`);
         return { skipped: 'priority', why: `${holderWords(holder)} already holds '${heldName}' at that priority` };
       }
     }
@@ -3513,6 +3513,7 @@ export class PremiumManager {
         tierName: this.config.tiers[paused.tierId]?.displayName || paused.tierId,
         providerName: this.providerDisplayName(paused.providerId),
         remainingDays: paused.remainingDaysAtPause ?? null,
+        ...(paused.providerMeta?.payOnce === true ? { payOnce: true } : {}),
       }, { carry });
     }
     const op = this.save({ carry });
@@ -3565,8 +3566,11 @@ export class PremiumManager {
         ? null
         : new Date(Date.now() + next.remainingDaysAtPause * DAY_MS).toISOString();
 
+      const keepsEnd = newEndDate !== null && next.source === 'paid' && !!next.providerId
+        && getPaymentRegistry().get(next.providerId)?.capabilities.endsAtPaidEnd === true;
       const resumed: Subscription = {
         ...next,
+        ...(keepsEnd ? { providerMeta: { ...next.providerMeta, keptEnd: newEndDate } } : {}),
         startDate: nowIso,
         endDate: newEndDate,
         status: 'active',

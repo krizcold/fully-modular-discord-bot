@@ -74,6 +74,52 @@ export interface PlanSpec {
   status?: 'ACTIVE' | 'INACTIVE' | 'CREATED';
   trial?: { unit: Unit; count?: number; cycles: number; price?: string };
   quantitySupported?: boolean;
+  /** `payment_preferences.setup_fee`, PayPal's decimal text ('5.00'). */
+  setupFee?: string;
+  /** The REGULAR cycle's `total_cycles` (0, infinite, by default). */
+  totalCycles?: number;
+}
+
+/**
+ * Per subscription, what PayPal does where its documentation is silent (sheet P5P, Y0 and Y7). Each is one way a real
+ * PayPal could behave; a row sets them with `configure` and clears them with `release`.
+ */
+export interface FakeSettings {
+  /** The last cycle paid: EXPIRED right after the sale (the default), ACTIVE until `expire`, or never expired. */
+  finalCycle?: 'expire-at-payment' | 'active-to-period-end' | 'stays-active';
+  /** After the last cycle is paid, `next_billing_time` is set to the last payment's time and kept (removed by default). */
+  keepNextAfterFinal?: boolean;
+  /** How a read shows an applied override: by `plan_overridden`, by `cycle_executions`, by both (the default), or neither. */
+  showOverrideBy?: 'flag' | 'cycles' | 'both' | 'none';
+  /** The override is not applied: `plan_overridden` false, the plan's own `total_cycles`, billed at each due date. */
+  ignoreOverride?: boolean;
+  /** The read shows the override by both fields, and `renew` still bills at each due date while ACTIVE. */
+  billsDespiteOverride?: boolean;
+  omitCycleExecutions?: boolean;
+  /** The REGULAR `cycles_completed` a read shows stays at this number (the count when set, for `true`). */
+  staleCycles?: boolean | number;
+  omitLastPayment?: boolean;
+  /** With `omitLastPayment`, only reads in this status leave it out. */
+  omitLastPaymentOn?: string;
+  /** The transactions list stays as it was when this was set: later sales and later refunds are not shown. */
+  listLag?: boolean;
+  /** The latest sale is listed PENDING; the read carries no `last_payment` for it unless `lpWhilePending`. */
+  pendingSale?: boolean;
+  lpWhilePending?: boolean;
+  /** Seconds by which a listed transaction's `time` is earlier (positive) or later (negative) than its sale's `last_payment.time`. */
+  lpSkew?: number;
+  /** The transactions call answers 404 while no transaction falls in its range. */
+  emptyListIs404?: boolean;
+  /** The list names each sale by another id than the sale's own (R14). */
+  listOtherIds?: boolean;
+}
+
+/** A PayPal-side action the fake refuses because PayPal would not do it (no cycle left to bill, a closed subscription). */
+export class FakeRefusal extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'FakeRefusal';
+  }
 }
 
 const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value));
@@ -101,10 +147,11 @@ export function addCycles(start: number, unit: Unit, count: number, n: number): 
  * HMAC-SHA256 keyed with the app's secret over the lines `smdb-paypal-custom`, the bot's CLIENT_ID, holder, buyer, tier
  * and offering (joined by `\n`), in base64url. For rows that forge one or check what the checkout sent.
  */
-export function customIdFor(fields: { clientId: string; secret?: string; holder: string; buyerId: string; tierId: string; offeringId: string }): string {
-  const lines = ['smdb-paypal-custom', fields.clientId, fields.holder, fields.buyerId, fields.tierId, fields.offeringId].join('\n');
+export function customIdFor(fields: { clientId: string; secret?: string; holder: string; buyerId: string; tierId: string; offeringId: string; once?: true }): string {
+  const named = [fields.holder, fields.buyerId, fields.tierId, fields.offeringId, ...(fields.once ? ['once'] : [])];
+  const lines = ['smdb-paypal-custom', fields.clientId, ...named].join('\n');
   const sig = crypto.createHmac('sha256', fields.secret ?? APP_CLIENT_SECRET).update(lines).digest().subarray(0, 16).toString('base64url');
-  return [fields.holder, fields.buyerId, fields.tierId, fields.offeringId, sig].join('|');
+  return [...named, sig].join('|');
 }
 
 /**
@@ -114,7 +161,8 @@ export function customIdFor(fields: { clientId: string; secret?: string; holder:
 export function ownerOfCustomId(text: unknown): { holder: string | null; buyerId: string | null; form: 'fields' | 'json' | null } {
   if (typeof text !== 'string' || text === '') return { holder: null, buyerId: null, form: null };
   const fields = text.split('|');
-  if (fields.length === 5 && /^(guild|user):\d{17,20}$/.test(fields[0])) return { holder: fields[0], buyerId: fields[1] || null, form: 'fields' };
+  const sized = fields.length === 5 || (fields.length === 6 && fields[4] === 'once');
+  if (sized && /^(guild|user):\d{17,20}$/.test(fields[0])) return { holder: fields[0], buyerId: fields[1] || null, form: 'fields' };
   try {
     const json = JSON.parse(text);
     if (json && typeof json.guildId === 'string') return { holder: `guild:${json.guildId}`, buyerId: typeof json.userId === 'string' ? json.userId : null, form: 'json' };
@@ -229,7 +277,7 @@ export class FakePayPal {
       frequency: { interval_unit: spec.unit, interval_count: spec.count ?? 1 },
       tenure_type: 'REGULAR',
       sequence: cycles.length + 1,
-      total_cycles: 0,
+      total_cycles: spec.totalCycles ?? 0,
       pricing_scheme: { fixed_price: { value: spec.price, currency_code: spec.currency ?? 'USD' } },
     });
     const plan = {
@@ -239,7 +287,12 @@ export class FakePayPal {
       status: spec.status ?? 'ACTIVE',
       usage_type: 'LICENSED',
       billing_cycles: cycles,
-      payment_preferences: { auto_bill_outstanding: true, setup_fee_failure_action: 'CONTINUE', payment_failure_threshold: 3 },
+      payment_preferences: {
+        auto_bill_outstanding: true,
+        ...(spec.setupFee !== undefined ? { setup_fee: { value: spec.setupFee, currency_code: spec.currency ?? 'USD' } } : {}),
+        setup_fee_failure_action: 'CONTINUE',
+        payment_failure_threshold: 3,
+      },
       quantity_supported: spec.quantitySupported ?? false,
       create_time: iso(Date.now()),
     };
@@ -258,6 +311,11 @@ export class FakePayPal {
   /** The next `times` calls of `method` whose path (with its query) matches answer with the fault. */
   fail(method: string, match: RegExp, fault: PayPalFault, times = 1): void {
     this.faults.push({ method, match, fault, times });
+  }
+
+  /** Drops every fault not yet used. */
+  clearFaults(): void {
+    this.faults = [];
   }
 
   /**
@@ -388,9 +446,77 @@ export class FakePayPal {
     return [{ href: `${SANDBOX_BASE}/v1/billing/subscriptions/${id}`, rel: 'self', method: 'GET' }];
   }
 
-  /** A subscription as the API answers it. */
+  /** A subscription as the API answers it, under the row's settings. */
   subscriptionOut(sub: Obj): Obj {
-    return { ...out(sub), links: this.links(sub.id) };
+    const body = out(sub);
+    const s: FakeSettings = sub._s ?? {};
+    if (sub._override) body.plan_overridden = ['flag', 'both'].includes(this.overrideShownBy(sub));
+    const info = body.billing_info;
+    if (info) {
+      if (s.omitCycleExecutions) delete info.cycle_executions;
+      else if (Array.isArray(info.cycle_executions)) {
+        info.cycle_executions = info.cycle_executions.map((c: Obj) => (c.tenure_type === 'REGULAR' ? this.regularExecution(sub, c) : c));
+      }
+      const latest = this.latestSale(sub.id);
+      if (s.pendingSale && !s.lpWhilePending && latest && info.last_payment) {
+        const earlier = this.salesOf(sub.id).filter(x => x.id !== latest.id);
+        const before = earlier[earlier.length - 1];
+        if (before) info.last_payment = { amount: { currency_code: before.amount.currency, value: before.amount.total }, time: before.create_time };
+        else delete info.last_payment;
+      }
+      if (s.omitLastPayment && (s.omitLastPaymentOn === undefined || s.omitLastPaymentOn === sub.status)) delete info.last_payment;
+    }
+    return { ...body, links: this.links(sub.id) };
+  }
+
+  /** How a read shows the subscription's override. */
+  private overrideShownBy(sub: Obj): 'flag' | 'cycles' | 'both' | 'none' {
+    const s: FakeSettings = sub._s ?? {};
+    if (!sub._override || s.ignoreOverride) return 'none';
+    if (s.billsDespiteOverride) return 'both';
+    return s.showOverrideBy ?? 'both';
+  }
+
+  private regularExecution(sub: Obj, stored: Obj): Obj {
+    const s: FakeSettings = sub._s ?? {};
+    const shown = this.overrideShownBy(sub);
+    const own = Number(this.regular(this.planOf(sub)).total_cycles) || 0;
+    const overridden = sub._override?.[String(stored.sequence)];
+    const total = (shown === 'cycles' || shown === 'both') && overridden !== undefined ? overridden : own;
+    const completed = s.staleCycles !== undefined && s.staleCycles !== false ? sub._stale : sub._completed;
+    return { ...stored, cycles_completed: completed, cycles_remaining: total > 0 ? Math.max(0, total - completed) : 0, total_cycles: total };
+  }
+
+  /** The REGULAR cycles PayPal bills for the subscription; 0 is no end. */
+  private billedTotal(sub: Obj): number {
+    const s: FakeSettings = sub._s ?? {};
+    const regular = this.regular(this.planOf(sub));
+    const own = Number(regular.total_cycles) || 0;
+    if (!sub._override || s.ignoreOverride) return own;
+    if (s.billsDespiteOverride) return 0;
+    return sub._override[String(regular.sequence)] ?? own;
+  }
+
+  /** Every cycle PayPal bills for the subscription is paid. */
+  allPaid(id: string): boolean {
+    const sub = this.sub(id, 'allPaid');
+    const total = this.billedTotal(sub);
+    return total > 0 && sub._completed >= total;
+  }
+
+  /** Sets the row's settings for a subscription (sheet P5P, Y7); `listLag` and `staleCycles` take their snapshot now. */
+  configure(id: string, settings: FakeSettings): void {
+    const sub = this.sub(id, 'configure');
+    if (settings.listLag && !sub._s.listLag) sub._lag = new Map(this.salesOf(id).map(x => [x.id, x.state]));
+    if (settings.staleCycles !== undefined && settings.staleCycles !== false) sub._stale = typeof settings.staleCycles === 'number' ? settings.staleCycles : sub._completed;
+    Object.assign(sub._s, settings);
+  }
+
+  /** Clears settings of a subscription: what they hid is shown at the next read. */
+  release(id: string, ...keys: Array<keyof FakeSettings>): void {
+    const sub = this.sub(id, 'release');
+    for (const key of keys) delete sub._s[key];
+    if (!sub._s.listLag) delete sub._lag;
   }
 
   /** A sale as the Payments v1 read and the sale events carry it. */
@@ -409,7 +535,20 @@ export class FakePayPal {
     if (plan.status !== 'ACTIVE') return unprocessable('PLAN_STATUS_INVALID');
     if (typeof json.custom_id === 'string' && json.custom_id.length > 127) return invalid('INVALID_STRING_MAX_LENGTH');
     if (json.quantity !== undefined && !plan.quantity_supported) return unprocessable('QUANTITY_NOT_SUPPORTED');
+    let override: Obj | null = null;
+    if (json.plan !== undefined) {
+      const items: Obj[] = Array.isArray(json.plan?.billing_cycles) ? json.plan.billing_cycles : [];
+      for (const item of items) {
+        if (!plan.billing_cycles.some((c: Obj) => c.sequence === item?.sequence)) return unprocessable('INVALID_BILLING_CYCLE_SEQUENCE');
+        if (item.pricing_scheme !== undefined && !item.pricing_scheme?.fixed_price) return unprocessable('INVALID_PRICING_SCHEME');
+      }
+      override = Object.fromEntries(items.filter(i => i.total_cycles !== undefined).map(i => [String(i.sequence), Number(i.total_cycles)]));
+    }
     const sub = this.newSubscription(plan.id, json.custom_id, json.quantity === undefined ? undefined : String(json.quantity));
+    if (override) {
+      sub._override = override;
+      sub.plan_overridden = true;
+    }
     this.createTexts.set(sub.id, text ?? '');
     const approve = { href: `https://www.sandbox.paypal.com/webapps/billing/subscriptions?ba_token=BA-${sub.id.slice(2)}`, rel: 'approve', method: 'GET' };
     return new Answer(201, { ...this.subscriptionOut(sub), links: [approve, { href: `${SANDBOX_BASE}/v1/billing/subscriptions/${sub.id}`, rel: 'edit', method: 'PATCH' }, ...this.links(sub.id)] });
@@ -425,10 +564,13 @@ export class FakePayPal {
       status_update_time: now,
       quantity: quantity ?? '1',
       ...(typeof customId === 'string' ? { custom_id: customId } : {}),
+      start_time: now,
       create_time: now,
       plan_overridden: false,
       _cycle: 0,
+      _completed: 0,
       _unpaid: [] as number[],
+      _s: {} as FakeSettings,
     };
     this.subscriptions.set(id, sub);
     this.emit('BILLING.SUBSCRIPTION.CREATED', sub);
@@ -475,11 +617,16 @@ export class FakePayPal {
     const start = Date.parse(query.get('start_time') ?? '');
     const end = Date.parse(query.get('end_time') ?? '');
     if (!Number.isFinite(start) || !Number.isFinite(end)) return invalid('INVALID_PARAMETER_SYNTAX');
-    const status = (s: Obj): string => ({ completed: 'COMPLETED', partially_refunded: 'PARTIALLY_REFUNDED', refunded: 'REFUNDED' } as Record<string, string>)[s.state];
+    const settings: FakeSettings = sub._s ?? {};
+    const lag: Map<string, string> | undefined = settings.listLag ? sub._lag : undefined;
+    const latest = this.latestSale(id);
+    const word = (state: string): string => ({ completed: 'COMPLETED', partially_refunded: 'PARTIALLY_REFUNDED', refunded: 'REFUNDED' } as Record<string, string>)[state];
+    const status = (s: Obj): string => (settings.pendingSale && s.id === latest?.id ? 'PENDING' : word(lag ? lag.get(s.id)! : s.state));
     const transactions = [...this.sales.values()]
       .filter(s => s.billing_agreement_id === id && Date.parse(s.create_time) >= start && Date.parse(s.create_time) <= end)
+      .filter(s => !lag || lag.has(s.id))
       .map(s => ({
-        id: s.id,
+        id: settings.listOtherIds ? `L${s.id}` : s.id,
         status: status(s),
         amount_with_breakdown: {
           gross_amount: { currency_code: s.amount.currency, value: s.amount.total },
@@ -488,8 +635,9 @@ export class FakePayPal {
         },
         payer_name: { given_name: 'Test', surname: 'Buyer' },
         payer_email: 'buyer@example.invalid',
-        time: s.create_time,
+        time: settings.lpSkew ? iso(Date.parse(s.create_time) - settings.lpSkew * 1000) : s.create_time,
       }));
+    if (transactions.length === 0 && settings.emptyListIs404) return missing();
     return new Answer(200, { transactions, total_items: transactions.length, total_pages: 1, links: [] });
   }
 
@@ -670,7 +818,7 @@ export class FakePayPal {
     sub._cycle = 1;
     this.setNext(sub);
     this.emit('BILLING.SUBSCRIPTION.ACTIVATED', sub);
-    this.sale(sub, this.priceOf(sub), at);
+    this.paidCycles(sub, this.priceOf(sub), at, 1);
     return sub;
   }
 
@@ -680,18 +828,19 @@ export class FakePayPal {
     if (sub.status !== 'ACTIVE' || sub._cycle !== 0) throw new Error(`p5PayPal.completeFirstSale: ${id} has no first sale waiting`);
     sub._cycle = 1;
     this.setNext(sub);
-    this.sale(sub, this.priceOf(sub), opts.at ?? Date.now());
+    this.paidCycles(sub, this.priceOf(sub), opts.at ?? Date.now(), 1);
     return sub;
   }
 
   /** A renewal is billed and paid: the sale of the cycle due at `next_billing_time` (or at `at`), then the next due date. */
   renew(id: string, opts: { at?: number } = {}): Obj {
     const sub = this.sub(id, 'renew');
+    this.refuseBilling(sub, 'renew');
     if (sub.status !== 'ACTIVE') throw new Error(`p5PayPal.renew: ${id} is ${sub.status}`);
     const at = opts.at ?? this.dueOf(sub, sub._cycle);
     sub._cycle += 1;
     this.setNext(sub);
-    this.sale(sub, this.priceOf(sub), at);
+    this.paidCycles(sub, this.priceOf(sub), at, 1);
     return sub;
   }
 
@@ -720,6 +869,7 @@ export class FakePayPal {
    */
   failPayment(id: string, opts: { at?: number; count?: number; reason?: string; moveNext?: boolean } = {}): Obj {
     const sub = this.sub(id, 'failPayment');
+    this.refuseBilling(sub, 'failPayment');
     if (sub.status !== 'ACTIVE') throw new Error(`p5PayPal.failPayment: ${id} is ${sub.status}`);
     this.failed(sub, opts.at ?? this.dueOf(sub, sub._cycle), opts);
     this.emit('BILLING.SUBSCRIPTION.PAYMENT.FAILED', sub);
@@ -732,17 +882,50 @@ export class FakePayPal {
    */
   retrySucceeds(id: string, opts: { at?: number } = {}): Obj {
     const sub = this.sub(id, 'retrySucceeds');
+    this.refuseBilling(sub, 'retrySucceeds');
     const info = this.billing(sub);
     if (sub._unpaid.length === 0) throw new Error(`p5PayPal.retrySucceeds: ${id} owes nothing`);
     const at = opts.at ?? Date.parse(info.last_failed_payment.next_payment_retry_time);
     const amount = this.priceOf(sub) * sub._unpaid.length;
+    const cycles = sub._unpaid.length;
     if (sub._unpaid.includes(this.dueOf(sub, sub._cycle))) sub._cycle += 1;
     sub._unpaid = [];
     info.failed_payments_count = 0;
     this.setBalance(sub);
     if (sub.status === 'SUSPENDED') this.toStatus(sub, 'ACTIVE');
     this.setNext(sub);
-    this.sale(sub, amount, at);
+    this.paidCycles(sub, amount, at, cycles);
+    return sub;
+  }
+
+  /** PayPal bills nothing more on a closed subscription or one whose cycles are all paid. */
+  private refuseBilling(sub: Obj, action: string): void {
+    if (sub.status === 'CANCELLED' || sub.status === 'EXPIRED') throw new FakeRefusal(`p5PayPal.${action}: PayPal bills nothing on ${sub.id}, which is ${sub.status}`);
+    if (this.allPaid(sub.id)) throw new FakeRefusal(`p5PayPal.${action}: PayPal bills nothing more on ${sub.id}, whose cycles are all paid`);
+  }
+
+  /** A sale of regular cycles: the REGULAR count moves on, and the last cycle paid follows the subscription's finalCycle. */
+  private paidCycles(sub: Obj, amount: number, at: number, cycles: number): Obj {
+    const sale = this.sale(sub, amount, at);
+    sub._completed += cycles;
+    if (this.allPaid(sub.id)) {
+      const info = this.billing(sub);
+      if (sub._s.keepNextAfterFinal) info.next_billing_time = iso(at);
+      else delete info.next_billing_time;
+      if ((sub._s.finalCycle ?? 'expire-at-payment') === 'expire-at-payment') {
+        this.toStatus(sub, 'EXPIRED');
+        this.emit('BILLING.SUBSCRIPTION.EXPIRED', sub);
+      }
+    }
+    return sale;
+  }
+
+  /** A checkout never approved expires at PayPal: its start_time kept, no cycle_executions, no last_payment. */
+  expireNeverApproved(id: string): Obj {
+    const sub = this.sub(id, 'expireNeverApproved');
+    if (sub.status !== 'APPROVAL_PENDING') throw new Error(`p5PayPal.expireNeverApproved: ${id} is ${sub.status}`);
+    this.toStatus(sub, 'EXPIRED');
+    this.emit('BILLING.SUBSCRIPTION.EXPIRED', sub);
     return sub;
   }
 
@@ -877,6 +1060,12 @@ export class FakePayPal {
   latestSale(id: string): Obj | null {
     const all = this.salesOf(id);
     return all.length ? all[all.length - 1] : null;
+  }
+
+  /** The transactions the list call answers for the subscription now, under its settings (every time); null for a 404. */
+  listed(id: string): Obj[] | null {
+    const answer = this.transactions(id, new URLSearchParams({ start_time: '1970-01-01T00:00:00Z', end_time: '9999-01-01T00:00:00Z' }));
+    return answer.status === 200 ? answer.body!.transactions : null;
   }
 
   /** The calls of one method whose path (without the query) matches. */

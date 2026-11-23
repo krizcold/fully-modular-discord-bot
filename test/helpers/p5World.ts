@@ -56,7 +56,13 @@ export const EXTRA_PLANS = {
   inactive: 'P-EXTRA-INACTIVE',
   unlinked: 'P-EXTRA-UNLINKED',
   quantity: 'P-EXTRA-QUANTITY',
+  fee: 'P-EXTRA-FEE',
+  feeZero: 'P-EXTRA-FEE-ZERO',
+  finite: 'P-EXTRA-FINITE',
 } as const;
+/** Every tier's offering linking, beside its cheap and dear plans, the trial plan, the plans with a setup fee of 5.00 and of 0.00, and the plan of three REGULAR cycles (sheet P5P, Y7). */
+export const ONCE_LINK: Partial<Record<TierId, string[]>> = Object.fromEntries((['gold', 'platinum', 'vip', 'star'] as TierId[])
+  .map(t => [t, [planId(t, 'cheap'), planId(t, 'dear'), EXTRA_PLANS.trial, EXTRA_PLANS.fee, EXTRA_PLANS.feeZero, EXTRA_PLANS.finite]]));
 
 const NAMES: Record<TierId, string> = { gold: 'Gold', platinum: 'Platinum', vip: 'VIP', star: 'Star' };
 const PRIORITY: Record<TierId, number> = { gold: 1, platinum: 2, vip: 1, star: 2 };
@@ -73,6 +79,9 @@ function planSpecs(): PlanSpec[] {
   specs.push({ id: EXTRA_PLANS.inactive, productId: 'PROD-EXTRA', name: 'Retired', unit: 'MONTH', price: '4.00', status: 'INACTIVE' });
   specs.push({ id: EXTRA_PLANS.unlinked, productId: 'PROD-EXTRA', name: 'Not sold', unit: 'MONTH', price: '8.00' });
   specs.push({ id: EXTRA_PLANS.quantity, productId: 'PROD-EXTRA', name: 'Per seat', unit: 'MONTH', price: '2.00', quantitySupported: true });
+  specs.push({ id: EXTRA_PLANS.fee, productId: 'PROD-EXTRA', name: 'Monthly with a setup fee', unit: 'MONTH', price: '6.00', setupFee: '5.00' });
+  specs.push({ id: EXTRA_PLANS.feeZero, productId: 'PROD-EXTRA', name: 'Monthly with no setup fee', unit: 'MONTH', price: '6.00', setupFee: '0.00' });
+  specs.push({ id: EXTRA_PLANS.finite, productId: 'PROD-EXTRA', name: 'Monthly, three payments', unit: 'MONTH', price: '6.00', totalCycles: 3 });
   return specs;
 }
 
@@ -345,6 +354,16 @@ export function p5World(backend: 'json' | 'rig' = 'json') {
         ? await callRoute(router, 'post', '/premium/users/:userId/paid', { params: { userId: idOf(holder) }, body })
         : await callRoute(router, 'post', '/premium/subscriptions/:guildId/paid', { params: { guildId: idOf(holder) }, body });
       return bought(before, reply);
+    },
+    /**
+     * A purchase through premium's op, as the routes call it, with the opt-out when `more.autoRenewOptOut`: the dev
+     * routes do not pass the opt-out, so a user's pay-once purchase is made here.
+     */
+    async buyOp(holder: string, buyerId: string, opts: { tierId?: TierId; plan?: string; more?: Record<string, unknown> } = {}): Promise<Bought> {
+      const tierId = tierFor(holder, opts.tierId);
+      const before = new Set(fake.createTexts.keys());
+      const reply = await op('initiatePaidSubscription', holder, tierId, `o-${tierId}`, { providerId: 'paypal', variantId: opts.plan ?? planId(tierId, 'cheap'), buyerId, ...(opts.more ?? {}) });
+      return bought(before, { status: reply.ok ? 200 : 400, body: reply.ok ? { result: reply.result } : { error: reply.error } });
     },
     /**
      * A purchase by the second bot (its own CLIENT_ID and webhook id, the same PayPal app): its own PayPalProvider's

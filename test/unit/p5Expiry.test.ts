@@ -14,6 +14,9 @@ import { getPremiumManager } from '../../src/bot/internalSetup/utils/premiumMana
 import { failFlushes } from '../helpers/configRig';
 import { z5End } from '../helpers/p5Model';
 import { heldPayPal, IDS, p5World, planId, TIERS, type Delivered } from '../helpers/p5World';
+import { onceEnd } from '../helpers/p5Model';
+import { FakeRefusal } from '../helpers/p5PayPal';
+import { FINAL_CYCLES, onceKit } from '../helpers/p5pOnce';
 import { heldStripe, IDS as P3_IDS, p3World } from '../helpers/p3World';
 
 const DAY = 86_400_000;
@@ -213,5 +216,34 @@ describe.each([['the JSON files', 'json' as const], ['the mirror rig', 'rig' as 
     await w.settle();
     expect(heldStripe(w.stored()).find(h => h.holder === holder)).toMatchObject({ location: 'active', sub: { status: 'active' } });
     expect(w.notices().filter(n => n.kind === 'paid.sub.expired')).toEqual([]);
+  });
+});
+
+describe.each([['the JSON files', 'json' as const], ['the mirror rig', 'rig' as const]])('P5P Q4 on %s: the checker frees a pay-once subscription at onceEnd(T) [R1]', (_name, backend) => {
+  const w = p5World(backend);
+  const o = onceKit(w);
+  beforeEach(async () => { await w.setup({ clock: T0 }); });
+  afterEach(async () => {
+    await w.teardown();
+    vi.restoreAllMocks();
+  });
+
+  it.each(FINAL_CYCLES)('under %s: held until onceEnd(T) and freed at it with one notice, the queued entry resuming; the renew at its due date is refused', async final => {
+    const id = await o.owned('guild', { level: 'high', settings: { finalCycle: final } });
+    const low = await o.owned('guild', { renewing: true });
+    expect([o.heldOf(id)?.location, o.heldOf(low)?.location]).toEqual(['active', 'paused']);
+    const end = o.endOf(id);
+    expect(end).toBe(onceEnd(w.fake, id));
+    const ended = () => w.notices().filter(n => n.kind === 'paid.sub.expired');
+    w.later(end - Date.now() - HOUR);
+    await w.tick();
+    expect([o.heldOf(id)?.location, ended()]).toEqual(['active', []]);
+    const sub = w.fake.subscriptions.get(id)!;
+    expect(() => w.fake.renew(id, { at: w.fake.dueOf(sub, 1) })).toThrow(FakeRefusal);
+    w.later(2 * HOUR);
+    await w.tick();
+    expect(o.heldOf(id)).toBeNull();
+    expect(o.heldOf(low)?.location).toBe('active');
+    expect(ended()).toEqual([{ to: HOLDER, kind: 'paid.sub.expired' }]);
   });
 });

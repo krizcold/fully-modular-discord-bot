@@ -18,8 +18,10 @@ import { getPremiumManager } from '../../src/bot/internalSetup/utils/premiumMana
 import { holderWords } from '../../src/bot/internalSetup/utils/premiumHolder';
 import { allowDropLines } from '../helpers/p1Guard';
 import { z5End } from '../helpers/p5Model';
-import { addCycles, customIdFor, type PayPalEvent } from '../helpers/p5PayPal';
-import { BOT_CLIENT_ID, EXTRA_PLANS, heldPayPal, IDS, p5World, planId, TIERS, type Delivered, type PlanKind, type TierId } from '../helpers/p5World';
+import { addCycles, customIdFor, FakeRefusal, type FakeSettings, type PayPalEvent } from '../helpers/p5PayPal';
+import { BOT_CLIENT_ID, EXTRA_PLANS, heldPayPal, IDS, ONCE_LINK, p5World, planId, TIERS, type Delivered, type PlanKind, type TierId } from '../helpers/p5World';
+import { onceEnd, onceProof } from '../helpers/p5Model';
+import { FINAL_CYCLES, HOUR, onceKit, PL16, PL16_ALREADY, PL17, PL17_ANY, PL18, PL18_ENDED, PL18_NONE, PL18_UNCOUNTED, PL19, PL6, PW7, PW7_NONE, PW8, RF } from '../helpers/p5pOnce';
 
 const DAY = 86_400_000;
 const T0 = Date.UTC(2027, 0, 31, 12);
@@ -174,7 +176,7 @@ describe.each(KINDS)('P5 claim 4: what is installed, for %s', (_name, k) => {
     await drain();
     expect(heldOf(id)).toBeNull();
     const label = { gold: 'Gold', vip: 'VIP' }[tierOf(k) as 'gold' | 'vip'];
-    expect(w.logged(`[PremiumManager] subscription.created from PayPal (subscription ${id}, ${words(k)}) was not installed: offering '${label}' does not sell variant '${EXTRA_PLANS.unlinked}' through PayPal. PayPal keeps billing it: cancel and refund it at PayPal.`).length).toBeGreaterThan(0);
+    expect(w.logged(`[PremiumManager] subscription.created from PayPal (subscription ${id}, ${words(k)}) was not installed: offering '${label}' does not sell variant '${EXTRA_PLANS.unlinked}' through PayPal. If PayPal keeps billing it, cancel it there; refund it at PayPal if it was paid.`).length).toBeGreaterThan(0);
   });
 
   it("a second subscription of the held tier, both approved: one installed, the other refused as 'priority' with the warning, again at its next delivery", async () => {
@@ -187,7 +189,7 @@ describe.each(KINDS)('P5 claim 4: what is installed, for %s', (_name, k) => {
     expect([heldOf(first)?.location, heldOf(second)]).toEqual(['active', null]);
     expect(fakeSub(second).status).toBe('ACTIVE');
     const label = { gold: 'Gold', vip: 'VIP' }[tierOf(k) as 'gold' | 'vip'];
-    const line = `[PremiumManager] subscription.created from PayPal (subscription ${second}, ${words(k)}) was not installed: ${words(k)} already holds '${label}' at that priority. PayPal keeps billing it: cancel and refund it at PayPal.`;
+    const line = `[PremiumManager] subscription.created from PayPal (subscription ${second}, ${words(k)}) was not installed: ${words(k)} already holds '${label}' at that priority. If PayPal keeps billing it, cancel it there; refund it at PayPal if it was paid.`;
     const before = w.logged(line).length;
     expect(before).toBeGreaterThan(0);
     expect(w.logged('[PremiumManager] subscription.created from PayPal').every(l => l === line)).toBe(true);
@@ -987,5 +989,851 @@ describe('P5 claim 14: chains', () => {
     expect(suspends(low)).toBe(2);
     expect(w.fake.queue.filter(e => e.event_type === 'BILLING.SUBSCRIPTION.SUSPENDED' && e.resource.id === low)).toHaveLength(1);
     expect(fakeSub(low).status).toBe('SUSPENDED');
+  });
+});
+
+// Sheet P5P, Y2 and Y7 (Q3, Q6, Q8 to Q12): a pay-once subscription's tier follows its payment record, never PayPal's
+// status; once the payment is proven the bot cancels it at PayPal; it sells one period from its earliest kept payment.
+// Ends come from helpers/p5Model.ts's onceEnd and onceProof over what the fake answers.
+
+const o = onceKit(w);
+const fakeStatus = (id: string): string => w.fake.subscriptions.get(id)!.status;
+/** The subscription's only queued event of `type` delivered after every other queued event is dropped. */
+async function only(type: string, id: string): Promise<Delivered> {
+  const event = o.take(type, id);
+  w.fake.queue.length = 0;
+  return w.deliver(event);
+}
+/** Bought with the opt-out, its first delivery's cancel answered 503, so premium holds it while PayPal keeps it ACTIVE. */
+async function heldActive(k: Kind, settings: FakeSettings = {}): Promise<string> {
+  const id = await o.buy(k);
+  w.fake.configure(id, { finalCycle: 'stays-active', ...settings });
+  w.fake.approve(id);
+  w.fake.fail('POST', new RegExp(`^/v1/billing/subscriptions/${id}/cancel$`), { status: 503 });
+  const first = await w.deliver(o.take('BILLING.SUBSCRIPTION.CREATED', id));
+  expect(first.status).toBe(400);
+  w.fake.queue.length = 0;
+  expect(o.heldOf(id)?.location).toBe('active');
+  expect(fakeStatus(id)).toBe('ACTIVE');
+  return id;
+}
+/** A delivery that only makes the bot read the subscription again. */
+function createdOf(id: string): PayPalEvent {
+  return { id: `WH-P5P-READ-${id}-${w.delivered.length}`, event_version: '1.0', create_time: isoOf(Date.now()), resource_type: 'subscription', resource_version: '2.0', event_type: 'BILLING.SUBSCRIPTION.ACTIVATED', summary: 'read', resource: { id }, links: [] };
+}
+/** The clock moved to the subscription's next due date at PayPal. */
+function toDue(id: string): void {
+  const due = Date.parse(w.fake.subscriptions.get(id)!.billing_info.next_billing_time);
+  w.later(due - Date.now() + 60_000);
+}
+
+describe.each(KINDS)('P5P Q3: expiry timing [R1], for %s', (_name, k) => {
+  it.each(FINAL_CYCLES)('under %s: installed once, active, auto-renew off, the end onceEnd(T), meta payOnce; one cancel only when a read shows ACTIVE', async final => {
+    const id = await o.owned(k, { settings: { finalCycle: final } });
+    const held = o.heldOf(id)!;
+    expect(held).toMatchObject({ location: 'active', sub: { status: 'active', autoRenew: false, providerMeta: { payOnce: true } } });
+    expect(o.endOf(id)).toBe(onceEnd(w.fake, id));
+    expect(o.installLines(id)).toHaveLength(1);
+    const cancelled = final === 'expire-at-payment' ? 0 : 1;
+    expect([o.cancels(id), w.logged(PL16(id, k)).length]).toEqual([cancelled, cancelled]);
+    expect(fakeStatus(id)).toBe(final === 'expire-at-payment' ? 'EXPIRED' : 'CANCELLED');
+  });
+
+  it.each([['cancelled', 'buyerCancel'], ['expired', 'expire']] as const)('the subscription %s at PayPal between the read and the cancel: 422, the read shows it, PL16 second form only', async (word, how) => {
+    const id = await o.buy(k);
+    w.fake.configure(id, { finalCycle: 'stays-active' });
+    w.fake.approve(id);
+    const hold = w.fake.hold('POST', new RegExp(`^/v1/billing/subscriptions/${id}/cancel$`));
+    const first = w.deliverNext(0);
+    await hold.reached;
+    if (how === 'buyerCancel') w.fake.buyerCancel(id);
+    else w.fake.expire(id);
+    hold.release();
+    expect((await first)?.status).toBe(200);
+    await o.drain();
+    expect([w.logged(PL16_ALREADY(id, k, word)).length, w.logged(PL16(id, k)).length, o.cancels(id)]).toEqual([1, 0, 1]);
+    expect(o.heldOf(id)?.location).toBe('active');
+    expect(o.endOf(id)).toBe(onceEnd(w.fake, id));
+  });
+
+  it.each([['in order', 'order'], ['in reverse order', 'reverse'], ['with only the last one', 'last']] as const)('the events delivered %s: the same single install and end', async (_label, how) => {
+    const id = await o.buy(k);
+    w.fake.configure(id, { finalCycle: 'active-to-period-end' });
+    w.fake.approve(id);
+    if (how === 'reverse') await w.drain(length => length - 1);
+    if (how === 'last') {
+      const last = w.fake.queue[w.fake.queue.length - 1];
+      w.fake.queue.length = 0;
+      await w.deliver(last);
+    }
+    await o.drain();
+    expect(o.installLines(id)).toHaveLength(1);
+    expect(o.endOf(id)).toBe(onceEnd(w.fake, id));
+    expect(o.cancels(id)).toBe(1);
+  });
+
+  it.each([['expire-at-payment', 'BILLING.SUBSCRIPTION.EXPIRED'], ['active-to-period-end', 'BILLING.SUBSCRIPTION.CANCELLED']] as const)('under %s, %s delivered again for the held one: the same state, no notice', async (final, type) => {
+    const id = await o.owned(k, { settings: { finalCycle: final } });
+    const before = o.plain();
+    const notices = w.notices().length;
+    const out = await w.deliver(o.lastDelivered(type, id));
+    expect(out.status).toBe(200);
+    expect([o.plain(), w.notices().length]).toEqual([before, notices]);
+  });
+
+  it('each event delivered twice: premium unchanged after the first apart from updatedAt, no second cancel', async () => {
+    const id = await o.owned(k, { settings: { finalCycle: 'stays-active' } });
+    const before = o.plain();
+    for (const done of [...w.delivered]) if (done.event) await w.deliver(done.event);
+    await o.drain();
+    expect(o.plain()).toEqual(before);
+    expect(o.cancels(id)).toBe(1);
+  });
+});
+
+describe.each(KINDS)('P5P Q6: the override and later charges [R2, R3], for %s', (_name, k) => {
+  const SHOWN: Array<[string, FakeSettings]> = [
+    ['flag', { showOverrideBy: 'flag' }], ['cycles', { showOverrideBy: 'cycles' }], ['both', { showOverrideBy: 'both' }], ['none', { showOverrideBy: 'none' }],
+    ['ignoreOverride', { ignoreOverride: true }], ['billsDespiteOverride', { billsDespiteOverride: true }],
+  ];
+  it.each(SHOWN)('under %s: one cancel at the first read that proves the payment and shows ACTIVE, PL16; CANCELLED keeps the end; the next renew is refused', async (_label, settings) => {
+    const id = await o.owned(k, { settings: { finalCycle: 'active-to-period-end', ...settings } });
+    expect([o.cancels(id), w.logged(PL16(id, k)).length, fakeStatus(id)]).toEqual([1, 1, 'CANCELLED']);
+    expect(o.heldOf(id)?.sub).toMatchObject({ status: 'active', autoRenew: false });
+    expect(o.endOf(id)).toBe(onceEnd(w.fake, id));
+    toDue(id);
+    expect(() => w.fake.renew(id)).toThrow(FakeRefusal);
+    expect(w.fake.salesOf(id)).toHaveLength(1);
+  });
+
+  const BILLED: Array<[string, FakeSettings]> = [['ignoreOverride', { ignoreOverride: true }], ['billsDespiteOverride', { billsDespiteOverride: true }]];
+
+  it.each(BILLED)('under %s, a second sale while held: the end stays the first payment\'s, PL17 once naming it, then one cancel', async (_label, settings) => {
+    const id = await heldActive(k, settings);
+    const first = o.endOf(id);
+    toDue(id);
+    w.fake.renew(id);
+    const [, second] = o.sales(id);
+    await o.drain();
+    expect(o.endOf(id)).toBe(first);
+    expect(o.endOf(id)).toBe(onceEnd(w.fake, id));
+    expect(w.logged(PL17(second, o.saleTime(second), id, k))).toHaveLength(1);
+    expect(w.logged(PL17_ANY(id)).filter(l => l.includes('PayPal took another payment'))).toHaveLength(1);
+    expect([fakeStatus(id), w.logged(PL16(id, k)).length]).toEqual(['CANCELLED', 1]);
+  });
+
+  it.each(BILLED)('under %s, a second sale before any delivery: installed from the first payment, PL17 once, one cancel', async (_label, settings) => {
+    const id = await o.buy(k);
+    w.fake.configure(id, settings);
+    w.fake.approve(id);
+    toDue(id);
+    w.fake.renew(id);
+    const [firstSale, second] = o.sales(id);
+    await o.drain();
+    expect(o.installLines(id)).toHaveLength(1);
+    expect(o.endOf(id)).toBe(onceEnd(w.fake, id));
+    expect(o.endOf(id)).toBeLessThan(o.saleTime(second) + 31 * DAY);
+    expect(o.saleTime(firstSale)).toBeLessThan(o.saleTime(second));
+    expect(w.logged(PL17(second, o.saleTime(second), id, k))).toHaveLength(1);
+    expect([o.cancels(id), fakeStatus(id)]).toEqual([1, 'CANCELLED']);
+  });
+
+  describe.each([['delivered', true], ['not delivered (the next read)', false]] as const)('the refund event %s', (_label, delivered) => {
+    async function twoSales(): Promise<[string, string, string]> {
+      const id = await o.buy(k);
+      w.fake.configure(id, { ignoreOverride: true });
+      w.fake.approve(id);
+      toDue(id);
+      w.fake.renew(id);
+      await o.drain();
+      const [a, b] = o.sales(id);
+      return [id, a, b];
+    }
+    async function refundThenRead(id: string, sale: string): Promise<Delivered | null> {
+      w.fake.refund(sale);
+      if (delivered) return w.deliverNext(w.fake.queue.findIndex(e => e.event_type === 'PAYMENT.SALE.REFUNDED'));
+      o.take('PAYMENT.SALE.REFUNDED', id);
+      return w.deliver(o.lastDelivered('BILLING.SUBSCRIPTION.CANCELLED', id));
+    }
+
+    it('a full refund of the second sale: nothing changes, PL18 when delivered, no second PL17', async () => {
+      const [id, a, b] = await twoSales();
+      const end = o.endOf(id);
+      const out = await refundThenRead(id, b);
+      expect(out?.status).toBe(200);
+      expect(o.endOf(id)).toBe(end);
+      expect(w.logged(PL18(b, id, k, o.saleTime(a), end))).toHaveLength(delivered ? 1 : 0);
+      expect(w.logged('PayPal took another payment')).toHaveLength(1);
+    });
+
+    it("a full refund of the first sale (T's own): T moves to the second sale and the end is its onceEnd", async () => {
+      const [id, a, b] = await twoSales();
+      const out = await refundThenRead(id, a);
+      expect(out?.status).toBe(200);
+      expect(o.endOf(id)).toBe(onceEnd(w.fake, id));
+      expect(onceProof(w.fake, id, 'BILLING.SUBSCRIPTION.UPDATED').T).toBe(o.saleTime(b));
+      expect(w.logged(PL18(a, id, k, o.saleTime(b), o.endOf(id)))).toHaveLength(delivered ? 1 : 0);
+    });
+
+    it('a full refund of both: ended at once', async () => {
+      const [id, a, b] = await twoSales();
+      await refundThenRead(id, a);
+      const out = await refundThenRead(id, b);
+      expect(out?.status).toBe(200);
+      expect(o.heldOf(id)).toBeNull();
+    });
+  });
+
+  it('a read taking last_payment (the second sale) while the list hides both, then the list released: the end moves back to the first sale\'s onceEnd', async () => {
+    const id = await o.buy(k);
+    w.fake.configure(id, { ignoreOverride: true, listLag: true });
+    w.fake.approve(id);
+    toDue(id);
+    w.fake.renew(id);
+    const [a, b] = o.sales(id);
+    w.fake.queue.length = 0;
+    const out = await w.deliver(createdOf(id));
+    expect(out.status).toBe(200);
+    expect(o.endOf(id)).toBe(onceEnd(w.fake, id));
+    expect(onceProof(w.fake, id, 'BILLING.SUBSCRIPTION.UPDATED').T).toBe(o.saleTime(b));
+    w.fake.release(id, 'listLag');
+    await w.deliver(createdOf(id));
+    expect(onceProof(w.fake, id, 'BILLING.SUBSCRIPTION.UPDATED').T).toBe(o.saleTime(a));
+    expect(o.endOf(id)).toBe(onceEnd(w.fake, id));
+    expect(w.logged(PL17(b, o.saleTime(b), id, k))).toHaveLength(1);
+  });
+
+  it('a renewing subscription: no cancel call', async () => {
+    const id = await o.owned(k, { renewing: true });
+    expect(o.heldOf(id)?.sub).toMatchObject({ autoRenew: true });
+    expect(o.cancels(id)).toBe(0);
+  });
+});
+
+describe.each(KINDS)('P5P Q8: next billing time [R4], for %s', (_name, k) => {
+  it.each([['removed', false], ['kept at the payment time', true]] as const)('next_billing_time %s after the last cycle: the end is onceEnd(T)', async (_label, keep) => {
+    const id = await o.owned(k, { settings: { finalCycle: 'active-to-period-end', keepNextAfterFinal: keep } });
+    const T = o.saleTime(o.sales(id)[0]);
+    expect(o.endOf(id)).toBe(onceEnd(w.fake, id));
+    expect(o.endOf(id)).not.toBe(T + DAY);
+  });
+});
+
+describe.each(KINDS)('P5P Q9: the payment proof [R5, R6, R7, R10, R11, R12], for %s', (_name, k) => {
+  /** Bought, the settings set, approved; only one event delivered (ACTIVATED under 'stays-active', or EXPIRED). */
+  async function single(settings: FakeSettings, type = 'BILLING.SUBSCRIPTION.ACTIVATED'): Promise<[string, Delivered]> {
+    const id = await o.buy(k);
+    w.fake.configure(id, { finalCycle: type === 'BILLING.SUBSCRIPTION.EXPIRED' ? 'expire-at-payment' : 'stays-active', ...settings });
+    w.fake.approve(id);
+    return [id, await only(type, id)];
+  }
+
+  it.each(['BILLING.SUBSCRIPTION.ACTIVATED', 'BILLING.SUBSCRIPTION.EXPIRED'])('omitLastPayment alone with the sale listed, only %s: installed at once from the listed sale, one cancel when ACTIVE', async type => {
+    const [id, out] = await single({ omitLastPayment: true }, type);
+    expect(out.status).toBe(200);
+    expect(o.endOf(id)).toBe(onceEnd(w.fake, id));
+    expect(o.cancels(id)).toBe(type.endsWith('ACTIVATED') ? 1 : 0);
+  });
+
+  it('listLag alone: installed at once from last_payment', async () => {
+    const [id, out] = await single({ listLag: true });
+    expect(out.status).toBe(200);
+    expect(o.endOf(id)).toBe(onceEnd(w.fake, id));
+    expect(o.cancels(id)).toBe(1);
+  });
+
+  it.each([
+    ['omitLastPayment with listLag', { omitLastPayment: true, listLag: true }, PW7_NONE],
+    ['pendingSale with omitLastPayment', { omitLastPayment: true, pendingSale: true }, 'its latest transaction is PENDING'],
+    ['omitCycleExecutions with omitLastPayment and listLag', { omitCycleExecutions: true, omitLastPayment: true, listLag: true }, PW7_NONE],
+  ] as Array<[string, FakeSettings, string]>)('%s: 400 PW7, nothing installed, no cancel; after the release the next delivery installs it once and cancels it', async (_label, settings, why) => {
+    const [id, out] = await single(settings);
+    expect([out.status, o.errorOf(out)]).toEqual([400, PW7(id, why)]);
+    expect([o.heldOf(id), o.cancels(id)]).toEqual([null, 0]);
+    w.fake.release(id, ...(Object.keys(settings) as Array<keyof FakeSettings>));
+    const again = await w.deliver(out.event);
+    expect(again.status).toBe(200);
+    await o.drain();
+    expect([o.installLines(id).length, o.cancels(id)]).toEqual([1, 1]);
+    expect(o.endOf(id)).toBe(onceEnd(w.fake, id));
+  });
+
+  it('pendingSale with lpWhilePending [R11]: installed at once from last_payment and cancelled', async () => {
+    const [id, out] = await single({ pendingSale: true, lpWhilePending: true });
+    expect(out.status).toBe(200);
+    expect([o.heldOf(id)?.location, o.cancels(id)]).toEqual(['active', 1]);
+  });
+
+  it('omitCycleExecutions alone: installed', async () => {
+    const [id, out] = await single({ omitCycleExecutions: true });
+    expect([out.status, o.heldOf(id)?.location]).toEqual([200, 'active']);
+  });
+
+  it('only PAYMENT.SALE.COMPLETED with omitLastPayment, listLag and staleCycles: 400 PW7, not none; staleCycles released first: still PW7; all released: installed once and cancelled', async () => {
+    const [id, out] = await single({ omitLastPayment: true, listLag: true, staleCycles: true }, 'PAYMENT.SALE.COMPLETED');
+    expect([out.status, o.errorOf(out)]).toEqual([400, PW7(id, PW7_NONE)]);
+    w.fake.release(id, 'staleCycles');
+    const still = await w.deliver(out.event);
+    expect([still.status, o.heldOf(id)]).toEqual([400, null]);
+    w.fake.release(id, 'omitLastPayment', 'listLag');
+    const last = await w.deliver(out.event);
+    expect(last.status).toBe(200);
+    expect([o.installLines(id).length, o.cancels(id)]).toEqual([1, 1]);
+  });
+
+  describe.each([[0], [1], [3540], [-1], [-3540]])('lpSkew %i seconds [R10]', skew => {
+    it('a full refund of the one payment, the refund event not delivered: not held, refunded (nothing installed, cancelled); held, ended at once and cancelled', async () => {
+      const other = await o.buy(k, { level: 'high' });
+      w.fake.configure(other, { finalCycle: 'stays-active', lpSkew: skew });
+      w.fake.approve(other);
+      w.fake.refund(o.sales(other)[0]);
+      const out = await only('BILLING.SUBSCRIPTION.ACTIVATED', other);
+      expect([out.status, o.heldOf(other), o.cancels(other)]).toEqual([200, null, 1]);
+      const held = await heldActive(k === 'guild' ? 'user' : 'guild', { lpSkew: skew });
+      w.fake.refund(o.sales(held)[0]);
+      w.fake.queue.length = 0;
+      const read = await w.deliver(o.lastDelivered('BILLING.SUBSCRIPTION.CREATED', held));
+      expect([read.status, o.heldOf(held), o.cancels(held), fakeStatus(held)]).toEqual([200, null, 2, 'CANCELLED']);
+    });
+  });
+
+  it.each([[7200], [-7200]])('lpSkew %i seconds: paid from last_payment, kept after a full refund (accepted limit Y8.7)', async skew => {
+    const id = await heldActive(k, { lpSkew: skew });
+    w.fake.refund(o.sales(id)[0]);
+    w.fake.queue.length = 0;
+    const read = await w.deliver(o.lastDelivered('BILLING.SUBSCRIPTION.CREATED', id));
+    expect(read.status).toBe(200);
+    expect(o.heldOf(id)?.location).toBe('active');
+  });
+
+  it('emptyListIs404 [R12] with last_payment: installed from it and cancelled; with no last_payment: 400 PW7', async () => {
+    const [id, out] = await single({ emptyListIs404: true, listLag: true });
+    expect([out.status, o.heldOf(id)?.location, o.cancels(id)]).toEqual([200, 'active', 1]);
+    expect(o.endOf(id)).toBe(onceEnd(w.fake, id));
+    const other = await o.buy(k, { level: 'high' });
+    w.fake.configure(other, { finalCycle: 'stays-active', emptyListIs404: true, listLag: true, omitLastPayment: true });
+    w.fake.approve(other);
+    const none = await only('BILLING.SUBSCRIPTION.ACTIVATED', other);
+    expect([none.status, o.errorOf(none), o.heldOf(other)]).toEqual([400, PW7(other, PW7_NONE), null]);
+  });
+
+  it('a refund event under emptyListIs404 with its sale not in the list: 400 PW8', async () => {
+    const [id] = await single({ emptyListIs404: true, listLag: true });
+    const sale = o.sales(id)[0];
+    w.fake.refund(sale);
+    const out = await only('PAYMENT.SALE.REFUNDED', id);
+    expect([out.status, o.errorOf(out)]).toEqual([400, PW8(sale, id)]);
+    expect(o.heldOf(id)?.location).toBe('active');
+  });
+
+  /** Refunded in full, the list frozen, then a second sale PayPal takes while the cancel fails. */
+  async function refundedThenLater(settings: FakeSettings, held: boolean): Promise<string> {
+    const id = held ? await heldActive(k, { ignoreOverride: true }) : await o.buy(k, { level: 'high' });
+    if (!held) {
+      w.fake.configure(id, { finalCycle: 'stays-active', ignoreOverride: true });
+      w.fake.approve(id);
+    }
+    w.fake.refund(o.sales(id)[0]);
+    w.fake.configure(id, { listLag: true });
+    toDue(id);
+    w.fake.renew(id);
+    w.fake.configure(id, settings);
+    w.fake.queue.length = 0;
+    return id;
+  }
+
+  it('refunded payments only, omitLastPayment, a second sale hidden, cycles_completed 2 (A5): unknown; held unchanged and cancelled, not held 400 PW7', async () => {
+    const held = await refundedThenLater({ omitLastPayment: true }, true);
+    const before = o.plain();
+    const read = await w.deliver(createdOf(held));
+    expect([read.status, o.plain(), fakeStatus(held)]).toEqual([200, before, 'CANCELLED']);
+    const free = await refundedThenLater({ omitLastPayment: true }, false);
+    const out = await w.deliver(createdOf(free));
+    expect([out.status, o.errorOf(out), o.heldOf(free), o.cancels(free)]).toEqual([400, PW7(free, 'its latest transaction is REFUNDED'), null, 0]);
+  });
+
+  it('the same with cycles_completed 1: refunded', async () => {
+    const id = await refundedThenLater({ omitLastPayment: true, staleCycles: 1 }, true);
+    const read = await w.deliver(createdOf(id));
+    expect([read.status, o.heldOf(id)]).toEqual([200, null]);
+  });
+
+  it('last_payment matched to the refunded sale and cycles_completed 1: refunded', async () => {
+    const id = await heldActive(k);
+    w.fake.refund(o.sales(id)[0]);
+    w.fake.queue.length = 0;
+    const read = await w.deliver(createdOf(id));
+    expect([read.status, o.heldOf(id)]).toEqual([200, null]);
+  });
+
+  it('a stale last_payment matched to the refunded sale with cycles_completed 2 and one payment listed (B3): unknown', async () => {
+    const id = await refundedThenLater({ pendingSale: true }, true);
+    const before = o.plain();
+    const read = await w.deliver(createdOf(id));
+    expect([read.status, o.plain()]).toEqual([200, before]);
+    expect(o.heldOf(id)?.location).toBe('active');
+  });
+
+  it('omitCycleExecutions and no last_payment, the only payment refunded: unknown, held unchanged', async () => {
+    const id = await heldActive(k, { omitCycleExecutions: true });
+    w.fake.refund(o.sales(id)[0]);
+    w.fake.configure(id, { omitLastPayment: true });
+    w.fake.queue.length = 0;
+    const before = o.plain();
+    const read = await w.deliver(createdOf(id));
+    expect([read.status, o.plain(), fakeStatus(id)]).toEqual([200, before, 'CANCELLED']);
+  });
+
+  it('held active under an unknown read (pendingSale with omitLastPayment): premium unchanged, the cancel tried again and landed', async () => {
+    const id = await heldActive(k);
+    w.fake.configure(id, { pendingSale: true, omitLastPayment: true });
+    const before = o.plain();
+    const read = await w.deliver(createdOf(id));
+    expect([read.status, o.plain(), fakeStatus(id), o.cancels(id)]).toEqual([200, before, 'CANCELLED', 2]);
+  });
+
+  it('an older sale refunded and the latest sale lagging (W5): paid from last_payment, kept', async () => {
+    const id = await refundedThenLater({}, true);
+    const read = await w.deliver(createdOf(id));
+    expect(read.status).toBe(200);
+    expect(o.heldOf(id)?.location).toBe('active');
+    expect(o.endOf(id)).toBe(onceEnd(w.fake, id));
+  });
+
+  it.each([['500', { status: 500 }], ['no answer', { drop: 'before' as const }]])('a transactions read answering %s: 400 PW3, premium unchanged, the next delivery applies it', async (_label, fault) => {
+    const id = await o.buy(k);
+    w.fake.configure(id, { finalCycle: 'stays-active' });
+    w.fake.approve(id);
+    const event = o.take('BILLING.SUBSCRIPTION.ACTIVATED', id);
+    w.fake.queue.length = 0;
+    w.fake.fail('GET', /\/transactions\?/, fault as any);
+    const out = await w.deliver(event);
+    expect(out.status).toBe(400);
+    expect(o.errorOf(out)).toMatch(new RegExp(`^PayPal webhook not applied: the bot could not read subscription ${id} at PayPal \\(.+\\); PayPal sends the event again\\.$`));
+    expect(o.heldOf(id)).toBeNull();
+    const again = await w.deliver(event);
+    expect([again.status, o.heldOf(id)?.location]).toEqual([200, 'active']);
+  });
+});
+
+describe.each(KINDS)('P5P Q10: status does not matter [R8], for %s', (_name, k) => {
+  it.each([
+    ['ACTIVE', (_id: string) => undefined, 1],
+    ['CANCELLED by the buyer', (id: string) => { w.fake.buyerCancel(id); }, 0],
+    ['EXPIRED', (id: string) => { w.fake.expire(id); }, 0],
+    ['SUSPENDED for failed payments', (id: string) => { w.fake.suspendForFailures(id); }, 1],
+  ] as Array<[string, (id: string) => void, number]>)('held, read %s: the same active state and end; the cancel only from ACTIVE or SUSPENDED; freed by the checker at that end', async (_label, change, cancelled) => {
+    const id = await heldActive(k);
+    const end = o.endOf(id);
+    change(id);
+    const read = await w.deliver(o.lastDelivered('BILLING.SUBSCRIPTION.CREATED', id));
+    expect(read.status).toBe(200);
+    expect(o.heldOf(id)?.sub).toMatchObject({ status: 'active', autoRenew: false });
+    expect(o.endOf(id)).toBe(end);
+    expect(o.cancels(id)).toBe(1 + cancelled);
+    w.later(end - Date.now() + HOUR);
+    await w.tick();
+    expect(o.heldOf(id)).toBeNull();
+  });
+
+  it("held, premium's soft cancel through the op: one cancel call, the same active state and end", async () => {
+    const id = await heldActive(k);
+    const end = o.endOf(id);
+    const calls = o.cancels(id);
+    const reply = await w.op('cancelPaidSubscription', holderOf(k));
+    expect(reply.ok).toBe(true);
+    expect(o.cancels(id) - calls).toBe(1);
+    await o.drain();
+    expect(o.heldOf(id)?.sub).toMatchObject({ status: 'active', autoRenew: false });
+    expect(o.endOf(id)).toBe(end);
+  });
+
+  it.each([['ACTIVE', false], ['SUSPENDED', true]] as const)('PAYMENT.FAILED for a held one, the fake %s, the cancel refused so far (B2): no renewal-failed notice, the state unchanged, the cancel sent', async (_status, suspended) => {
+    const id = await heldActive(k, { ignoreOverride: true });
+    toDue(id);
+    w.fake.failPayment(id);
+    if (suspended) w.fake.suspendForFailures(id);
+    // SUSPENDED: the only field allowed to change is PayPal's status in the entry's meta.
+    const bytes = (): any => (suspended ? JSON.parse(JSON.stringify(o.plain(), (key, value) => (key === 'paypalStatus' ? undefined : value))) : o.plain());
+    const before = bytes();
+    const out = await only('BILLING.SUBSCRIPTION.PAYMENT.FAILED', id);
+    expect(out.status).toBe(200);
+    expect(w.notices().filter(n => n.kind === 'paid.sub.renewal-failed')).toEqual([]);
+    expect(bytes()).toEqual(before);
+    expect([o.cancels(id), fakeStatus(id)]).toEqual([2, 'CANCELLED']);
+  });
+
+  it.each([
+    ['ACTIVE', (_id: string) => undefined, 1],
+    ['CANCELLED', (id: string) => { w.fake.buyerCancel(id); }, 0],
+    ['EXPIRED', (id: string) => { w.fake.expire(id); }, 0],
+    ['SUSPENDED', (id: string) => { w.fake.suspendForFailures(id); }, 1],
+  ] as Array<[string, (id: string) => void, number]>)('not held, first read %s with the payment proven: installed once with onceEnd(T)', async (_label, change, cancelled) => {
+    const id = await o.buy(k);
+    w.fake.configure(id, { finalCycle: 'stays-active' });
+    w.fake.approve(id);
+    change(id);
+    await o.drain();
+    expect(o.installLines(id)).toHaveLength(1);
+    expect(o.endOf(id)).toBe(onceEnd(w.fake, id));
+    expect(o.cancels(id)).toBe(cancelled);
+  });
+
+  it('none [R8, X4]: an APPROVAL_PENDING read, and a read with every cycles_completed 0, for an event other than PAYMENT.SALE.COMPLETED: 200, nothing, no line, no cancel', async () => {
+    const id = await o.buy(k);
+    const lines = () => w.logged('[PayPalProvider]').length;
+    const before = lines();
+    const created = await w.deliverNext(0);
+    expect([created?.status, o.heldOf(id), lines()]).toEqual([200, null, before]);
+    w.fake.approve(id, { firstSale: 'later' });
+    const activated = await only('BILLING.SUBSCRIPTION.ACTIVATED', id);
+    expect([activated.status, o.heldOf(id), lines(), o.cancels(id)]).toEqual([200, null, before, 0]);
+  });
+
+  it('expireNeverApproved: 400 PW7 at each delivery, nothing installed, no cancel (accepted limit Y8.8)', async () => {
+    const id = await o.buy(k);
+    w.fake.queue.length = 0;
+    w.fake.expireNeverApproved(id);
+    const outs = [await w.deliverNext(0), await w.deliver(o.lastDelivered('BILLING.SUBSCRIPTION.EXPIRED', id))];
+    expect(outs.map(x => [x?.status, o.errorOf(x!)])).toEqual([[400, PW7(id, PW7_NONE)], [400, PW7(id, PW7_NONE)]]);
+    expect([o.heldOf(id), o.cancels(id)]).toEqual([null, 0]);
+  });
+});
+
+describe.each(KINDS)('P5P Q11: what still ends at once, for %s', (_name, k) => {
+  it.each([['', {}], [', last_payment omitted on EXPIRED reads (R5)', { omitLastPayment: true, omitLastPaymentOn: 'EXPIRED' }]] as Array<[string, FakeSettings]>)('a held pay-once EXPIRED whose sale was refunded in full%s, the refund event not delivered: ended at once; the refund delivered: no cancel, PL6 had already expired', async (_label, settings) => {
+    const id = await o.owned(k, { settings });
+    expect(fakeStatus(id)).toBe('EXPIRED');
+    expect(o.heldOf(id)?.location).toBe('active');
+    const sale = o.sales(id)[0];
+    w.fake.refund(sale);
+    const refund = o.take('PAYMENT.SALE.REFUNDED', id);
+    await w.deliver(o.lastDelivered('BILLING.SUBSCRIPTION.EXPIRED', id));
+    expect(o.heldOf(id)).toBeNull();
+    const other = await o.owned(k, { level: 'high' });
+    const otherSale = o.sales(other)[0];
+    w.fake.refund(otherSale);
+    const out = await only('PAYMENT.SALE.REFUNDED', other);
+    expect([out.status, o.heldOf(other), o.cancels(other)]).toEqual([200, null, 0]);
+    expect(w.logged(PL6(otherSale, other, k, 'had already expired at PayPal'))).toHaveLength(1);
+    expect(refund.event_type).toBe('PAYMENT.SALE.REFUNDED');
+  });
+
+  it('a held pay-once ACTIVE (the cancel refused so far) refunded in full: one refund cancel, ended, PL6', async () => {
+    const id = await heldActive(k);
+    const sale = o.sales(id)[0];
+    w.fake.refund(sale);
+    const out = await only('PAYMENT.SALE.REFUNDED', id);
+    expect([out.status, o.heldOf(id), fakeStatus(id)]).toEqual([200, null, 'CANCELLED']);
+    const calls = w.fake.callsOf('POST', new RegExp(`^/v1/billing/subscriptions/${id}/cancel$`));
+    expect(calls.map(c => c.json?.reason)).toEqual(['sold as one payment', 'refunded']);
+    expect(w.logged(PL6(sale, id, k, 'was cancelled at PayPal'))).toHaveLength(1);
+  });
+
+  it('a partial refund delivered once (C2): PL5, 200, no PW8, kept, and the second rule\'s cancel', async () => {
+    const id = await heldActive(k);
+    const sale = o.sales(id)[0];
+    w.fake.refund(sale, 100);
+    const out = await only('PAYMENT.SALE.REFUNDED', id);
+    expect([out.status, o.errorOf(out)]).toEqual([200, '']);
+    expect(w.logged(`[PayPalProvider] Sale ${sale} was refunded (PARTIALLY_REFUNDED), and it is not a full refund of the latest payment of subscription ${id}; the subscription stays.`)).toHaveLength(1);
+    expect([o.heldOf(id)?.location, fakeStatus(id)]).toEqual(['active', 'CANCELLED']);
+  });
+
+  it('the refund event read while the list lags behind the refund (Z3): 400 PW8 after the cancel, nothing ended; after the release it ends it', async () => {
+    const id = await heldActive(k);
+    const sale = o.sales(id)[0];
+    w.fake.configure(id, { listLag: true });
+    w.fake.refund(sale);
+    const event = o.take('PAYMENT.SALE.REFUNDED', id);
+    w.fake.queue.length = 0;
+    const out = await w.deliver(event);
+    expect([out.status, o.errorOf(out), o.heldOf(id)?.location]).toEqual([400, PW8(sale, id), 'active']);
+    w.fake.release(id, 'listLag');
+    expect([fakeStatus(id), o.cancels(id)]).toEqual(['CANCELLED', 2]);
+    const again = await w.deliver(event);
+    expect([again.status, o.heldOf(id), o.cancels(id)]).toEqual([200, null, 2]);
+    expect(w.logged(PL6(sale, id, k, 'was already cancelled at PayPal'))).toHaveLength(1);
+  });
+
+  it('the refund event naming the sale by another id than the list (R14, B1): every payment refunded ends the tier with no PW8', async () => {
+    const id = await heldActive(k, { listOtherIds: true });
+    const sale = o.sales(id)[0];
+    w.fake.refund(sale);
+    const out = await only('PAYMENT.SALE.REFUNDED', id);
+    expect([out.status, o.errorOf(out), o.heldOf(id)]).toEqual([200, '', null]);
+  });
+
+  it('the refund event naming the sale by another id, an earlier payment still kept: the paid cell, then 400 PW8', async () => {
+    const id = await heldActive(k, { listOtherIds: true, ignoreOverride: true });
+    toDue(id);
+    w.fake.renew(id);
+    const [, second] = o.sales(id);
+    w.fake.refund(second);
+    const out = await only('PAYMENT.SALE.REFUNDED', id);
+    expect([out.status, o.errorOf(out), o.heldOf(id)?.location]).toEqual([400, PW8(second, id), 'active']);
+    expect(o.endOf(id)).toBe(onceEnd(w.fake, id));
+  });
+
+  it('under ignoreOverride, the refund event never delivered again: the next read (refunded, the fake ACTIVE) ends it and sends the cancel; the next renew is refused', async () => {
+    const id = await heldActive(k, { ignoreOverride: true });
+    w.fake.refund(o.sales(id)[0]);
+    w.fake.queue.length = 0;
+    const read = await w.deliver(o.lastDelivered('BILLING.SUBSCRIPTION.CREATED', id));
+    expect([read.status, o.heldOf(id), fakeStatus(id)]).toEqual([200, null, 'CANCELLED']);
+    toDue(id);
+    expect(() => w.fake.renew(id)).toThrow(FakeRefusal);
+  });
+
+  it("the finite plan (total_cycles 3) bought renewing: P5's table, its EXPIRED ends it at once", async () => {
+    await w.teardown();
+    await w.setup({ clock: T0, link: ONCE_LINK });
+    const id = await o.owned(k, { renewing: true, plan: EXTRA_PLANS.finite });
+    expect(o.heldOf(id)?.sub).toMatchObject({ autoRenew: true });
+    expect(o.endOf(id)).toBe(z5End(w.fake, id).end);
+    for (let i = 0; i < 2; i++) {
+      toDue(id);
+      w.fake.renew(id);
+      await o.drain();
+    }
+    expect(fakeStatus(id)).toBe('EXPIRED');
+    expect(o.heldOf(id)).toBeNull();
+    expect(o.cancels(id)).toBe(0);
+  });
+});
+
+describe.each(KINDS)('P5P Q12: never installed, for %s', (_name, k) => {
+  it('refunded in full before its first delivery: 200, nothing installed; the cancel sent', async () => {
+    const id = await o.buy(k);
+    w.fake.configure(id, { finalCycle: 'stays-active' });
+    w.fake.approve(id);
+    w.fake.refund(o.sales(id)[0]);
+    const outs = await o.drain();
+    expect(outs.every(x => x.status === 200)).toBe(true);
+    expect([o.heldOf(id), o.installLines(id).length, fakeStatus(id)]).toEqual([null, 0, 'CANCELLED']);
+  });
+
+  it('its onceEnd(T) passed when its first event is read: nothing installed, the cancel sent when the read is ACTIVE', async () => {
+    const id = await o.buy(k);
+    w.fake.configure(id, { finalCycle: 'stays-active' });
+    w.fake.approve(id);
+    w.later(40 * DAY);
+    const outs = await o.drain();
+    expect(outs.every(x => x.status === 200)).toBe(true);
+    expect([o.heldOf(id), o.cancels(id), fakeStatus(id)]).toEqual([null, 1, 'CANCELLED']);
+  });
+
+  it.each(FINAL_CYCLES)('removed with "Cancel & remove now" and redelivered in the same process, under %s: not installed again', async final => {
+    const id = await o.owned(k, { settings: { finalCycle: final } });
+    const reply = await w.op('cancelPaidSubscriptionImmediately', holderOf(k));
+    expect(reply.ok).toBe(true);
+    await o.drain();
+    expect(o.heldOf(id)).toBeNull();
+    for (const done of [...w.delivered]) if (done.event?.resource?.id === id || done.event?.resource?.billing_agreement_id === id) await w.deliver(done.event);
+    expect(o.heldOf(id)).toBeNull();
+    expect(o.installLines(id)).toHaveLength(1);
+  });
+});
+
+describe('P5P Q14: the price migration of a pay-once subscription [R9]', () => {
+  const OTHER = `guild:${IDS[1]}`;
+  const revises = (id: string): number => w.fake.callsOf('POST', new RegExp(`^/v1/billing/subscriptions/${id}/revise$`)).length;
+  async function migrated(failRead: boolean): Promise<{ once: string; renewing: string; decisions: any[]; readsDuring: number }> {
+    const once = await o.owned('guild', { settings: { finalCycle: 'stays-active' } });
+    const reply = await w.buyMember(OTHER, IDS[1], { tierId: 'gold', plan: planId('gold', 'cheap') });
+    w.fake.approve(reply.subscriptionId!);
+    await o.drain();
+    const renewing = reply.subscriptionId!;
+    const pm = o.premium();
+    const migration = await pm.scheduleMigration({
+      providerId: 'paypal', sourceTierId: 'gold', sourceOfferingId: 'o-gold', sourceVariantId: planId('gold', 'cheap'),
+      targetTierId: 'gold', targetOfferingId: 'o-gold', targetVariantId: planId('gold', 'dear'),
+      effectiveDate: new Date(Date.now() + DAY).toISOString(), message: '',
+    });
+    await w.settle();
+    for (const holder of [holderOf('guild'), OTHER]) expect(pm.recordMigrationDecision(migration.id, holder, 'accepted')).toBe(true);
+    await w.settle();
+    if (failRead) w.fake.fail('GET', new RegExp(`^/v1/billing/subscriptions/${once}$`), { status: 500 });
+    const readsBefore = o.reads(once);
+    w.later(2 * DAY);
+    await pm.processDueMigrations();
+    await w.settle();
+    const stored = (w.stored()?.migrations ?? []).find((m: any) => m.id === migration.id);
+    return { once, renewing, decisions: stored?.decisions ?? [], readsDuring: o.reads(once) - readsBefore };
+  }
+
+  it('accepted: the pay-once one gets one read, no revise, its decision failed with PR1 and the entry unchanged; the renewing one is revised', async () => {
+    const { once, renewing, decisions, readsDuring } = await migrated(false);
+    expect([revises(once), revises(renewing), readsDuring]).toEqual([0, 1, 1]);
+    const decision = decisions.find((d: any) => d.providerSubId === once);
+    expect(decision).toMatchObject({ outcome: 'failed', outcomeNote: `PayPal subscription ${once} was sold as one payment and has no later payment to reprice; it was not migrated.` });
+    expect(decisions.find((d: any) => d.providerSubId === renewing)).toMatchObject({ outcome: 'migrated' });
+    expect(o.heldOf(once)!.sub).toMatchObject({ tierId: 'gold', variantId: planId('gold', 'cheap'), autoRenew: false });
+  });
+
+  it("a renewing subscription's read answering 500 (W9, review 1 B7): its decision failed with the can't-confirm form, no revise", async () => {
+    const once = await o.owned('guild', { settings: { finalCycle: 'stays-active' } });
+    const reply = await w.buyMember(OTHER, IDS[1], { tierId: 'gold', plan: planId('gold', 'cheap') });
+    const renewing = reply.subscriptionId!;
+    w.fake.approve(renewing);
+    await o.drain();
+    const pm = o.premium();
+    const migration = await pm.scheduleMigration({
+      providerId: 'paypal', sourceTierId: 'gold', sourceOfferingId: 'o-gold', sourceVariantId: planId('gold', 'cheap'),
+      targetTierId: 'gold', targetOfferingId: 'o-gold', targetVariantId: planId('gold', 'dear'),
+      effectiveDate: new Date(Date.now() + DAY).toISOString(), message: '',
+    });
+    await w.settle();
+    for (const holder of [holderOf('guild'), OTHER]) expect(pm.recordMigrationDecision(migration.id, holder, 'accepted')).toBe(true);
+    await w.settle();
+    w.fake.fail('GET', new RegExp(`^/v1/billing/subscriptions/${renewing}$`), { status: 500 });
+    w.later(2 * DAY);
+    await pm.processDueMigrations();
+    await w.settle();
+    const decisions = ((w.stored()?.migrations ?? []).find((m: any) => m.id === migration.id)?.decisions ?? []) as any[];
+    expect(revises(renewing)).toBe(0);
+    expect(decisions.find((d: any) => d.providerSubId === renewing)).toMatchObject({
+      outcome: 'failed', outcomeNote: `Can't confirm whether PayPal subscription ${renewing} was sold as one payment (PayPal answered 500: An internal server error has occurred.); it was not migrated.`,
+    });
+    expect(o.heldOf(renewing)!.sub).toMatchObject({ variantId: planId('gold', 'cheap') });
+    expect(once).toBeTruthy();
+  });
+
+  it("the read answering 500: PR1's can't-confirm form, no revise", async () => {
+    const { once, decisions } = await migrated(true);
+    expect(revises(once)).toBe(0);
+    expect(decisions.find((d: any) => d.providerSubId === once)).toMatchObject({
+      outcome: 'failed', outcomeNote: `Can't confirm whether PayPal subscription ${once} was sold as one payment (PayPal answered 500: An internal server error has occurred.); it was not migrated.`,
+    });
+  });
+});
+
+describe.each(KINDS)('P5P review 1, A1 to A3: texts after a refund, PL18, a cycle the bot cannot count, for %s', (_name, k) => {
+  const cancelPath = (id: string): RegExp => new RegExp(`^/v1/billing/subscriptions/${id}/cancel$`);
+  /** A held pay-once subscription whose only sale is refunded in full; the refund event taken out of the queue. */
+  async function refundedHeld(): Promise<[string, PayPalEvent]> {
+    const id = await heldActive(k);
+    w.fake.refund(o.sales(id)[0]);
+    const event = o.take('PAYMENT.SALE.REFUNDED', id);
+    w.fake.queue.length = 0;
+    return [id, event];
+  }
+  /** Held, a second sale taken while the cancel failed, then the cancel landed. */
+  async function twoSalesHeld(): Promise<[string, string, string]> {
+    const id = await heldActive(k, { ignoreOverride: true });
+    toDue(id);
+    w.fake.renew(id);
+    await o.drain();
+    const [a, b] = o.sales(id);
+    return [id, a, b];
+  }
+  const uncountable = (id: string): void => {
+    const plan = w.fake.plans.get(w.fake.subscriptions.get(id)!.plan_id)!;
+    plan.billing_cycles.find((c: any) => c.tenure_type === 'REGULAR').frequency = { interval_unit: 'FORTNIGHT', interval_count: 1 };
+  };
+
+  it("A1: the refund's cancel refused (422 with the fake ACTIVE): 400 saying the tier was ended; the resend, not held, says the bot holds none", async () => {
+    const [id, event] = await refundedHeld();
+    w.fake.fail('POST', cancelPath(id), { status: 422, message: 'Refused by the p5p row.' }, 2);
+    const out = await w.deliver(event);
+    expect([out.status, o.errorOf(out), o.heldOf(id)]).toEqual([400, RF.refused(id, true, 'Refused by the p5p row', 'ACTIVE'), null]);
+    const calls = o.cancels(id);
+    const again = await w.deliver(event);
+    expect([again.status, o.errorOf(again), o.cancels(id)]).toEqual([400, RF.refused(id, false, 'Refused by the p5p row', 'ACTIVE'), calls + 1]);
+  });
+
+  it("A1: the refund's cancel answering 503: 400 with the can't-confirm form, the tier ended", async () => {
+    const [id, event] = await refundedHeld();
+    w.fake.fail('POST', cancelPath(id), { status: 503 });
+    const out = await w.deliver(event);
+    expect([out.status, o.errorOf(out), o.heldOf(id)]).toEqual([400, RF.unsure(id, true, 'PayPal answered 503: An internal server error has occurred.'), null]);
+  });
+
+  it("A1: the refund's cancel never sent (a refused sign-in): 400 with the not-sent form, the tier ended", async () => {
+    const [id, event] = await refundedHeld();
+    const hold = w.fake.hold('GET', /\/transactions\?/);
+    const first = w.deliver(event);
+    await hold.reached;
+    (getPaymentRegistry().get('paypal') as any).tokenCache = null;
+    w.fake.fail('POST', /^\/v1\/oauth2\/token$/, { status: 401 });
+    hold.release();
+    const out = await first;
+    expect([out.status, o.errorOf(out), o.heldOf(id)]).toEqual([400, RF.notSent(id, true, 'the bot could not sign in to PayPal: PayPal answered 401'), null]);
+  });
+
+  it("A1: the refund's cancel 4xx and its read answering 404: 400 with the 404 form, not PL9", async () => {
+    const [id, event] = await refundedHeld();
+    w.fake.fail('POST', cancelPath(id), { status: 422 });
+    const hold = w.fake.hold('POST', cancelPath(id));
+    const first = w.deliver(event);
+    await hold.reached;
+    w.fake.fail('GET', new RegExp(`^/v1/billing/subscriptions/${id}$`), { status: 404 });
+    hold.release();
+    const out = await first;
+    expect([out.status, o.errorOf(out), o.heldOf(id)]).toEqual([400, RF.missing(id, true), null]);
+    expect(w.logged('PayPal has no subscription')).toEqual([]);
+  });
+
+  it('A2: the later sale refunded after "Cancel & remove now": PL18 says the bot holds no tier', async () => {
+    const [id, , b] = await twoSalesHeld();
+    expect((await w.op('cancelPaidSubscriptionImmediately', holderOf(k))).ok).toBe(true);
+    await o.drain();
+    expect(o.heldOf(id)).toBeNull();
+    w.fake.refund(b);
+    const out = await only('PAYMENT.SALE.REFUNDED', id);
+    expect(out.status).toBe(200);
+    expect(w.logged(PL18_NONE(b, id, k))).toHaveLength(1);
+    expect(w.logged('keeps its tier')).toEqual([]);
+  });
+
+  it('A2: the later sale refunded once the held end has passed: ended, and PL18 says the paid period ended (review 2, A4)', async () => {
+    const [id, a, b] = await twoSalesHeld();
+    const end = o.endOf(id);
+    w.later(end - Date.now() + HOUR);
+    w.fake.refund(b);
+    const out = await only('PAYMENT.SALE.REFUNDED', id);
+    expect([out.status, o.heldOf(id)]).toEqual([200, null]);
+    expect(w.logged(PL18_ENDED(b, id, k, o.saleTime(a), end))).toHaveLength(1);
+    expect(w.logged('holds no tier')).toEqual([]);
+    expect(w.logged('keeps its tier')).toEqual([]);
+  });
+
+  it('A4: the later sale refunded, the refund the first event delivered while unheld: installed with onceEnd(T), PL18 says until that end', async () => {
+    const id = await o.buy(k);
+    w.fake.configure(id, { finalCycle: 'stays-active', ignoreOverride: true });
+    w.fake.approve(id);
+    toDue(id);
+    w.fake.renew(id);
+    w.fake.queue.length = 0;
+    const [a, b] = o.sales(id);
+    w.fake.refund(b);
+    const out = await only('PAYMENT.SALE.REFUNDED', id);
+    expect(out.status).toBe(200);
+    expect(o.heldOf(id)?.location).toBe('active');
+    expect(o.endOf(id)).toBe(onceEnd(w.fake, id));
+    expect(w.logged(PL18(b, id, k, o.saleTime(a), onceEnd(w.fake, id)!))).toHaveLength(1);
+    expect(w.logged('holds no tier')).toEqual([]);
+  });
+
+  it('A3: a paid one premium does not hold, its plan cycle uncountable: 200, nothing installed, PL19 asks for a refund, the cancel sent', async () => {
+    const id = await o.buy(k);
+    w.fake.configure(id, { finalCycle: 'stays-active' });
+    w.fake.approve(id);
+    uncountable(id);
+    const out = await only('BILLING.SUBSCRIPTION.ACTIVATED', id);
+    expect([out.status, o.heldOf(id), fakeStatus(id)]).toEqual([200, null, 'CANCELLED']);
+    const T = o.saleTime(o.sales(id)[0]);
+    expect(w.logged(PL19(id, k, T, w.fake.subscriptions.get(id)!.plan_id))).toHaveLength(1);
+  });
+
+  it('A3: a later sale refunded on a held one whose plan cycle became uncountable: 200, the entry kept, PL18 with no end', async () => {
+    const [id, a, b] = await twoSalesHeld();
+    const before = o.plain();
+    uncountable(id);
+    w.fake.refund(b);
+    const out = await only('PAYMENT.SALE.REFUNDED', id);
+    expect([out.status, o.errorOf(out)]).toEqual([200, '']);
+    expect(o.plain()).toEqual(before);
+    expect(w.logged(PL18_UNCOUNTED(b, id, k, o.saleTime(a)))).toHaveLength(1);
   });
 });

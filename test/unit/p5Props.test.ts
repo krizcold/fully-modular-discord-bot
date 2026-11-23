@@ -20,8 +20,8 @@ vi.mock('../../src/bot/internalSetup/utils/appStoreManager', async orig => {
 });
 
 import { allowDropLines } from '../helpers/p1Guard';
-import { z5End } from '../helpers/p5Model';
-import { ownerOfCustomId } from '../helpers/p5PayPal';
+import { laterPayments, onceEnd, onceProof, z5End } from '../helpers/p5Model';
+import { FakeRefusal, ownerOfCustomId, type FakeSettings, type PayPalEvent } from '../helpers/p5PayPal';
 import { EXTRA_PLANS, heldPayPal, IDS, p5World, planId, TIERS, type P5World, type PlanKind, type TierId } from '../helpers/p5World';
 
 const HOLDERS = [`guild:${IDS[0]}`, `guild:${IDS[1]}`];
@@ -180,6 +180,14 @@ describe.each([['the JSON files', 'json' as const, 20], ['the mirror rig', 'rig'
 // queued event and again of any delivered one; the clock moved on by days and the checker ticked; a new premium process
 // over the stored files. After every step A3; after the queue is drained in a random order and the checker ticked: A1
 // to A5.
+// Sheet P5P, Q15: the steps also buy with the opt-out (one payment), set and release the fake's settings of Y7 on any
+// subscription, and make PayPal refuse or not answer a cancel; a renewal, failure or retry PayPal would not bill (the
+// fake's FakeRefusal) is an expected outcome. A5 holds no APPROVAL_PENDING subscription and no EXPIRED renewing one.
+// A6: no sale after a landed cancel of a pay-once subscription. A7, after every setting is released, a read of each
+// pay-once subscription delivered, deliveries answered 400 delivered again and the checker ticked: premium holds a
+// pay-once subscription (not refused by premium) exactly when its proof is paid, it is not removed here and its end is
+// after now (or it waits in the queue); held active, its end is max(keptEnd, onceEnd(T)); a proven one is cancelled or
+// expired at PayPal; each later payment was reported by PL17; no pay-once subscription was activated.
 
 const HOLDERS3 = [`guild:${IDS[0]}`, `guild:${IDS[1]}`, `user:${IDS[0]}`, `user:${IDS[1]}`];
 const HOUR = 3_600_000;
@@ -195,7 +203,19 @@ type Step3 =
   | { t: 'cancel' | 'removeNow'; h: number }
   | { t: 'deliver' | 'redeliver'; pick: number }
   | { t: 'clock'; days: number }
-  | { t: 'reload' };
+  | { t: 'reload' }
+  | { t: 'buyOnce'; h: number; buyer: number; high: boolean; plan: PlanKind }
+  | { t: 'setting' | 'release'; pick: number; which: number }
+  | { t: 'failCancel'; how: number };
+
+const SETTINGS: FakeSettings[] = [
+  { finalCycle: 'stays-active' }, { finalCycle: 'active-to-period-end' }, { ignoreOverride: true }, { billsDespiteOverride: true },
+  { omitLastPayment: true }, { listLag: true }, { pendingSale: true }, { omitCycleExecutions: true }, { staleCycles: true },
+  { lpSkew: -30 }, { emptyListIs404: true }, { listOtherIds: true }, { keepNextAfterFinal: true }, { showOverrideBy: 'none' },
+  { pendingSale: true, lpWhilePending: true }, { omitLastPayment: true, omitLastPaymentOn: 'EXPIRED' }, { showOverrideBy: 'flag' }, { showOverrideBy: 'cycles' },
+];
+const SETTING_KEYS = [...new Set(SETTINGS.flatMap(s => Object.keys(s)))] as Array<keyof FakeSettings>;
+const CANCEL_FAULTS = [{ status: 422 }, { status: 503 }, { drop: 'before' as const }];
 
 const h3 = fc.nat({ max: HOLDERS3.length - 1 });
 const who3 = fc.nat({ max: 1 });
@@ -217,11 +237,24 @@ const steps3: fc.Arbitrary<Step3>[] = [
   fc.record({ t: fc.constant('redeliver' as const), pick }),
   fc.record({ t: fc.constant('reload' as const) }),
   fc.record({ t: fc.constant('clock' as const), days: fc.constantFrom(1, 10, 32) }),
+  fc.record({ t: fc.constant('buyOnce' as const), h: h3, buyer: who3, high: fc.boolean(), plan: fc.constantFrom<PlanKind>('cheap', 'dear') }),
+  fc.record({ t: fc.constant('buyOnce' as const), h: h3, buyer: who3, high: fc.boolean(), plan: fc.constantFrom<PlanKind>('cheap', 'dear') }),
+  fc.record({ t: fc.constantFrom<'setting' | 'release'>('setting', 'release'), pick, which: fc.nat({ max: SETTINGS.length - 1 }) }),
+  fc.record({ t: fc.constant('setting' as const), pick, which: fc.nat({ max: SETTINGS.length - 1 }) }),
+  fc.record({ t: fc.constant('failCancel' as const), how: fc.nat({ max: 2 }) }),
 ];
 
-const tally3 = { steps: 0, made: 0, delivered200: 0, a1: 0, a2: 0, refundedEnded: 0, queued: 0, freed: 0 };
+const tally3 = { steps: 0, made: 0, delivered200: 0, a1: 0, a2: 0, refundedEnded: 0, queued: 0, freed: 0, once: 0, onceChecked: 0, onceHeld: 0, later: 0, a6Armed: 0 };
 /** The subscriptions this bot's checkout made, with their holder and tier. */
-const own = new Map<string, { holder: string; tierId: TierId }>();
+const own = new Map<string, { holder: string; tierId: TierId; once?: boolean }>();
+/** The clock of each new premium process started in this sequence. */
+let reloadTimes: number[] = [];
+/** The model's keptEnd of each pay-once entry: the end premium set when the step that ended the higher tier resumed it. */
+const keptEnds = new Map<string, string>();
+/** Pay-once ids this process removed (removeNow on its entry, a full refund delivered that ended it); reset at each reload. */
+const removedModel = new Set<string>();
+/** A pay-once id and the clock of a fault-free delivery that read it ACTIVE with its payment proven: no sale may follow. */
+const mustStop = new Map<string, number>();
 /** The forged ones and the second bot's. */
 const foreign = new Set<string>();
 
@@ -245,11 +278,100 @@ function pickSub(w: P5World, n: number, ok: (s: any) => boolean): any | null {
   return all.length === 0 ? null : all[n % all.length];
 }
 
+/** The pay-once ids premium held in its queue when `track` last looked. */
+let lastPaused = new Set<string>();
+
+/** Records the end premium set for each pay-once entry that left the queue since the last look (its keptEnd). */
+function track(w: P5World): void {
+  const held = heldPayPal(w.stored());
+  for (const h of held) {
+    if (h.location === 'active' && lastPaused.has(h.sub.providerSubId) && own.get(h.sub.providerSubId)?.once) keptEnds.set(h.sub.providerSubId, h.sub.endDate);
+  }
+  lastPaused = new Set(held.filter(h => h.location === 'paused').map(h => h.sub.providerSubId));
+}
+
 async function run3(w: P5World, step: Step3): Promise<void> {
+  try {
+    await runStep3(w, step);
+  } catch (error) {
+    if (!(error instanceof FakeRefusal)) throw error;
+  }
+  track(w);
+}
+
+/** The checker's tick, then the bookkeeping. */
+async function tick3(w: P5World): Promise<void> {
+  await w.tick();
+  track(w);
+}
+
+/** Every queued event delivered through `delivered`, in the order `pick` chooses. */
+async function drain3(w: P5World, pick: (length: number) => number = () => 0): Promise<Array<{ status: number }>> {
+  const outs: Array<{ status: number }> = [];
+  for (let guard = 0; w.fake.queue.length > 0; guard++) {
+    if (guard > 1000) throw new Error('drain3: the queue does not empty');
+    const index = pick(w.fake.queue.length);
+    const out = await delivered(w, () => w.deliverNext(index), w.fake.queue[index]);
+    if (out) outs.push(out);
+  }
+  return outs;
+}
+
+/** The subscription an event names; a refund event through its sale. */
+function subOf(w: P5World, event: PayPalEvent | null | undefined): string | null {
+  if (!event) return null;
+  const resource = event.resource as any;
+  if (resource?.billing_agreement_id) return String(resource.billing_agreement_id);
+  if (resource?.sale_id) return String(w.fake.sales.get(String(resource.sale_id))?.billing_agreement_id ?? '') || null;
+  return String(resource?.id ?? '') || null;
+}
+const cancelArmed = (fake: any, id: string): boolean => fake.faults.some((r: any) => r.method === 'POST' && r.times > 0 && r.match.test(`/v1/billing/subscriptions/${id}/cancel`));
+
+/** A delivery with what A6 and the removed-ids model need around it. */
+async function delivered(w: P5World, send: () => Promise<{ status: number } | null>, event: PayPalEvent | null | undefined): Promise<{ status: number } | null> {
+  const id = subOf(w, event);
+  const once = !!id && own.get(id)?.once === true;
+  const watched = once && w.fake.subscriptions.get(id!)?.status === 'ACTIVE' && !cancelArmed(w.fake, id!);
+  const out = await send();
+  if (once && out?.status === 200) {
+    const { proof } = onceProof(w.fake, id!, event!.event_type);
+    if (watched && proof === 'paid' && !mustStop.has(id!)) mustStop.set(id!, Date.now());
+    if (event!.event_type === 'PAYMENT.SALE.REFUNDED' && proof === 'refunded') removedModel.add(id!);
+  }
+  track(w);
+  return out;
+}
+
+async function runStep3(w: P5World, step: Step3): Promise<void> {
   w.later(HOUR);
   const now = Date.now();
   const fake = w.fake;
   switch (step.t) {
+    case 'buyOnce': {
+      const holder = HOLDERS3[step.h];
+      const tierId = tierOf3(holder, step.high);
+      if (busy3(w, holder, tierId)) return;
+      const buyer = buyerOf3(holder, step.buyer);
+      const opts = { tierId, plan: planId(tierId, step.plan), more: { autoRenewOptOut: true } };
+      const reply = kindOf(holder) === 'user' ? await w.buyOp(holder, buyer, opts) : await w.buyMember(holder, buyer, opts);
+      if (reply.subscriptionId) {
+        tally3.made += 1;
+        tally3.once += 1;
+        own.set(reply.subscriptionId, { holder, tierId, once: true });
+      }
+      return;
+    }
+    case 'setting':
+    case 'release': {
+      const s = pickSub(w, step.pick, x => own.get(x.id)?.once === true);
+      if (!s) return;
+      if (step.t === 'setting') fake.configure(s.id, SETTINGS[step.which % SETTINGS.length]);
+      else fake.release(s.id, ...(Object.keys(SETTINGS[step.which % SETTINGS.length]) as Array<keyof FakeSettings>));
+      return;
+    }
+    case 'failCancel':
+      fake.fail('POST', /\/cancel$/, CANCEL_FAULTS[step.how % CANCEL_FAULTS.length]);
+      return;
     case 'buy': {
       const holder = HOLDERS3[step.h];
       const tierId = tierOf3(holder, step.high);
@@ -337,17 +459,27 @@ async function run3(w: P5World, step: Step3): Promise<void> {
       return;
     }
     case 'cancel':
-    case 'removeNow':
-      await w.op(step.t === 'cancel' ? 'cancelPaidSubscription' : 'cancelPaidSubscriptionImmediately', HOLDERS3[step.h]);
+    case 'removeNow': {
+      const active = step.t === 'removeNow'
+        ? heldPayPal(w.stored()).find(h => h.holder === HOLDERS3[step.h] && h.location === 'active' && own.get(h.sub.providerSubId)?.once)
+        : undefined;
+      const reply = await w.op(step.t === 'cancel' ? 'cancelPaidSubscription' : 'cancelPaidSubscriptionImmediately', HOLDERS3[step.h]);
+      if (active && reply.ok) removedModel.add(active.sub.providerSubId);
       return;
+    }
     case 'deliver': {
-      const out = fake.queue.length ? await w.deliverNext(step.pick % fake.queue.length) : null;
+      if (!fake.queue.length) return;
+      const index = step.pick % fake.queue.length;
+      const out = await delivered(w, () => w.deliverNext(index), fake.queue[index]);
       if (out?.status === 200) tally3.delivered200 += 1;
       return;
     }
     case 'redeliver': {
       const done = w.delivered.filter(d => d.event);
-      if (done.length) await w.deliver(done[step.pick % done.length].event);
+      if (done.length) {
+        const event = done[step.pick % done.length].event;
+        await delivered(w, () => w.deliver(event), event);
+      }
       return;
     }
     case 'clock': {
@@ -358,6 +490,8 @@ async function run3(w: P5World, step: Step3): Promise<void> {
       return;
     }
     case 'reload':
+      reloadTimes.push(Date.now());
+      removedModel.clear();
       await w.reload();
   }
 }
@@ -377,7 +511,9 @@ function brokenAtRest(w: P5World): string[] {
     }
     const object = w.fake.subscriptions.get(sub.providerSubId);
     if (!object) continue;
-    if (['EXPIRED', 'APPROVAL_PENDING'].includes(object.status)) broken.push(`A5: ${holder} holds ${sub.providerSubId} (${location}), which PayPal reports ${object.status}`);
+    const once = own.get(object.id)?.once === true;
+    if (object.status === 'APPROVAL_PENDING' || (object.status === 'EXPIRED' && !once)) broken.push(`A5: ${holder} holds ${sub.providerSubId} (${location}), which PayPal reports ${object.status}`);
+    if (once) continue;
     const latest = w.fake.latestSale(object.id);
     if (latest?.state === 'refunded') broken.push(`A5: ${holder} holds ${sub.providerSubId} (${location}), whose latest sale ${latest.id} was refunded in full`);
     if (location === 'active' && object.status === 'CANCELLED') {
@@ -389,7 +525,7 @@ function brokenAtRest(w: P5World): string[] {
   }
   for (const object of w.fake.subscriptions.values()) {
     const made = own.get(object.id);
-    if (!made) continue;
+    if (!made || made.once) continue;
     const latest = w.fake.latestSale(object.id);
     if (latest?.state === 'refunded') {
       tally3.refundedEnded += 1;
@@ -406,10 +542,91 @@ function brokenAtRest(w: P5World): string[] {
   return broken;
 }
 
+let readCount = 0;
+const readEvent = (id: string): PayPalEvent => ({ id: `WH-P5P-PROPS-${readCount++}`, event_version: '1.0', create_time: new Date().toISOString(), resource_type: 'subscription', resource_version: '2.0', event_type: 'BILLING.SUBSCRIPTION.ACTIVATED', summary: 'read', resource: { id }, links: [] });
+
+/** Every setting released, a read of each pay-once subscription delivered, and deliveries answered 400 delivered again (five rounds at most); the events of paid pay-once subscriptions still answered 400. */
+async function settleOnce(w: P5World): Promise<string[]> {
+  for (const id of w.fake.subscriptions.keys()) w.fake.release(id, ...SETTING_KEYS);
+  w.fake.clearFaults();
+  for (const [id, made] of own) if (made.once) await delivered(w, () => w.deliver(readEvent(id)), readEvent(id));
+  for (let round = 0; round < 5; round++) {
+    await drain3(w);
+    await w.settle();
+    track(w);
+    const failing = new Map<string, PayPalEvent>();
+    for (const d of w.delivered) {
+      if (!d.event) continue;
+      if (d.status === 400) failing.set(d.event.id, d.event);
+      else failing.delete(d.event.id);
+    }
+    if (failing.size === 0) return [];
+    for (const event of failing.values()) await delivered(w, () => w.deliver(event), event);
+  }
+  const left = new Map<string, PayPalEvent>();
+  for (const d of w.delivered) {
+    if (!d.event) continue;
+    if (d.status === 400) left.set(d.event.id, d.event);
+    else left.delete(d.event.id);
+  }
+  // Y8.8: a pay-once subscription with no sale at all is answered 400 (can't confirm its payment) until PayPal stops resending.
+  const accepted = (id: string | null): boolean => !!id && own.get(id)?.once === true && w.fake.salesOf(id).length === 0;
+  return [...left.values()].filter(e => !accepted(subOf(w, e))).map(e => `${e.event_type} ${subOf(w, e) ?? e.id}`);
+}
+
+/** A6 and A7 for the pay-once subscriptions, after settleOnce and the checker. */
+function brokenOnce(w: P5World): string[] {
+  const broken: string[] = [];
+  const held = heldPayPal(w.stored());
+  const removed = removedModel;
+  const now = Date.now();
+  // The mirror rig keeps the log lines it captures itself.
+  const lines = [...w.logs, ...(w.rig?.m.state.lines ?? [])];
+  for (const [id, made] of own) {
+    if (!made.once) continue;
+    const object = w.fake.subscriptions.get(id);
+    if (!object) continue;
+    tally3.onceChecked += 1;
+    const stopAt = mustStop.get(id);
+    if (stopAt !== undefined) {
+      tally3.a6Armed += 1;
+      for (const sale of w.fake.salesOf(id)) if (Date.parse(sale.create_time) > stopAt) broken.push(`A6: ${id} took sale ${sale.id} after a fault-free delivery at ${new Date(stopAt).toISOString()} read it ACTIVE and paid`);
+    }
+    if (w.fake.callsOf('POST', new RegExp(`^/v1/billing/subscriptions/${id}/activate$`)).length > 0) broken.push(`A7: pay-once ${id} was activated`);
+    if (object.status === 'APPROVAL_PENDING') continue;
+    const { proof } = onceProof(w.fake, id, 'BILLING.SUBSCRIPTION.UPDATED');
+    const entry = held.find(h => h.sub.providerSubId === id) ?? null;
+    const refused = lines.some(l => l.includes(`subscription.created from PayPal (subscription ${id},`) && l.includes('was not installed'));
+    if (!refused) {
+      const end = proof === 'paid' ? onceEnd(w.fake, id, keptEnds.get(id)) : null;
+      const expected = proof === 'paid' && !removed.has(id) && end !== null && (entry?.location === 'paused' || end > now);
+      if (!!entry !== expected) broken.push(`A7: ${id} is ${entry ? `held (${entry.location})` : 'not held'}; proof ${proof}, end ${end === null ? 'none' : new Date(end).toISOString()}, removed here ${removed.has(id)}`);
+      if (entry?.location === 'active' && end !== null && Date.parse(entry.sub.endDate) !== end) broken.push(`A7: ${id} ends ${entry.sub.endDate}; the model says ${new Date(end).toISOString()}`);
+      if (entry) tally3.onceHeld += 1;
+    }
+    if ((proof === 'paid' || proof === 'refunded') && !['CANCELLED', 'EXPIRED'].includes(object.status)) broken.push(`A7: ${id}'s payment is ${proof} and PayPal still reports it ${object.status}`);
+    if (proof === 'paid') {
+      for (const sale of laterPayments(w.fake, id)) {
+        const reported = lines.filter(l => l.includes(`PayPal took another payment (sale ${sale},`)).length;
+        tally3.later += 1;
+        const at = Date.parse(w.fake.salesOf(id).find(x => x.id === sale)?.create_time ?? '');
+        const processes = 1 + reloadTimes.filter(r => r >= at).length;
+        if (reported < 1 || reported > processes) broken.push(`A7: ${id}'s later payment ${sale} was reported ${reported} times over ${processes} processes`);
+      }
+    }
+  }
+  return broken;
+}
+
 async function broken3(w: P5World, sequence: Step3[], order: number[]): Promise<string[]> {
   const found: string[] = [];
   own.clear();
   foreign.clear();
+  reloadTimes = [];
+  lastPaused = new Set();
+  keptEnds.clear();
+  removedModel.clear();
+  mustStop.clear();
   await w.setup({ clock: Date.UTC(2027, 0, 31, 12) });
   // A plan change to a plan the offering does not sell makes premium log its 'variant' line (L3) by design.
   allowDropLines('L3');
@@ -421,12 +638,17 @@ async function broken3(w: P5World, sequence: Step3[], order: number[]): Promise<
       if (found.length > 0) return found;
     }
     let turn = 0;
-    for (const out of await w.drain(length => order[turn++ % order.length] % length)) if (out.status === 200) tally3.delivered200 += 1;
+    for (const out of await drain3(w, length => order[turn++ % order.length] % length)) if (out.status === 200) tally3.delivered200 += 1;
     await w.settle();
-    await w.drain();
-    await w.tick();
+    track(w);
+    await drain3(w);
+    await tick3(w);
+    const left = await settleOnce(w);
+    await tick3(w);
+    for (const e of left) found.push(`settleOnce: ${e} still answered 400 after five rounds`);
     found.push(...brokenA3(w).map(l => `${l} after the drain`));
     found.push(...brokenAtRest(w).map(l => `${l} after the drain`));
+    found.push(...brokenOnce(w).map(l => `${l} after the settings were released`));
     for (const call of w.fake.unexpected) found.push(`a call the fake does not serve: ${call}`);
   } finally {
     await w.teardown();
@@ -434,11 +656,11 @@ async function broken3(w: P5World, sequence: Step3[], order: number[]): Promise<
   return found;
 }
 
-describe.each([['the JSON files', 'json' as const, 15], ['the mirror rig', 'rig' as const, 4]])('P5 claim 10, the full form, on %s: servers and users through PayPal', (_name, backend, numRuns) => {
+describe.each([['the JSON files', 'json' as const, 19], ['the mirror rig', 'rig' as const, 8]])('P5 claim 10, the full form, on %s: servers and users through PayPal', (_name, backend, numRuns) => {
   const w = p5World(backend);
 
   it('A3 after every step; A1 to A5 after the queue is drained in a random order and the checker ticked', async () => {
-    Object.assign(tally3, { steps: 0, made: 0, delivered200: 0, a1: 0, a2: 0, refundedEnded: 0, queued: 0, freed: 0 });
+    Object.assign(tally3, { steps: 0, made: 0, delivered200: 0, a1: 0, a2: 0, refundedEnded: 0, queued: 0, freed: 0, once: 0, onceChecked: 0, onceHeld: 0, later: 0, a6Armed: 0 });
     const seed = runSeed();
     const lifecycle: Step3[] = [
       { t: 'buy', h: 0, buyer: 0, high: true, plan: 'cheap' }, { t: 'buy', h: 2, buyer: 0, high: false, plan: 'dear' },
@@ -450,14 +672,30 @@ describe.each([['the JSON files', 'json' as const, 15], ['the mirror rig', 'rig'
       { t: 'refund', pick: 2, full: true }, { t: 'expire', pick: 1 }, { t: 'clock', days: 32 }, { t: 'deliver', pick: 0 },
     ];
     const cancelled: Step3[] = [...lifecycle.slice(0, 12), { t: 'buyerCancel', pick: 0 }, { t: 'clock', days: 1 }, { t: 'deliver', pick: 0 }];
+    const paidOnce: Step3[] = [
+      { t: 'buyOnce', h: 0, buyer: 0, high: true, plan: 'cheap' }, { t: 'setting', pick: 0, which: 2 }, { t: 'approve', pick: 0, first: 'now' },
+      { t: 'clock', days: 10 }, { t: 'renew', pick: 0 }, { t: 'failCancel', how: 1 }, { t: 'deliver', pick: 0 }, { t: 'deliver', pick: 0 },
+      { t: 'deliver', pick: 0 }, { t: 'deliver', pick: 0 }, { t: 'deliver', pick: 0 }, { t: 'buyOnce', h: 2, buyer: 0, high: false, plan: 'cheap' },
+      { t: 'approve', pick: 0, first: 'now' }, { t: 'deliver', pick: 0 }, { t: 'removeNow', h: 2 }, { t: 'reload' }, { t: 'deliver', pick: 0 },
+    ];
+    // A6: a pay-once subscription PayPal keeps billing (ignoreOverride), read ACTIVE and paid by a fault-free delivery, then renewed.
+    const a6Once: Step3[] = [
+      { t: 'buyOnce', h: 0, buyer: 0, high: true, plan: 'cheap' }, { t: 'setting', pick: 0, which: 2 }, { t: 'approve', pick: 0, first: 'now' },
+      { t: 'deliver', pick: 0 }, { t: 'deliver', pick: 0 }, { t: 'deliver', pick: 0 }, { t: 'clock', days: 32 }, { t: 'renew', pick: 0 }, { t: 'deliver', pick: 0 },
+    ];
+    // A pay-once subscription whose only sale is refunded in full: its refund event resolves through sale_id in settleOnce.
+    const refundOnce: Step3[] = [
+      { t: 'buyOnce', h: 0, buyer: 0, high: true, plan: 'cheap' }, { t: 'approve', pick: 0, first: 'now' }, { t: 'deliver', pick: 0 },
+      { t: 'deliver', pick: 0 }, { t: 'deliver', pick: 0 }, { t: 'refund', pick: 0, full: true }, { t: 'deliver', pick: 0 },
+    ];
     await fc.assert(fc.asyncProperty(
       fc.array(fc.oneof(...steps3), { minLength: 12, maxLength: 40, size: 'max' }),
       fc.array(fc.nat({ max: 50 }), { minLength: 1, maxLength: 8 }),
       async (sequence, order) => {
         expect(await broken3(w, sequence, order), `seed ${seed}`).toEqual([]);
       },
-    ), { numRuns, seed, examples: [[lifecycle, [0]], [lifecycle, [3, 1, 4]], [cancelled, [0]]] });
+    ), { numRuns, seed, examples: [[lifecycle, [0]], [lifecycle, [3, 1, 4]], [cancelled, [0]], [paidOnce, [0]], [paidOnce, [2, 7]], [a6Once, [0]], [refundOnce, [0]]] });
     process.stdout.write(`[p5Props] full ${backend} seed ${seed}: ${JSON.stringify(tally3)}\n`);
-    expect({ ...tally3, seed, enough: tally3.made > 0 && tally3.delivered200 > 0 && tally3.a1 > 0 && tally3.a2 > 0 && tally3.freed > 0 }).toMatchObject({ enough: true });
+    expect({ ...tally3, seed, enough: tally3.made > 0 && tally3.delivered200 > 0 && tally3.a1 > 0 && tally3.a2 > 0 && tally3.freed > 0 && tally3.onceHeld > 0 && tally3.later > 0 && tally3.a6Armed > 0 }).toMatchObject({ enough: true });
   }, 900_000);
 });

@@ -1,8 +1,11 @@
 import { addCycles, type FakePayPal, type Unit } from './p5PayPal';
 
-// The end rule of sheet P5, Revision 9, Z5, computed from the fake's own fields, for the rows of p5Events and p5Props.
+// The end rule of sheet P5, Revision 9, Z5, computed from the fake's own fields, for the rows of p5Events and p5Props;
+// and sheet P5P's rules for a pay-once subscription (Y2: the payment proof, the later payments, the end), computed
+// from what the fake answers a read and a transactions list.
 
 const DAY_MS = 86_400_000;
+const HOUR_MS = 3_600_000;
 const LONGEST_DAYS: Record<Unit, number> = { DAY: 1, WEEK: 7, MONTH: 31, YEAR: 366 };
 
 export interface ModelEnd {
@@ -54,4 +57,65 @@ export function z5End(fake: FakePayPal, id: string, held?: { endDate: string | n
     end = Math.max(end, Date.parse(held.endDate));
   }
   return { live: sub.status === 'ACTIVE', side, failing, windowApplies, end };
+}
+
+export interface OnceProof {
+  proof: 'paid' | 'refunded' | 'none' | 'unknown';
+  /** The earliest kept payment's time, with proof `paid`. */
+  T: number | null;
+}
+
+const PAYMENT = ['COMPLETED', 'PARTIALLY_REFUNDED', 'REFUNDED'];
+const KEPT = ['COMPLETED', 'PARTIALLY_REFUNDED'];
+
+/** Y2's payment proof of a pay-once subscription for an event of `eventType`, from the fake's read and list as it answers them now. */
+export function onceProof(fake: FakePayPal, id: string, eventType: string): OnceProof {
+  const object = fake.subscriptions.get(id);
+  if (!object) throw new Error(`p5Model: no subscription ${id}`);
+  const sub = fake.subscriptionOut(object);
+  const listed = fake.listed(id) ?? [];
+  const payments = listed.filter(t => PAYMENT.includes(t.status)).map(t => ({ status: t.status as string, time: Date.parse(t.time) }));
+  const lp = Date.parse(sub.billing_info?.last_payment?.time ?? '');
+  let match: { status: string; time: number } | null = null;
+  if (Number.isFinite(lp)) {
+    for (const p of payments) {
+      if (Math.abs(p.time - lp) <= HOUR_MS && (!match || Math.abs(p.time - lp) < Math.abs(match.time - lp))) match = p;
+    }
+  }
+  const lpAlone = Number.isFinite(lp) && !match;
+  const kept = [...payments.filter(p => KEPT.includes(p.status)).map(p => p.time), ...(lpAlone ? [lp] : [])];
+  if (kept.length > 0) return { proof: 'paid', T: Math.min(...kept) };
+  const executions = sub.billing_info?.cycle_executions;
+  if (payments.length > 0) {
+    const regular = Array.isArray(executions) ? executions.find((c: any) => c.tenure_type === 'REGULAR') : undefined;
+    const completed = Number(regular?.cycles_completed);
+    const counted = regular !== undefined && Number.isFinite(completed);
+    const positive = match?.status === 'REFUNDED' || (counted && completed <= payments.length);
+    const contrary = lpAlone || (counted && completed > payments.length);
+    return { proof: positive && !contrary ? 'refunded' : 'unknown', T: null };
+  }
+  const beforeApproval = sub.status === 'APPROVAL_PENDING' || sub.status === 'APPROVED';
+  const noneCompleted = Array.isArray(executions) && executions.length > 0 && executions.every((c: any) => Number(c.cycles_completed) === 0);
+  if (listed.length === 0 && eventType !== 'PAYMENT.SALE.COMPLETED' && (beforeApproval || noneCompleted)) return { proof: 'none', T: null };
+  return { proof: 'unknown', T: null };
+}
+
+/** The third rule's later payments: each kept listed payment more than an hour after `T`, by its listed id. */
+export function laterPayments(fake: FakePayPal, id: string): string[] {
+  const { proof, T } = onceProof(fake, id, 'BILLING.SUBSCRIPTION.UPDATED');
+  if (proof !== 'paid' || T === null) return [];
+  return (fake.listed(id) ?? []).filter(t => KEPT.includes(t.status) && Date.parse(t.time) > T + HOUR_MS).map(t => t.id);
+}
+
+/** `onceEnd(T)`, or the state's end `max(keptEnd, onceEnd(T))` with `keptEnd`; null unless the proof is `paid`. */
+export function onceEnd(fake: FakePayPal, id: string, keptEnd?: string | number | null): number | null {
+  const { proof, T } = onceProof(fake, id, 'BILLING.SUBSCRIPTION.UPDATED');
+  if (proof !== 'paid' || T === null) return null;
+  const sub = fake.subscriptions.get(id)!;
+  const regular = fake.plans.get(sub.plan_id)!.billing_cycles.find((c: any) => c.tenure_type === 'REGULAR');
+  const unit = regular.frequency.interval_unit as Unit;
+  const count = regular.frequency.interval_count;
+  const end = Math.min(addCycles(T, unit, count, 1), T + LONGEST_DAYS[unit] * count * DAY_MS) + DAY_MS;
+  const kept = keptEnd === undefined || keptEnd === null ? Number.NaN : typeof keptEnd === 'number' ? keptEnd : Date.parse(keptEnd);
+  return Number.isFinite(kept) ? Math.max(kept, end) : end;
 }

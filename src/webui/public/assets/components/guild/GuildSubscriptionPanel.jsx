@@ -740,7 +740,7 @@ function GuildSubscriptionPanel({ guild, subData, onRefresh }) {
                 <div style={{ color: '#888', fontSize: '0.78rem', marginTop: '4px' }}>
                   via <strong style={{ color: '#ccc' }}>{getProviderName(paid.providerId)}</strong>
                   {paid.autoRenew === false && paid.status === 'active' && (
-                    <span style={{ color: '#e67e22', marginLeft: '6px' }}>(cancelled, will not renew)</span>
+                    <span style={{ color: '#e67e22', marginLeft: '6px' }}>{paidMeta.payOnce ? '(paid in full, will not renew)' : '(cancelled, will not renew)'}</span>
                   )}
                   {paid.autoRenew === true && (paidMeta.paymentFailing ? (
                     <span style={{ color: '#e67e22', marginLeft: '6px' }}>({getProviderName(paid.providerId)} has not collected the latest payment; access ends {new Date(paid.endDate).toLocaleDateString()} unless it does)</span>

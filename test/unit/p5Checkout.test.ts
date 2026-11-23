@@ -16,7 +16,7 @@ vi.mock('../../src/bot/internalSetup/utils/appStoreManager', async orig => {
 import { getPaymentRegistry } from '../../src/bot/internalSetup/utils/payment/paymentRegistry';
 import { customFrom } from '../../src/bot/internalSetup/utils/payment/paypalProvider';
 import { customIdFor } from '../helpers/p5PayPal';
-import { BOT_CLIENT_ID, HOST, IDS, p5World, planId, SECOND_CLIENT_ID, tierDefOf, type RouteReply } from '../helpers/p5World';
+import { BOT_CLIENT_ID, EXTRA_PLANS, heldPayPal, HOST, IDS, ONCE_LINK, p5World, planId, SECOND_CLIENT_ID, tierDefOf, type RouteReply } from '../helpers/p5World';
 
 const SERVER = `guild:${IDS[0]}`;
 const USER = `user:${IDS[1]}`;
@@ -116,7 +116,7 @@ describe('P5 claim 3: what the create sends', () => {
   it('customFrom: signed only for the bot own signature; null for anything that is not five fields with a holder and a Discord buyer', async () => {
     const custom = customIdFor({ clientId: BOT_CLIENT_ID, holder: SERVER, buyerId: IDS[1], tierId: 'gold', offeringId: 'o-gold' });
     const [holder, buyer, tier, offering, sig] = custom.split('|');
-    expect(customFrom(custom)).toEqual({ holder: SERVER, buyerId: IDS[1], tierId: 'gold', offeringId: 'o-gold', signed: true });
+    expect(customFrom(custom)).toEqual({ holder: SERVER, buyerId: IDS[1], tierId: 'gold', offeringId: 'o-gold', once: false, signed: true });
     const outcomes = [
       customFrom([holder, buyer, 'platinum', offering, sig].join('|')),
       customFrom([holder, buyer, tier, offering, 'AAAAAAAAAAAAAAAAAAAAAA'].join('|')),
@@ -161,14 +161,6 @@ describe('P5 claim 3: refusals before any call', () => {
     const reply = await w.buyDev(USER, IDS[1], { tierId: 'vip' });
     expect(reply.subscriptionId).toBeNull();
     expect(errorOf(reply)).toContain('PayPal checkout did not start: neither WEBUI_BASE_URL nor OAUTH_CALLBACK_URL is set, so the bot has no address for PayPal to send the buyer back to. Nothing was charged.');
-    expect(w.fake.calls.length).toBe(calls);
-  });
-
-  it('PT5 for the opt-out on the member route, with no call', async () => {
-    const calls = w.fake.calls.length;
-    const reply = await w.buyMember(SERVER, IDS[1], { more: { autoRenewOptOut: true } });
-    expect(reply.subscriptionId).toBeNull();
-    expect(errorOf(reply)).toContain('PayPal subscriptions renew until they are cancelled, so no checkout was started with auto-renew off. Buy with auto-renew on and cancel it afterwards (you keep access until the period ends), or pay with another provider. Nothing was charged.');
     expect(w.fake.calls.length).toBe(calls);
   });
 
@@ -302,5 +294,146 @@ describe('P5 claim 3: auto-renew', () => {
     expect((await w.op('setTier', 'gold', def)).ok).toBe(true);
     await w.buyMember(SERVER, IDS[1], { more: { autoRenewOptOut: true } });
     expect(seen).toEqual([true, undefined, undefined]);
+  });
+});
+
+// P5P Q1 and Q2 (sheet P5P, Y1): the opt-out buys one payment. The create carries P5's body plus one plan override
+// naming the REGULAR cycle with total_cycles 1, and the six-field custom_id whose signature covers `once`; a plan
+// with a trial, no regular cycle or a setup fee above 0 is refused with PT11 before any create.
+
+const PT11 = (plan: string, why: string): string => `PayPal checkout did not start: plan ${plan} ${why}, so it can't be bought as one payment. Buy it with auto-renew on, or pick another plan or provider. Nothing was charged.`;
+/** The create body P5 sends for the holder and plan, plus `more`. */
+const bodyFor = (holder: string, plan: string, custom: string, more: Record<string, unknown> = {}): string => JSON.stringify({
+  plan_id: plan,
+  custom_id: custom,
+  application_context: {
+    brand_name: 'Discord Bot Premium',
+    user_action: 'SUBSCRIBE_NOW',
+    return_url: holder.startsWith('guild:') ? `${HOST}/guild/${holder.slice(6)}/subscription?subscribe=success` : `${HOST}/guild?subscribe=success`,
+    cancel_url: holder.startsWith('guild:') ? `${HOST}/guild/${holder.slice(6)}/subscription?subscribe=cancel` : `${HOST}/guild?subscribe=cancel`,
+  },
+  ...more,
+});
+const ONCE_PLAN = { plan: { billing_cycles: [{ sequence: 1, total_cycles: 1 }] } };
+const OPT_OUT = { more: { autoRenewOptOut: true } };
+
+describe('P5P Q1: the checkout of one payment', () => {
+  beforeEach(async () => {
+    await w.teardown();
+    await w.setup({ link: ONCE_LINK });
+  });
+
+  it('a server on the member route with the opt-out: P5 body plus the override, the six-field custom_id; one plan read and one create; premium stores nothing', async () => {
+    const before = w.storedText();
+    const reply = await w.buyMember(SERVER, IDS[1], OPT_OUT);
+    expect(reply.status).toBe(200);
+    const custom = customIdFor({ clientId: BOT_CLIENT_ID, holder: SERVER, buyerId: IDS[1], tierId: 'gold', offeringId: 'o-gold', once: true });
+    expect(custom.split('|')).toHaveLength(6);
+    expect(custom.split('|')[4]).toBe('once');
+    const text = w.fake.createTexts.get(reply.subscriptionId!)!;
+    expect(text).toBe(bodyFor(SERVER, PLAN, custom, ONCE_PLAN));
+    expect([w.fake.callsOf('GET', PLAN_READ).length, creates()]).toEqual([1, 1]);
+    expect([text.includes('pricing_scheme'), text.includes('quantity'), text.includes('auto_renewal')]).toEqual([false, false, false]);
+    expect(w.fake.subscriptions.get(reply.subscriptionId!)!.plan_overridden).toBe(true);
+    expect(w.storedText()).toBe(before);
+    expect(w.fake.unexpected).toEqual([]);
+  });
+
+  it("a user through premium's op with the opt-out (the dev user route does not pass it): the same override and the six-field custom_id", async () => {
+    const reply = await w.buyOp(USER, IDS[1], { tierId: 'vip', ...OPT_OUT });
+    expect(reply.status).toBe(200);
+    const custom = customIdFor({ clientId: BOT_CLIENT_ID, holder: USER, buyerId: IDS[1], tierId: 'vip', offeringId: 'o-vip', once: true });
+    expect(w.fake.createTexts.get(reply.subscriptionId!)).toBe(bodyFor(USER, planId('vip', 'cheap'), custom, ONCE_PLAN));
+  });
+
+  it('the plan whose REGULAR total_cycles is 3 gets the same override; the plan with a setup fee of 0.00 is sold', async () => {
+    for (const plan of [EXTRA_PLANS.finite, EXTRA_PLANS.feeZero]) {
+      const reply = await w.buyMember(SERVER, IDS[1], { plan, ...OPT_OUT });
+      expect(reply.status).toBe(200);
+      const custom = customIdFor({ clientId: BOT_CLIENT_ID, holder: SERVER, buyerId: IDS[1], tierId: 'gold', offeringId: 'o-gold', once: true });
+      expect(w.fake.createTexts.get(reply.subscriptionId!)).toBe(bodyFor(SERVER, plan, custom, ONCE_PLAN));
+    }
+  });
+
+  it("without the opt-out, with the opt-out on an offering forcing auto-renew, and with premium's variant read failing: P5's body, five fields", async () => {
+    const five = customIdFor({ clientId: BOT_CLIENT_ID, holder: SERVER, buyerId: IDS[1], tierId: 'gold', offeringId: 'o-gold' });
+    const plain = await w.buyMember(SERVER, IDS[1]);
+    expect(w.fake.createTexts.get(plain.subscriptionId!)).toBe(bodyFor(SERVER, PLAN, five));
+    const forced: any = tierDefOf('gold', ONCE_LINK.gold);
+    forced.offerings[0].forceAutoRenew = true;
+    expect((await w.op('setTier', 'gold', forced)).ok).toBe(true);
+    const kept = await w.buyMember(SERVER, IDS[1], OPT_OUT);
+    expect(w.fake.createTexts.get(kept.subscriptionId!)).toBe(bodyFor(SERVER, PLAN, five));
+    const unread: any = tierDefOf('gold', ONCE_LINK.gold);
+    delete unread.offerings[0].providerLinks[0].cache;
+    expect((await w.op('setTier', 'gold', unread)).ok).toBe(true);
+    vi.spyOn(provider(), 'fetchVariant').mockRejectedValue(new Error('p5p variant read failed'));
+    const failed = await w.buyMember(SERVER, IDS[1]);
+    expect(w.fake.createTexts.get(failed.subscriptionId!)).toBe(bodyFor(SERVER, PLAN, five));
+  });
+
+  it('PT11 for the trial plan, for a plan with no REGULAR cycle and for a setup fee of 5.00: one plan read each, no create', async () => {
+    const trial = await w.buyMember(SERVER, IDS[1], { plan: EXTRA_PLANS.trial, ...OPT_OUT });
+    expect(errorOf(trial)).toContain(PT11(EXTRA_PLANS.trial, 'starts with a free or paid trial'));
+    const fee = await w.buyMember(SERVER, IDS[1], { plan: EXTRA_PLANS.fee, ...OPT_OUT });
+    expect(errorOf(fee)).toContain(PT11(EXTRA_PLANS.fee, 'has a setup fee'));
+    const plan = w.fake.plans.get(PLAN)!;
+    plan.billing_cycles = plan.billing_cycles.filter((c: any) => c.tenure_type !== 'REGULAR');
+    const none = await w.buyMember(SERVER, IDS[1], OPT_OUT);
+    expect(errorOf(none)).toContain(PT11(PLAN, 'has no regular billing cycle'));
+    expect([trial.subscriptionId, fee.subscriptionId, none.subscriptionId, creates(), w.fake.callsOf('GET', PLAN_READ).length]).toEqual([null, null, null, 0, 3]);
+  });
+
+  it('PT11 for a REGULAR cycle the bot cannot count (review 1, A3): one plan read, no create; without the opt-out it starts', async () => {
+    w.fake.plans.get(PLAN)!.billing_cycles.find((c: any) => c.tenure_type === 'REGULAR').frequency = { interval_unit: 'FORTNIGHT', interval_count: 1 };
+    const reply = await w.buyMember(SERVER, IDS[1], OPT_OUT);
+    expect(errorOf(reply)).toContain(PT11(PLAN, 'has a billing cycle the bot cannot count'));
+    expect([reply.subscriptionId, creates(), w.fake.callsOf('GET', PLAN_READ).length]).toEqual([null, 0, 1]);
+    expect((await w.buyMember(SERVER, IDS[1])).status).toBe(200);
+  });
+
+  it('PT3 for a tier id that fits the five-field form and not the six-field one, with the opt-out only', async () => {
+    const tierId = 't'.repeat(53);
+    const five = customIdFor({ clientId: BOT_CLIENT_ID, holder: SERVER, buyerId: IDS[1], tierId, offeringId: 'o-gold' }).length;
+    const six = customIdFor({ clientId: BOT_CLIENT_ID, holder: SERVER, buyerId: IDS[1], tierId, offeringId: 'o-gold', once: true }).length;
+    expect([five <= 127, six > 127]).toEqual([true, true]);
+    expect(await refusal(initiate({ tierId, autoRenewOptOut: true }))).toBe(
+      `PayPal checkout did not start: the subscription's label for PayPal (server, buyer, tier '${tierId}', offering 'o-gold') is ${six} characters, over PayPal's limit of 127. Use a shorter tier or offering id. Nothing was charged.`,
+    );
+    expect(creates()).toBe(0);
+    expect(await refusal(initiate({ tierId }))).toBe('resolved');
+    expect(creates()).toBe(1);
+  });
+
+  it("the create answering 422 INVALID_BILLING_CYCLE_SEQUENCE: PT7 with PayPal's message, premium stores nothing", async () => {
+    const before = w.storedText();
+    w.fake.fail('POST', CREATE, { status: 422, message: 'The provided billing cycle sequence is not available.', issue: 'INVALID_BILLING_CYCLE_SEQUENCE' });
+    const reply = await w.buyMember(SERVER, IDS[1], OPT_OUT);
+    expect(errorOf(reply)).toContain('PayPal did not start the checkout: The provided billing cycle sequence is not available. Nothing was charged.');
+    expect([reply.subscriptionId, w.fake.subscriptions.size, w.storedText() === before]).toEqual([null, 0, true]);
+  });
+});
+
+describe('P5P Q2: the signature of the pay-once form', () => {
+  it('customFrom: the six-field once form signed, with |once removed or added not signed, another fifth field null', () => {
+    const six = customIdFor({ clientId: BOT_CLIENT_ID, holder: SERVER, buyerId: IDS[1], tierId: 'gold', offeringId: 'o-gold', once: true });
+    const five = customIdFor({ clientId: BOT_CLIENT_ID, holder: SERVER, buyerId: IDS[1], tierId: 'gold', offeringId: 'o-gold' });
+    const [holder, buyer, tier, offering, , sig] = six.split('|');
+    const fiveSig = five.split('|')[4];
+    expect(customFrom(six)).toEqual({ holder: SERVER, buyerId: IDS[1], tierId: 'gold', offeringId: 'o-gold', once: true, signed: true });
+    expect(customFrom(five)).toEqual({ holder: SERVER, buyerId: IDS[1], tierId: 'gold', offeringId: 'o-gold', once: false, signed: true });
+    expect(customFrom([holder, buyer, tier, offering, sig].join('|'))).toMatchObject({ once: false, signed: false });
+    expect(customFrom([holder, buyer, tier, offering, 'once', fiveSig].join('|'))).toMatchObject({ once: true, signed: false });
+    expect(customFrom([holder, buyer, tier, offering, 'twice', sig].join('|'))).toBeNull();
+    expect(customFrom([holder, buyer, tier, offering, 'once', sig, 'x'].join('|'))).toBeNull();
+  });
+
+  it('a forged pay-once subscription is never installed (PL2) and never cancelled', async () => {
+    const forged = w.fake.forge(PLAN, `${SERVER}|${IDS[1]}|gold|o-gold|once|AAAAAAAAAAAAAAAAAAAAAA`);
+    const outs = await w.drain();
+    expect(outs.every(o => o.status === 200)).toBe(true);
+    expect(heldPayPal(w.stored())).toEqual([]);
+    expect(w.logged(`[PayPalProvider] A BILLING.SUBSCRIPTION.CREATED event for subscription ${forged.id} was not applied: its custom_id's signature does not match`)).toHaveLength(1);
+    expect(w.fake.callsOf('POST', /\/cancel$/)).toEqual([]);
   });
 });
