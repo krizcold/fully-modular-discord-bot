@@ -3,7 +3,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { providerCredentialsPath, useSharedDocReader } from '../../src/utils/envLoader';
 import { ServerBoostingProvider } from '../../src/bot/internalSetup/utils/payment/boostProvider';
 import { DiscordProvider } from '../../src/bot/internalSetup/utils/payment/discordProvider';
-import { LemonSqueezyProvider } from '../../src/bot/internalSetup/utils/payment/lemonsqueezyProvider';
 import { PatreonProvider } from '../../src/bot/internalSetup/utils/payment/patreonProvider';
 import { PayPalProvider } from '../../src/bot/internalSetup/utils/payment/paypalProvider';
 import { StripeProvider } from '../../src/bot/internalSetup/utils/payment/stripeProvider';
@@ -80,26 +79,6 @@ describe('Discord', () => {
     const state = await new DiscordProvider().getSubscriptionState('e1');
     expect(state).not.toBeNull();
     expect(calls.map(c => c.url)).toEqual(['https://discord.com/api/v10/applications/app-doc/entitlements']);
-  });
-});
-
-describe('Lemon Squeezy', () => {
-  it("a checkout is created for the doc's store with the doc's API key", async () => {
-    vi.stubEnv('LEMONSQUEEZY_API_KEY', 'ls-key-env');
-    vi.stubEnv('LEMONSQUEEZY_STORE_ID', '111');
-    doc = { lemonsqueezy: { LEMONSQUEEZY_API_KEY: 'ls-key-doc', LEMONSQUEEZY_STORE_ID: '222' } };
-    stubFetch(() => json({ data: { attributes: { url: 'https://pay.example/checkout/1' } } }));
-    const result = await new LemonSqueezyProvider().initiatePurchase({ holder: 'guild:70000000000000001', buyerId: '80000000000000001', tierId: 't1', offeringId: 'o1', variantId: '9' } as any);
-    expect(result).toEqual({ redirectUrl: 'https://pay.example/checkout/1' });
-    expect(calls).toHaveLength(1);
-    expect(JSON.parse(calls[0].init.body).data.relationships.store.data.id).toBe('222');
-  });
-
-  it("a webhook signed with the doc's secret is accepted", async () => {
-    vi.stubEnv('LEMONSQUEEZY_WEBHOOK_SECRET', 'ls-whsec-env');
-    doc = { lemonsqueezy: { LEMONSQUEEZY_WEBHOOK_SECRET: 'ls-whsec-doc' } };
-    const body = Buffer.from(JSON.stringify({ meta: {} }));
-    await expect(new LemonSqueezyProvider().handleWebhook(body, hmacHex('ls-whsec-doc', body), {})).resolves.toBeUndefined();
   });
 });
 

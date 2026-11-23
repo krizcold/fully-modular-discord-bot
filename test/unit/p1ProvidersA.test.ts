@@ -8,11 +8,10 @@ vi.mock('../../src/bot/internalSetup/utils/payment/paymentRegistry', () => ({
 }));
 
 import { StripeProvider } from '../../src/bot/internalSetup/utils/payment/stripeProvider';
-import { LemonSqueezyProvider } from '../../src/bot/internalSetup/utils/payment/lemonsqueezyProvider';
 import { PayPalProvider } from '../../src/bot/internalSetup/utils/payment/paypalProvider';
 import { customIdFor, FakePayPal } from '../helpers/p5PayPal';
 
-// P1 sheet section 8 claim 13 (first file): Stripe, Lemon Squeezy and PayPal keep their wire for a server and speak
+// P1 sheet section 8 claim 13 (first file): Stripe and PayPal keep their wire for a server and speak
 // holders to premium.
 
 const G = '70000000000000001';
@@ -183,81 +182,6 @@ describe('Stripe', () => {
     const calls = stubFetch(() => ({ data: [] }));
     expect(await new StripeProvider().listSubscriptionsFor(`user:${B}`)).toEqual([]);
     expect(new URL(calls[0].url).searchParams.get('query')).toBe(`metadata['holder']:'user:${B}'`);
-  });
-});
-
-describe('Lemon Squeezy', () => {
-  const secret = 'ls_p1';
-  const env = () => {
-    vi.stubEnv('LEMONSQUEEZY_API_KEY', 'key_p1');
-    vi.stubEnv('LEMONSQUEEZY_STORE_ID', '12345');
-    vi.stubEnv('LEMONSQUEEZY_WEBHOOK_SECRET', secret);
-  };
-  const webhook = async (eventName: string, custom: Record<string, string>) => {
-    const body = JSON.stringify({
-      meta: { event_name: eventName, custom_data: custom },
-      data: { id: '77', attributes: { status: 'active', variant_id: 5, renews_at: '2026-12-21T00:00:00.000Z', ends_at: null } },
-    });
-    const sig = crypto.createHmac('sha256', secret).update(body).digest('hex');
-    await new LemonSqueezyProvider().handleWebhook(Buffer.from(body), sig, {});
-  };
-
-  it('sells servers only', () => {
-    expect(new LemonSqueezyProvider().capabilities.sells).toEqual(['guild']);
-  });
-
-  it("a server purchase sends today's custom data", async () => {
-    env();
-    const calls = stubFetch(() => ({ data: { attributes: { url: 'https://ls.example/c' } } }));
-    await new LemonSqueezyProvider().initiatePurchase({ ...purchase, variantId: '5' });
-    expect(calls).toHaveLength(1);
-    expect(String(calls[0].init!.body)).toBe(JSON.stringify({
-      data: {
-        type: 'checkouts',
-        attributes: {
-          checkout_data: { custom: { guildId: G, tierId: 't1', offeringId: 'o1', variantId: '5', userId: B } },
-          checkout_options: { embed: false },
-        },
-        relationships: {
-          store: { data: { type: 'stores', id: '12345' } },
-          variant: { data: { type: 'variants', id: '5' } },
-        },
-      },
-    }));
-  });
-
-  it('a purchase for a user throws X3 without a request', async () => {
-    env();
-    const calls = stubFetch(() => ({}));
-    await expect(new LemonSqueezyProvider().initiatePurchase({ ...purchase, holder: `user:${B}`, variantId: '5' }))
-      .rejects.toThrow('Lemon Squeezy does not sell user subscriptions.');
-    expect(calls).toHaveLength(0);
-  });
-
-  it('webhook events carry the holder, and the created one the buyer of custom.userId', async () => {
-    env();
-    await webhook('subscription_created', { guildId: G, tierId: 't1', offeringId: 'o1', variantId: '5', userId: B });
-    await webhook('subscription_updated', { guildId: G });
-    expect(emitted[0]).toMatchObject({ type: 'subscription.created', holder: `guild:${G}`, buyerId: B, tierId: 't1' });
-    expect(emitted[1]).toMatchObject({ type: 'subscription.updated', holder: `guild:${G}` });
-  });
-
-  it('an id that is not a Discord id emits nothing and logs nothing', async () => {
-    env();
-    const outcomes: string[] = [];
-    for (const name of ['subscription_created', 'subscription_updated', 'subscription_payment_success']) {
-      outcomes.push(await webhook(name, { guildId: 'not-a-server', tierId: 't1', offeringId: 'o1' }).then(() => 'ok', (e: Error) => e.message));
-    }
-    expect(outcomes).toEqual(['ok', 'ok', 'ok']);
-    expect(emitted).toEqual([]);
-    expect(logs).toEqual([]);
-  });
-
-  it("a user's list is empty without a request", async () => {
-    env();
-    const calls = stubFetch(() => ({}));
-    expect(await new LemonSqueezyProvider().listSubscriptionsFor(`user:${B}`)).toEqual([]);
-    expect(calls).toHaveLength(0);
   });
 });
 

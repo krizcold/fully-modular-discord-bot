@@ -91,7 +91,7 @@ export async function createServer(botManager: BotManager): Promise<Express> {
 
   // Payment provider webhooks. MUST be mounted before express.json() so the
   // raw body bytes survive intact - HMAC signature verification (Stripe,
-  // Lemon Squeezy, PayPal) checks against the exact transmitted payload, and
+  // PayPal) checks against the exact transmitted payload, and
   // any JSON re-serialisation breaks the signature. Public endpoint by
   // design: providers send webhooks unauthenticated and prove identity via
   // their per-provider signature scheme inside `handleWebhook`. Body is

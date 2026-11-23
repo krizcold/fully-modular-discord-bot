@@ -188,7 +188,7 @@ describe('P1 claim 19, part 3: the subscription routes', () => {
 
     expect(sent).toHaveLength(1);
     expect(sent[0].status).toBe(200);
-    expect(Object.keys(sent[0].body).sort()).toEqual(['effective', 'providers', 'subscriptions', 'success', 'tiers']);
+    expect(Object.keys(sent[0].body).sort()).toEqual(['effective', 'providers', 'registeredProviders', 'subscriptions', 'success', 'tiers']);
     expect(Object.keys(sent[0].body.tiers).sort()).toEqual(['alt', 'free', 'high', 'low', 'mid']);
     expect(sent[0].body.subscriptions).toEqual(w.recordOf(S));
     expect(Object.keys(sent[0].body.subscriptions).sort()).toEqual(['active', 'paused']);

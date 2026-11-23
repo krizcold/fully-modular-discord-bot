@@ -11,7 +11,6 @@ vi.mock('../../src/bot/internalSetup/utils/premiumNotifications', async () => (a
 
 import { getPaymentRegistry } from '../../src/bot/internalSetup/utils/payment/paymentRegistry';
 import type { PaymentProvider } from '../../src/bot/internalSetup/utils/payment/paymentTypes';
-import { LemonSqueezyProvider } from '../../src/bot/internalSetup/utils/payment/lemonsqueezyProvider';
 import { PayPalProvider } from '../../src/bot/internalSetup/utils/payment/paypalProvider';
 import { PatreonProvider } from '../../src/bot/internalSetup/utils/payment/patreonProvider';
 import { ServerBoostingProvider } from '../../src/bot/internalSetup/utils/payment/boostProvider';
@@ -192,21 +191,21 @@ describe('P1 claim 14: a provider that sells servers only', () => {
   });
 });
 
-describe('P1 claim 14 as P5 leaves it: the four providers that sell servers only, each by its own `sells` (Stripe sells users from P3, PayPal from P5)', () => {
+describe('P1 claim 14 as P5 leaves it: the three providers that sell servers only, each by its own `sells` (Stripe sells users from P3, PayPal from P5)', () => {
   it('PayPal sells servers and users', () => {
     expect(new PayPalProvider().capabilities.sells).toEqual(['guild', 'user']);
   });
 
   it('each sells servers; a user tier linking it is refused (X8), and a user purchase and adoption through it never reach it', async () => {
-    const six: PaymentProvider[] = [new LemonSqueezyProvider(), new PatreonProvider(), new ServerBoostingProvider(), new DiscordProvider()];
+    const serverOnly: PaymentProvider[] = [new PatreonProvider(), new ServerBoostingProvider(), new DiscordProvider()];
     const offering = (enabled: boolean) => ({
       id: 'o-useven', label: 'Seven monthly',
-      providerLinks: six.map(p => ({ providerId: p.id, enabled, mode: 'price', priceConfig: { entries: [{ variantId: `${p.id}_v` }] } })),
+      providerLinks: serverOnly.map(p => ({ providerId: p.id, enabled, mode: 'price', priceConfig: { entries: [{ variantId: `${p.id}_v` }] } })),
     });
     expect((await w.op('setTier', 'useven', { ...userSoldTierDef('vlow', 'U Seven'), priority: 5, offerings: [offering(true)] })).ok).toBe(true);
     const outcomes: unknown[] = [];
     try {
-      for (const p of six) {
+      for (const p of serverOnly) {
         const configured = vi.spyOn(p, 'isConfigured').mockReturnValue(true);
         const bought = vi.spyOn(p, 'initiatePurchase');
         const listed = vi.spyOn(p as Required<PaymentProvider>, 'listSubscriptionsFor');
@@ -221,14 +220,13 @@ describe('P1 claim 14 as P5 leaves it: the four providers that sell servers only
         outcomes.push([p.id, p.capabilities.sells, purchase.ok, purchase.error, askedByPurchase, adopt.ok, adopt.error, tier.ok, tier.error, bought.mock.calls.length, listed.mock.calls.length, state().premium === before.premium]);
       }
     } finally {
-      for (const p of six) p.stop?.();
+      for (const p of serverOnly) p.stop?.();
     }
 
     const x3 = (name: string) => `${name} does not sell user subscriptions.`;
     const x8 = (name: string) => `${name} does not sell user subscriptions; turn its link off on offering 'Seven monthly'.`;
     const row = (id: string, name: string) => [id, ['guild'], false, expect.stringContaining(x3(name)), 0, false, expect.stringContaining(x3(name)), false, expect.stringContaining(x8(name)), 0, 0, true];
     expect(outcomes).toEqual([
-      row('lemonsqueezy', 'Lemon Squeezy'),
       row('patreon', 'Patreon'),
       row('boost', 'Server Boosting'),
       row('discord', 'Discord App Monetization'),

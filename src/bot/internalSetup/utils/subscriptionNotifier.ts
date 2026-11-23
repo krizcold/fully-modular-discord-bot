@@ -5,7 +5,7 @@
  * IPC message handled in `ipcNotificationHandler.ts`.
  *
  * Skip-native: events the provider already notifies natively (Stripe
- * receipts, LS dunning, PayPal billing, Discord billing) should NOT call
+ * receipts, PayPal billing, Discord billing) should NOT call
  * `notify` for the corresponding type. The notifier itself doesn't know
  * about provider event sources, so callers in PremiumManager / webhook
  * handlers decide whether to fire each event.

@@ -603,7 +603,10 @@ export function writeEnvKeys(changes: Record<string, string | null>, unread: Rec
   }
 }
 
-/** The keys of each built-in payment provider that the credentials doc may hold (NB6 decision 57). */
+/**
+ * The keys the credentials doc may hold and a data migration carries, per built-in provider id (NB6 decision 57); no
+ * provider reads the lemonsqueezy keys.
+ */
 const BUILTIN_PROVIDER_KEYS: Record<string, (key: string) => boolean> = {
   stripe: key => key.startsWith('STRIPE_'),
   paypal: key => key.startsWith('PAYPAL_'),

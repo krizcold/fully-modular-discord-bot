@@ -1925,7 +1925,6 @@ function TierCard({
 const PROVIDER_VISUALS = {
   stripe:        { color: '#635bff', glyph: 'S', tagline: 'Cards, redirect checkout, full lifecycle' },
   discord:       { color: '#5865F2', glyph: 'D', tagline: 'Discord App Monetization (Premium Apps)' },
-  lemonsqueezy:  { color: '#ffc233', glyph: 'L', tagline: 'Hosted checkout, MoR billing' },
   paypal:        { color: '#003087', glyph: 'P', tagline: 'Subscriptions API, sandbox + live' },
   patreon:       { color: '#ff424d', glyph: 'P', tagline: 'OAuth-link to existing pledges' },
   boost:         { color: '#ff73fa', glyph: 'B', tagline: 'Verify Discord server boost count' },
@@ -3211,7 +3210,7 @@ function PremiumTiersView({ tiers, subscriptions, messages, messageDefaults, onR
   async function loadCoupons() {
     try {
       // Coupons live at the provider in the new model. The Dummy provider has
-      // a built-in registry; real providers (Stripe, LS, ...) own theirs at
+      // a built-in registry; real providers (Stripe, PayPal, ...) own theirs at
       // their dashboard. This panel manages Dummy's only.
       const res = await api.get('/appstore/premium/providers/dummy/coupons');
       if (res.success) {
@@ -3985,7 +3984,7 @@ function PremiumTiersView({ tiers, subscriptions, messages, messageDefaults, onR
 
       {/* Dummy Provider Settings - only visible when Dummy is activated.
           The global coupon CRUD lives here alongside Dummy's variants and
-          products catalog. Real providers (Stripe, LS, PayPal, ...) own
+          products catalog. Real providers (Stripe, PayPal, ...) own
           their catalogs at their dashboards; only Dummy's lives in our
           config. */}
       {activatedProviders?.dummy && (

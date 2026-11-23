@@ -255,7 +255,7 @@ function GuildSubscriptionPanel({ guild, subData, onRefresh }) {
     return <FirstLoadPlaceholder label="Loading subscription…" />;
   }
 
-  const { subscriptions = {}, effective, tiers = {}, providers = [] } = subData;
+  const { subscriptions = {}, effective, tiers = {}, providers = [], registeredProviders } = subData;
   // New model: single active slot + paused queue. Derive view-friendly slices:
   //   active source-segregated for the cards (manual vs paid),
   //   pausedAll = full queue for the queued-cards section.
@@ -277,6 +277,12 @@ function GuildSubscriptionPanel({ guild, subData, onRefresh }) {
   }
   function capabilitiesOf(providerId) {
     return providers.find(p => p.id === providerId)?.capabilities || null;
+  }
+  function providerGone(providerId) {
+    return Array.isArray(registeredProviders) && !!providerId && !registeredProviders.includes(providerId);
+  }
+  function goneConfirm(providerId) {
+    return `This removes it from the bot only: the bot does not have the payment provider '${providerId}', so the billing there does not stop. Cancel it at that provider as well.`;
   }
   function cancelText(providerId) {
     return capabilitiesOf(providerId)?.endsAtPaidEnd
@@ -395,7 +401,8 @@ function GuildSubscriptionPanel({ guild, subData, onRefresh }) {
     if (!confirm(
       `Cancel '${tierName}' immediately?${remainingMsg} ` +
       `If you have a queued subscription it will resume in this slot. ` +
-      `This cannot be undone.`
+      `This cannot be undone.` +
+      (paid && providerGone(paid.providerId) ? ` ${goneConfirm(paid.providerId)}` : '')
     )) return;
     setProcessing(true); setError(null);
     try {
@@ -491,9 +498,11 @@ function GuildSubscriptionPanel({ guild, subData, onRefresh }) {
     const tierName = getTierName(ps.tierId);
     const isPaid = ps.source === 'paid';
     if (!confirm(
-      isPaid
-        ? `Cancel your queued '${tierName}' subscription? It will not resume when your current plan ends, and the provider will stop billing for it.`
-        : `Cancel your queued '${tierName}' grant? It will not resume when your current plan ends.`,
+      isPaid && providerGone(ps.providerId)
+        ? `Cancel your queued '${tierName}' subscription? It will not resume when your current plan ends. ${goneConfirm(ps.providerId)}`
+        : isPaid
+          ? `Cancel your queued '${tierName}' subscription? It will not resume when your current plan ends, and the provider will stop billing for it.`
+          : `Cancel your queued '${tierName}' grant? It will not resume when your current plan ends.`,
     )) return;
     setProcessing(true); setError(null);
     try {
@@ -741,8 +750,13 @@ function GuildSubscriptionPanel({ guild, subData, onRefresh }) {
                     <span style={{ color: '#3ba55d', marginLeft: '6px' }}>(auto-renewing)</span>
                   ))}
                 </div>
+                {providerGone(paid.providerId) && (
+                  <div style={{ color: '#e67e22', fontSize: '0.78rem', marginTop: '4px' }}>
+                    This bot does not have the payment provider '{paid.providerId}', so it cannot change this subscription there. Manage or cancel it at that provider.
+                  </div>
+                )}
                 <div style={{ display: 'flex', gap: '6px', marginTop: '10px', flexWrap: 'wrap' }}>
-                  {paid.autoRenew === true ? (
+                  {providerGone(paid.providerId) ? null : paid.autoRenew === true ? (
                     <button onClick={handleCancel} disabled={processing} style={{
                       background: 'transparent', color: '#ed4245', border: '1px solid #ed4245',
                       padding: '5px 12px', borderRadius: '5px', cursor: 'pointer', fontSize: '0.78rem',
@@ -767,7 +781,7 @@ function GuildSubscriptionPanel({ guild, subData, onRefresh }) {
                   title="End this subscription right now and free the slot. Loses remaining time. If you have a queued sub, it resumes here.">
                     {processing ? 'Cancelling…' : 'Cancel & remove now'}
                   </button>
-                  {(!paidCaps || paidCaps.supportsCustomerPortal) && (
+                  {!providerGone(paid.providerId) && (!paidCaps || paidCaps.supportsCustomerPortal) && (
                   <button onClick={handleOpenBillingPortal} disabled={processing} style={{
                     background: 'transparent', color: '#aaa', border: '1px solid #555',
                     padding: '5px 12px', borderRadius: '5px',
@@ -1320,8 +1334,7 @@ function SubscribeModal({ guildId, tierId, tier, providers, willBePaused, active
                   && !!link.productConfig?.useProviderHostedPicker
                   && provider.capabilities?.supportsHostedPicker;
                 if (useHostedPicker) {
-                  // Send the FIRST active variant to the provider's checkout page: Lemon
-                  // Squeezy's page lists the Product's variants; Stripe's shows that one price.
+                  // The provider's checkout page shows the first active variant only.
                   const firstActive = variants[0];
                   const key = `${provider.id}:${firstActive.variantId}`;
                   const selected = selectionKey === key;

@@ -2357,7 +2357,7 @@ function OfferingsEditorPanel({ tierId, tier, providers, activatedProviders, onS
                           color: isActivated ? '#7289da' : '#e67e22',
                           padding: '2px 8px', borderRadius: '10px', fontSize: '0.72rem',
                         }}>
-                          {p?.displayName || pid}{!isActivated && ' (deactivated)'}
+                          {p?.displayName || pid}{!isActivated && (p ? ' (deactivated)' : ' (not installed)')}
                         </span>
                       );
                     })}

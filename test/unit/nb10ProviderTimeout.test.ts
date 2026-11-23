@@ -56,9 +56,9 @@ afterEach(() => {
 });
 
 describe('the provider fetch sites', () => {
-  it('are 8, and each carries AbortSignal.timeout(PROVIDER_FETCH_MS), which is 30 s', () => {
+  it('are 7, and each carries AbortSignal.timeout(PROVIDER_FETCH_MS), which is 30 s', () => {
     const calls = fetchCalls();
-    expect(calls).toHaveLength(8);
+    expect(calls).toHaveLength(7);
     for (const { file, call } of calls) expect(call, file).toContain('signal: AbortSignal.timeout(PROVIDER_FETCH_MS)');
     expect(PROVIDER_FETCH_MS).toBe(30_000);
   });

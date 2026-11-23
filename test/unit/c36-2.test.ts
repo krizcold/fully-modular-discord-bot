@@ -223,13 +223,4 @@ describe('C36-2 review rows', () => {
       await expect(new StripeProvider().validateCoupon('SAVE')).rejects.toThrow('network down');
     } finally { vi.unstubAllGlobals(); vi.doUnmock('@/utils/envLoader'); }
   });
-
-  it('an unconfigured Lemon Squeezy coupon check is thrown, not answered as a refusal', async () => {
-    vi.resetModules();
-    vi.doMock('@/utils/envLoader', () => ({ loadCredentials: () => ({}), providerCredentials: () => ({}), useSharedDocReader: () => undefined }));
-    try {
-      const { LemonSqueezyProvider } = await import('@/bot/internalSetup/utils/payment/lemonsqueezyProvider');
-      await expect(new LemonSqueezyProvider().validateCoupon('SAVE')).rejects.toThrow('not configured');
-    } finally { vi.doUnmock('@/utils/envLoader'); }
-  });
 });

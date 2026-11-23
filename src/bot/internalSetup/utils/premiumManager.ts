@@ -226,7 +226,7 @@ export interface Subscription {
 
   // Paid only:
   offeringId?: string;
-  /** Wire-level identifier picked at sign-up (Stripe Price ID, LS Variant ID, ...). */
+  /** Wire-level identifier picked at sign-up (Stripe Price ID, PayPal Plan ID, ...). */
   variantId?: string;
   providerId?: string;
   providerSubId?: string;
@@ -1026,6 +1026,16 @@ const sleepOutside = (ms: number): Promise<void> => new Promise(resolve => {
 /** PL1. */
 function recordMissingLine(providerSubId: string, holder: HolderKey): string {
   return `[PremiumManager] The Dummy provider holds no record of subscription ${providerSubId} (${holderWords(holder)}), so nothing was cancelled there; the bot's copy was removed.`;
+}
+
+/** A paid subscription whose provider this bot does not register: no call reaches that provider (sheet P4, R2.2). */
+function providerGone(sub: Subscription): boolean {
+  return !!sub.providerId && !getPaymentRegistry().get(sub.providerId);
+}
+
+/** The audit metadata that keeps what an operator needs to end such a subscription at its provider. */
+function goneMetadata(sub: Subscription): Record<string, unknown> {
+  return { providerNotCalled: true, ...(sub.providerSubId ? { providerSubId: sub.providerSubId } : {}), endDate: sub.endDate };
 }
 
 export class PremiumManager {
@@ -3351,7 +3361,10 @@ export class PremiumManager {
 
     if (!activeAlive) {
       // No active sub (or it's expired): incoming becomes active.
-      if (active) delete subs.active;
+      if (active) {
+        this.auditReplaced(holder, active, carry);
+        delete subs.active;
+      }
       subs.active = this.intoActiveSlot(incoming);
       return this.save({ carry });
     }
@@ -3405,6 +3418,25 @@ export class PremiumManager {
     return op;
   }
 
+  /** The audit line of an active subscription a new one replaces without queueing it (sheet P4, C4). */
+  private auditReplaced(holder: HolderKey, dropped: Subscription, carry: Carry): void {
+    const ended = dropped.endDate !== null && Date.parse(dropped.endDate) <= Date.now();
+    this.writeAudit({
+      timestamp: new Date().toISOString(),
+      actor: 'admin',
+      action: dropped.source === 'manual' ? 'subscription.revoke.manual' : 'subscription.expire.paid',
+      holder,
+      subscriptionId: dropped.id,
+      providerId: dropped.providerId,
+      metadata: {
+        reason: ended ? 'replaced-after-end' : `replaced-while-${dropped.status}`,
+        ...(ended ? {} : { status: dropped.status }),
+        ...(dropped.providerSubId ? { providerSubId: dropped.providerSubId } : {}),
+        endDate: dropped.endDate,
+      },
+    }, { carry });
+  }
+
   /**
    * Decision 95: a paused Dummy sub that takes the active slot goes in as resumeNext builds a resumed sub; the Dummy
    * provider's tick writes its record active. Any other sub goes in as it came.
@@ -3451,6 +3483,7 @@ export class PremiumManager {
     }
     if (remaining === 0) {
       // Nothing left: drop outright instead of queueing.
+      this.auditReplaced(holder, cur, carry);
       subs.active = replacement;
       return this.save({ carry });
     }
@@ -3465,6 +3498,7 @@ export class PremiumManager {
     subs.paused.push(paused);
     this.sortPausedQueue(subs);
     subs.active = replacement;
+    const gone = paused.source === 'paid' && providerGone(paused);
     this.writeAudit({
       timestamp: nowIso,
       actor: 'admin',
@@ -3472,8 +3506,9 @@ export class PremiumManager {
       holder,
       subscriptionId: paused.id,
       providerId: paused.providerId,
+      ...(gone ? { metadata: { providerNotCalled: true } } : {}),
     }, { carry });
-    if (paused.source === 'paid') {
+    if (paused.source === 'paid' && !gone) {
       void this.notify(holder, 'paid.sub.paused-by-stacking', {
         tierName: this.config.tiers[paused.tierId]?.displayName || paused.tierId,
         providerName: this.providerDisplayName(paused.providerId),
@@ -3758,7 +3793,7 @@ export class PremiumManager {
 
   /**
    * Initiate a paid subscription. Sync providers (Dummy) install inline;
-   * async providers (Stripe / LS / PayPal) return a redirect/handoff URL and
+   * async providers (Stripe / PayPal) return a redirect/handoff URL and
    * install via `subscription.created` after the webhook arrives.
    */
   initiatePaidSubscription(
@@ -4051,7 +4086,12 @@ export class PremiumManager {
     if (!active || active.source !== 'paid') return 'gone';
 
     const missing = active.providerId && active.providerSubId ? await this.cancelAtProvider(active.providerId, active.providerSubId) : false;
-    return this.dropCancelledSubscription(holder, active, { immediately: true, ...(missing ? { providerRecordMissing: true } : {}) }, true, missing ? recordMissingLine(active.providerSubId!, holder) : undefined);
+    const gone = providerGone(active);
+    return this.dropCancelledSubscription(holder, active, {
+      immediately: true,
+      ...(missing ? { providerRecordMissing: true } : {}),
+      ...(gone ? goneMetadata(active) : {}),
+    }, !gone, missing ? recordMissingLine(active.providerSubId!, holder) : undefined);
   }
 
   /**
@@ -4207,7 +4247,11 @@ export class PremiumManager {
     const missing = removed.source === 'paid' && removed.providerId && removed.providerSubId
       ? await this.cancelAtProvider(removed.providerId, removed.providerSubId)
       : false;
-    return this.dropCancelledSubscription(holder, removed, { fromPausedQueue: true, ...(missing ? { providerRecordMissing: true } : {}) }, false, missing ? recordMissingLine(removed.providerSubId!, holder) : undefined);
+    return this.dropCancelledSubscription(holder, removed, {
+      fromPausedQueue: true,
+      ...(missing ? { providerRecordMissing: true } : {}),
+      ...(removed.source === 'paid' && providerGone(removed) ? goneMetadata(removed) : {}),
+    }, false, missing ? recordMissingLine(removed.providerSubId!, holder) : undefined);
   }
 
   // ============================================================================

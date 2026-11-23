@@ -1364,7 +1364,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
   // DUMMY PROVIDER ADMIN: variants, products, coupons
   //
   // Dummy is the in-process simulator; admin manages its catalog (variants +
-  // products + coupons) via these endpoints. Real providers (Stripe, LS,
+  // products + coupons) via these endpoints. Real providers (Stripe,
   // PayPal, ...) own their catalogs at the provider's dashboard, so they
   // don't have equivalent admin endpoints.
   // ============================================================================

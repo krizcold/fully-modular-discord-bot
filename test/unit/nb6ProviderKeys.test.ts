@@ -7,7 +7,6 @@ import { _resetRowQueue } from '../../src/bot/internalSetup/utils/sharedStore';
 import { StripeProvider } from '../../src/bot/internalSetup/utils/payment/stripeProvider';
 import { PayPalProvider } from '../../src/bot/internalSetup/utils/payment/paypalProvider';
 import { PatreonProvider } from '../../src/bot/internalSetup/utils/payment/patreonProvider';
-import { LemonSqueezyProvider } from '../../src/bot/internalSetup/utils/payment/lemonsqueezyProvider';
 import { DiscordProvider } from '../../src/bot/internalSetup/utils/payment/discordProvider';
 import { ServerBoostingProvider } from '../../src/bot/internalSetup/utils/payment/boostProvider';
 import { setBackendKind } from '../helpers/backendKind';
@@ -172,28 +171,6 @@ describe('the built-in providers read their keys through providerCredentials', (
 });
 
 describe('the second half of the built-in providers read their keys through providerCredentials', () => {
-  it("Lemon Squeezy: configured from the doc; its API calls carry the doc's key and its coupon lookup names the doc's store", async () => {
-    writeEnv({ LEMONSQUEEZY_API_KEY: 'ls_env_made_up', LEMONSQUEEZY_STORE_ID: '111' });
-    saveDoc({ lemonsqueezy: { LEMONSQUEEZY_API_KEY: 'ls_doc_made_up', LEMONSQUEEZY_STORE_ID: '222', LEMONSQUEEZY_WEBHOOK_SECRET: 'lsw_doc_made_up' } });
-    const ls = new LemonSqueezyProvider();
-    expect(ls.isConfigured()).toBe(true);
-    stubFetch(() => ({ data: [] }));
-    await ls.cancelSubscription('77');
-    expect(calls).toHaveLength(1);
-    expect(calls[0].init.headers.Authorization === 'Bearer ls_doc_made_up').toBe(true);
-    await ls.validateCoupon('SAVE');
-    expect(calls).toHaveLength(2);
-    expect(new URL(calls[1].url).searchParams.get('filter[store_id]')).toBe('222');
-    expect(calls[1].init.headers.Authorization === 'Bearer ls_doc_made_up').toBe(true);
-  });
-
-  it('Lemon Squeezy: a key cleared in the doc leaves it not configured', () => {
-    writeEnv({ LEMONSQUEEZY_API_KEY: 'ls_env_made_up', LEMONSQUEEZY_STORE_ID: '111', LEMONSQUEEZY_WEBHOOK_SECRET: 'lsw_env_made_up' });
-    expect(new LemonSqueezyProvider().isConfigured()).toBe(true);
-    saveDoc({ lemonsqueezy: { LEMONSQUEEZY_WEBHOOK_SECRET: null } });
-    expect(new LemonSqueezyProvider().isConfigured()).toBe(false);
-  });
-
   it("Discord: configured from the doc's application id with the bot token from /data/.env; its API calls use both", async () => {
     writeEnv({ DISCORD_TOKEN: 'token_env_made_up', DISCORD_APPLICATION_ID: '100000000000000001' });
     saveDoc({ discord: { DISCORD_APPLICATION_ID: '100000000000000002', DISCORD_TOKEN: 'token_doc_made_up' } });

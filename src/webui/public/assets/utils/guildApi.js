@@ -249,7 +249,7 @@ const guildApi = {
    * Preview a coupon before subscribing. Returns { valid, effectText, reason }.
    * Forwards to provider.validateCoupon (provider is source of truth in the
    * new model). `variantId` is optional but helps providers that tie coupons
-   * to specific variants (e.g. LS).
+   * to specific variants.
    */
   async previewCoupon(guildId, providerId, code, variantId) {
     const response = await guildFetch(`${GUILD_API_BASE}/subscriptions/${guildId}/coupon/preview`, {

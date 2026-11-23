@@ -10,14 +10,13 @@
  * its own mode independently of any other link:
  *
  *   - Price mode: host enters one or more wire-level variant IDs (Stripe
- *     Price ID, LS Variant ID, PayPal Plan ID, Discord SKU). One row per
+ *     Price ID, PayPal Plan ID, Discord SKU). One row per
  *     billing option the host wants to expose. We render the variant picker.
  *
  *   - Product mode: host enters one Product identifier. We pull variants
  *     from the provider's API. Optional toggle hands variant selection off
  *     to the provider's hosted page when the provider supports it (Stripe:
- *     one button opening a one-price Checkout, no Pricing Table; LS hosted
- *     checkout).
+ *     one button opening a one-price Checkout, no Pricing Table).
  */
 import type { HolderKey, HolderKind } from '../premiumHolder';
 
@@ -29,7 +28,7 @@ import type { HolderKey, HolderKind } from '../premiumHolder';
 export type ProviderMechanism =
   /** Fully server-side, sync return with state (Dummy). */
   | 'immediate'
-  /** Server returns a checkout URL; webhook reconciles (Stripe, Lemon Squeezy). */
+  /** Server returns a checkout URL; webhook reconciles (Stripe, PayPal). */
   | 'redirect'
   /** Purchase happens in a host app; gateway events reconcile (Discord App Monetization). */
   | 'client_handoff'
@@ -47,7 +46,7 @@ export type ProviderMode = 'price' | 'product';
 
 /** A single host-typed variant entry in Price mode. */
 export interface PriceModeEntry {
-  /** Wire-level identifier: Stripe Price ID, LS Variant ID, PayPal Plan ID, Discord SKU. */
+  /** Wire-level identifier: Stripe Price ID, PayPal Plan ID, Discord SKU. */
   variantId: string;
   /** Optional admin override for the variant label shown to subscribers. */
   labelOverride?: string;
@@ -64,7 +63,7 @@ export interface PriceModeConfig {
 
 /** Single-Product config for Product mode (variants synced from the provider). */
 export interface ProductModeConfig {
-  /** Wire-level Product identifier: Stripe Product ID, LS Product ID, PayPal Product ID. */
+  /** Wire-level Product identifier: Stripe Product ID, PayPal Product ID. */
   productId: string;
   /**
    * When true, subscriber sees one "Subscribe via [Provider]" button and the
@@ -86,7 +85,7 @@ export interface ProductModeConfig {
 
 /** Variant resolved from the provider (read-only at our end, synced from API). */
 export interface OfferingVariant {
-  /** Wire-level identifier: Stripe Price ID, LS Variant ID, PayPal Plan ID, Discord SKU. */
+  /** Wire-level identifier: Stripe Price ID, PayPal Plan ID, Discord SKU. */
   variantId: string;
   /** Provider's name for the variant; can be host-overridden via `PriceModeEntry.labelOverride`. */
   label: string;
@@ -148,7 +147,7 @@ export interface ProviderCapabilities {
   supportsProductMode: boolean;
   /**
    * (Product mode only) Can the subscribe card send the member to the
-   * provider's checkout page with one button? Stripe + LS yes; PayPal no.
+   * provider's checkout page with one button? Stripe yes; PayPal no.
    */
   supportsHostedPicker: boolean;
   /** (When `supportsHostedPicker`) Provider-imposed cap on the prices its hosted page shows. */
@@ -296,7 +295,7 @@ export interface InitiateResult {
  * provider for what it has on file for a guild, compares against local
  * cache, and surfaces mismatches as orphans the user can adopt or cancel.
  *
- * Provider-agnostic by design - Stripe, PayPal, Lemon Squeezy, Patreon all
+ * Provider-agnostic by design - Stripe, PayPal and Patreon all
  * map their own subscription objects into this shape. The UI and route
  * layer never see provider-specific fields.
  */
@@ -364,8 +363,8 @@ export interface SubscriptionReader {
 /** Unified provider event emitted on the registry's bus. */
 export type ProviderEvent =
   /**
-   * Async install: emitted by webhook-driven providers (Stripe, Lemon Squeezy,
-   * PayPal) when a checkout completes and we need to install a brand-new
+   * Async install: emitted by webhook-driven providers (Stripe, PayPal) when a
+   * checkout completes and we need to install a brand-new
    * paid subscription into the cache. Synchronous providers (Dummy) install
    * inline from `initiatePaidSubscription` and never emit this. The extra
    * `tierId` / `offeringId` / `variantId` / `couponCode` / `variantSnapshot`
@@ -462,9 +461,9 @@ export interface PaymentProvider {
 
   /**
    * Optional: pre-validate a coupon code without consuming it. Provider-side
-   * lookup (e.g. Stripe Promotion Codes, LS checkout preview). Called from
-   * the subscribe modal's coupon preview field. variantId is optional; some
-   * providers tie coupons to specific variants (e.g. LS).
+   * lookup (e.g. Stripe Promotion Codes). Called from the subscribe modal's
+   * coupon preview field. variantId is optional; some providers tie coupons to
+   * specific variants.
    */
   validateCoupon?(code: string, variantId?: string): Promise<ProviderCouponValidation>;
 
@@ -525,7 +524,7 @@ export interface PaymentProvider {
 
   getSubscriptionState(providerSubId: string): Promise<ProviderSubscriptionState | null>;
 
-  /** Webhook-driven providers (Stripe, Lemon Squeezy) implement this. */
+  /** Webhook-driven providers (Stripe, PayPal) implement this. */
   handleWebhook?(rawBody: Buffer, signature: string, headers: Record<string, string>): Promise<void>;
   /** The event id of a delivery, read before handleWebhook verifies it (a provider may answer an id it has not verified); null when the delivery carries none. The route only skips an id it recorded after the op answered 200. */
   webhookEventId?(rawBody: Buffer, headers: Record<string, string>): string | null;

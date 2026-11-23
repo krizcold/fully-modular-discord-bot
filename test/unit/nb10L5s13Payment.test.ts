@@ -2,7 +2,6 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { PaymentProviderRegistry } from '../../src/bot/internalSetup/utils/payment/paymentRegistry';
 import { StripeProvider } from '../../src/bot/internalSetup/utils/payment/stripeProvider';
-import { LemonSqueezyProvider } from '../../src/bot/internalSetup/utils/payment/lemonsqueezyProvider';
 import { isCoreOwnedGlobalFile, isInternalGlobalRel } from '../../src/bot/internalSetup/utils/configDiscovery';
 import type { PaymentProvider } from '../../src/bot/internalSetup/utils/payment/paymentTypes';
 
@@ -52,19 +51,6 @@ describe('the provider API calls', () => {
     const [url, init] = fetch.mock.calls[0] as unknown as [string, RequestInit];
     expect(url).toBe('https://api.stripe.com/v1/subscriptions/sub_s13');
     expect(init.method).toBe('DELETE');
-  });
-
-  it('Lemon Squeezy cancels with a DELETE to its v1 API, carrying the key and an abort signal', async () => {
-    vi.stubEnv('LEMONSQUEEZY_API_KEY', 'ls_key_s13');
-    const fetch = vi.fn(async () => new Response(null, { status: 204 }));
-    vi.stubGlobal('fetch', fetch);
-    await new LemonSqueezyProvider().cancelSubscription('77');
-    expect(fetch).toHaveBeenCalledTimes(1);
-    const [url, init] = fetch.mock.calls[0] as unknown as [string, RequestInit & { headers: Record<string, string> }];
-    expect(url).toBe('https://api.lemonsqueezy.com/v1/subscriptions/77');
-    expect(init.method).toBe('DELETE');
-    expect(init.headers.Authorization).toBe('Bearer ls_key_s13');
-    expect(init.signal).toBeInstanceOf(AbortSignal);
   });
 });
 

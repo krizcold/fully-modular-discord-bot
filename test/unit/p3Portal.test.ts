@@ -4,8 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 // P3 claim 14's op rows (sheet P3, section 7; part 3): the read-only op payment.billingPortal answers { portalUrl },
 // writes nothing (its ledger holds no ticket and no refusal, the doc's and premium-tiers.json's bytes unchanged), turns a
 // provider's throw into code 'invalid' with the provider's own text, and applySharedOp tags only refreshBeforeOp's
-// refusal with refreshFailed. Lemon Squeezy's two-parameter method answers through the op as before. The route rows of
-// claim 14 are part 5's.
+// refusal with refreshFailed. The route rows of claim 14 are part 5's.
 
 vi.mock('../../src/bot/internalSetup/utils/payment/paymentRegistry', async orig => (await import('../helpers/p1Mocks')).bareRegistry(await orig<any>()));
 vi.mock('../../src/bot/internalSetup/utils/premiumNotifications', async () => (await import('../helpers/p1Mocks')).noticeModule());
@@ -19,8 +18,6 @@ import { getPremiumManager } from '../../src/bot/internalSetup/utils/premiumMana
 import { dataPath } from '../../src/utils/dataRoot';
 import { carriedWrites } from '../../src/bot/internalSetup/utils/dataBackends/writeLedger';
 import { PROVIDER_SENTENCE } from '../../src/bot/internalSetup/utils/sharedOps';
-import { getPaymentRegistry } from '../../src/bot/internalSetup/utils/payment/paymentRegistry';
-import { LemonSqueezyProvider } from '../../src/bot/internalSetup/utils/payment/lemonsqueezyProvider';
 import { createGuildSubscriptionRoutes } from '../../src/webui/routes/guildSubscriptions';
 import { sharedOpFailure } from '../../src/webui/routes/hopFailure';
 import { CUSTOMERS_KEY, customersPath, HOST, IDS, p3World, type P3World } from '../helpers/p3World';
@@ -47,7 +44,6 @@ describe('payment.billingPortal on the JSON files', () => {
     await w.setup();
   });
   afterEach(async () => {
-    getPaymentRegistry().unregister('lemonsqueezy');
     await w.teardown();
     vi.restoreAllMocks();
   });
@@ -83,19 +79,6 @@ describe('payment.billingPortal on the JSON files', () => {
     expect([(unreadable as any).refreshFailed, (unknown as any).refreshFailed]).toEqual([undefined, undefined]);
   });
 
-  it("Lemon Squeezy's method, called through the op with the buyer, answers its portal URL as before", async () => {
-    vi.stubEnv('LEMONSQUEEZY_API_KEY', 'ls_key');
-    getPaymentRegistry().register(new LemonSqueezyProvider());
-    const seen: string[] = [];
-    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
-      seen.push(String(url));
-      return new Response(JSON.stringify({ data: { id: '9', attributes: { urls: { customer_portal: 'https://ls.example/portal/9' } } } }), { status: 200 });
-    }));
-    const reply = await portal(w, { providerId: 'lemonsqueezy', providerSubId: '9', returnUrl: RETURN, buyerId: A });
-    expect(reply).toEqual({ ok: true, result: { portalUrl: 'https://ls.example/portal/9' } });
-    expect(seen).toEqual(['https://api.lemonsqueezy.com/v1/subscriptions/9']);
-    vi.unstubAllEnvs();
-  });
 });
 
 describe('payment.billingPortal on the mirror rig', () => {
@@ -356,9 +339,7 @@ describe('the portal route on the mirror rig: the doc refreshed inside the op', 
     const mirrorAfter = fs.existsSync(customersPath()) ? fs.readFileSync(customersPath(), 'utf8') : null;
     expect(mirrorAfter).toBe(mirrorBefore);
   }, 30_000);
-  it('a Lemon Squeezy subscription whose refresh fails: 503 with the provider-neutral text, no Stripe named', async () => {
-    vi.stubEnv('LEMONSQUEEZY_API_KEY', 'ls_key');
-    getPaymentRegistry().register(new LemonSqueezyProvider());
+  it('a subscription whose provider the bot does not have, whose refresh fails: 503 with the provider-neutral text', async () => {
     const fetched = vi.fn(async () => new Response(JSON.stringify({ data: { id: '9', attributes: { urls: { customer_portal: 'https://ls.example/portal/9' } } } }), { status: 200 }));
     vi.stubGlobal('fetch', fetched);
     vi.spyOn(getPremiumManager(), 'getSubscriptions').mockReturnValue({ active: { source: 'paid', providerId: 'lemonsqueezy', providerSubId: '9', buyerId: A } } as any);
@@ -370,8 +351,6 @@ describe('the portal route on the mirror rig: the doc refreshed inside the op', 
       replies.push(r);
       return r;
     });
-    getPaymentRegistry().unregister('lemonsqueezy');
-    vi.unstubAllEnvs();
     vi.unstubAllGlobals();
     expect(replies[0]).toMatchObject({ ok: false, refreshFailed: true });
     expect(reply).toEqual({ status: 503, body: { success: false, error: `${REFRESH_LEAD}${String(replies[0].error).trim().replace(/\.+$/, '')}).` } });

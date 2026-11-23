@@ -90,7 +90,7 @@ export function createGuildSubscriptionRoutes(botManager: BotManager): Router {
 
   /**
    * GET /guild/api/subscriptions/:guildId
-   * Returns: { success, subscriptions, effective, tiers, providers }
+   * Returns: { success, subscriptions, effective, tiers, providers, registeredProviders }
    * Guild admins (Manage Server) only.
    */
   router.get('/:guildId', requireOAuth, requireGuildAccess, (req: Request, res: Response) => {
@@ -119,6 +119,7 @@ export function createGuildSubscriptionRoutes(botManager: BotManager): Router {
         effective: { tierId: resolved.tierId, tier: resolved.tier, source: resolved.source },
         tiers,
         providers,
+        registeredProviders: registry.listAll().map(p => p.id),
       });
     } catch (error) {
       if (error instanceof SharedOpAnswered) return;

@@ -161,9 +161,6 @@ export function getPaymentRegistry(): PaymentProviderRegistry {
     const { ServerBoostingProvider } = require('./boostProvider');
     instance.register(new ServerBoostingProvider());
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const { LemonSqueezyProvider } = require('./lemonsqueezyProvider');
-    instance.register(new LemonSqueezyProvider());
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
     const { PayPalProvider } = require('./paypalProvider');
     instance.register(new PayPalProvider());
     // eslint-disable-next-line @typescript-eslint/no-var-requires

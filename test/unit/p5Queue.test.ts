@@ -1,11 +1,10 @@
-import * as crypto from 'crypto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // P5 claim 13 (sheet P5, Revision 9, Z8): an expired event for a queued entry removes it from the queue, with one audit
 // line of reason `ended-while-queued` and one notice, for every provider; any other state for a queued entry leaves it
 // paused with its held endDate and startDate, taking only the state's autoRenew and meta (the queued-entry guard in
 // copyProviderState), so resumeNext later grants its remainingDaysAtPause. Both backends. PayPal in P5's world, Stripe
-// in P3's, Lemon Squeezy, Server Boosting and Discord in P1's world beside a manual grant of a higher tier, the Dummy in
+// in P3's, Server Boosting and Discord in P1's world beside a manual grant of a higher tier, the Dummy in
 // P1's world with the real Dummy provider.
 
 vi.mock('../../src/bot/internalSetup/utils/payment/paymentRegistry', async orig => (await import('../helpers/p1Mocks')).bareRegistry(await orig<any>()));
@@ -13,7 +12,6 @@ vi.mock('../../src/bot/internalSetup/utils/premiumNotifications', async () => (a
 
 import { getPremiumManager } from '../../src/bot/internalSetup/utils/premiumManager';
 import { getPaymentRegistry } from '../../src/bot/internalSetup/utils/payment/paymentRegistry';
-import { LemonSqueezyProvider } from '../../src/bot/internalSetup/utils/payment/lemonsqueezyProvider';
 import { ServerBoostingProvider } from '../../src/bot/internalSetup/utils/payment/boostProvider';
 import { DiscordProvider } from '../../src/bot/internalSetup/utils/payment/discordProvider';
 import { EXTRA_PLANS, heldPayPal, IDS, p5World, planId, TIERS, type Delivered } from '../helpers/p5World';
@@ -204,7 +202,7 @@ describe.each(BACKENDS)('P5 claim 13 on %s: Stripe', (_name, backend) => {
   });
 });
 
-describe.each(BACKENDS)('P5 claim 13 on %s: Lemon Squeezy, Server Boosting and Discord', (_name, backend) => {
+describe.each(BACKENDS)('P5 claim 13 on %s: Server Boosting and Discord', (_name, backend) => {
   const w = p1World(backend);
   const G = SERVERS[0];
   const HOLDER = `guild:${G}`;
@@ -233,28 +231,6 @@ describe.each(BACKENDS)('P5 claim 13 on %s: Lemon Squeezy, Server Boosting and D
     expect((await w.revoke(G)).ok).toBe(true);
     expect(w.recordOf(G)?.active ?? null).toBeNull();
   }
-
-  it("Lemon Squeezy's subscription_cancelled for a queued entry (its webhook) removes it", async () => {
-    const secret = 'ls_p5';
-    vi.stubEnv('LEMONSQUEEZY_API_KEY', 'key_p5');
-    vi.stubEnv('LEMONSQUEEZY_STORE_ID', '12345');
-    vi.stubEnv('LEMONSQUEEZY_WEBHOOK_SECRET', secret);
-    const provider = new LemonSqueezyProvider();
-    getPaymentRegistry().register(provider);
-    const webhook = async (eventName: string, status: string) => {
-      const body = JSON.stringify({
-        meta: { event_name: eventName, custom_data: { guildId: G, tierId: 'low', offeringId: 'o-low', variantId: '5', userId: BUYER } },
-        data: { id: '7701', attributes: { status, variant_id: 5, renews_at: new Date(Date.now() + 30 * DAY).toISOString(), ends_at: null } },
-      });
-      await provider.handleWebhook(Buffer.from(body), crypto.createHmac('sha256', secret).update(body).digest('hex'), {});
-      await w.settle();
-    };
-    await webhook('subscription_created', 'active');
-    const queued = queuedOf('lemonsqueezy');
-    expect(queued).toMatchObject({ status: 'paused', providerSubId: '7701' });
-    await webhook('subscription_cancelled', 'cancelled');
-    await removed('lemonsqueezy', queued.id);
-  });
 
   it("Server Boosting's tick for a queued entry whose owner stopped boosting removes it", async () => {
     vi.stubEnv('BOOST_TARGET_GUILD_ID', '60000000000000001');

@@ -14,7 +14,6 @@ import { getPaymentRegistry } from '../../src/bot/internalSetup/utils/payment/pa
 import { PayPalProvider } from '../../src/bot/internalSetup/utils/payment/paypalProvider';
 import { DiscordProvider } from '../../src/bot/internalSetup/utils/payment/discordProvider';
 import { DummyProvider } from '../../src/bot/internalSetup/utils/payment/dummyProvider';
-import { LemonSqueezyProvider } from '../../src/bot/internalSetup/utils/payment/lemonsqueezyProvider';
 import { PatreonProvider } from '../../src/bot/internalSetup/utils/payment/patreonProvider';
 import { ServerBoostingProvider } from '../../src/bot/internalSetup/utils/payment/boostProvider';
 import { StripeProvider } from '../../src/bot/internalSetup/utils/payment/stripeProvider';
@@ -192,7 +191,7 @@ describe.each(MODES)('P5 claim 11: PayPal\'s answers to %s', (_name, op) => {
   });
 });
 
-const PANEL_PROVIDERS = [StripeProvider, LemonSqueezyProvider, DummyProvider, DiscordProvider, PatreonProvider, ServerBoostingProvider];
+const PANEL_PROVIDERS = [StripeProvider, DummyProvider, DiscordProvider, PatreonProvider, ServerBoostingProvider];
 const listed = (): any[] => [...PANEL_PROVIDERS.map(P => new (P as any)()), getPaymentRegistry().get('paypal')!]
   .map(p => ({ id: p.id, displayName: p.displayName, capabilities: p.capabilities }));
 
@@ -240,7 +239,7 @@ const TODAY_TITLE = 'Stop auto-renewing. You keep access until the current perio
 
 describe('P5 claim 11: the panel', () => {
   it.each([
-    ['stripe', true, true], ['lemonsqueezy', true, true], ['dummy', true, false], ['paypal', false, false],
+    ['stripe', true, true], ['dummy', true, false], ['paypal', false, false],
     ['discord', false, false], ['patreon', false, false], ['boost', false, false],
   ])('%s: Reactivate %s, "Manage at provider" %s; Cancel and "Cancel & remove now" shown', async (providerId, reactivate, portal) => {
     const off = await showPanel(paidCard(providerId, false));
