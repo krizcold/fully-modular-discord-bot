@@ -189,7 +189,7 @@ describe('the provider-link unlink stops only on a step that did not save (D1, O
     expect(held.cancels).toEqual(['p1', 'p2']);
   });
 
-  it('a step whose save is refused stops the unlink with the link kept, and the answer is not ok', async () => {
+  it('P7 U5, link first: a step whose save is refused stops the unlink after the link is gone, and the answer is not ok', async () => {
     writePremium(
       { [gh(G)]: { paused: [paused('s1', 'p1', 'high')] } },
       { providerAccountLinks: { patreon: { acct1: linkOf(G) } } },
@@ -201,8 +201,12 @@ describe('the provider-link unlink stops only on a step that did not save (D1, O
     held.open('p1');
     const reply: any = await answer;
     expect(reply.ok).toBe(false);
-    expect(getPremiumManager().getFullConfig().providerAccountLinks.patreon).toEqual({ acct1: linkOf(G) });
+    expect(getPremiumManager().getFullConfig().providerAccountLinks.patreon).toBeUndefined();
     (getPremiumManager() as any).stopped = null;
+    await settleQueue();
+    const stored = jsonOf(PREMIUM);
+    expect(stored.providerAccountLinks.patreon).toBeUndefined();
+    expect(stored.subscriptions[gh(G)].paused.map((p: any) => p.id)).toEqual(['s1']);
   });
 });
 

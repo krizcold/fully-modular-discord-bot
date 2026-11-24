@@ -1995,11 +1995,14 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       const providers = registry.listAll().map(p => {
         const activation = activated[p.id];
         const fields = p.getCredentialFields ? p.getCredentialFields() : [];
+        const linkBase = (p as { linkBaseUrl?: () => string | null }).linkBaseUrl;
         return {
           id: p.id,
           displayName: p.displayName,
           isConfigured: p.isConfigured(),
           capabilities: p.capabilities,
+          /** The address a member's link starts on (WEBUI_BASE_URL), for a provider whose members link on this site. */
+          ...(typeof linkBase === 'function' ? { linkBaseUrl: linkBase.call(p) } : {}),
           activated: !!activation,
           defaultEnabled: activation ? !!activation.defaultEnabled : false,
           /** True when the provider declares any credential fields - drives

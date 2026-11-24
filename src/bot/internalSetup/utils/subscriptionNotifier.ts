@@ -52,8 +52,10 @@ export interface NotificationPayload {
   details?: string;
   /** The subscription was sold as one payment (a queued PayPal pay-once entry). */
   payOnce?: boolean;
-  /** The provider keeps billing the queued subscription (a Discord one). */
+  /** The provider keeps billing the queued subscription (`billedWhileQueued`). */
   billedWhileQueued?: boolean;
+  /** That provider's `queuedBilledText`, the notice's second sentence. */
+  queuedBilledText?: string;
 }
 
 export type NotifyOutcome =
@@ -182,7 +184,7 @@ export class SubscriptionNotifier {
         return `**Subscription active:** **${tier}**${provider} is now active for ${kind === 'user' ? 'you' : 'your server'}.${ends}`;
       case 'paid.sub.paused-by-stacking':
         if (p.billedWhileQueued) {
-          return `**Subscription paused:** Your **${tier}**${provider} subscription is queued behind a higher-tier plan. The bot cannot pause it in Discord; if you no longer want it, cancel it in Discord.`;
+          return `**Subscription paused:** Your **${tier}**${provider} subscription is queued behind a higher-tier plan.${p.queuedBilledText ? ` ${p.queuedBilledText}` : ''}`;
         }
         return p.payOnce
           ? `**Subscription paused:** Your **${tier}**${provider} subscription is queued behind a higher-tier plan. It was sold as one payment; its remaining paid time starts when it resumes.${remaining}`

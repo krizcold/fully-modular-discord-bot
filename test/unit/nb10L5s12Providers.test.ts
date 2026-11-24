@@ -38,16 +38,30 @@ afterEach(() => {
 });
 
 const PATREON_TOKEN = 'https://www.patreon.com/api/oauth2/token';
-const PATREON_IDENTITY = 'https://www.patreon.com/api/oauth2/v2/identity?include=memberships,memberships.currently_entitled_tiers,memberships.campaign&fields[member]=patron_status,currently_entitled_amount_cents';
+const PATREON_IDENTITY = 'https://www.patreon.com/api/oauth2/v2/identity?include=memberships,memberships.campaign&fields[member]=patron_status';
 const REDIRECT = 'https://bot.example/guild/api/subscriptions/patreon/callback';
+const BUYER = '80000000000000001';
 
+/** A state of the start route's shape (sheet P7, 4.2), signed with the secret. */
 function signedState(payload: Record<string, unknown>, secret: string): string {
   const body = Buffer.from(JSON.stringify(payload), 'utf-8');
   const sig = crypto.createHmac('sha256', secret).update(body).digest();
   return `${body.toString('base64url')}.${sig.toString('base64url')}`;
 }
+const linkState = (secret: string) => signedState({ u: BUYER, h: 'guild:123456789012345678', n: 'n0nce', x: Date.now() + 60_000 }, secret);
 
 describe('the Patreon requests', () => {
+  it('the start URL asks Patreon for the identity scope only, with the registered redirect URI', () => {
+    vi.stubEnv('PATREON_CLIENT_ID', 'cid');
+    vi.stubEnv('PATREON_CLIENT_SECRET', 'csec');
+    vi.stubEnv('PATREON_CAMPAIGN_ID', '77');
+    vi.stubEnv('PATREON_CREATOR_ACCESS_TOKEN', 'ctok');
+    vi.stubEnv('WEBUI_BASE_URL', 'https://bot.example');
+    const url = new URL(new PatreonProvider().linkStart(BUYER, 'user:80000000000000001').url);
+    expect(`${url.origin}${url.pathname}`).toBe('https://www.patreon.com/oauth2/authorize');
+    expect(Object.fromEntries([...url.searchParams].filter(([k]) => k !== 'state'))).toEqual({ response_type: 'code', client_id: 'cid', redirect_uri: REDIRECT, scope: 'identity' });
+  });
+
   it('the OAuth callback posts the code exchange, then reads the identity with the token', async () => {
     vi.stubEnv('PATREON_CLIENT_ID', 'cid');
     vi.stubEnv('PATREON_CLIENT_SECRET', 'csec');
@@ -56,13 +70,12 @@ describe('the Patreon requests', () => {
     stubFetch(url => url === PATREON_TOKEN
       ? json({ access_token: 'tok' })
       : json({
-        data: { id: 'u1' },
-        included: [{ type: 'member', attributes: { patron_status: 'active_patron' }, relationships: { campaign: { data: { id: '77' } }, currently_entitled_tiers: { data: [{ id: '5' }] } } }],
+        data: { id: 'u1', type: 'user', relationships: { memberships: { data: [{ type: 'member', id: 'm-1' }] } } },
+        included: [{ type: 'member', id: 'm-1', attributes: { patron_status: 'active_patron' }, relationships: { campaign: { data: { type: 'campaign', id: '77' } } } }],
       }));
     const provider = new PatreonProvider();
-    const state = signedState({ guildId: '123456789012345678', tierId: 'gold', offeringId: 'o1', variantId: 'tier:5' }, 'csec');
-    const result = await provider.handleOAuthCallback({ code: 'c0de', state });
-    expect(result).toMatchObject({ externalAccountId: 'u1', holder: 'guild:123456789012345678', tierId: 'gold', variantId: 'tier:5' });
+    const result = await provider.handleOAuthCallback({ code: 'c0de', state: linkState('csec') }, BUYER);
+    expect(result).toEqual({ patreonUserId: 'u1', memberId: 'm-1', holder: 'guild:123456789012345678', membership: 'found' });
     expect(calls.map(c => c.url)).toEqual([PATREON_TOKEN, PATREON_IDENTITY]);
     const [token, identity] = calls;
     expect(token.init.method).toBe('POST');
@@ -79,8 +92,7 @@ describe('the Patreon requests', () => {
     vi.stubEnv('PATREON_CLIENT_ID', 'cid');
     vi.stubEnv('WEBUI_BASE_URL', 'https://bot.example');
     stubFetch(() => json({ error: 'invalid_client' }, 401));
-    const state = signedState({ guildId: '123456789012345678', tierId: 'gold', variantId: 'tier:5' }, '');
-    await expect(new PatreonProvider().handleOAuthCallback({ code: 'c0de', state })).rejects.toThrow('Patreon token exchange failed: 401');
+    await expect(new PatreonProvider().handleOAuthCallback({ code: 'c0de', state: linkState('') }, BUYER)).rejects.toThrow('Patreon token exchange failed: 401');
     expect(calls).toHaveLength(1);
     expect(new URLSearchParams(String(calls[0].init.body)).get('client_secret')).toBe('');
   });

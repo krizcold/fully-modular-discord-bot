@@ -237,17 +237,25 @@ const dateOf = (iso: string): string => new Date(iso).toLocaleDateString();
 const ENDS_TEXT = 'Cancel your paid subscription? PayPal stops billing it now. You keep access until the current period ends; it cannot be restarted, so to continue after that you buy again.';
 const TODAY_TEXT = 'Cancel your paid subscription? You keep access until the current period ends and can reactivate any time before then.';
 const TODAY_TITLE = 'Stop auto-renewing. You keep access until the current period ends.';
-const DISCORD_PD16 = "The bot no longer follows server subscriptions from Discord, so this record ends only when it is removed here or at an end date it already holds. Removing it does not stop Discord's billing; remove it once Discord no longer bills it.";
+const PATREON_PT9 = 'Patreon manages this pledge. The member ends it on patreon.com or unlinks their Patreon account here; the tier ends when Patreon no longer shows it as paid. Refunds are made on Patreon.';
+const DISCORD_PD16 ="The bot no longer follows server subscriptions from Discord, so this record ends only when it is removed here or at an end date it already holds. Removing it does not stop Discord's billing; remove it once Discord no longer bills it.";
 
 describe('P5 claim 11: the panel', () => {
   it.each([
-    ['stripe', true, true], ['dummy', true, false], ['paypal', false, false],
-    ['patreon', false, false], ['boost', false, false],
+    ['stripe', true, true], ['dummy', true, false], ['paypal', false, false], ['boost', false, false],
   ])('%s: Reactivate %s, "Manage at provider" %s; Cancel and "Cancel & remove now" shown', async (providerId, reactivate, portal) => {
     const off = await showPanel(paidCard(providerId, false));
     const on = await showPanel(paidCard(providerId, true));
     expect([off.has('Reactivate'), off.has('Manage at provider'), off.labels.includes('Cancel & remove now')]).toEqual([reactivate, portal, true]);
     expect([on.labels.includes('Cancel'), on.has('Manage at provider'), on.labels.includes('Cancel & remove now')]).toEqual([true, portal, true]);
+  });
+
+  it('patreon (sheet P7, 4.7): a followed Patreon card shows PT9 and only "Unlink Patreon", renewing or not', async () => {
+    for (const autoRenew of [false, true]) {
+      const shown = await showPanel({ ...paidCard('patreon', autoRenew), followed: true });
+      expect(shown.text).toContain(PATREON_PT9);
+      expect(shown.labels.filter(l => /^(Cancel|Reactivate|Manage at provider|Unlink Patreon)/.test(l))).toEqual(['Unlink Patreon']);
+    }
   });
 
   it('discord (sheet P6 claim 9): a guild: Discord card shows PD16 and only "Cancel & remove now", renewing or not', async () => {

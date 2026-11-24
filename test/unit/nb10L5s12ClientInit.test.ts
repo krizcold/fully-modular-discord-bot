@@ -9,6 +9,8 @@ const ctl = vi.hoisted(() => ({
   steps: [] as Array<() => Promise<void>>,
   close: (async () => undefined) as (reason: string) => Promise<void>,
   reported: [] as string[],
+  client: null as unknown,
+  patreonClients: [] as unknown[],
 }));
 
 vi.mock('dotenv/config', () => ({}));
@@ -35,7 +37,12 @@ vi.mock('../../src/bot/internalSetup/utils/ipcToggleHandler', () => ({ setupTogg
 vi.mock('../../src/bot/internalSetup/utils/ipcNotificationHandler', () => ({ setupIPCNotificationHandler: () => undefined }));
 vi.mock('../../src/bot/internalSetup/utils/subscriptionNotifier', () => ({ getSubscriptionNotifier: () => ({ setClient: () => undefined }) }));
 vi.mock('../../src/bot/internalSetup/utils/payment/paymentRegistry', () => ({
-  getPaymentRegistry: () => ({ listAll: () => [], get: () => undefined, on: () => undefined, off: () => undefined }),
+  getPaymentRegistry: () => ({
+    listAll: () => [],
+    get: (id: string) => (id === 'patreon' ? { setClient: (client: unknown) => { ctl.patreonClients.push(client); } } : undefined),
+    on: () => undefined,
+    off: () => undefined,
+  }),
 }));
 vi.mock('../../src/bot/internalSetup/utils/premiumManager', async orig => ({
   ...(await orig<any>()),
@@ -46,7 +53,10 @@ vi.mock('../../src/bot/internalSetup/utils/moduleAutoUpdater', () => ({ startMod
 vi.mock('../../src/bot/internalSetup/fleet/shardBoot', () => ({ bootShards: async () => ({ startIngest: () => undefined }), getShardClaims: () => null }));
 vi.mock('../../src/bot/internalSetup/ingest/ingestService', () => ({
   getIngestService: () => ({
-    buildClient: () => ({ once: () => undefined, on: () => undefined, user: null }),
+    buildClient: () => {
+      ctl.client = { once: () => undefined, on: () => undefined, user: null };
+      return ctl.client;
+    },
     close: (reason: string) => { ctl.order.push(`close ${reason}`); return ctl.close(reason); },
   }),
 }));
@@ -129,5 +139,13 @@ describe('the bot stop step', () => {
     } finally {
       warns.mockRestore();
     }
+  });
+});
+
+describe('the Patreon provider gets the client', () => {
+  it("main() hands the bot's client to the Patreon provider, which asks Discord with it who owns a server (sheet P7, 4.3; fails on a build without that wiring)", async () => {
+    await stopStep();
+    expect(ctl.patreonClients).toHaveLength(1);
+    expect(ctl.patreonClients[0]).toBe(ctl.client);
   });
 });

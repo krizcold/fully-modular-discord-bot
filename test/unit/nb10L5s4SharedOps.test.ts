@@ -159,31 +159,38 @@ describe('payment.oauthCallback', () => {
     expect(await applySharedOp({ op: 'payment.oauthCallback' })).toEqual({ ok: false, code: 'invalid', error: 'patreon is not configured on this bot.' });
   });
 
+  // The op of sheet P7, 4.2 step 3, with a faked OAuth provider: it proves the account, the owner check passes, and the
+  // member read answers can't confirm.
   const registerOAuth = (guildId: string) => getPaymentRegistry().register({
     id: 'oauthy', displayName: 'OAuthy', capabilities: { sells: ['guild'] }, isConfigured: () => true,
-    handleOAuthCallback: async () => ({ externalAccountId: 'ext1', holder: `guild:${guildId}`, buyerId: LINK_BUYER, tierId: 'low', offeringId: 'o1', variantId: 'v1', state: state() }),
+    handleOAuthCallback: async () => ({ patreonUserId: 'ext1', memberId: 'm1', holder: `guild:${guildId}`, membership: 'found' }),
+    checkOwner: async () => ({ kind: 'owner', name: 'Server' }),
+    readAfterLink: async () => ({ kind: 'failed', reason: 'not read', recheck: false }),
   } as any);
 
-  it('an account already linked to the same guild is linked again and announced', async () => {
+  it('an account the same Discord user linked to the same server is not linked again, and the op raises no event of its own', async () => {
     writePremium({}, { providerAccountLinks: { oauthy: { ext1: linkOf('70000000000000001') } } });
     registerOAuth('70000000000000001');
     const events: any[] = [];
     getPaymentRegistry().on('provider.event', (e: any) => events.push(e));
-    const reply = await applySharedOp({ op: 'payment.oauthCallback', args: { providerId: 'oauthy', query: {} } });
-    expect(reply).toEqual({ ok: true, result: { linked: 'guild:70000000000000001' } });
-    expect(events.map(e => [e.type, e.holder, e.providerSubId])).toEqual([['subscription.created', 'guild:70000000000000001', 'oauthy:ext1:70000000000000001']]);
+    const before = rawOf(PREMIUM);
+    const reply = await applySharedOp({ op: 'payment.oauthCallback', args: { providerId: 'oauthy', query: {}, userId: LINK_BUYER } });
+    expect(reply).toMatchObject({ ok: true, result: { linked: 'guild:70000000000000001', where: 'the server Server', pledge: 'failed', reason: 'not read' } });
+    expect(events).toEqual([]);
+    await settleQueue();
+    expect(rawOf(PREMIUM)).toBe(before);
   });
 
-  it('an account linked to another guild answers linkedElsewhere and keeps the stored link', async () => {
-    writePremium({}, { providerAccountLinks: { oauthy: { ext1: linkOf('70000000000000002') } } });
+  it('an account another Discord user linked answers the linked-elsewhere refusal and keeps the stored link', async () => {
+    writePremium({}, { providerAccountLinks: { oauthy: { ext1: linkOf('70000000000000002', '80000000000000002') } } });
     registerOAuth('70000000000000001');
     const events: any[] = [];
     getPaymentRegistry().on('provider.event', (e: any) => events.push(e));
-    const reply = await applySharedOp({ op: 'payment.oauthCallback', args: { providerId: 'oauthy', query: {} } });
-    expect(reply).toEqual({ ok: true, result: { linkedElsewhere: 'guild:70000000000000002' } });
+    const reply = await applySharedOp({ op: 'payment.oauthCallback', args: { providerId: 'oauthy', query: {}, userId: LINK_BUYER } });
+    expect(reply).toEqual({ ok: true, result: { refused: 'linked-elsewhere' } });
     expect(events).toEqual([]);
     await settleQueue();
-    expect(jsonOf(PREMIUM).providerAccountLinks).toEqual({ oauthy: { ext1: linkOf('70000000000000002') } });
+    expect(jsonOf(PREMIUM).providerAccountLinks).toEqual({ oauthy: { ext1: linkOf('70000000000000002', '80000000000000002') } });
   });
 });
 

@@ -163,8 +163,9 @@ export function eachSeller(names: Array<'p1seller' | 'dummy'>, body: (make: () =
 
 export const LINKER = 'p1link';
 /**
- * A provider that links an account, as Patreon does: its callback answers what the query names (`account`, `guild`
- * and `buyer`; `holder`, when given, is answered as the holder in place of the server).
+ * A provider that links an account, as Patreon does after sheet P7 (4.2): its callback answers the account the query
+ * names (`account`; `holder`, when given, in place of `guild:<guild>`) and no member, the owner check passes, and
+ * `install` emits the record a read of the account would install, bought by the buyer it names.
  */
 export function linkProvider() {
   const calls: string[] = [];
@@ -175,17 +176,21 @@ export function linkProvider() {
     isConfigured: () => true,
     initiatePurchase: async () => ({ oauthUrl: 'https://link.example/' }),
     handleOAuthCallback: async (query: Record<string, string>) => ({
-      externalAccountId: query.account,
+      patreonUserId: query.account,
+      memberId: null,
       holder: query.holder ?? `guild:${query.guild}`,
-      ...(query.buyer === undefined ? {} : { buyerId: query.buyer }),
-      tierId: 'low',
-      offeringId: 'o-low',
-      variantId: SELLER_VARIANT,
-      state: { status: 'active', startDate: new Date().toISOString(), endDate: null, autoRenew: true },
+      membership: 'none',
     }),
+    checkOwner: async (_userId: string, guildId: string) => ({ kind: 'owner', name: guildId }),
+    readAfterLink: async () => ({ kind: 'failed', reason: 'no member', recheck: false }),
     cancelSubscription: async (providerSubId: string, immediately?: boolean) => { calls.push(`cancel ${providerSubId} ${immediately}`); },
   };
-  return { provider, calls };
+  const install = (account: string, guild: string, buyerId: string): void => getPaymentRegistry().emitEvent({
+    type: 'subscription.created', providerId: LINKER, providerSubId: `${LINKER}:${account}:${guild}`, holder: `guild:${guild}`, buyerId,
+    tierId: 'low', offeringId: 'o-low', variantId: SELLER_VARIANT,
+    state: { status: 'active', startDate: new Date().toISOString(), endDate: null, autoRenew: true },
+  } as any);
+  return { provider, calls, install };
 }
 /** What an event carries to name its holder. */
 const eventOwner = (record: SellerRecord): { holder: TestHolder } => ({ holder: record.holder });

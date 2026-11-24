@@ -3,9 +3,22 @@
 
 const { useState: useSubState, useEffect: useSubEffect } = React;
 
+const PROVIDER_MANAGED_TEXT = {
+  patreon: 'Patreon manages this pledge. The member ends it on patreon.com or unlinks their Patreon account here; the tier ends when Patreon no longer shows it as paid. Refunds are made on Patreon.',
+};
+const NOT_FOLLOWED_TEXT = {
+  patreon: {
+    'old-record': "The bot does not follow this Patreon record (it was made by an earlier version or under another campaign), so it never ends it. Removing it does not change the member's pledge on Patreon.",
+    'not-configured': "Patreon is not configured on this bot, so it does not follow this record. Removing it does not change the member's pledge on Patreon.",
+    unread: "payment-providers/credentials.json cannot be read now, so the bot can't confirm whether Patreon bills this subscription, and it does not end or remove it. Try again once it can be read.",
+  },
+};
+const PATREON_SIGN_IN_TEXT = 'If you are asked to sign in with Discord first, open this link again afterwards.';
+
 function GuildSubscriptionPanel({ guild, subData, onRefresh }) {
   const [processing, setProcessing] = useSubState(false);
   const [error, setError] = useSubState(null);
+  const [notice, setNotice] = useSubState(null);
   const [subscribeModalTierId, setSubscribeModalTierId] = useSubState(null);
   // Orphans: provider-side subs the local cache doesn't track. Reloaded
   // on mount, on guild change, and after every mutation that could
@@ -269,6 +282,10 @@ function GuildSubscriptionPanel({ guild, subData, onRefresh }) {
   const pausedPaid = pausedAll;
   const paidCaps = paid ? capabilitiesOf(paid.providerId) : null;
   const paidMeta = paid?.providerMeta || {};
+  const paidManaged = providerManaged(paid);
+  const paidUnfollowed = unfollowed(paid);
+  // One Unlink Patreon per panel: on the active card when it is Patreon's, else on the first queued Patreon card.
+  const patreonQueued = paid?.providerId === 'patreon' ? null : pausedPaid.find(ps => ps.source === 'paid' && ps.providerId === 'patreon') || null;
 
   // ── Helpers ──
   function getTierName(tierId) { return tiers[tierId]?.displayName || tierId; }
@@ -285,6 +302,20 @@ function GuildSubscriptionPanel({ guild, subData, onRefresh }) {
     return `This removes it from the bot only: the bot does not have the payment provider '${providerId}', so the billing there does not stop. Cancel it at that provider as well.`;
   }
   const DISCORD_SERVER_TEXT = "The bot no longer follows server subscriptions from Discord, so this record ends only when it is removed here or at an end date it already holds. Removing it does not stop Discord's billing; remove it once Discord no longer bills it.";
+  /** A paid record its provider follows and ends on its own: no button here ends or removes it. */
+  function providerManaged(sub) {
+    return !!sub && sub.source === 'paid' && sub.followed === true && !!capabilitiesOf(sub.providerId)?.endedByProviderOnly;
+  }
+  /**
+   * A paid record its provider does not follow (Discord's server cards keep their own text): the card's text, and
+   * whether it can be removed (not while the provider's settings cannot be read).
+   */
+  function unfollowed(sub) {
+    if (!sub || sub.source !== 'paid' || sub.followed !== false || sub.providerId === 'discord') return null;
+    const unread = sub.whyNot === 'unread';
+    const text = (unread && capabilitiesOf(sub.providerId)?.settingsUnreadText) || NOT_FOLLOWED_TEXT[sub.providerId]?.[sub.whyNot] || null;
+    return text ? { text, removable: !unread } : null;
+  }
   function cancelText(providerId) {
     return capabilitiesOf(providerId)?.endsAtPaidEnd
       ? `Cancel your paid subscription? ${getProviderName(providerId)} stops billing it now. You keep access until the current period ends; it cannot be restarted, so to continue after that you buy again.`
@@ -399,7 +430,7 @@ function GuildSubscriptionPanel({ guild, subData, onRefresh }) {
     const remainingMsg = paid && paid.endDate
       ? ` You'll lose any remaining time on it.`
       : '';
-    if (!confirm(paid?.providerId === 'discord' ? DISCORD_SERVER_TEXT :
+    if (!confirm(paid?.providerId === 'discord' ? DISCORD_SERVER_TEXT : paidUnfollowed ? paidUnfollowed.text :
       `Cancel '${tierName}' immediately?${remainingMsg} ` +
       `If you have a queued subscription it will resume in this slot. ` +
       `This cannot be undone.` +
@@ -420,11 +451,13 @@ function GuildSubscriptionPanel({ guild, subData, onRefresh }) {
       'This stops the Patreon-backed tier here. Your Patreon pledge itself stays untouched on patreon.com; ' +
       'unlinking just frees the account so you can link it to a different Discord server.'
     )) return;
-    setProcessing(true); setError(null);
+    setProcessing(true); setError(null); setNotice(null);
     try {
       const res = await guildApi.unlinkProvider(guild.id, 'patreon');
-      if (res.success) await onRefresh();
-      else setError(res.error || 'Failed to unlink Patreon');
+      if (res.success) {
+        setNotice(res.message || null);
+        await onRefresh();
+      } else setError(res.error || 'Failed to unlink Patreon');
     } catch (err) { setError(err.message); }
     finally { setProcessing(false); }
   }
@@ -498,14 +531,17 @@ function GuildSubscriptionPanel({ guild, subData, onRefresh }) {
     }
     const tierName = getTierName(ps.tierId);
     const isPaid = ps.source === 'paid';
+    const notFollowed = unfollowed(ps);
     if (!confirm(
       isPaid && ps.providerId === 'discord'
         ? DISCORD_SERVER_TEXT
-        : isPaid && providerGone(ps.providerId)
-          ? `Cancel your queued '${tierName}' subscription? It will not resume when your current plan ends. ${goneConfirm(ps.providerId)}`
-          : isPaid
-            ? `Cancel your queued '${tierName}' subscription? It will not resume when your current plan ends, and the provider will stop billing for it.`
-            : `Cancel your queued '${tierName}' grant? It will not resume when your current plan ends.`,
+        : notFollowed
+          ? notFollowed.text
+          : isPaid && providerGone(ps.providerId)
+            ? `Cancel your queued '${tierName}' subscription? It will not resume when your current plan ends. ${goneConfirm(ps.providerId)}`
+            : isPaid
+              ? `Cancel your queued '${tierName}' subscription? It will not resume when your current plan ends, and the provider will stop billing for it.`
+              : `Cancel your queued '${tierName}' grant? It will not resume when your current plan ends.`,
     )) return;
     setProcessing(true); setError(null);
     try {
@@ -689,6 +725,12 @@ function GuildSubscriptionPanel({ guild, subData, onRefresh }) {
           color: '#ed4245', padding: '10px 14px', borderRadius: '6px', marginBottom: '16px',
         }}>{error}</div>
       )}
+      {notice && (
+        <div style={{
+          background: 'rgba(59, 165, 93, 0.12)', border: '1px solid rgba(59, 165, 93, 0.5)',
+          color: '#3ba55d', padding: '10px 14px', borderRadius: '6px', marginBottom: '16px',
+        }}>{notice}</div>
+      )}
 
       {/* Current status. Wrapped in RefetchOverlay so any in-flight
           mutation (cancel, reactivate, adopt, etc.) dims the previous
@@ -761,8 +803,14 @@ function GuildSubscriptionPanel({ guild, subData, onRefresh }) {
                 {paid.providerId === 'discord' && (
                   <div style={{ color: '#e67e22', fontSize: '0.78rem', marginTop: '4px' }}>{DISCORD_SERVER_TEXT}</div>
                 )}
+                {paidManaged && PROVIDER_MANAGED_TEXT[paid.providerId] && (
+                  <div style={{ color: '#aaa', fontSize: '0.78rem', marginTop: '4px' }}>{PROVIDER_MANAGED_TEXT[paid.providerId]}</div>
+                )}
+                {paidUnfollowed && (
+                  <div style={{ color: '#e67e22', fontSize: '0.78rem', marginTop: '4px' }}>{paidUnfollowed.text}</div>
+                )}
                 <div style={{ display: 'flex', gap: '6px', marginTop: '10px', flexWrap: 'wrap' }}>
-                  {providerGone(paid.providerId) || paid.providerId === 'discord' ? null : paid.autoRenew === true ? (
+                  {providerGone(paid.providerId) || paid.providerId === 'discord' || paidManaged || paidUnfollowed ? null : paid.autoRenew === true ? (
                     <button onClick={handleCancel} disabled={processing} style={{
                       background: 'transparent', color: '#ed4245', border: '1px solid #ed4245',
                       padding: '5px 12px', borderRadius: '5px', cursor: 'pointer', fontSize: '0.78rem',
@@ -778,6 +826,7 @@ function GuildSubscriptionPanel({ guild, subData, onRefresh }) {
                       ...disabledButtonStyle(processing),
                     }}>{processing ? 'Reactivating…' : 'Reactivate'}</button>
                   ) : null}
+                  {!paidManaged && (!paidUnfollowed || paidUnfollowed.removable) && (
                   <button onClick={handleCancelImmediately} disabled={processing} style={{
                     background: '#ed4245', color: '#fff', border: 'none',
                     padding: '5px 12px', borderRadius: '5px',
@@ -787,7 +836,8 @@ function GuildSubscriptionPanel({ guild, subData, onRefresh }) {
                   title="End this subscription right now and free the slot. Loses remaining time. If you have a queued sub, it resumes here.">
                     {processing ? 'Cancelling…' : 'Cancel & remove now'}
                   </button>
-                  {!providerGone(paid.providerId) && paid.providerId !== 'discord' && (!paidCaps || paidCaps.supportsCustomerPortal) && (
+                  )}
+                  {!providerGone(paid.providerId) && paid.providerId !== 'discord' && !paidUnfollowed && (!paidCaps || paidCaps.supportsCustomerPortal) && (
                   <button onClick={handleOpenBillingPortal} disabled={processing} style={{
                     background: 'transparent', color: '#aaa', border: '1px solid #555',
                     padding: '5px 12px', borderRadius: '5px',
@@ -820,6 +870,8 @@ function GuildSubscriptionPanel({ guild, subData, onRefresh }) {
                   ? '1 day remaining (resumes after current plan ends)'
                   : `${remaining} days remaining (resumes after current plan ends)`;
               const isPaid = ps.source === 'paid';
+              const managed = providerManaged(ps);
+              const notFollowed = unfollowed(ps);
               return (
                 <div key={ps.id || `${ps.tierId}:${idx}`} style={{
                   ...cardStyle,
@@ -841,7 +893,14 @@ function GuildSubscriptionPanel({ guild, subData, onRefresh }) {
                   {isPaid && ps.providerId === 'discord' && (
                     <div style={{ color: '#e67e22', fontSize: '0.78rem', marginTop: '4px' }}>{DISCORD_SERVER_TEXT}</div>
                   )}
+                  {managed && PROVIDER_MANAGED_TEXT[ps.providerId] && (
+                    <div style={{ color: '#aaa', fontSize: '0.78rem', marginTop: '4px' }}>{PROVIDER_MANAGED_TEXT[ps.providerId]}</div>
+                  )}
+                  {notFollowed && (
+                    <div style={{ color: '#e67e22', fontSize: '0.78rem', marginTop: '4px' }}>{notFollowed.text}</div>
+                  )}
                   <div style={{ display: 'flex', gap: '6px', marginTop: '10px' }}>
+                    {!managed && (!notFollowed || notFollowed.removable) && (
                     <button onClick={() => handleCancelPaused(ps)} disabled={processing} style={{
                       background: 'transparent', color: '#ed4245', border: '1px solid #ed4245',
                       padding: '5px 12px', borderRadius: '5px',
@@ -851,6 +910,18 @@ function GuildSubscriptionPanel({ guild, subData, onRefresh }) {
                     title="Stop this queued entry so it won't resume when your active plan ends.">
                       {processing ? 'Cancelling…' : 'Cancel & remove'}
                     </button>
+                    )}
+                    {ps === patreonQueued && (
+                    <button onClick={handleUnlinkPatreon} disabled={processing} style={{
+                      background: 'transparent', color: '#aaa', border: '1px solid #555',
+                      padding: '5px 12px', borderRadius: '5px',
+                      cursor: 'pointer', fontSize: '0.78rem',
+                      ...disabledButtonStyle(processing),
+                    }}
+                    title="Free your Patreon account from this server so you can link it to a different one. Your pledge on patreon.com is unaffected.">
+                      {processing ? 'Unlinking…' : 'Unlink Patreon'}
+                    </button>
+                    )}
                   </div>
                 </div>
               );
@@ -1339,6 +1410,28 @@ function SubscribeModal({ guildId, tierId, tier, providers, willBePaused, active
                 const provider = providers.find(p => p.id === link.providerId);
                 const variants = (link.cache?.variants || []).filter(v => v.active);
                 if (!provider || variants.length === 0) return null;
+                if (provider.id === 'patreon') {
+                  return (
+                    <div key={provider.id} style={{
+                      background: '#36393f', borderRadius: '10px', padding: '12px 14px',
+                      border: '1px solid #444',
+                    }}>
+                      <div style={{ color: '#fff', fontSize: '0.92rem', fontWeight: 600 }}>{provider.displayName}</div>
+                      <div style={{ color: '#aaa', fontSize: '0.78rem', marginTop: '2px' }}>
+                        Pledge to {variants.map(v => variantDisplayLabel(link, v)).join(' or ')} on Patreon, then link your Patreon account to this server. Only the server's owner can link it.
+                      </div>
+                      <button onClick={() => { window.location.href = guildApi.patreonStartUrl(guildId); }}
+                        style={{
+                          marginTop: '10px', background: '#40444b',
+                          color: '#fff', border: 'none', padding: '7px 14px', borderRadius: '6px',
+                          cursor: 'pointer', fontWeight: 600, fontSize: '0.85rem',
+                        }}>
+                        Link Patreon
+                      </button>
+                      <div style={{ color: '#888', fontSize: '0.75rem', marginTop: '6px' }}>{PATREON_SIGN_IN_TEXT}</div>
+                    </div>
+                  );
+                }
                 const useHostedPicker = link.mode === 'product'
                   && !!link.productConfig?.useProviderHostedPicker
                   && provider.capabilities?.supportsHostedPicker;

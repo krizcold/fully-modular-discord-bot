@@ -307,14 +307,24 @@ const guildApi = {
     return await response.json();
   },
 
-  /** Clear an external-account provider link (e.g. Patreon) and revoke any
-   * subs backed by it. Used to free a Patreon account so it can be linked
-   * to a different server. */
+  /** Removes the signed-in member's own provider link (Patreon) that backs this server, then the records it gave there;
+   * the answer's `message` says what ended, and a member who did not make the link is refused (403). */
   async unlinkProvider(guildId, providerId) {
     const response = await guildFetch(
       `${GUILD_API_BASE}/subscriptions/${guildId}/provider-links/${encodeURIComponent(providerId)}`,
       { method: 'DELETE' },
     );
+    return await response.json();
+  },
+
+  /** The address that starts a Patreon link for the signed-in member; `forWhat` is 'me' (their own VIP) or a server id. */
+  patreonStartUrl(forWhat) {
+    return `${GUILD_API_BASE}/subscriptions/patreon/start?for=${encodeURIComponent(forWhat)}`;
+  },
+
+  /** Unlinks the signed-in member's own Patreon account, whatever it backs; the answer's `message` says what ended. */
+  async patreonUnlink() {
+    const response = await guildFetch(`${GUILD_API_BASE}/subscriptions/patreon/link`, { method: 'DELETE' });
     return await response.json();
   },
 };

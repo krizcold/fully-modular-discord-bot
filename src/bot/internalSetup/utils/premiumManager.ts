@@ -1014,6 +1014,12 @@ function billedWhileQueued(sub: Subscription): boolean {
   return sub.source === 'paid' && !!sub.providerId && getPaymentRegistry().get(sub.providerId)?.capabilities.billedWhileQueued === true;
 }
 
+/** The queue notice's fields for a sub its provider bills while queued: the flag and that provider's sentence. */
+function billedQueueNotice(sub: Subscription): Pick<NotificationPayload, 'billedWhileQueued' | 'queuedBilledText'> {
+  const text = sub.providerId ? getPaymentRegistry().get(sub.providerId)?.capabilities.queuedBilledText : undefined;
+  return { billedWhileQueued: true, ...(text ? { queuedBilledText: text } : {}) };
+}
+
 const eventHolder = (event: { holder?: unknown }): HolderKey | null => parseHolder(event.holder)?.key ?? null;
 
 const listedBuyer = (ref: ProviderSubscriptionRef): string | undefined => (isDiscordId(ref.metadata.buyerId) ? ref.metadata.buyerId : undefined);
@@ -1516,10 +1522,9 @@ export class PremiumManager {
       if (found.length !== 1) {
         const name = this.providerDisplayName(event.providerId);
         const why = found.length === 0
-          ? `no ${kindWord(this.kindOf(holder))} tier has an offering that sells SKU '${event.variantId}' through ${name}`
-          : `SKU '${event.variantId}' is sold by more than one offering (${found.map(f => `${f.tier.displayName}/${f.offering.label}`).join(', ')})`;
-        const next = found.length === 0 ? 'Wire the SKU to one offering' : 'Wire it to one offering';
-        if (!opts.carry) console.warn(`[PremiumManager] subscription.created from ${name} (subscription ${event.providerSubId}, ${holderWords(holder)}) was not installed: ${why}. ${next}; the bot tries again at its next check.`);
+          ? `no ${kindWord(this.kindOf(holder))} tier has an offering that sells '${event.variantId}' through ${name}`
+          : `'${event.variantId}' is sold by more than one offering (${found.map(f => `${f.tier.displayName}/${f.offering.label}`).join(', ')})`;
+        if (!opts.carry) console.warn(`[PremiumManager] subscription.created from ${name} (subscription ${event.providerSubId}, ${holderWords(holder)}) was not installed: ${why}. Wire it to one offering; the bot tries again at its next check.`);
         return { skipped: 'tier', why };
       }
       event = { ...event, tierId: found[0].tierId, offeringId: found[0].offering.id };
@@ -1552,8 +1557,9 @@ export class PremiumManager {
     const sellingLink = walkedLink ?? offering.providerLinks.find(l => l.providerId === event.providerId);
     if (!notInstalled && event.soldVariantOnly && !linkSells(sellingLink, event.variantId)) {
       const name = this.providerDisplayName(event.providerId);
+      const own = seller?.capabilities.variantNotSoldText;
       const next = endedByProvider
-        ? `The member cancels it in ${name}; the bot tries again at its next check.`
+        ? own ? `${own} The bot tries again at its next check.` : `The member cancels it in ${name}; the bot tries again at its next check.`
         : `If ${name} keeps billing it, cancel it there; refund it at ${name} if it was paid.`;
       if (!opts.carry) console.warn(`[PremiumManager] subscription.created from ${name} (subscription ${event.providerSubId}, ${holderWords(holder)}) was not installed: offering '${offering.label}' does not sell variant '${event.variantId}' through ${name}. ${next}`);
       return { skipped: 'variant', why: `offering '${offering.label}' does not sell variant '${event.variantId}'` };
@@ -1574,11 +1580,13 @@ export class PremiumManager {
       if (held) {
         const name = this.providerDisplayName(event.providerId);
         const heldName = this.config.tiers[held.tierId]?.displayName || held.tierId;
+        const own = seller?.capabilities.variantNotSoldText;
+        const lead = held.source === 'paid' && held.providerId === event.providerId
+          ? `If it replaces that subscription, it is installed once ${name} ends the old one`
+          : `The bot tries again at each check, so it is installed once '${heldName}' ends`;
         const next = !endedByProvider
           ? `If ${name} keeps billing it, cancel it there; refund it at ${name} if it was paid.`
-          : held.source === 'paid' && held.providerId === event.providerId
-            ? `If it replaces that subscription, it is installed once ${name} ends the old one; otherwise the member cancels it in ${name}.`
-            : `The bot tries again at each check, so it is installed once '${heldName}' ends; otherwise the member cancels it in ${name}.`;
+          : own ? `${lead}. ${own}` : `${lead}; otherwise the member cancels it in ${name}.`;
         if (!opts.carry) console.warn(`[PremiumManager] subscription.created from ${name} (subscription ${event.providerSubId}, ${holderWords(holder)}) was not installed: ${holderWords(holder)} already holds '${heldName}' at that priority. ${next}`);
         return { skipped: 'priority', why: `${holderWords(holder)} already holds '${heldName}' at that priority` };
       }
@@ -3464,7 +3472,7 @@ export class PremiumManager {
       void this.notify(holder, 'paid.sub.paused-by-stacking', {
         tierName: opts.started.tierName,
         providerName: opts.started.providerName,
-        billedWhileQueued: true,
+        ...billedQueueNotice(paused),
       }, { carry });
     }
     const op = this.save({ carry });
@@ -3580,7 +3588,7 @@ export class PremiumManager {
         providerName: this.providerDisplayName(paused.providerId),
         remainingDays: paused.remainingDaysAtPause ?? null,
         ...(paused.providerMeta?.payOnce === true ? { payOnce: true } : {}),
-        ...(billedWhileQueued(paused) ? { billedWhileQueued: true } : {}),
+        ...(billedWhileQueued(paused) ? billedQueueNotice(paused) : {}),
       }, { carry });
     }
     const op = this.save({ carry });
@@ -4159,20 +4167,23 @@ export class PremiumManager {
   }
 
   /**
-   * An admin's End now or queued remove of a `user:` record whose provider ends it (`endedByProviderOnly`) and follows
-   * it is refused before any change: the record would come back at the provider's next check (sheet P6, 4.5, PD11).
-   * While the provider's settings cannot be read, whether it follows the record is not known, and it is refused too.
+   * An admin's End now or queued remove of a record whose provider ends it (`endedByProviderOnly`) and follows it is
+   * refused before any change, with the provider's `endedByProviderText`: the record would come back at the provider's
+   * next check (sheet P6, 4.5; sheet P7, 4.7). While the provider's settings cannot be read, whether it follows the
+   * record is not known, and it is refused too.
    */
   private refuseProviderEnded(holder: HolderKey, sub: Subscription | undefined): void {
-    if (!sub || sub.source !== 'paid' || !sub.providerId || parseHolder(holder)?.kind !== 'user') return;
+    if (!sub || sub.source !== 'paid' || !sub.providerId) return;
     const provider = getPaymentRegistry().get(sub.providerId);
-    if (provider?.capabilities.endedByProviderOnly !== true) return;
+    if (!provider || provider.capabilities.endedByProviderOnly !== true) return;
     const follow = this.followAnswer(holder, sub);
     if (!follow.followed && follow.whyNot === 'unread') {
-      throw new BeforeProviderCall("payment-providers/credentials.json cannot be read now, so the bot can't confirm whether Discord bills this subscription, and it does not end or remove it. Try again once it can be read.");
+      throw new BeforeProviderCall(provider.capabilities.settingsUnreadText
+        ?? `payment-providers/credentials.json cannot be read now, so the bot can't confirm whether ${provider.displayName} bills this subscription, and it does not end or remove it. Try again once it can be read.`);
     }
     if (!follow.followed) return;
-    throw new BeforeProviderCall("Discord manages this subscription, so the bot cannot end or remove it. It ends when the member's subscription ends in Discord or Discord refunds it.");
+    throw new BeforeProviderCall(provider.capabilities.endedByProviderText
+      ?? `${provider.displayName} manages this subscription, so the bot cannot end or remove it.`);
   }
 
   /** Whether the record's provider follows it; a provider without `followsSubscription` follows every record (E13). */
@@ -4925,35 +4936,62 @@ export class PremiumManager {
   }
 
   /**
-   * Cancels the paid subscriptions a provider backs on this guild (paused first, then the active one) and then clears
-   * the guild's link for that provider, as one change. False when the guild has no link for it. A step that did not
-   * save stops it with the link kept, so the same request can finish the change; the op's verdict answers the failure.
-   * The subscriptions are read again before each step, since other changes may move or remove them meanwhile.
+   * Moves a link to another holder in one save (sheet P7, 4.3). False, with nothing changed, when no link of that
+   * account exists, its stored buyer is not `buyerId`, or premium refuses the save.
    */
-  unlinkProviderAccount(holder: HolderKey, providerId: string): Promise<boolean> {
-    return this.work.run(CHANGE_WORK, () => this.unlinkProviderRun(holder, providerId));
+  setAccountHolder(providerId: string, externalAccountId: string, buyerId: string, holder: HolderKey): boolean {
+    this.holderArg(holder);
+    if (this.refusedAtEntry()) return false;
+    const link = this.config.providerAccountLinks[providerId]?.[externalAccountId];
+    if (!link || link.buyerId !== buyerId) return false;
+    if (link.holder === holder) return true;
+    const was = link.holder;
+    link.holder = holder;
+    if (this.save() !== null) return true;
+    link.holder = was;
+    return false;
   }
 
-  private async unlinkProviderRun(holder: HolderKey, providerId: string): Promise<boolean> {
+  /**
+   * Removes a holder's link for a provider, then ends the paid subscriptions it backed there (paused first, then the
+   * active one), as one change (sheet P7, 4.7 and decision 4: link first). With `buyerId` the link is the one naming
+   * this holder and that buyer, and only the records whose `meta.patreonUserId` is that link's account end; without
+   * it, the first link naming the holder, and every paid record of the provider there. False when no such link
+   * exists. A refused link save changes nothing; a step that did not save stops the change, and the op's verdict
+   * answers the failure. The subscriptions are read again before each step, since other changes may move or remove
+   * them meanwhile. `ended`, when given, counts the records this run ended.
+   */
+  unlinkProviderAccount(holder: HolderKey, providerId: string, buyerId?: string, ended?: { count: number }): Promise<boolean> {
+    return this.work.run(CHANGE_WORK, () => this.unlinkProviderRun(holder, providerId, buyerId, ended));
+  }
+
+  private async unlinkProviderRun(holder: HolderKey, providerId: string, buyerId?: string, ended?: { count: number }): Promise<boolean> {
     this.holderArg(holder);
     if (this.refusedAtEntry()) return false;
     const links = this.config.providerAccountLinks[providerId] || {};
-    const externalAccountId = Object.entries(links).find(([, link]) => link.holder === holder)?.[0];
-    if (!externalAccountId) return false;
+    const found = Object.entries(links).find(([, link]) => link.holder === holder && (buyerId === undefined || link.buyerId === buyerId));
+    if (!found) return false;
+    const [externalAccountId, link] = found;
+    delete links[externalAccountId];
+    if (Object.keys(links).length === 0) delete this.config.providerAccountLinks[providerId];
+    if (this.save() === null) {
+      (this.config.providerAccountLinks[providerId] ??= {})[externalAccountId] = link;
+      return true;
+    }
+    const backed = (s: Subscription): boolean => s.source === 'paid' && s.providerId === providerId
+      && (buyerId === undefined || String(s.providerMeta?.patreonUserId) === externalAccountId);
     const tried = new Set<string>();
     for (;;) {
       const subs = this.config.subscriptions[holder];
       const next = [...(subs?.paused || []), ...(subs?.active ? [subs.active] : [])]
-        .find(s => s.source === 'paid' && s.providerId === providerId && s.id && !tried.has(s.id));
+        .find(s => backed(s) && s.id && !tried.has(s.id));
       if (!next) break;
       tried.add(next.id);
       const step = subs!.active?.id === next.id
         ? await this.cancelActiveImmediately(holder)
         : await this.cancelPausedStep(holder, next.id);
       if (step === 'not saved') return true;
-    }
-    if (this.config.providerAccountLinks[providerId]?.[externalAccountId]?.holder === holder) {
-      this.unlinkAccount(providerId, externalAccountId);
+      if (step === 'done' && ended) ended.count += 1;
     }
     return true;
   }

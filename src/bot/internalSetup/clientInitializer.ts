@@ -918,6 +918,11 @@ export async function runBot(opts: RunBotOptions): Promise<void> {
     if (boost && (boost as any).setClient) {
       (boost as any).setClient(client);
     }
+    // The Patreon link asks Discord through this client who owns the server a member picks.
+    const patreon = registry.get('patreon');
+    if (patreon && (patreon as any).setClient) {
+      (patreon as any).setClient(client);
+    }
   } catch (err) {
     console.warn('[clientInitializer] Failed to attach payment provider gateway bridges:', err);
   }

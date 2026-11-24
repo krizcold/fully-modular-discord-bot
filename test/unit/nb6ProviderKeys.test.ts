@@ -151,19 +151,21 @@ describe('the built-in providers read their keys through providerCredentials', (
     expect(calls[0].init.headers.Authorization === `Basic ${basic}`).toBe(true);
   });
 
-  it('Patreon: configured from the doc with WEBUI_BASE_URL from /data/.env; the OAuth link names the doc\'s client id', async () => {
+  it('Patreon: configured from the doc\'s keys with WEBUI_BASE_URL from /data/.env, and not without the creator token; a variant lookup uses the doc\'s campaign and creator token', async () => {
     writeEnv({ WEBUI_BASE_URL: 'https://bot.example', PATREON_CLIENT_ID: 'pc_env_made_up' });
     saveDoc({ patreon: { PATREON_CLIENT_ID: 'pc_doc_made_up', PATREON_CLIENT_SECRET: 'pcs_doc_made_up', PATREON_CAMPAIGN_ID: '77' } });
+    expect(new PatreonProvider().isConfigured()).toBe(false);
+    saveDoc({ patreon: { PATREON_CLIENT_ID: 'pc_doc_made_up', PATREON_CLIENT_SECRET: 'pcs_doc_made_up', PATREON_CAMPAIGN_ID: '77', PATREON_CREATOR_ACCESS_TOKEN: 'pct_doc_made_up' } });
     const patreon = new PatreonProvider();
     expect(patreon.isConfigured()).toBe(true);
-    const answer = await patreon.initiatePurchase({ holder: 'guild:70000000000000001', buyerId: '80000000000000001', tierId: 't1', offeringId: 'o1', variantId: 'tier:5' } as any);
-    const url = new URL(answer.oauthUrl!);
-    expect(url.searchParams.get('client_id') === 'pc_doc_made_up').toBe(true);
-    expect(url.searchParams.get('redirect_uri')).toBe('https://bot.example/guild/api/subscriptions/patreon/callback');
+    stubFetch(() => ({ included: [{ type: 'tier', id: '5', attributes: { title: 'Gold', amount_cents: 500, published: true } }] }));
+    expect(await patreon.fetchVariant('tier:5')).toMatchObject({ variantId: 'tier:5', label: 'Gold' });
+    expect(calls[0].url).toBe('https://www.patreon.com/api/oauth2/v2/campaigns/77?include=tiers&fields[tier]=title,amount_cents,published');
+    expect(calls[0].init.headers.Authorization === 'Bearer pct_doc_made_up').toBe(true);
   });
 
   it('Patreon: a key cleared in the doc leaves it not configured', () => {
-    writeEnv({ WEBUI_BASE_URL: 'https://bot.example', PATREON_CLIENT_ID: 'pc_env_made_up', PATREON_CLIENT_SECRET: 'pcs_env_made_up', PATREON_CAMPAIGN_ID: '77' });
+    writeEnv({ WEBUI_BASE_URL: 'https://bot.example', PATREON_CLIENT_ID: 'pc_env_made_up', PATREON_CLIENT_SECRET: 'pcs_env_made_up', PATREON_CAMPAIGN_ID: '77', PATREON_CREATOR_ACCESS_TOKEN: 'pct_env_made_up' });
     expect(new PatreonProvider().isConfigured()).toBe(true);
     saveDoc({ patreon: { PATREON_CLIENT_ID: null } });
     expect(new PatreonProvider().isConfigured()).toBe(false);

@@ -101,20 +101,26 @@ describe('Patreon', () => {
     return `${bytes.toString('base64url')}.${crypto.createHmac('sha256', secret).update(bytes).digest().toString('base64url')}`;
   };
 
-  it("the link's state is signed with the doc's client secret", async () => {
-    const result = await new PatreonProvider().initiatePurchase({ holder: 'guild:70000000000000001', buyerId: '80000000000000001', tierId: 't1', offeringId: 'o1', variantId: 'tier:5' } as any);
-    const params = new URL(result.oauthUrl!).searchParams;
-    expect(params.get('client_id')).toBe('cid-doc');
-    const state = params.get('state')!;
-    const [body, sig] = state.split('.');
-    const expected = crypto.createHmac('sha256', 'csec-doc').update(Buffer.from(body, 'base64url')).digest().toString('base64url');
-    expect(sig).toBe(expected);
+  it("a delivery is checked against the doc's webhook secret, not the env's", async () => {
+    vi.stubEnv('PATREON_WEBHOOK_SECRET', 'whsec-env');
+    doc!.patreon.PATREON_WEBHOOK_SECRET = 'whsec-doc';
+    stubFetch(() => json({}));
+    const body = Buffer.from('{"data":{"type":"post","id":"1"}}');
+    const md5 = (secret: string) => crypto.createHmac('md5', secret).update(body).digest('hex');
+    await expect(new PatreonProvider().handleWebhook(body, '', { 'x-patreon-signature': md5('whsec-env') })).rejects.toThrow("The Patreon delivery's signature does not match the saved webhook secret; nothing was applied.");
+    await new PatreonProvider().handleWebhook(body, '', { 'x-patreon-signature': md5('whsec-doc') });
+    expect(calls).toEqual([]);
   });
 
-  it("a callback whose state the doc's secret signed passes to the code exchange, sent with the doc's client", async () => {
+  it("the start URL names the doc's client and its state is signed with the doc's secret; a callback whose state the doc's secret signed passes to the code exchange, sent with the doc's client", async () => {
+    const buyer = '80000000000000001';
+    const start = new URL(new PatreonProvider().linkStart(buyer, 'user:80000000000000001').url);
+    expect(start.searchParams.get('client_id')).toBe('cid-doc');
+    const [json64, sig64] = String(start.searchParams.get('state')).split('.');
+    expect(crypto.createHmac('sha256', 'csec-doc').update(Buffer.from(json64, 'base64url')).digest().toString('base64url')).toBe(sig64);
     stubFetch(() => json({ error: 'invalid_client' }, 401));
-    const state = signed({ guildId: '123456789012345678', tierId: 'gold', variantId: 'tier:5' }, 'csec-doc');
-    await expect(new PatreonProvider().handleOAuthCallback({ code: 'c0de', state })).rejects.toThrow('Patreon token exchange failed: 401');
+    const state = signed({ u: buyer, h: 'guild:123456789012345678', n: 'n0nce', x: Date.now() + 60_000 }, 'csec-doc');
+    await expect(new PatreonProvider().handleOAuthCallback({ code: 'c0de', state }, buyer)).rejects.toThrow('Patreon token exchange failed: 401');
     expect(calls).toHaveLength(1);
     const sent = new URLSearchParams(String(calls[0].init.body));
     expect(sent.get('client_id')).toBe('cid-doc');

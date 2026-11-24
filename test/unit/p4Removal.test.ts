@@ -383,12 +383,17 @@ describe('stored Lemon Squeezy data on the JSON files', () => {
     pm.stopExpiryChecker();
   });
 
-  it('13: the guild view answers the subscription as stored and lists the registered providers apart', async () => {
+  it('13: the guild view answers the subscription as stored, each paid one marked followed or not (sheet P7, C4), and lists the registered providers apart', async () => {
     await lemonActiveStripeQueued(w);
     getPaymentRegistry().register(new ServerBoostingProvider());
     const reply = await w.callRoute(createGuildSubscriptionRoutes(w.botManager), 'get', '/:guildId', { params: { guildId: G }, user: { id: A } });
     expect(reply.status).toBe(200);
-    expect(reply.body.subscriptions).toEqual(subsOf(w, G));
+    const answered = reply.body.subscriptions;
+    const paid = [answered.active, ...answered.paused].filter((s: any) => s?.source === 'paid');
+    expect(paid.length).toBeGreaterThan(0);
+    for (const s of paid) expect(typeof s.followed).toBe('boolean');
+    const unmark = (s: any) => { if (!s) return s; const { followed: _f, whyNot: _w, ...rest } = s; return rest; };
+    expect({ ...answered, active: unmark(answered.active), paused: answered.paused.map(unmark) }).toEqual(subsOf(w, G));
     const listed = reply.body.providers.map((p: any) => p.id);
     expect(listed).not.toContain('lemonsqueezy');
     expect(listed).not.toContain('boost');

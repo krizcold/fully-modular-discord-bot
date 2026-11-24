@@ -65,49 +65,51 @@ describe('Patreon', () => {
       included: [{ type: 'member', attributes: { patron_status: 'active_patron' }, relationships: { campaign: { data: { id: '77' } }, currently_entitled_tiers: { data: [{ id: '5' }] } } }],
     }));
 
-  it('sells servers only', () => {
-    expect(new PatreonProvider().capabilities.sells).toEqual(['guild']);
+  it('sells servers and users (sheet P7, 4.1)', () => {
+    expect(new PatreonProvider().capabilities.sells).toEqual(['guild', 'user']);
   });
 
-  it("a server purchase signs today's state plus the buyer", async () => {
-    env();
-    const answer = await new PatreonProvider().initiatePurchase({ ...purchase, variantId: 'tier:5' });
-    const state = new URL(answer.oauthUrl!).searchParams.get('state')!;
-    expect(state).toBe(sign({ guildId: G, userId: B, tierId: 't1', offeringId: 'o1', variantId: 'tier:5' }));
-  });
-
-  it('a purchase for a user throws X3 without a request', async () => {
+  it('a purchase for a server or a user throws PT2 without a request (the pledge is made on Patreon)', async () => {
     env();
     const calls = stubFetch(() => ({}));
-    await expect(new PatreonProvider().initiatePurchase({ ...userPurchase, variantId: 'tier:5' })).rejects.toThrow(doesNotSellText('Patreon', 'user'));
+    const pt2 = 'Patreon pledges are made on Patreon. The member links their Patreon account on this site, and the tier their pledge pays for follows.';
+    await expect(new PatreonProvider().initiatePurchase({ ...purchase, variantId: 'tier:5' })).rejects.toThrow(pt2);
+    await expect(new PatreonProvider().initiatePurchase({ ...userPurchase, variantId: 'tier:5' })).rejects.toThrow(pt2);
     expect(calls).toEqual([]);
   });
 
-  it('the callback answers the holder and the buyer its state held', async () => {
+  it("the callback answers the Patreon user /identity proves, its member of the configured campaign and the holder the state names, never a tier (sheet P7, 4.2 and 4.4)", async () => {
     env();
-    patron();
-    const result = await new PatreonProvider().handleOAuthCallback({
-      code: 'c0de', state: sign({ guildId: G, userId: B, tierId: 't1', offeringId: 'o1', variantId: 'tier:5' }),
-    });
-    expect(result).toMatchObject({ externalAccountId: 'p1', holder: `guild:${G}`, buyerId: B, tierId: 't1', offeringId: 'o1', variantId: 'tier:5' });
-    expect(result).not.toHaveProperty('guildId');
+    vi.stubEnv('PATREON_CREATOR_ACCESS_TOKEN', 'ctok');
+    const calls = stubFetch(url => (url.includes('/token')
+      ? { access_token: 'tok' }
+      : {
+        data: { id: 'p1', type: 'user', relationships: { memberships: { data: [{ type: 'member', id: 'm-1' }] } } },
+        included: [{ type: 'member', id: 'm-1', attributes: { patron_status: 'active_patron' }, relationships: { campaign: { data: { type: 'campaign', id: '77' } } } }],
+      }));
+    const provider = new PatreonProvider();
+    const { url } = provider.linkStart(B, `guild:${G}`);
+    const state = String(new URL(url).searchParams.get('state'));
+    const result = await provider.handleOAuthCallback({ code: 'c0de', state }, B);
+    expect(result).toEqual({ patreonUserId: 'p1', memberId: 'm-1', holder: `guild:${G}`, membership: 'found' });
+    expect(calls).toHaveLength(2);
   });
 
-  it('a state that names no buyer answers no buyer', async () => {
+  it('a state signed for another Discord user, a state of the old shape, or one past its expiry is refused before any request', async () => {
     env();
-    patron();
-    const result = await new PatreonProvider().handleOAuthCallback({
-      code: 'c0de', state: sign({ guildId: G, tierId: 't1', offeringId: 'o1', variantId: 'tier:5' }),
-    });
-    expect(result.holder).toBe(`guild:${G}`);
-    expect(result.buyerId).toBe('');
-  });
-
-  it("a user's list is empty without a request", async () => {
-    env();
-    const calls = stubFetch(() => ({}));
-    expect(await new PatreonProvider().listSubscriptionsFor(`user:${U}`)).toEqual([]);
+    vi.stubEnv('PATREON_CREATOR_ACCESS_TOKEN', 'ctok');
+    const calls = patron();
+    const provider = new PatreonProvider();
+    const state = String(new URL(provider.linkStart(B, `guild:${G}`).url).searchParams.get('state'));
+    await expect(provider.handleOAuthCallback({ code: 'c0de', state }, U)).rejects.toThrow('started by another Discord account');
+    await expect(provider.handleOAuthCallback({ code: 'c0de', state: sign({ guildId: G, userId: B, tierId: 't1', offeringId: 'o1', variantId: 'tier:5' }) }, B)).rejects.toThrow('Invalid state parameter');
+    const late = sign({ u: B, h: `guild:${G}`, n: 'n0nce', x: Date.now() - 1 });
+    await expect(provider.handleOAuthCallback({ code: 'c0de', state: late }, B)).rejects.toThrow('expired');
     expect(calls).toEqual([]);
+  });
+
+  it('has no listSubscriptionsFor: rounds read the campaign instead (sheet P7, claim 1)', () => {
+    expect('listSubscriptionsFor' in new PatreonProvider()).toBe(false);
   });
 });
 

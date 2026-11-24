@@ -168,16 +168,31 @@ export interface ProviderCapabilities {
   /** Premium's end is what was paid; premium frees the slot at the end. */
   endsAtPaidEnd?: boolean;
   /**
-   * Only the provider ends or removes a user's subscription it follows: premium refuses an admin's end or removal of
-   * one, and its install refusals tell the operator that the member cancels at the provider.
+   * Only the provider ends or removes a subscription it follows: premium refuses an admin's end or removal of one,
+   * and its install refusals tell the operator that the member cancels at the provider.
    */
   endedByProviderOnly?: boolean;
+  /** (When `endedByProviderOnly`) The admin's error when premium refuses to end or remove a followed subscription. */
+  endedByProviderText?: string;
+  /** (When `endedByProviderOnly`) The admin's error while the provider's settings cannot be read, so whether it follows the subscription is not known. */
+  settingsUnreadText?: string;
+  /**
+   * (When `endedByProviderOnly`) The log's last sentence when an install is refused because the offering does not sell
+   * the variant or a tier is held at its priority: how the member ends it at the provider. Without it the line names
+   * the provider's displayName.
+   */
+  variantNotSoldText?: string;
   /** The provider keeps billing a subscription premium queues, and the provider's end is the queued record's end. */
   billedWhileQueued?: boolean;
+  /** (When `billedWhileQueued`) The queue notice's second sentence: what the member does about the billing. */
+  queuedBilledText?: string;
 }
 
-/** Why a provider's checks do not follow a record premium holds; 'unread': its settings cannot be read, so it is not known. */
-export type NotFollowedReason = 'guild' | 'other-app' | 'not-configured' | 'unread';
+/**
+ * Why a provider's checks do not follow a record premium holds; 'old-record': an earlier version or another campaign
+ * made it; 'unread': its settings cannot be read, so it is not known.
+ */
+export type NotFollowedReason = 'guild' | 'other-app' | 'old-record' | 'not-configured' | 'unread';
 
 /** Whether a provider's checks follow a record premium holds, and why not when they do not. */
 export type FollowAnswer = { followed: true } | { followed: false; whyNot: NotFollowedReason };
@@ -546,16 +561,15 @@ export interface PaymentProvider {
   webhookEventId?(rawBody: Buffer, headers: Record<string, string>): string | null;
   /** Polling-driven providers (Patreon, Server Boosting) implement this. */
   scheduledReconcile?(providerSubId: string): Promise<ProviderSubscriptionState | null>;
-  /** OAuth-linked providers (Patreon) implement this. */
-  handleOAuthCallback?(query: Record<string, string>): Promise<{
-    externalAccountId: string;
+  /**
+   * OAuth-linked providers (Patreon) implement this: the callback's query checked for the signed-in Discord user
+   * `userId`, within the deadline; it answers the account the provider proved and the holder the link names.
+   */
+  handleOAuthCallback?(query: Record<string, string>, userId: string, opts?: { deadline?: number }): Promise<{
+    patreonUserId: string;
+    memberId: string | null;
     holder: HolderKey;
-    /** The Discord user who linked the account. */
-    buyerId: string;
-    tierId: string;
-    offeringId: string;
-    variantId: string;
-    state: ProviderSubscriptionState;
+    membership: 'found' | 'none' | 'other-campaign' | 'unreadable';
   }>;
 
   /** Called when the provider is registered. Providers with their own scheduled work kick it off here. */

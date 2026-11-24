@@ -2987,8 +2987,31 @@ function dummySoldTiers(tierMap) {
   return out;
 }
 
-function DummyTestPurchase({ activated, showSuccess }) {
+const PROVIDER_MANAGED_TEXTS = {
+  discord: 'Discord manages this subscription. The member cancels it in Discord; the tier ends when Discord reports that it ended or was refunded. The bot learns of a cancel only when Discord shows an end date, so a cancelled subscription can show as renewing until its end.',
+  patreon: 'Patreon manages this pledge. The member ends it on patreon.com or unlinks their Patreon account here; the tier ends when Patreon no longer shows it as paid. Refunds are made on Patreon.',
+};
+const NOT_FOLLOWED_TEXTS = {
+  discord: {
+    unread: "payment-providers/credentials.json cannot be read now, so the bot can't confirm whether Discord bills this subscription, and it does not end or remove it. Try again once it can be read.",
+    'not-configured': "Discord is not configured on this bot, so it does not follow this subscription. Removing it does not stop Discord's billing.",
+    'other-app': "This subscription carries another Discord application id than the one configured, so the bot does not follow it. If the configured id is wrong, fix it instead. Removing it does not stop that application's billing.",
+  },
+  patreon: {
+    unread: "payment-providers/credentials.json cannot be read now, so the bot can't confirm whether Patreon bills this subscription, and it does not end or remove it. Try again once it can be read.",
+    'not-configured': "Patreon is not configured on this bot, so it does not follow this record. Removing it does not change the member's pledge on Patreon.",
+    'old-record': "The bot does not follow this Patreon record (it was made by an earlier version or under another campaign), so it never ends it. Removing it does not change the member's pledge on Patreon.",
+  },
+};
+
+/** Whether a tier list (the dev tiers route's) has a tier with an enabled Patreon link. */
+function sellsThroughPatreon(tiers) {
+  return Object.values(tiers || {}).some(tier => (tier.offerings || []).some(o => (o.providerLinks || []).some(l => l && l.enabled && l.providerId === 'patreon')));
+}
+
+function DummyTestPurchase({ activated, showSuccess, providers }) {
   const [tierLists, setTierLists] = useState({ guild: [], user: [] });
+  const [patreonUserTier, setPatreonUserTier] = useState(false);
   const [kind, setKind] = useState('guild');
   const [holderId, setHolderId] = useState('');
   const [buyerId, setBuyerId] = useState('');
@@ -3004,8 +3027,10 @@ function DummyTestPurchase({ activated, showSuccess }) {
     (async () => {
       try {
         const res = await api.get('/appstore/premium/tiers');
-        if (res.success) setTierLists({ guild: dummySoldTiers(res.tiers), user: dummySoldTiers(res.userTiers) });
-        else setFailure(res.error || 'Could not load the tiers');
+        if (res.success) {
+          setTierLists({ guild: dummySoldTiers(res.tiers), user: dummySoldTiers(res.userTiers) });
+          setPatreonUserTier(sellsThroughPatreon(res.userTiers));
+        } else setFailure(res.error || 'Could not load the tiers');
       } catch (err) { setFailure(err.message); }
     })();
   }, [activated]);
@@ -3064,16 +3089,16 @@ function DummyTestPurchase({ activated, showSuccess }) {
   const subs = lookup ? lookup.subscriptions : null;
   const active = subs && subs.active && subs.active.source === 'paid' ? subs.active : null;
   const removableUnfollowed = sub => sub.followed === false && sub.whyNot !== 'unread';
-  const notFollowedText = sub => (sub.whyNot === 'unread'
-    ? "payment-providers/credentials.json cannot be read now, so the bot can't confirm whether Discord bills this subscription, and it does not end or remove it. Try again once it can be read."
-    : sub.whyNot === 'not-configured'
-    ? "Discord is not configured on this bot, so it does not follow this subscription. Removing it does not stop Discord's billing."
-    : "This subscription carries another Discord application id than the one configured, so the bot does not follow it. If the configured id is wrong, fix it instead. Removing it does not stop that application's billing.");
-  const discordManagedText = 'Discord manages this subscription. The member cancels it in Discord; the tier ends when Discord reports that it ended or was refunded. The bot learns of a cancel only when Discord shows an end date, so a cancelled subscription can show as renewing until its end.';
+  const providerOf = sub => (providers || []).find(p => p.id === sub.providerId) || null;
+  const patreonBase = (providers || []).find(p => p.id === 'patreon')?.linkBaseUrl || null;
+  const notFollowedText = sub => {
+    const unreadText = sub.whyNot === 'unread' && providerOf(sub) && providerOf(sub).capabilities && providerOf(sub).capabilities.settingsUnreadText;
+    return unreadText || (NOT_FOLLOWED_TEXTS[sub.providerId] || {})[sub.whyNot] || null;
+  };
   const noteStyle = { color: '#999', fontSize: '0.72rem' };
   const cardNote = sub => (sub.source !== 'paid' ? null
     : sub.followed === false ? notFollowedText(sub)
-      : sub.providerId === 'discord' ? discordManagedText : null);
+      : PROVIDER_MANAGED_TEXTS[sub.providerId] || null);
   const activeNote = active ? cardNote(active) : null;
 
   return (
@@ -3119,6 +3144,11 @@ function DummyTestPurchase({ activated, showSuccess }) {
       {kind === 'user' && tiersShown.length === 0 && (
         <p style={{ color: '#999', margin: '8px 0 0 0', fontSize: '0.75rem' }}>
           No personal tier is sold through the Dummy provider yet. Make one with a request to the dev API: a tier with kind "user" and an enabled Dummy link.
+        </p>
+      )}
+      {kind === 'user' && patreonUserTier && patreonBase && (
+        <p style={{ color: '#999', margin: '8px 0 0 0', fontSize: '0.75rem' }}>
+          A member backs their own VIP with Patreon at {`${patreonBase}/guild/api/subscriptions/patreon/start?for=me`}. If you are asked to sign in with Discord first, open this link again afterwards.
         </p>
       )}
       {failure && (
@@ -4390,7 +4420,7 @@ function PremiumTiersView({ tiers, subscriptions, messages, messageDefaults, onR
             </div>
           </div>
 
-          <DummyTestPurchase activated={!!activatedProviders?.dummy} showSuccess={showSuccess} />
+          <DummyTestPurchase activated={!!activatedProviders?.dummy} showSuccess={showSuccess} providers={providers} />
         </div>
       )}
 

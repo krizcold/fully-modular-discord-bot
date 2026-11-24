@@ -11,7 +11,11 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../../src/bot/internalSetup/utils/payment/paymentRegistry', async orig => ({
   ...(await orig<object>()),
-  getPaymentRegistry: () => ({ get: (id: string) => (id === 'patreon' ? { handleOAuthCallback: async () => ({}) } : undefined) }),
+  getPaymentRegistry: () => ({
+    get: (id: string) => (id === 'patreon'
+      ? { handleOAuthCallback: async () => ({}), readLinkState: (s: unknown) => (s === 'S' ? { u: 'u1', h: 'guild:123456789012345678', n: 'n0nce', x: 4_102_444_800_000 } : null) }
+      : undefined),
+  }),
 }));
 
 import { securityHeaders } from '../../src/webui/securityHeaders';
@@ -437,8 +441,15 @@ describe('the built files on a bare app', () => {
 describe('the Patreon callback failure page', () => {
   it('holds no script: no javascript: link, no script tag, no event attribute', async () => {
     const manager = { runSharedOp: async () => ({ ok: false, code: 'invalid', error: 'The code was refused' }) };
-    const page = await served(app => app.use('/guild/api/subscriptions', createGuildSubscriptionRoutes(manager as never)),
-      '/guild/api/subscriptions/patreon/callback?code=abc&state=1');
+    const page = await served(app => {
+      app.use((req: any, _res, next) => {
+        req.user = { id: 'u1' };
+        req.isAuthenticated = () => true;
+        req.session = { patreonLink: { nonce: 'n0nce', holder: 'guild:123456789012345678', expires: 4_102_444_800_000 } };
+        next();
+      });
+      app.use('/guild/api/subscriptions', createGuildSubscriptionRoutes(manager as never));
+    }, '/guild/api/subscriptions/patreon/callback?code=abc&state=S');
     expect(page.status).toBe(400);
     expect(page.type).toMatch(/^text\/html/);
     expect(page.text).toContain('Patreon link failed');

@@ -324,14 +324,14 @@ describe("unlinking a provider account with the guild's subscriptions", () => {
     expect(cancels).toEqual(['psA']);
   });
 
-  it('stops at a step that did not save: answers true, cancels nothing more and keeps the link', async () => {
+  it('P7 U5, link first: stops at a step that did not save: answers true, cancels nothing more, and the link is gone', async () => {
     writePremium({ [gh(G)]: { paused: [paidSub('p1', 'ps1'), paidSub('p2', 'ps2')] } }, { providerAccountLinks: { fake: { acct: linkOf(G) } } });
     onCancel = () => { inject.refuse.add('premium-tiers.json'); };
     expect(await m().unlinkProviderAccount(gh(G), 'fake')).toBe(true);
     expect(cancels).toEqual(['ps1']);
-    expect(m().getAccountLink('fake', 'acct')).toEqual(linkOf(G));
+    expect(m().getAccountLink('fake', 'acct')).toBeUndefined();
     inject.refuse.clear();
-    expect((await stored()).providerAccountLinks).toEqual({ fake: { acct: linkOf(G) } });
+    expect((await stored()).providerAccountLinks).toEqual({});
   });
 
   it('keeps the link when the account was linked to another guild meanwhile', async () => {

@@ -87,7 +87,7 @@ const guildRows: Row[] = [
   ['adopt an orphan', 'POST', `/${G}/orphans/dummy/os1/adopt`, { plan: { kind: 'install' } }, 'premium.adoptOrphan', [gh(G), 'dummy', 'os1', { kind: 'install' }]],
   ['cancel an orphan', 'DELETE', `/${G}/orphans/dummy/os1`, undefined, 'premium.cancelOrphan', ['dummy', 'os1']],
   ['remove a paused subscription', 'DELETE', `/${G}/paused/s1`, undefined, 'premium.cancelAndRemovePausedSubscription', [gh(G), 's1']],
-  ['unlink a provider account', 'DELETE', `/${G}/provider-links/patreon`, undefined, 'premium.unlinkProviderAccount', [gh(G), 'patreon']],
+  ['unlink a provider account', 'DELETE', `/${G}/provider-links/stripe`, undefined, 'premium.unlinkProviderAccount', [gh(G), 'stripe']],
   ['record a migration decision', 'PUT', `/${G}/migrations/m1`, { decision: 'accepted' }, 'premium.recordMigrationDecision', ['m1', gh(G), 'accepted']],
   ['set the notifications channel', 'PUT', `/${G}/notifications-channel`, { channelId: '223456789012345678' }, 'premium.setNotificationsChannelId', [gh(G), '223456789012345678']],
 ];

@@ -56,10 +56,16 @@ afterEach(() => {
 });
 
 describe('the provider fetch sites', () => {
-  it('are 7, and each carries AbortSignal.timeout(PROVIDER_FETCH_MS), which is 30 s', () => {
-    const calls = fetchCalls();
-    expect(calls).toHaveLength(7);
-    for (const { file, call } of calls) expect(call, file).toContain('signal: AbortSignal.timeout(PROVIDER_FETCH_MS)');
+  it("are 8, and each carries AbortSignal.timeout(PROVIDER_FETCH_MS), which is 30 s, except Patreon's budgeted calls (its reads, and the link's code exchange and /identity), whose timeout is the smaller of it and the budget left (sheet P7, 4.2 and 4.6)", () => {
+    // The owner check's client type declares a `fetch(opts: ...)` member, which is no request.
+    const calls = fetchCalls().filter(c => !c.call.startsWith('fetch(opts:'));
+    expect(calls).toHaveLength(8);
+    const budgeted = calls.filter(c => c.file === 'patreonProvider.ts' && (c.call.includes('signal: AbortSignal.timeout(left)') || c.call.includes('signal: AbortSignal.timeout(timeout())')));
+    expect(budgeted).toHaveLength(3);
+    for (const { file, call } of calls.filter(c => !budgeted.includes(c))) expect(call, file).toContain('signal: AbortSignal.timeout(PROVIDER_FETCH_MS)');
+    const pp = readSourceText(PAYMENT_DIR, 'patreonProvider.ts');
+    expect(pp).toContain('const left = ctx.deadline === null ? PROVIDER_FETCH_MS : Math.min(PROVIDER_FETCH_MS, ctx.deadline - Date.now());');
+    expect(pp).toContain('const left = deadline === null ? PROVIDER_FETCH_MS : Math.min(PROVIDER_FETCH_MS, deadline - Date.now());');
     expect(PROVIDER_FETCH_MS).toBe(30_000);
   });
 });

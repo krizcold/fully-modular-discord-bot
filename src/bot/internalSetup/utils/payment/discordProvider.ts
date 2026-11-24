@@ -47,7 +47,10 @@ const CAPABILITIES: ProviderCapabilities = {
   sells: ['user'],
   endsAtPaidEnd: true,
   endedByProviderOnly: true,
+  endedByProviderText: "Discord manages this subscription, so the bot cannot end or remove it. It ends when the member's subscription ends in Discord or Discord refunds it.",
+  settingsUnreadText: "payment-providers/credentials.json cannot be read now, so the bot can't confirm whether Discord bills this subscription, and it does not end or remove it. Try again once it can be read.",
   billedWhileQueued: true,
+  queuedBilledText: 'The bot cannot pause it in Discord; if you no longer want it, cancel it in Discord.',
 };
 
 /** How long an event's time and the end evidence this process gained are kept (sheet P6, 4.3). */

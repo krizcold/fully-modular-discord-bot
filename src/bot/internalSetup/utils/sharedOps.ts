@@ -9,14 +9,16 @@ import { ROOT_CONFIG_PATH } from './configManager';
 import { isInternalGlobalRel } from './configDiscovery';
 import { applyOperatorGlobalRead, shaOfRaw, CHANGED_SINCE_OPEN_TEXT, CHANGED_TEXT, type GlobalDataReadRequest } from './ipcDataHandler';
 import { maintenanceIpcRefusal } from './maintenance';
-import { isMaintenanceBoot, maintenanceText, orderRefusesSharedOps, runAcceptedOp } from './maintenanceGate';
-import { carryWrites, landed, markPaymentLedger, NO_WRITES, runSealed, writesOf, type OpWrites, type WriteLedger } from './dataBackends/writeLedger';
+import { isMaintenanceBoot, isMaintenanceGateClosed, maintenanceText, orderRefusesSharedOps, runAcceptedOp } from './maintenanceGate';
+import { carryWrites, currentLedger, landed, markPaymentLedger, NO_WRITES, runSealed, writesOf, type OpWrites, type WriteLedger } from './dataBackends/writeLedger';
 import { truthText, verdictOf, type TruthAnswer } from './dataBackends/replyGate';
 import { checkWriterLock, deposedText } from './writerLock';
 export { deposedText } from './writerLock';
-import { notHolderText, parseHolder } from './premiumHolder';
+import { notHolderText, parseHolder, type HolderKey } from './premiumHolder';
 import { BeforeProviderCall, getPremiumManager, invalidatePremiumCache, MigrationBusy, settlePremiumInstalls } from './premiumManager';
 import { getPaymentRegistry } from './payment/paymentRegistry';
+import { WorkStop, type LinkRead, type OwnerAnswer } from './payment/patreonProvider';
+import type { PaymentProvider } from './payment/paymentTypes';
 import { invalidateDummyCaches } from './payment/dummyProvider';
 import { refreshShared, sharedBootCause, sharedBootCauseLocal, sharedBootDone } from './sharedMirror';
 import { getDataBootStatus } from './dataBackends/boot';
@@ -28,9 +30,10 @@ export interface SharedOpRequest {
 
 export type SharedOpCode = 'invalid' | 'maintenance' | 'held-elsewhere' | 'changed' | 'changed-since-open' | 'unconfirmed' | 'failed' | 'starting' | 'refused';
 
+/** ended: the records premium.unlinkProviderAccount's run ended, on a call that names a buyer. */
 export type SharedOpReply =
-  | { ok: true; result?: unknown }
-  | { ok: false; code: SharedOpCode; error: string; status?: number; answer?: TruthAnswer; partial?: boolean; result?: unknown; stopping?: boolean; refreshFailed?: boolean };
+  | { ok: true; result?: unknown; ended?: number }
+  | { ok: false; code: SharedOpCode; error: string; status?: number; answer?: TruthAnswer; partial?: boolean; result?: unknown; ended?: number; stopping?: boolean; refreshFailed?: boolean };
 
 export const PROVIDER_SENTENCE = "A payment provider call this change made may already have taken effect; check the provider's dashboard.";
 
@@ -88,6 +91,11 @@ export function globalTarget(req: GlobalDataReadRequest): string | null {
   const globalDir = dataPath('global');
   const absPath = path.join(globalDir, ...rel.split('/'));
   return absPath.startsWith(globalDir + path.sep) ? absPath : null;
+}
+
+/** An op's result with the count of records its run ended, which the reply carries as `ended`. */
+class WithEnded {
+  constructor(readonly result: unknown, readonly ended: number) {}
 }
 
 class OpRefusal extends Error {
@@ -149,39 +157,130 @@ async function paymentBillingPortal(args: { providerId?: unknown; providerSubId?
 /** handleWebhook's own error: the route answers it 400 as today. */
 export class WebhookRejected extends Error {}
 
-async function paymentOAuthCallback(args: { providerId?: unknown; query?: unknown }): Promise<{ linked: string } | { linkedElsewhere: string }> {
+/** The callback op's budget for every call it makes (sheet P7, 4.2 step 3). */
+const LINK_BUDGET_MS = 45_000;
+
+/** The provider calls the callback op makes beyond handleOAuthCallback (PatreonProvider's). */
+interface LinkSteps {
+  checkOwner(userId: string, guildId: string, deadline: number): Promise<OwnerAnswer>;
+  readAfterLink(memberId: string, accountId: string, deadline: number): Promise<LinkRead>;
+}
+
+/** Why the callback op linked nothing, for the callback page (PT16, PT17, PT18a, PT18c, PT18b). */
+type LinkRefusal = 'linked-elsewhere' | 'other-account' | 'not-owner' | 'not-visible' | 'cant-confirm-owner';
+
+export type LinkResult =
+  | { refused: LinkRefusal; reason?: string }
+  | {
+    linked: HolderKey;
+    /** "your own VIP" or "the server <name>". */
+    where: string;
+    /** What the member read showed: no membership, one /identity could not read, only another campaign's, the read, or no read. */
+    pledge: 'none' | 'unreadable' | 'other-campaign' | 'read' | 'deferred' | 'failed';
+    /** THE LAG RULE deferred the read (E6). */
+    deferred?: boolean;
+    reason?: string;
+    recheck: boolean;
+    paid: Array<{ ptier: string; title: string }>;
+    trial: boolean;
+    /** Paid tiers set up for the holder, not installed because no charge gives the install allowance yet. */
+    uncharged: string[];
+    /** The tiers premium holds for the holder from this member afterwards. */
+    held: Array<{ ptier: string; tier: string; status: 'active' | 'queued' }>;
+  };
+
+const linkStopped = (): OpRefusal => new OpRefusal('maintenance', maintenanceText());
+
+/** The ledgers of link ops past their link rules, and whether a save ran: a throw after it answers can't confirm, never a failed link (4.2). */
+const pastLinkSave = new WeakMap<WriteLedger, 'saved' | 'checked'>();
+
+const afterLinkSaveText = (error: unknown, step: 'saved' | 'checked'): string => {
+  const cause = (error instanceof Error ? error.message : String(error)).trim().replace(/\.+$/, '');
+  return step === 'saved'
+    ? `The bot stopped with an error after it saved the link, before premium confirmed the save: ${cause}.`
+    : `The bot stopped with an error after it checked the link, before premium confirmed the result: ${cause}.`;
+};
+
+/**
+ * The Patreon link's op (sheet P7, 4.2 step 3 and 4.3): the provider proves the Patreon account for the signed-in
+ * Discord user `userId`, the holder is checked (a server only by its owner now), then the link rules and the save run
+ * in one turn, then the member is read with what is left of the 45 s budget. Every call checks the gate and the order
+ * first; a stop before the save saves nothing.
+ */
+async function paymentOAuthCallback(args: { providerId?: unknown; query?: unknown; userId?: unknown }): Promise<LinkResult> {
   const providerId = typeof args?.providerId === 'string' ? args.providerId : 'patreon';
-  const provider = getPaymentRegistry().get(providerId);
-  if (!provider || !provider.handleOAuthCallback) throw new OpRefusal('invalid', `${providerId} is not configured on this bot.`);
-  let result;
+  const provider = getPaymentRegistry().get(providerId) as (PaymentProvider & Partial<LinkSteps>) | undefined;
+  if (!provider || !provider.handleOAuthCallback || !provider.checkOwner || !provider.readAfterLink) {
+    throw new OpRefusal('invalid', `${providerId} is not configured on this bot.`);
+  }
+  const userId = args?.userId;
+  if (typeof userId !== 'string' || !userId) throw new OpRefusal('invalid', 'The link names no signed-in Discord account, so nothing was linked.');
+  const deadline = Date.now() + LINK_BUDGET_MS;
+  let proved;
   try {
-    result = await provider.handleOAuthCallback((args.query ?? {}) as Record<string, string>);
+    proved = await provider.handleOAuthCallback((args.query ?? {}) as Record<string, string>, userId, { deadline });
   } catch (error) {
+    if (error instanceof WorkStop && error.cause !== 'budget') throw linkStopped();
     throw new WebhookRejected(error instanceof Error ? error.message : String(error));
   }
-  const parsed = parseHolder(result.holder);
-  if (!parsed) throw new OpRefusal('invalid', notHolderText(result.holder));
-  if (parsed.kind !== 'guild') {
-    throw new OpRefusal('invalid', `${provider.displayName} links accounts to servers only; it answered for user ${parsed.id}, and nothing was linked.`);
+  const parsed = parseHolder(proved.holder);
+  if (!parsed) throw new OpRefusal('invalid', notHolderText(proved.holder));
+  if (parsed.kind === 'user' && parsed.id !== userId) throw new OpRefusal('invalid', 'The link names another Discord account, so nothing was linked.');
+  let where = 'your own VIP';
+  if (parsed.kind === 'guild') {
+    let owner: OwnerAnswer;
+    try {
+      owner = await provider.checkOwner(userId, parsed.id, deadline);
+    } catch (error) {
+      if (error instanceof WorkStop) throw linkStopped();
+      throw error;
+    }
+    if (owner.kind === 'not-owner') return { refused: 'not-owner' };
+    if (owner.kind === 'not-visible') return { refused: 'not-visible' };
+    if (owner.kind === 'cant-confirm') return { refused: 'cant-confirm-owner', reason: owner.reason };
+    where = `the server ${owner.name}`;
   }
+
+  // From here to the save, one turn (D10): two callbacks of one Discord user cannot both pass the rules.
+  if (isMaintenanceGateClosed() || orderRefusesSharedOps()) throw linkStopped();
   const holder = parsed.key;
+  const account = proved.patreonUserId;
   const mgr = getPremiumManager();
-  const existing = mgr.getAccountLink(provider.id, result.externalAccountId);
-  if (existing && existing.holder !== holder) return { linkedElsewhere: existing.holder };
-  // linkAccount throws when the callback named no buyer: nothing is linked and no event is raised.
-  mgr.linkAccount(provider.id, result.externalAccountId, holder, result.buyerId as string);
-  getPaymentRegistry().emitEvent({
-    type: 'subscription.created',
-    providerId: provider.id,
-    providerSubId: `${provider.id}:${result.externalAccountId}:${parsed.id}`,
-    holder,
-    buyerId: existing ? existing.buyerId : result.buyerId,
-    tierId: result.tierId,
-    offeringId: result.offeringId,
-    variantId: result.variantId,
-    state: result.state,
-  });
-  return { linked: holder };
+  const existing = mgr.getAccountLink(provider.id, account);
+  if (existing && existing.buyerId !== userId) return { refused: 'linked-elsewhere' };
+  const links = mgr.getFullConfig().providerAccountLinks?.[provider.id] ?? {};
+  if (Object.entries(links).some(([id, link]) => id !== account && link.buyerId === userId)) return { refused: 'other-account' };
+  let step: 'saved' | 'checked' = 'checked';
+  if (!existing) {
+    if (!mgr.linkAccount(provider.id, account, holder, userId)) throw new OpRefusal('failed', 'Premium did not save the link, so nothing was linked. Try again in a moment.');
+    step = 'saved';
+  } else if (existing.holder !== holder) {
+    if (!mgr.setAccountHolder(provider.id, account, userId, holder)) throw new OpRefusal('failed', 'Premium did not save the new holder, so nothing changed. Try again in a moment.');
+    step = 'saved';
+  }
+  const sealed = currentLedger();
+  if (sealed) pastLinkSave.set(sealed, step);
+
+  const base = { linked: holder, where, recheck: false, paid: [] as Array<{ ptier: string; title: string }>, trial: false, uncharged: [] as string[], held: [] as Array<{ ptier: string; tier: string; status: 'active' | 'queued' }> };
+  if (proved.membership !== 'found' || proved.memberId === null) {
+    const reason = proved.membership === 'other-campaign'
+      ? 'Patreon showed memberships of other creators only'
+      : proved.membership === 'unreadable' ? "Patreon's answer about your memberships could not be read" : undefined;
+    return { ...base, pledge: proved.membership === 'found' ? 'unreadable' : proved.membership, ...(reason ? { reason } : {}) };
+  }
+  const memberId = proved.memberId;
+  const read = await provider.readAfterLink(memberId, account, deadline);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    mgr.settled(currentLedger()),
+    new Promise<void>(resolve => { timer = setTimeout(resolve, Math.max(0, deadline - Date.now())); }),
+  ]).finally(() => clearTimeout(timer));
+  const subs = mgr.getSubscriptions(holder);
+  const held = [...(subs.active ? [{ sub: subs.active, status: 'active' as const }] : []), ...subs.paused.map(sub => ({ sub, status: 'queued' as const }))]
+    .filter(({ sub }) => sub.source === 'paid' && sub.providerId === provider.id && sub.providerMeta?.memberId === memberId)
+    .map(({ sub, status }) => ({ ptier: String(sub.providerMeta?.patreonTierId ?? ''), tier: mgr.getTier(sub.tierId)?.displayName ?? sub.tierId, status }));
+  if (read.kind === 'failed') return { ...base, pledge: 'failed', reason: read.reason, recheck: read.recheck, held };
+  return { ...base, pledge: read.deferred ? 'deferred' : 'read', recheck: read.recheck, paid: read.paid, trial: read.trial, uncharged: read.uncharged, held, ...(read.deferred ? { deferred: true } : {}) };
 }
 
 function setGlobalModuleConfig(args: { moduleName?: unknown; partial?: unknown; expectSha?: unknown; rel?: unknown }): unknown {
@@ -260,6 +359,15 @@ for (const method of PREMIUM_METHODS) {
     return fn.apply(getPremiumManager(), Array.isArray(args?.args) ? args.args : []);
   });
 }
+registry.set('premium.unlinkProviderAccount', async (args: { args?: unknown[] }) => {
+  const list = Array.isArray(args?.args) ? args.args : [];
+  const mgr = getPremiumManager();
+  if (typeof mgr.unlinkProviderAccount !== 'function') throw new OpRefusal('invalid', 'unknown premium op unlinkProviderAccount');
+  if (list[2] === undefined) return (mgr.unlinkProviderAccount as (...a: unknown[]) => Promise<boolean>).apply(mgr, list);
+  const ended = { count: 0 };
+  const result = await mgr.unlinkProviderAccount(list[0] as HolderKey, list[1] as string, list[2] as string, ended);
+  return new WithEnded(result, ended.count);
+});
 registry.set('premium.setGlobalModuleConfig', setGlobalModuleConfig);
 for (const method of DUMMY_METHODS) {
   registry.set(`dummy.${method}`, (args: { args?: unknown[] }) => dummyProvider()[method](...(Array.isArray(args?.args) ? args.args : [])));
@@ -355,14 +463,18 @@ export async function applySharedOp(req: SharedOpRequest): Promise<SharedOpReply
     if (refusal) return carryWrites({ ok: false, code: 'failed', error: refusal }, NO_WRITES);
   }
   let writes: OpWrites | undefined;
+  let opLedger: WriteLedger | undefined;
   try {
     const reply = await runSealed('console', null, null, async ledger => {
+      opLedger = ledger;
       try {
         if (op.startsWith('payment.')) markPaymentLedger(ledger, op);
-        const result = await fn(req.args);
+        const out = await fn(req.args);
+        const result = out instanceof WithEnded ? out.result : out;
+        const ended = out instanceof WithEnded ? { ended: out.ended } : {};
         if (settler) await settler(ledger);
         const verdict = await verdictOf([ledger]);
-        if (verdict.ok) return { ok: true as const, result };
+        if (verdict.ok) return { ok: true as const, result, ...ended };
         return {
           ok: false as const,
           code: 'unconfirmed' as const,
@@ -370,6 +482,7 @@ export async function applySharedOp(req: SharedOpRequest): Promise<SharedOpReply
           partial: verdict.partial,
           error: withProviderSentence(op, verdict.partial ? partialText(truthText(verdict.answer, true, verdict.changed), ledger) : truthText(verdict.answer, false, verdict.changed)),
           result,
+          ...ended,
           ...(isStopping() ? { stopping: true } : {}),
         };
       } finally {
@@ -378,6 +491,10 @@ export async function applySharedOp(req: SharedOpRequest): Promise<SharedOpReply
     });
     return carryWrites(reply, writes);
   } catch (error) {
+    const linkStep = opLedger ? pastLinkSave.get(opLedger) : undefined;
+    if (linkStep && !(error instanceof OpRefusal && error.code === 'unconfirmed')) {
+      return carryWrites({ ok: false, code: 'unconfirmed', error: withProviderSentence(op, afterLinkSaveText(error, linkStep)) }, writes);
+    }
     if (error instanceof OpRefusal) {
       const status = error.status !== undefined ? { status: error.status } : {};
       return carryWrites({ ok: false, code: error.code, ...status, error: error.code === 'unconfirmed' ? withProviderSentence(op, error.message) : error.message }, writes);

@@ -75,15 +75,26 @@ function seedLinked(): void {
 }
 
 describe('the provider-link DELETE as one op (O1)', () => {
-  it('sends one shared op, which cancels both subscriptions and removes the link', async () => {
-    seedLinked();
+  it("sends one shared op from the payer's session, which cancels both of that payer's subscriptions and removes the link (sheet P7, 4.7)", async () => {
+    const backed = (sub: any) => ({ ...sub, providerMeta: { ...(sub.providerMeta ?? {}), patreonUserId: 'acct1' } });
+    writePremium(
+      { [gh(G)]: { active: backed(paidSub('sA', 'pA', 'low', 'patreon')), paused: [backed({ ...paidSub('sP', 'pP', 'high', 'patreon'), status: 'paused' })] } },
+      { providerAccountLinks: { patreon: { acct1: linkOf(G) } } },
+    );
     const ops: string[] = [];
     const manager = { runSharedOp: async (op: string, args: unknown) => { ops.push(op); return applySharedOp({ op, args }); } };
-    const app = await startApp(a => a.use('/guild/api/subscriptions', createGuildSubscriptionRoutes(manager as any)));
+    const app = await startApp(a => {
+      a.use((req: any, _res, next) => {
+        req.user = { id: linkOf(G).buyerId };
+        req.isAuthenticated = () => true;
+        next();
+      });
+      a.use('/guild/api/subscriptions', createGuildSubscriptionRoutes(manager as any));
+    });
     try {
       const res = await fetch(`${app.url}/guild/api/subscriptions/${G}/provider-links/patreon`, { method: 'DELETE' });
       expect(res.status).toBe(200);
-      expect(await res.json()).toEqual({ success: true });
+      expect(await res.json()).toEqual({ success: true, message: `Your Patreon account is unlinked, and its tier was removed from guild ${G}.` });
       expect(ops).toEqual(['premium.unlinkProviderAccount']);
       await settleQueue();
       const stored = jsonOf(PREMIUM);
@@ -96,24 +107,21 @@ describe('the provider-link DELETE as one op (O1)', () => {
     }
   });
 
-  it('a provider cancel that fails keeps the link, so the same request finishes the change', async () => {
+  it('P7 U5, link first: a provider cancel that fails leaves the link removed and the records not cancelled; the same request then finds no link', async () => {
     seedLinked();
-    let fail = true;
     getPaymentRegistry().register({
       id: 'patreon', displayName: 'Patreon', capabilities: { sells: ['guild'], supportsCancel: true }, isConfigured: () => true,
-      cancelSubscription: async () => { if (fail) throw new Error('Patreon did not answer'); },
+      cancelSubscription: async () => { throw new Error('Patreon did not answer'); },
     } as any);
     const first: any = await applySharedOp({ op: 'premium.unlinkProviderAccount', args: { args: [gh(G), 'patreon'] } });
     expect(first.ok).toBe(false);
     expect(first.error).not.toContain('nothing was saved');
     await settleQueue();
-    expect(jsonOf(PREMIUM).providerAccountLinks.patreon).toEqual({ acct1: linkOf(G) });
-    expect(getPremiumManager().getFullConfig().providerAccountLinks.patreon).toEqual({ acct1: linkOf(G) });
-    fail = false;
-    expect(await applySharedOp({ op: 'premium.unlinkProviderAccount', args: { args: [gh(G), 'patreon'] } })).toEqual({ ok: true, result: true });
-    await settleQueue();
     expect(jsonOf(PREMIUM).providerAccountLinks.patreon).toBeUndefined();
-    expect(jsonOf(PREMIUM).subscriptions[gh(G)]).toBeUndefined();
+    expect(getPremiumManager().getFullConfig().providerAccountLinks.patreon).toBeUndefined();
+    const subs = jsonOf(PREMIUM).subscriptions[gh(G)];
+    expect([subs.active?.id, ...subs.paused.map((p: any) => p.id)]).toEqual(['sA', 'sP']);
+    expect(await applySharedOp({ op: 'premium.unlinkProviderAccount', args: { args: [gh(G), 'patreon'] } })).toEqual({ ok: true, result: false });
   });
 });
 

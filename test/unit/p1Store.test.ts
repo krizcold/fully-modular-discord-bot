@@ -161,9 +161,11 @@ describe("the world's default buyer", () => {
 });
 
 describe('P1 claim 17: a provider account link stores its holder and its buyer', () => {
+  // After sheet P7 (4.2) the callback op links the signed-in Discord user (`userId`) and installs nothing of its own: a
+  // record comes from the provider's read of the account, as `link.install` emits it.
   const w = p1World();
   let link: ReturnType<typeof linkProvider>;
-  const callback = (query: Record<string, string>) => w.sharedOp('payment.oauthCallback', { providerId: LINKER, query });
+  const callback = (query: Record<string, string>) => w.sharedOp('payment.oauthCallback', { providerId: LINKER, query, userId: query.buyer });
   beforeEach(async () => {
     await w.setup();
     link = linkProvider();
@@ -176,7 +178,6 @@ describe('P1 claim 17: a provider account link stores its holder and its buyer',
 
     expect(reply).toMatchObject({ ok: true, result: { linked: gh(SERVERS[0]) } });
     expect(w.stored().providerAccountLinks).toStrictEqual({ [LINKER]: { 'acct-1': { holder: gh(SERVERS[0]), buyerId: BUYER } } });
-    expect(w.recordOf(SERVERS[0]).active).toMatchObject({ source: 'paid', providerId: LINKER, providerSubId: `${LINKER}:acct-1:${SERVERS[0]}` });
 
     await w.reload();
     expect((getPremiumManager() as any).getAccountLink(LINKER, 'acct-1')).toStrictEqual({ holder: gh(SERVERS[0]), buyerId: BUYER });
@@ -184,32 +185,34 @@ describe('P1 claim 17: a provider account link stores its holder and its buyer',
     expect(w.stored().providerAccountLinks).toStrictEqual({ [LINKER]: { 'acct-1': { holder: gh(SERVERS[0]), buyerId: BUYER } } });
   });
 
-  it("the callback's created event carries the holder and the buyer the provider answered, and no server id", async () => {
+  it('the callback raises no event of its own: the tier comes from the provider\'s read (sheet P7, 4.4)', async () => {
     const events: any[] = [];
     getPaymentRegistry().on('provider.event', (e: any) => events.push(e));
 
     expect(await callback({ account: 'acct-1', guild: SERVERS[0], buyer: BUYER })).toMatchObject({ ok: true });
 
-    expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({ type: 'subscription.created', providerSubId: `${LINKER}:acct-1:${SERVERS[0]}`, holder: gh(SERVERS[0]), buyerId: BUYER });
-    expect(events[0]).not.toHaveProperty('guildId');
+    expect(events).toEqual([]);
+    expect(w.recordOf(SERVERS[0])).toBeNull();
   });
 
-  it.each([['no buyer', undefined], ['a buyer that is no Discord id', 'abc']])('a callback that names %s answers X12 and links nothing', async (_what, buyer) => {
+  it.each([
+    ['no signed-in user', undefined, 'The link names no signed-in Discord account, so nothing was linked.'],
+    ['a user that is no Discord id', 'abc', X12],
+  ])('a callback for %s is refused and links nothing', async (_what, buyer, text) => {
     const before = w.storedText();
     const audit = w.auditText();
 
     const reply = await callback({ account: 'acct-1', guild: SERVERS[0], ...(buyer === undefined ? {} : { buyer }) });
 
     expect(reply.ok).toBe(false);
-    expect(reply.error).toContain(X12);
+    expect(reply.error).toContain(text);
     expect(w.storedText()).toBe(before);
     expect(w.auditText()).toBe(audit);
     expect(w.recordOf(SERVERS[0])).toBeNull();
   });
 
   it.each([
-    ['a user holder', uh(USERS[0]), `P1 Linker links accounts to servers only; it answered for user ${USERS[0]}, and nothing was linked.`],
+    ["another user's VIP", uh(USERS[1]), 'The link names another Discord account, so nothing was linked.'],
     ['a text that is not a holder', 'guild:abc', "'guild:abc' is not a holder: expected guild:<id> or user:<id> with a Discord id."],
   ])('a callback that answers %s is refused with its own text, links nothing and raises no event', async (_what, holder, text) => {
     const events: any[] = [];
@@ -226,7 +229,7 @@ describe('P1 claim 17: a provider account link stores its holder and its buyer',
     expect(w.auditText()).toBe(audit);
   });
 
-  it('an account already linked to this server, called back with a state that names no valid buyer, answers X12, raises no event and keeps the link', async () => {
+  it('an account already linked to this server, called back for no user or by another user, is refused, raises no event and keeps the link', async () => {
     expect(await callback({ account: 'acct-1', guild: SERVERS[0], buyer: BUYER })).toMatchObject({ ok: true });
     await w.settle();
     const events: any[] = [];
@@ -237,27 +240,25 @@ describe('P1 claim 17: a provider account link stores its holder and its buyer',
     const none = await callback({ account: 'acct-1', guild: SERVERS[0] });
     const text = await callback({ account: 'acct-1', guild: SERVERS[0], buyer: 'abc' });
 
-    expect([none.ok, text.ok]).toEqual([false, false]);
-    expect(none.error).toContain(X12);
-    expect(text.error).toContain(X12);
+    expect(none.ok).toBe(false);
+    expect(text).toMatchObject({ ok: true, result: { refused: 'linked-elsewhere' } });
     expect(events).toEqual([]);
     expect(w.storedText()).toBe(before);
     expect(w.auditText()).toBe(audit);
     expect((getPremiumManager() as any).getAccountLink(LINKER, 'acct-1')).toStrictEqual({ holder: gh(SERVERS[0]), buyerId: BUYER });
   });
 
-  it('a second server linking the same account answers linkedElsewhere with the first holder and changes nothing', async () => {
+  it('a second server picked by the same user moves the link there in one save (a pick change, sheet P7 4.3)', async () => {
     expect(await callback({ account: 'acct-1', guild: SERVERS[0], buyer: BUYER })).toMatchObject({ ok: true });
-    const before = w.storedText();
 
     const second = await callback({ account: 'acct-1', guild: SERVERS[1], buyer: BUYER });
 
-    expect(second).toMatchObject({ ok: true, result: { linkedElsewhere: gh(SERVERS[0]) } });
-    expect(w.storedText()).toBe(before);
+    expect(second).toMatchObject({ ok: true, result: { linked: gh(SERVERS[1]) } });
+    expect(w.stored().providerAccountLinks).toStrictEqual({ [LINKER]: { 'acct-1': { holder: gh(SERVERS[1]), buyerId: BUYER } } });
     expect(w.recordOf(SERVERS[1])).toBeNull();
   });
 
-  it('a second link of the same account to the same holder by another user keeps the first buyer and writes nothing', async () => {
+  it('a second link of the same account to the same holder by another user is refused and writes nothing; linkAccount keeps the first buyer', async () => {
     const other = '80000000000000002';
     expect(await callback({ account: 'acct-1', guild: SERVERS[0], buyer: BUYER })).toMatchObject({ ok: true });
     await w.settle();
@@ -265,7 +266,7 @@ describe('P1 claim 17: a provider account link stores its holder and its buyer',
 
     const again = await callback({ account: 'acct-1', guild: SERVERS[0], buyer: other });
     await w.settle();
-    expect(again).toMatchObject({ ok: true, result: { linked: gh(SERVERS[0]) } });
+    expect(again).toMatchObject({ ok: true, result: { refused: 'linked-elsewhere' } });
     expect(w.stored().providerAccountLinks).toStrictEqual(first);
 
     const before = w.storedText();
@@ -278,29 +279,18 @@ describe('P1 claim 17: a provider account link stores its holder and its buyer',
     expect((getPremiumManager() as any).getAccountLink(LINKER, 'acct-1')).toStrictEqual({ holder: gh(SERVERS[0]), buyerId: BUYER });
   });
 
-  it("after keep-first the callback's created event carries the linked buyer, and a later install names that buyer", async () => {
+  it("after another user's refused callback an install of the account names the linked buyer", async () => {
     const other = '80000000000000002';
-    const events: any[] = [];
-    getPaymentRegistry().on('provider.event', (e: any) => events.push(e));
     expect(await callback({ account: 'acct-1', guild: SERVERS[0], buyer: BUYER })).toMatchObject({ ok: true });
     await w.settle();
     const subId = `${LINKER}:acct-1:${SERVERS[0]}`;
 
-    expect(await callback({ account: 'acct-1', guild: SERVERS[0], buyer: other })).toMatchObject({ ok: true, result: { linked: gh(SERVERS[0]) } });
+    expect(await callback({ account: 'acct-1', guild: SERVERS[0], buyer: other })).toMatchObject({ ok: true, result: { refused: 'linked-elsewhere' } });
     await w.settle();
     expect((getPremiumManager() as any).getAccountLink(LINKER, 'acct-1')).toStrictEqual({ holder: gh(SERVERS[0]), buyerId: BUYER });
-    expect(events.map(e => [e.type, e.buyerId])).toEqual([['subscription.created', BUYER], ['subscription.created', BUYER]]);
 
-    getPaymentRegistry().emitEvent({
-      type: 'subscription.expired', providerId: LINKER, providerSubId: subId, holder: gh(SERVERS[0]),
-      state: { status: 'expired', startDate: new Date(Date.now() - 1000).toISOString(), endDate: new Date().toISOString(), autoRenew: false },
-    } as any);
+    link.install('acct-1', SERVERS[0], (getPremiumManager() as any).getAccountLink(LINKER, 'acct-1').buyerId);
     await w.settle();
-    expect(w.recordOf(SERVERS[0])?.active?.providerSubId).not.toBe(subId);
-
-    expect(await callback({ account: 'acct-1', guild: SERVERS[0], buyer: other })).toMatchObject({ ok: true });
-    await w.settle();
-    expect(events.at(-1)).toMatchObject({ type: 'subscription.created', buyerId: BUYER });
     expect(w.recordOf(SERVERS[0]).active).toMatchObject({ providerId: LINKER, providerSubId: subId, buyerId: BUYER });
   });
 
@@ -336,7 +326,11 @@ describe('P1 claim 17: a provider account link stores its holder and its buyer',
 
   it("unlinkProviderAccount(holder, provider) cancels that holder's subscriptions of the provider and removes the link", async () => {
     expect(await callback({ account: 'acct-1', guild: SERVERS[0], buyer: BUYER })).toMatchObject({ ok: true });
-    expect(await callback({ account: 'acct-9', guild: SERVERS[1], buyer: BUYER })).toMatchObject({ ok: true });
+    expect(await callback({ account: 'acct-9', guild: SERVERS[1], buyer: BUYER })).toMatchObject({ ok: true, result: { refused: 'other-account' } });
+    expect(await w.op('linkAccount', LINKER, 'acct-9', gh(SERVERS[1]), BUYER)).toMatchObject({ ok: true, result: true });
+    link.install('acct-1', SERVERS[0], BUYER);
+    link.install('acct-9', SERVERS[1], BUYER);
+    await w.settle();
     const otherBefore = JSON.stringify(w.recordOf(SERVERS[1]));
 
     const noLink = await w.op('unlinkProviderAccount', gh('70000000000000009'), LINKER);
