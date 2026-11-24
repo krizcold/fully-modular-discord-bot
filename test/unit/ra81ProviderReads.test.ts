@@ -32,16 +32,16 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe('Discord: a cancel reads the doc for the application and again for the call', () => {
+describe('Discord: a subscription read reads the doc for the application and again for the call', () => {
   it('a second read that fails is logged, though the first one answered', async () => {
     vi.stubEnv('DISCORD_TOKEN', 'bot-token-made-up');
     vi.stubEnv('DISCORD_APPLICATION_ID', undefined);
     vi.stubGlobal('fetch', vi.fn(async (url: string) => {
       calls.push(String(url));
-      return new Response(null, { status: 204 });
+      return new Response(JSON.stringify({ id: 'e1', sku_id: 'sku1', type: 8, user_id: '80000000000000001', ends_at: null }), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }));
     answers = [JSON.stringify({ discord: { DISCORD_APPLICATION_ID: 'app-doc' } }), new Error('ra81 discord second read')];
-    await new DiscordProvider().cancelSubscription('e1');
+    await new DiscordProvider().getSubscriptionState('e1');
     expect(calls).toEqual(['https://discord.com/api/v10/applications/app-doc/entitlements/e1']);
     expect(errors.filter(e => e.includes('cannot be read (ra81 discord second read)'))).toHaveLength(1);
   });

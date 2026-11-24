@@ -1634,7 +1634,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       const resolved = manager.resolveActiveUserTier(req.params.userId);
       res.json({
         success: true,
-        subscriptions: manager.getSubscriptions(holder),
+        subscriptions: manager.getSubscriptionsFollowed(holder),
         effective: resolved ? { tierId: resolved.tierId, tier: resolved.tier, source: resolved.source } : null,
       });
     } catch (error) {

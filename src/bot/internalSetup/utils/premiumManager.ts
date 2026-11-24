@@ -55,7 +55,7 @@ import { confirmFile, enqueueAppend, fileTicket, fileTicketFailure, fileTicketSt
 import { syncWords } from './folderChain';
 import type { ModuleManifest } from '../../types/moduleTypes';
 import { doesNotSellText, holderFromWire, holderWords, isDiscordId, notHolderText, parseHolder, userHolder, type HolderKey, type HolderKind } from './premiumHolder';
-import type { InitiateOpts, PaymentProvider } from './payment/paymentTypes';
+import type { FollowAnswer, InitiateOpts, PaymentProvider } from './payment/paymentTypes';
 import {
   currentLedger,
   isPaymentLedger,
@@ -1009,6 +1009,11 @@ function sellsTo(provider: Pick<PaymentProvider, 'capabilities'> | undefined, ki
   return provider ? provider.capabilities.sells.includes(kind) : kind === 'guild';
 }
 
+/** A paid sub whose provider keeps billing it while premium queues it, so the provider's end is its end. */
+function billedWhileQueued(sub: Subscription): boolean {
+  return sub.source === 'paid' && !!sub.providerId && getPaymentRegistry().get(sub.providerId)?.capabilities.billedWhileQueued === true;
+}
+
 const eventHolder = (event: { holder?: unknown }): HolderKey | null => parseHolder(event.holder)?.key ?? null;
 
 const listedBuyer = (ref: ProviderSubscriptionRef): string | undefined => (isDiscordId(ref.metadata.buyerId) ? ref.metadata.buyerId : undefined);
@@ -1335,18 +1340,21 @@ export class PremiumManager {
 
   /**
    * Decision 72: a provider's state copied into premium's sub, with the status mapped to premium's three values. A sub
-   * in the holder's queue keeps status paused and its held dates, and takes only the state's autoRenew and meta.
+   * in the holder's queue keeps status paused and its held dates, and takes only the state's autoRenew and meta; one
+   * whose provider bills it while queued (`billedWhileQueued`) takes the state's endDate as well. A state's startDate
+   * of '' (the provider has none) keeps the held one.
    */
   private copyProviderState(holder: HolderKey, sub: Subscription, s: ProviderSubscriptionState): void {
     const subs = this.config.subscriptions[holder];
     if (subs && subs.active?.id !== sub.id && subs.paused.some(p => p.id === sub.id)) {
+      if (billedWhileQueued(sub)) sub.endDate = s.endDate;
       sub.autoRenew = s.autoRenew;
       sub.providerMeta = s.meta;
       sub.status = 'paused';
       sub.updatedAt = new Date().toISOString();
       return;
     }
-    sub.startDate = s.startDate;
+    if (s.startDate !== '') sub.startDate = s.startDate;
     sub.endDate = s.endDate;
     sub.autoRenew = s.autoRenew;
     sub.providerMeta = s.meta;
@@ -1471,6 +1479,20 @@ export class PremiumManager {
     }
   }
 
+  /** Each offering of a tier of the holder's kind whose enabled link for the event's provider sells its variant (sheet P6, 4.2). */
+  private offeringsSelling(event: CreatedEvent): Array<{ tierId: string; tier: PremiumTier; offering: TierOffering; link: ProviderLink }> {
+    const kind = this.kindOf(event.holder);
+    const found: Array<{ tierId: string; tier: PremiumTier; offering: TierOffering; link: ProviderLink }> = [];
+    for (const [tierId, tier] of Object.entries(this.config.tiers)) {
+      if (tierKind(tier) !== kind) continue;
+      for (const offering of tier.offerings ?? []) {
+        const link = (offering.providerLinks ?? []).find(l => l.providerId === event.providerId && l.enabled && linkSells(l, event.variantId));
+        if (link) found.push({ tierId, tier, offering, link });
+      }
+    }
+    return found;
+  }
+
   /**
    * Async install: webhook-driven providers fire `subscription.created` after
    * a successful checkout. Construct the cache record, snapshot, and route
@@ -1486,6 +1508,22 @@ export class PremiumManager {
     if (existing) {
       if (isPaymentLedger(currentLedger())) await this.confirmRedelivery(holder, existing);
       return { skipped: 'already' };
+    }
+
+    let walkedLink: ProviderLink | undefined;
+    if (event.tierFromVariant) {
+      const found = this.offeringsSelling(event);
+      if (found.length !== 1) {
+        const name = this.providerDisplayName(event.providerId);
+        const why = found.length === 0
+          ? `no ${kindWord(this.kindOf(holder))} tier has an offering that sells SKU '${event.variantId}' through ${name}`
+          : `SKU '${event.variantId}' is sold by more than one offering (${found.map(f => `${f.tier.displayName}/${f.offering.label}`).join(', ')})`;
+        const next = found.length === 0 ? 'Wire the SKU to one offering' : 'Wire it to one offering';
+        if (!opts.carry) console.warn(`[PremiumManager] subscription.created from ${name} (subscription ${event.providerSubId}, ${holderWords(holder)}) was not installed: ${why}. ${next}; the bot tries again at its next check.`);
+        return { skipped: 'tier', why };
+      }
+      event = { ...event, tierId: found[0].tierId, offeringId: found[0].offering.id };
+      walkedLink = found[0].link;
     }
 
     const tier = this.config.tiers[event.tierId];
@@ -1510,9 +1548,14 @@ export class PremiumManager {
           : kind === 'user' && buyerId !== parseHolder(holder)?.id
             ? { skipped: 'buyer', why: 'its buyer is not the user it is for' }
             : null;
-    if (!notInstalled && event.soldVariantOnly && !linkSells(offering.providerLinks.find(l => l.providerId === event.providerId), event.variantId)) {
+    const endedByProvider = seller?.capabilities.endedByProviderOnly === true;
+    const sellingLink = walkedLink ?? offering.providerLinks.find(l => l.providerId === event.providerId);
+    if (!notInstalled && event.soldVariantOnly && !linkSells(sellingLink, event.variantId)) {
       const name = this.providerDisplayName(event.providerId);
-      if (!opts.carry) console.warn(`[PremiumManager] subscription.created from ${name} (subscription ${event.providerSubId}, ${holderWords(holder)}) was not installed: offering '${offering.label}' does not sell variant '${event.variantId}' through ${name}. If ${name} keeps billing it, cancel it there; refund it at ${name} if it was paid.`);
+      const next = endedByProvider
+        ? `The member cancels it in ${name}; the bot tries again at its next check.`
+        : `If ${name} keeps billing it, cancel it there; refund it at ${name} if it was paid.`;
+      if (!opts.carry) console.warn(`[PremiumManager] subscription.created from ${name} (subscription ${event.providerSubId}, ${holderWords(holder)}) was not installed: offering '${offering.label}' does not sell variant '${event.variantId}' through ${name}. ${next}`);
       return { skipped: 'variant', why: `offering '${offering.label}' does not sell variant '${event.variantId}'` };
     }
     if (notInstalled) {
@@ -1521,12 +1564,22 @@ export class PremiumManager {
       return notInstalled;
     }
     if (event.soldVariantOnly) {
-      const held = this.config.subscriptions[holder]?.active;
-      if (held && held.status === 'active' && (held.endDate === null || Date.parse(held.endDate) > Date.now())
-        && (this.config.tiers[held.tierId]?.priority ?? 0) === (tier.priority ?? 0)) {
+      const samePriority = (s: Subscription | undefined, status: 'active' | 'paused'): boolean => !!s && s.status === status
+        && (s.endDate === null || Date.parse(s.endDate) > Date.now())
+        && (this.config.tiers[s.tierId]?.priority ?? 0) === (tier.priority ?? 0);
+      const record = this.config.subscriptions[holder];
+      // In the queue too only for a provider that offers a refused purchase again at its next check (sheet P6, claim 11).
+      const held = samePriority(record?.active, 'active') ? record!.active
+        : endedByProvider ? record?.paused.find(p => samePriority(p, 'paused')) : undefined;
+      if (held) {
         const name = this.providerDisplayName(event.providerId);
         const heldName = this.config.tiers[held.tierId]?.displayName || held.tierId;
-        if (!opts.carry) console.warn(`[PremiumManager] subscription.created from ${name} (subscription ${event.providerSubId}, ${holderWords(holder)}) was not installed: ${holderWords(holder)} already holds '${heldName}' at that priority. If ${name} keeps billing it, cancel it there; refund it at ${name} if it was paid.`);
+        const next = !endedByProvider
+          ? `If ${name} keeps billing it, cancel it there; refund it at ${name} if it was paid.`
+          : held.source === 'paid' && held.providerId === event.providerId
+            ? `If it replaces that subscription, it is installed once ${name} ends the old one; otherwise the member cancels it in ${name}.`
+            : `The bot tries again at each check, so it is installed once '${heldName}' ends; otherwise the member cancels it in ${name}.`;
+        if (!opts.carry) console.warn(`[PremiumManager] subscription.created from ${name} (subscription ${event.providerSubId}, ${holderWords(holder)}) was not installed: ${holderWords(holder)} already holds '${heldName}' at that priority. ${next}`);
         return { skipped: 'priority', why: `${holderWords(holder)} already holds '${heldName}' at that priority` };
       }
     }
@@ -1553,7 +1606,7 @@ export class PremiumManager {
       providerMeta: event.state.meta,
       purchasedSnapshot,
       buyerId,
-      startDate: event.state.startDate,
+      startDate: event.state.startDate === '' ? nowIso : event.state.startDate,
       endDate: event.state.endDate,
       autoRenew: event.state.autoRenew,
       status: event.state.status === 'expired' ? 'expired'
@@ -1576,14 +1629,16 @@ export class PremiumManager {
       subscriptionId: sub.id,
       metadata: { variantId: event.variantId, buyerId },
     }, { carry }, event.providerSubId);
-    void this.notify(holder, 'paid.sub.started', {
+    const started: NotificationPayload = {
       tierName: tier.displayName,
       providerName: this.providerDisplayName(event.providerId),
       endDate: sub.endDate,
-    }, { carry });
+    };
+    const choosesNotice = billedWhileQueued(sub);
+    if (!choosesNotice) void this.notify(holder, 'paid.sub.started', started, { carry });
     let op: SaveOp | null;
     try {
-      op = await this.installSubscription(holder, sub, carry);
+      op = await this.installSubscription(holder, sub, carry, choosesNotice ? { started } : {});
     } catch (error) {
       forgetItems(carry.items.splice(0));
       throw error;
@@ -3343,8 +3398,10 @@ export class PremiumManager {
    *   same priority + manual -> active pauses, manual replaces (manual wins ties)
    *   same priority + paid   -> caller already rejected; defensive throw here
    *   lower priority -> insert into paused queue at correct position
+   * With `started` (a provider that bills a queued subscription, sheet P6 D17), the started notice goes with a record
+   * that takes the slot and the paused-by-stacking notice with one that is queued.
    */
-  private async installSubscription(holder: HolderKey, incoming: Subscription, carry: Carry, opts: { boughtPaused?: true } = {}): Promise<SaveOp | null> {
+  private async installSubscription(holder: HolderKey, incoming: Subscription, carry: Carry, opts: { boughtPaused?: true; started?: NotificationPayload } = {}): Promise<SaveOp | null> {
     const incomingTier = this.config.tiers[incoming.tierId];
     if (incomingTier && tierKind(incomingTier) !== this.kindOf(holder)) throw new Error(wrongKindText(incomingTier, this.kindOf(holder)));
     if (incoming.source === 'paid') {
@@ -3366,12 +3423,14 @@ export class PremiumManager {
         delete subs.active;
       }
       subs.active = this.intoActiveSlot(incoming);
+      if (opts.started) void this.notify(holder, 'paid.sub.started', opts.started, { carry });
       return this.save({ carry });
     }
 
     const activePriority = this.config.tiers[active!.tierId]?.priority ?? 0;
 
     if (incomingPriority > activePriority) {
+      if (opts.started) void this.notify(holder, 'paid.sub.started', opts.started, { carry });
       return this.pauseActiveIntoQueue(holder, this.intoActiveSlot(incoming), carry);
     }
 
@@ -3401,6 +3460,13 @@ export class PremiumManager {
     };
     subs.paused.push(paused);
     this.sortPausedQueue(subs);
+    if (opts.started) {
+      void this.notify(holder, 'paid.sub.paused-by-stacking', {
+        tierName: opts.started.tierName,
+        providerName: opts.started.providerName,
+        billedWhileQueued: true,
+      }, { carry });
+    }
     const op = this.save({ carry });
 
     // Best-effort provider pause for paid: the sub was just created as
@@ -3514,6 +3580,7 @@ export class PremiumManager {
         providerName: this.providerDisplayName(paused.providerId),
         remainingDays: paused.remainingDaysAtPause ?? null,
         ...(paused.providerMeta?.payOnce === true ? { payOnce: true } : {}),
+        ...(billedWhileQueued(paused) ? { billedWhileQueued: true } : {}),
       }, { carry });
     }
     const op = this.save({ carry });
@@ -3562,11 +3629,14 @@ export class PremiumManager {
     while (!subs.active && subs.paused.length > 0) {
       const next = subs.paused.shift()!;
       const nowIso = new Date().toISOString();
-      const newEndDate: string | null = next.remainingDaysAtPause == null
-        ? null
-        : new Date(Date.now() + next.remainingDaysAtPause * DAY_MS).toISOString();
+      const billed = billedWhileQueued(next);
+      const newEndDate: string | null = billed
+        ? next.endDate
+        : next.remainingDaysAtPause == null
+          ? null
+          : new Date(Date.now() + next.remainingDaysAtPause * DAY_MS).toISOString();
 
-      const keepsEnd = newEndDate !== null && next.source === 'paid' && !!next.providerId
+      const keepsEnd = !billed && newEndDate !== null && next.source === 'paid' && !!next.providerId
         && getPaymentRegistry().get(next.providerId)?.capabilities.endsAtPaidEnd === true;
       const resumed: Subscription = {
         ...next,
@@ -4080,7 +4150,35 @@ export class PremiumManager {
    * we wipe local state.
    */
   cancelPaidSubscriptionImmediately(holder: HolderKey): Promise<boolean> {
-    return this.work.run(CHANGE_WORK, async () => (await this.cancelActiveImmediately(holder)) === 'done');
+    return this.work.run(CHANGE_WORK, async () => {
+      this.holderArg(holder);
+      if (this.refusedAtEntry()) return false;
+      this.refuseProviderEnded(holder, this.config.subscriptions[holder]?.active);
+      return (await this.cancelActiveImmediately(holder)) === 'done';
+    });
+  }
+
+  /**
+   * An admin's End now or queued remove of a `user:` record whose provider ends it (`endedByProviderOnly`) and follows
+   * it is refused before any change: the record would come back at the provider's next check (sheet P6, 4.5, PD11).
+   * While the provider's settings cannot be read, whether it follows the record is not known, and it is refused too.
+   */
+  private refuseProviderEnded(holder: HolderKey, sub: Subscription | undefined): void {
+    if (!sub || sub.source !== 'paid' || !sub.providerId || parseHolder(holder)?.kind !== 'user') return;
+    const provider = getPaymentRegistry().get(sub.providerId);
+    if (provider?.capabilities.endedByProviderOnly !== true) return;
+    const follow = this.followAnswer(holder, sub);
+    if (!follow.followed && follow.whyNot === 'unread') {
+      throw new BeforeProviderCall("payment-providers/credentials.json cannot be read now, so the bot can't confirm whether Discord bills this subscription, and it does not end or remove it. Try again once it can be read.");
+    }
+    if (!follow.followed) return;
+    throw new BeforeProviderCall("Discord manages this subscription, so the bot cannot end or remove it. It ends when the member's subscription ends in Discord or Discord refunds it.");
+  }
+
+  /** Whether the record's provider follows it; a provider without `followsSubscription` follows every record (E13). */
+  private followAnswer(holder: HolderKey, sub: Subscription): FollowAnswer {
+    const provider = sub.providerId ? getPaymentRegistry().get(sub.providerId) : undefined;
+    return provider?.followsSubscription ? provider.followsSubscription({ holder, providerMeta: sub.providerMeta }) : { followed: true };
   }
 
   private async cancelActiveImmediately(holder: HolderKey): Promise<CancelStep> {
@@ -4095,7 +4193,16 @@ export class PremiumManager {
       immediately: true,
       ...(missing ? { providerRecordMissing: true } : {}),
       ...(gone ? goneMetadata(active) : {}),
-    }, !gone, missing ? recordMissingLine(active.providerSubId!, holder) : undefined);
+    }, !gone && !this.removedUnfollowed(holder, active), missing ? recordMissingLine(active.providerSubId!, holder) : undefined);
+  }
+
+  /**
+   * A record of an `endedByProviderOnly` provider that the provider does not follow (sheet P6, PD16, PD19, PD19b): its
+   * removal calls nothing and the provider keeps billing, so the member gets no "will not auto-renew" notice.
+   */
+  private removedUnfollowed(holder: HolderKey, sub: Subscription): boolean {
+    const provider = sub.providerId ? getPaymentRegistry().get(sub.providerId) : undefined;
+    return provider?.capabilities.endedByProviderOnly === true && !this.followAnswer(holder, sub).followed;
   }
 
   /**
@@ -4239,7 +4346,12 @@ export class PremiumManager {
    * queue. Provider call must succeed before we drop the queue entry.
    */
   cancelAndRemovePausedSubscription(holder: HolderKey, subscriptionId: string): Promise<boolean> {
-    return this.work.run(CHANGE_WORK, async () => (await this.cancelPausedStep(holder, subscriptionId)) === 'done');
+    return this.work.run(CHANGE_WORK, async () => {
+      this.holderArg(holder);
+      if (this.refusedAtEntry()) return false;
+      this.refuseProviderEnded(holder, this.config.subscriptions[holder]?.paused.find(p => p.id === subscriptionId));
+      return (await this.cancelPausedStep(holder, subscriptionId)) === 'done';
+    });
   }
 
   private async cancelPausedStep(holder: HolderKey, subscriptionId: string): Promise<CancelStep> {
@@ -4632,6 +4744,17 @@ export class PremiumManager {
     this.ensureLoaded();
     const subs = parseHolder(holder) ? this.config.subscriptions[holder] : undefined;
     return subs ? { ...subs } : { paused: [] };
+  }
+
+  /**
+   * A holder's record for the dev lookup, built from new objects (sheet P6, E16): each paid subscription carries
+   * `followed` and, when its provider does not follow it, `whyNot`.
+   */
+  getSubscriptionsFollowed(holder: HolderKey): HolderSubscriptions {
+    const subs = this.getSubscriptions(holder);
+    const key = parseHolder(holder)?.key;
+    const mark = (sub: Subscription): Subscription => (sub.source !== 'paid' || !key ? { ...sub } : { ...sub, ...this.followAnswer(key, sub) });
+    return { ...subs, ...(subs.active ? { active: mark(subs.active) } : {}), paused: subs.paused.map(mark) };
   }
 
   getAllSubscriptions(): Record<HolderKey, HolderSubscriptions> {

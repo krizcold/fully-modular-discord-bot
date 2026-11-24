@@ -4,8 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 // line of reason `ended-while-queued` and one notice, for every provider; any other state for a queued entry leaves it
 // paused with its held endDate and startDate, taking only the state's autoRenew and meta (the queued-entry guard in
 // copyProviderState), so resumeNext later grants its remainingDaysAtPause. Both backends. PayPal in P5's world, Stripe
-// in P3's, Server Boosting and Discord in P1's world beside a manual grant of a higher tier, the Dummy in
-// P1's world with the real Dummy provider.
+// in P3's, Server Boosting (for a server) and Discord (for a user) in P1's world beside a manual grant of a higher tier,
+// the Dummy in P1's world with the real Dummy provider.
 
 vi.mock('../../src/bot/internalSetup/utils/payment/paymentRegistry', async orig => (await import('../helpers/p1Mocks')).bareRegistry(await orig<any>()));
 vi.mock('../../src/bot/internalSetup/utils/premiumNotifications', async () => (await import('../helpers/p1Mocks')).noticeModule());
@@ -20,7 +20,7 @@ import { onceEnd, z5End } from '../helpers/p5Model';
 import type { PayPalEvent } from '../helpers/p5PayPal';
 import { FINAL_CYCLES, HOUR, onceKit, PL16, PL17, PL18 } from '../helpers/p5pOnce';
 import { heldStripe, IDS as P3_IDS, p3World } from '../helpers/p3World';
-import { BUYER, p1World, SERVERS } from '../helpers/p1World';
+import { BUYER, p1World, SERVERS, USERS } from '../helpers/p1World';
 import { DUMMY_VARIANT, dummyDriver } from '../helpers/p2DummyDriver';
 import { noticePayloads, notices } from '../helpers/p1Mocks';
 
@@ -263,21 +263,31 @@ describe.each(BACKENDS)('P5 claim 13 on %s: Server Boosting and Discord', (_name
     await removed('boost', queued.id);
   });
 
-  it("Discord's entitlement delete for a queued entry (its gateway bridge) removes it", async () => {
+  it("Discord's entitlement delete for a queued user entry (its gateway bridge) removes it", async () => {
     vi.stubEnv('DISCORD_APPLICATION_ID', '50000000000000001');
     vi.stubEnv('DISCORD_TOKEN', 'bot-token');
     const provider = new DiscordProvider();
     getPaymentRegistry().register(provider);
     const handlers: Record<string, (raw: any) => void> = {};
     provider.attachGatewayBridge((name, handler) => { handlers[name] = handler; });
-    const raw = { id: '40000000000000901', sku_id: 'sku-low', guild_id: G, user_id: BUYER };
-    // Discord's created event names no tier; premium installs one through an adoption, whose created event names it.
-    getPaymentRegistry().emitEvent({ type: 'subscription.created', providerId: 'discord', providerSubId: raw.id, holder: HOLDER as any, buyerId: BUYER, tierId: 'low', offeringId: 'o-low', variantId: raw.sku_id, state: { status: 'active', startDate: new Date().toISOString(), endDate: new Date(Date.now() + 30 * DAY).toISOString(), autoRenew: true, meta: {} } });
+    const user = USERS[0];
+    const holder = `user:${user}`;
+    await w.addUserTiers();
+    expect((await w.op('setTier', 'udisc', { displayName: 'U Discord', priority: 1, overrides: {}, kind: 'user', offerings: [{ id: 'o-udisc', label: 'U Discord', providerLinks: [{ providerId: 'discord', enabled: true, mode: 'price', priceConfig: { entries: [{ variantId: 'sku-low' }] } }] }] })).ok).toBe(true);
+    expect((await w.op('grantManual', holder, 'uhigh', 60)).ok).toBe(true);
+    const raw = { id: '40000000000000901', sku_id: 'sku-low', user_id: user, application_id: '50000000000000001', type: 8 };
+    handlers.entitlementCreate(raw);
     await w.settle();
-    const queued = queuedOf('discord');
-    expect(queued).toMatchObject({ status: 'paused', providerSubId: raw.id });
+    const queuedOfUser = () => (w.recordOf(holder)?.paused ?? []).find((p: any) => p.providerId === 'discord') ?? null;
+    const queued = queuedOfUser();
+    expect(queued).toMatchObject({ status: 'paused', providerSubId: raw.id, tierId: 'udisc' });
     handlers.entitlementDelete(raw);
-    await removed('discord', queued.id);
+    await w.settle();
+    expect(queuedOfUser()).toBeNull();
+    expect(queueEnds(w.auditLines(), queued.id)).toHaveLength(1);
+    expect(ended()).toEqual([{ to: holder, kind: 'paid.sub.expired' }]);
+    expect((await w.op('revokeManual', holder)).ok).toBe(true);
+    expect(w.recordOf(holder)?.active ?? null).toBeNull();
   });
 });
 

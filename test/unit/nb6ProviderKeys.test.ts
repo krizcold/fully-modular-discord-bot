@@ -176,8 +176,8 @@ describe('the second half of the built-in providers read their keys through prov
     saveDoc({ discord: { DISCORD_APPLICATION_ID: '100000000000000002', DISCORD_TOKEN: 'token_doc_made_up' } });
     const discord = new DiscordProvider();
     expect(discord.isConfigured()).toBe(true);
-    stubFetch(() => ({}));
-    await discord.cancelSubscription('ent1');
+    stubFetch(() => ({ id: 'ent1', sku_id: 'sku1', application_id: '100000000000000002', user_id: '80000000000000001', type: 8, deleted: false, starts_at: null, ends_at: null }));
+    await discord.getSubscriptionState('ent1');
     expect(calls).toHaveLength(1);
     expect(calls[0].url).toBe('https://discord.com/api/v10/applications/100000000000000002/entitlements/ent1');
     expect(calls[0].init.headers.Authorization === 'Bot token_env_made_up').toBe(true);

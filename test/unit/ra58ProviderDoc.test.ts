@@ -74,11 +74,11 @@ describe('Discord', () => {
     expect(calls.map(c => c.url)).toEqual(['https://discord.com/api/v10/applications/app-doc/skus']);
   });
 
-  it("a subscription read lists the doc's application's entitlements", async () => {
-    stubFetch(() => json([{ id: 'e1', sku_id: 'sku1', type: 8, ends_at: null }]));
+  it("a subscription read gets the one entitlement from the doc's application", async () => {
+    stubFetch(() => json({ id: 'e1', sku_id: 'sku1', type: 8, user_id: '80000000000000001', ends_at: null }));
     const state = await new DiscordProvider().getSubscriptionState('e1');
     expect(state).not.toBeNull();
-    expect(calls.map(c => c.url)).toEqual(['https://discord.com/api/v10/applications/app-doc/entitlements']);
+    expect(calls.map(c => c.url)).toEqual(['https://discord.com/api/v10/applications/app-doc/entitlements/e1']);
   });
 });
 

@@ -11,8 +11,8 @@ import { ServerBoostingProvider } from '../../src/bot/internalSetup/utils/paymen
 import { DiscordProvider } from '../../src/bot/internalSetup/utils/payment/discordProvider';
 import { doesNotSellText } from '../../src/bot/internalSetup/utils/premiumHolder';
 
-// P1 sheet section 8 claim 13 (second file): Patreon, Server Boosting and Discord's store keep their wire for a
-// server and speak holders to premium.
+// P1 sheet section 8 claim 13 (second file): Patreon and Server Boosting keep their wire for a server and speak
+// holders to premium. Discord's store sells users only (sheet P6, claim 12): a user entitlement's events name the user.
 
 const G = '70000000000000001';
 const B = '80000000000000001';
@@ -155,10 +155,6 @@ describe('Server Boosting', () => {
 });
 
 describe("Discord's store", () => {
-  const env = () => {
-    vi.stubEnv('DISCORD_APPLICATION_ID', '50000000000000001');
-    vi.stubEnv('DISCORD_TOKEN', 'bot-token');
-  };
   let seq = 0;
   const entId = () => `40000000000000${String(++seq).padStart(3, '0')}`;
   const bridge = () => {
@@ -166,40 +162,43 @@ describe("Discord's store", () => {
     new DiscordProvider().attachGatewayBridge((name, handler) => { handlers[name] = handler; });
     return handlers;
   };
-  const l4 = (id: string, sku: string) => `[DiscordProvider] Entitlement ${id} (SKU ${sku}) is for a user, not a server; this version does not handle user entitlements, so its events are not applied.`;
+  const pd1 = (id: string, sku: string) => `[DiscordProvider] Entitlement ${id} (SKU ${sku}) is for a server; this bot sells only user subscriptions through Discord, so no tier was given for it. Discord keeps billing it until it is cancelled or refunded in Discord.`;
 
-  it('sells servers only', () => {
-    expect(new DiscordProvider().capabilities.sells).toEqual(['guild']);
+  it('sells users only', () => {
+    expect(new DiscordProvider().capabilities.sells).toEqual(['user']);
   });
 
-  it('a purchase for a user throws X3', async () => {
-    await expect(new DiscordProvider().initiatePurchase({ ...userPurchase, variantId: 'sku1' })).rejects.toThrow(doesNotSellText('Discord App Monetization', 'user'));
+  it('a purchase for a user or a server throws PD2 (members buy in Discord)', async () => {
+    const pd2 = 'Members buy Discord subscriptions in Discord; the bot cannot start one.';
+    await expect(new DiscordProvider().initiatePurchase({ ...userPurchase, variantId: 'sku1' })).rejects.toThrow(pd2);
+    await expect(new DiscordProvider().initiatePurchase({ ...purchase, variantId: 'sku1' })).rejects.toThrow(pd2);
   });
 
-  it("a server entitlement's three events carry the holder, and the created one the entitlement's user", () => {
+  it("a user entitlement's three events carry the user as holder, and the created one the user as buyer and the SKU for premium to find the tier", () => {
     const h = bridge();
     const id = entId();
-    const raw = { id, sku_id: 'sku1', guild_id: G, user_id: B };
+    const raw = { id, sku_id: 'sku1', user_id: U, application_id: '50000000000000001', type: 8 };
     h.entitlementCreate(raw);
     h.entitlementUpdate(raw);
     h.entitlementDelete(raw);
     expect(emitted.map(e => [e.type, e.holder, e.buyerId, 'guildId' in e])).toEqual([
-      ['subscription.created', `guild:${G}`, B, false],
-      ['subscription.updated', `guild:${G}`, undefined, false],
-      ['subscription.expired', `guild:${G}`, undefined, false],
+      ['subscription.created', `user:${U}`, U, false],
+      ['subscription.updated', `user:${U}`, undefined, false],
+      ['subscription.expired', `user:${U}`, undefined, false],
     ]);
+    expect(emitted[0]).toMatchObject({ tierId: '', offeringId: '', variantId: 'sku1', soldVariantOnly: true, tierFromVariant: true });
   });
 
-  it('an entitlement with a user and no server emits nothing and logs L4 once over its three events', () => {
+  it('an entitlement for a server emits nothing and logs PD1 once over its three events', () => {
     const h = bridge();
     const id = entId();
-    const raw = { id, sku_id: 'sku9', user_id: U };
+    const raw = { id, sku_id: 'sku9', guild_id: G, user_id: B };
     h.entitlementUpdate(raw);
     h.entitlementCreate(raw);
     h.entitlementDelete(raw);
     bridge().entitlementCreate(raw);
     expect(emitted).toEqual([]);
-    expect(logs).toEqual([l4(id, 'sku9')]);
+    expect(logs).toEqual([pd1(id, 'sku9')]);
   });
 
   it('an entitlement with neither a user nor a server, or a server id that is no Discord id, emits nothing and logs nothing', () => {
@@ -208,20 +207,5 @@ describe("Discord's store", () => {
     h.entitlementUpdate({ id: entId(), sku_id: 'sku1', guild_id: 'g1' });
     expect(emitted).toEqual([]);
     expect(logs).toEqual([]);
-  });
-
-  it("a server's list names the holder and the entitlement's user as buyer", async () => {
-    env();
-    const id = entId();
-    stubFetch(url => (url.includes('/skus') ? [{ id: 'sku1', name: 'Gold' }] : [{ id, sku_id: 'sku1', guild_id: G, user_id: B, type: 8 }]));
-    const list = await new DiscordProvider().listSubscriptionsFor(`guild:${G}`);
-    expect(list.map(r => r.metadata)).toEqual([{ holder: `guild:${G}`, buyerId: B, variantId: 'sku1' }]);
-  });
-
-  it("a user's list is empty without a request", async () => {
-    env();
-    const calls = stubFetch(() => []);
-    expect(await new DiscordProvider().listSubscriptionsFor(`user:${U}`)).toEqual([]);
-    expect(calls).toEqual([]);
   });
 });

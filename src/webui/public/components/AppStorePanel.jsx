@@ -3063,6 +3063,18 @@ function DummyTestPurchase({ activated, showSuccess }) {
   const rowStyle = { display: 'flex', gap: '8px', alignItems: 'center', fontSize: '0.75rem', color: '#ccc', marginBottom: '4px' };
   const subs = lookup ? lookup.subscriptions : null;
   const active = subs && subs.active && subs.active.source === 'paid' ? subs.active : null;
+  const removableUnfollowed = sub => sub.followed === false && sub.whyNot !== 'unread';
+  const notFollowedText = sub => (sub.whyNot === 'unread'
+    ? "payment-providers/credentials.json cannot be read now, so the bot can't confirm whether Discord bills this subscription, and it does not end or remove it. Try again once it can be read."
+    : sub.whyNot === 'not-configured'
+    ? "Discord is not configured on this bot, so it does not follow this subscription. Removing it does not stop Discord's billing."
+    : "This subscription carries another Discord application id than the one configured, so the bot does not follow it. If the configured id is wrong, fix it instead. Removing it does not stop that application's billing.");
+  const discordManagedText = 'Discord manages this subscription. The member cancels it in Discord; the tier ends when Discord reports that it ended or was refunded. The bot learns of a cancel only when Discord shows an end date, so a cancelled subscription can show as renewing until its end.';
+  const noteStyle = { color: '#999', fontSize: '0.72rem' };
+  const cardNote = sub => (sub.source !== 'paid' ? null
+    : sub.followed === false ? notFollowedText(sub)
+      : sub.providerId === 'discord' ? discordManagedText : null);
+  const activeNote = active ? cardNote(active) : null;
 
   return (
     <div style={{ marginTop: '24px', paddingTop: '14px', borderTop: '1px solid #333' }}>
@@ -3121,7 +3133,11 @@ function DummyTestPurchase({ activated, showSuccess }) {
           {subs.active && (
             <div style={rowStyle}>
               <span>Active: {tierName(subs.active.tierId)} ({subs.active.source}, {subs.active.status})</span>
-              {active && (
+              {active && activeNote && <span style={noteStyle}>{activeNote}</span>}
+              {active && removableUnfollowed(active) && (
+                <button className="btn btn-danger btn-sm" disabled={busy} onClick={() => { if (confirm(activeNote)) run(() => api.post(`${userBase}/paid/expire-now`), 'Subscription removed', true); }}>End now</button>
+              )}
+              {active && !activeNote && (
                 <>
                   <button className="btn btn-secondary btn-sm" disabled={busy} onClick={() => run(() => api.delete(`${userBase}/paid`), 'Subscription cancelled', true)}>Cancel</button>
                   <button className="btn btn-secondary btn-sm" disabled={busy} onClick={() => run(() => api.post(`${userBase}/paid/reactivate`), 'Subscription renews again', true)}>Renew again</button>
@@ -3130,12 +3146,19 @@ function DummyTestPurchase({ activated, showSuccess }) {
               )}
             </div>
           )}
-          {(subs.paused || []).map(entry => (
-            <div key={entry.id} style={rowStyle}>
-              <span>Queued: {tierName(entry.tierId)} ({entry.source})</span>
-              <button className="btn btn-danger btn-sm" disabled={busy} onClick={() => { if (confirm(entry.source === 'paid' ? `End the queued '${tierName(entry.tierId)}' subscription now? It is cancelled at the provider, and its days are lost.` : `Remove the queued '${tierName(entry.tierId)}' grant now? Its days are lost.`)) run(() => api.delete(`${userBase}/paused/${encodeURIComponent(entry.id)}`), 'Queued subscription cancelled', true); }}>Cancel & remove</button>
-            </div>
-          ))}
+          {(subs.paused || []).map(entry => {
+            const note = cardNote(entry);
+            const removable = !note || removableUnfollowed(entry);
+            return (
+              <div key={entry.id} style={rowStyle}>
+                <span>Queued: {tierName(entry.tierId)} ({entry.source})</span>
+                {note && <span style={noteStyle}>{note}</span>}
+                {removable && (
+                  <button className="btn btn-danger btn-sm" disabled={busy} onClick={() => { if (confirm(note || (entry.source === 'paid' ? `End the queued '${tierName(entry.tierId)}' subscription now? It is cancelled at the provider, and its days are lost.` : `Remove the queued '${tierName(entry.tierId)}' grant now? Its days are lost.`))) run(() => api.delete(`${userBase}/paused/${encodeURIComponent(entry.id)}`), note ? 'Queued subscription removed' : 'Queued subscription cancelled', true); }}>Cancel & remove</button>
+                )}
+              </div>
+            );
+          })}
           <div style={{ fontSize: '0.8rem', color: '#ddd', margin: '10px 0 6px 0' }}>Found at the Dummy provider, not in the bot</div>
           {lookup.orphanError && <div style={{ fontSize: '0.75rem', color: '#f87171' }}>{lookup.orphanError}</div>}
           {!lookup.orphanError && lookup.orphans.length === 0 && (

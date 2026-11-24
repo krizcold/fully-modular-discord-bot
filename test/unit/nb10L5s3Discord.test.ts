@@ -11,23 +11,24 @@ vi.mock('../../src/bot/internalSetup/utils/payment/paymentRegistry', () => ({
 
 import { DiscordProvider } from '../../src/bot/internalSetup/utils/payment/discordProvider';
 
-// The Discord provider's REST call: the method, the bot's authorization and a bound on the wait.
+// The Discord provider's REST call: the route, the method, the bot's authorization and a bound on the wait.
 
 afterEach(() => {
   vi.unstubAllGlobals();
 });
 
 describe('a Discord REST call', () => {
-  it('cancels with DELETE, the bot token and a timeout signal', async () => {
+  it('reads one entitlement with GET, the bot token and a timeout signal', async () => {
     const calls: Array<{ url: string; init: RequestInit }> = [];
     vi.stubGlobal('fetch', async (url: string, init: RequestInit) => {
       calls.push({ url, init });
-      return new Response(null, { status: 204 });
+      return new Response(JSON.stringify({ id: 'ent1', sku_id: 'sku1', application_id: '4242', user_id: '80000000000000001', type: 8, deleted: false, starts_at: null, ends_at: null }), { status: 200, headers: { 'Content-Type': 'application/json' } });
     });
-    await new DiscordProvider().cancelSubscription('ent1');
+    const state = await new DiscordProvider().getSubscriptionState('ent1');
+    expect(state).toMatchObject({ status: 'active', endDate: null, autoRenew: true });
     expect(calls).toHaveLength(1);
     expect(calls[0].url).toBe('https://discord.com/api/v10/applications/4242/entitlements/ent1');
-    expect(calls[0].init.method).toBe('DELETE');
+    expect(calls[0].init.method).toBe('GET');
     expect((calls[0].init.headers as Record<string, string>).Authorization).toBe('Bot test-token');
     expect(calls[0].init.signal).toBeInstanceOf(AbortSignal);
   });

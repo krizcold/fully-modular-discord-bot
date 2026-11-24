@@ -167,7 +167,20 @@ export interface ProviderCapabilities {
   sells: readonly HolderKind[];
   /** Premium's end is what was paid; premium frees the slot at the end. */
   endsAtPaidEnd?: boolean;
+  /**
+   * Only the provider ends or removes a user's subscription it follows: premium refuses an admin's end or removal of
+   * one, and its install refusals tell the operator that the member cancels at the provider.
+   */
+  endedByProviderOnly?: boolean;
+  /** The provider keeps billing a subscription premium queues, and the provider's end is the queued record's end. */
+  billedWhileQueued?: boolean;
 }
+
+/** Why a provider's checks do not follow a record premium holds; 'unread': its settings cannot be read, so it is not known. */
+export type NotFollowedReason = 'guild' | 'other-app' | 'not-configured' | 'unread';
+
+/** Whether a provider's checks follow a record premium holds, and why not when they do not. */
+export type FollowAnswer = { followed: true } | { followed: false; whyNot: NotFollowedReason };
 
 // ============================================================================
 // PROVIDER STATE
@@ -371,7 +384,7 @@ export type ProviderEvent =
    * are needed because the cache has no record yet and PremiumManager can't
    * infer them.
    */
-  | { type: 'subscription.created'; providerId: string; providerSubId: string; holder: HolderKey; buyerId?: string; tierId: string; offeringId: string; variantId?: string; couponCode?: string; state: ProviderSubscriptionState; variantSnapshot?: OfferingVariant; soldVariantOnly?: true }
+  | { type: 'subscription.created'; providerId: string; providerSubId: string; holder: HolderKey; buyerId?: string; tierId: string; offeringId: string; variantId?: string; couponCode?: string; state: ProviderSubscriptionState; variantSnapshot?: OfferingVariant; soldVariantOnly?: true; tierFromVariant?: true }
   | { type: 'subscription.renewed'; providerId: string; providerSubId: string; holder: HolderKey; state: ProviderSubscriptionState }
   | { type: 'subscription.expired'; providerId: string; providerSubId: string; holder: HolderKey; state: ProviderSubscriptionState }
   | { type: 'subscription.cancelled'; providerId: string; providerSubId: string; holder: HolderKey; state: ProviderSubscriptionState }
@@ -523,6 +536,9 @@ export interface PaymentProvider {
   migrateSubscriptionPrice?(providerSubId: string, newVariantId: string, prorationBehavior: 'none' | 'create_prorations'): Promise<void | ProviderSubscriptionState>;
 
   getSubscriptionState(providerSubId: string): Promise<ProviderSubscriptionState | null>;
+
+  /** Optional: whether this provider's checks follow a record premium holds; a provider without it follows every record. */
+  followsSubscription?(sub: { holder: HolderKey; providerMeta?: Record<string, any> }): FollowAnswer;
 
   /** Webhook-driven providers (Stripe, PayPal) implement this. */
   handleWebhook?(rawBody: Buffer, signature: string, headers: Record<string, string>): Promise<void>;

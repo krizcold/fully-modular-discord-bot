@@ -33,6 +33,14 @@ export function runEntitlementEvent<T>(fn: () => T): T {
 }
 
 /**
+ * Runs code outside an entitlement event's handler: a timer or promise chain it starts does not pass the order's
+ * refusal, which AsyncLocalStorage would otherwise carry into it (sheet P6, D16).
+ */
+export function outsideEntitlementEvent<T>(fn: () => T): T {
+  return passesOrder.exit(fn);
+}
+
+/**
  * NX5 ruling G8-9 (a): a core subsystem's save of a change it accepted and holds (its retry, its final stop pass, the
  * answer's save run) passes the order's refusal.
  */

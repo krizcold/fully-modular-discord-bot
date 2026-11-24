@@ -191,13 +191,13 @@ describe('P1 claim 14: a provider that sells servers only', () => {
   });
 });
 
-describe('P1 claim 14 as P5 leaves it: the three providers that sell servers only, each by its own `sells` (Stripe sells users from P3, PayPal from P5)', () => {
+describe('P1 claim 14 as P6 leaves it: the two providers that sell servers only, each by its own `sells` (Stripe sells users from P3, PayPal from P5)', () => {
   it('PayPal sells servers and users', () => {
     expect(new PayPalProvider().capabilities.sells).toEqual(['guild', 'user']);
   });
 
   it('each sells servers; a user tier linking it is refused (X8), and a user purchase and adoption through it never reach it', async () => {
-    const serverOnly: PaymentProvider[] = [new PatreonProvider(), new ServerBoostingProvider(), new DiscordProvider()];
+    const serverOnly: PaymentProvider[] = [new PatreonProvider(), new ServerBoostingProvider()];
     const offering = (enabled: boolean) => ({
       id: 'o-useven', label: 'Seven monthly',
       providerLinks: serverOnly.map(p => ({ providerId: p.id, enabled, mode: 'price', priceConfig: { entries: [{ variantId: `${p.id}_v` }] } })),
@@ -229,8 +229,35 @@ describe('P1 claim 14 as P5 leaves it: the three providers that sell servers onl
     expect(outcomes).toEqual([
       row('patreon', 'Patreon'),
       row('boost', 'Server Boosting'),
-      row('discord', 'Discord App Monetization'),
     ]);
+  });
+});
+
+describe("P6 claim 12: Discord's store sells users only", () => {
+  it('a server tier linking it is refused (X8), a user tier linking it is saved, and a purchase through it is refused before any call', async () => {
+    const discord = new DiscordProvider();
+    vi.spyOn(discord, 'isConfigured').mockReturnValue(true);
+    const bought = vi.spyOn(discord, 'initiatePurchase');
+    getPaymentRegistry().register(discord);
+    try {
+      expect(discord.capabilities.sells).toEqual(['user']);
+      expect((await w.op('setProviderActivation', 'discord', true)).ok).toBe(true);
+      const link = (enabled: boolean) => ({ providerId: 'discord', enabled, mode: 'price', priceConfig: { entries: [{ variantId: 'discord_v' }] } });
+      const before = state();
+      const server = await w.op('setTier', 'gseven', { displayName: 'G Seven', priority: 7, overrides: {}, offerings: [{ id: 'o-gseven', label: 'Seven monthly', providerLinks: [link(true)] }] });
+      expect(server.ok).toBe(false);
+      expect(server.error).toContain("Discord App Monetization does not sell server subscriptions; turn its link off on offering 'Seven monthly'.");
+      expect(state().premium).toBe(before.premium);
+      expect((await w.op('setTier', 'useven', { ...userSoldTierDef('vlow', 'U Seven'), priority: 5, offerings: [{ id: 'o-useven', label: 'Seven monthly', providerLinks: [link(true)] }] })).ok).toBe(true);
+      const saved = state();
+      const purchase = await w.op('initiatePaidSubscription', USER, 'useven', 'o-useven', { providerId: 'discord', variantId: 'discord_v', buyerId: USERS[0] });
+      expect(purchase.ok).toBe(false);
+      expect(purchase.error).toContain("Provider 'discord' cannot initiate purchase server-side");
+      expect(bought).not.toHaveBeenCalled();
+      expect(state()).toEqual(saved);
+    } finally {
+      (discord as PaymentProvider).stop?.();
+    }
   });
 });
 

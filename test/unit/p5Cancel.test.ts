@@ -237,16 +237,25 @@ const dateOf = (iso: string): string => new Date(iso).toLocaleDateString();
 const ENDS_TEXT = 'Cancel your paid subscription? PayPal stops billing it now. You keep access until the current period ends; it cannot be restarted, so to continue after that you buy again.';
 const TODAY_TEXT = 'Cancel your paid subscription? You keep access until the current period ends and can reactivate any time before then.';
 const TODAY_TITLE = 'Stop auto-renewing. You keep access until the current period ends.';
+const DISCORD_PD16 = "The bot no longer follows server subscriptions from Discord, so this record ends only when it is removed here or at an end date it already holds. Removing it does not stop Discord's billing; remove it once Discord no longer bills it.";
 
 describe('P5 claim 11: the panel', () => {
   it.each([
     ['stripe', true, true], ['dummy', true, false], ['paypal', false, false],
-    ['discord', false, false], ['patreon', false, false], ['boost', false, false],
+    ['patreon', false, false], ['boost', false, false],
   ])('%s: Reactivate %s, "Manage at provider" %s; Cancel and "Cancel & remove now" shown', async (providerId, reactivate, portal) => {
     const off = await showPanel(paidCard(providerId, false));
     const on = await showPanel(paidCard(providerId, true));
     expect([off.has('Reactivate'), off.has('Manage at provider'), off.labels.includes('Cancel & remove now')]).toEqual([reactivate, portal, true]);
     expect([on.labels.includes('Cancel'), on.has('Manage at provider'), on.labels.includes('Cancel & remove now')]).toEqual([true, portal, true]);
+  });
+
+  it('discord (sheet P6 claim 9): a guild: Discord card shows PD16 and only "Cancel & remove now", renewing or not', async () => {
+    for (const autoRenew of [false, true]) {
+      const shown = await showPanel(paidCard('discord', autoRenew));
+      expect(shown.text).toContain(DISCORD_PD16);
+      expect(shown.labels.filter(l => /^(Cancel|Reactivate|Manage at provider|Unlink Patreon)/.test(l))).toEqual(['Cancel & remove now']);
+    }
   });
 
   it("a provider not in providers keeps today's buttons", async () => {
@@ -256,11 +265,17 @@ describe('P5 claim 11: the panel', () => {
     expect([on.labels.includes('Cancel'), on.has('Manage at provider')]).toEqual([true, true]);
   });
 
-  it.each([['paypal', ENDS_TEXT, ENDS_TEXT], ['stripe', TODAY_TEXT, TODAY_TITLE], ['discord', TODAY_TEXT, TODAY_TITLE]])('%s: the cancel confirm text and the Cancel title', async (providerId, text, title) => {
+  it.each([['paypal', ENDS_TEXT, ENDS_TEXT], ['stripe', TODAY_TEXT, TODAY_TITLE]])('%s: the cancel confirm text and the Cancel title', async (providerId, text, title) => {
     const shown = await showPanel(paidCard(providerId, true));
     const cancel = shown.button('Cancel');
     await cancel.onClick();
     expect([shown.confirms, cancel.title]).toEqual([[text], title]);
+  });
+
+  it('discord (sheet P6 claim 9): the confirm of "Cancel & remove now" on a guild: Discord card is PD16', async () => {
+    const shown = await showPanel(paidCard('discord', true));
+    await shown.button('Cancel & remove now').onClick();
+    expect(shown.confirms).toEqual([DISCORD_PD16]);
   });
 
   it('a failed renewal shows the failing tag beside Cancel; after a retry that succeeds, (auto-renewing)', async () => {

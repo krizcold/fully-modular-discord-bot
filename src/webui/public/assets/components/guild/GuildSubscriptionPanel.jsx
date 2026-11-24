@@ -284,6 +284,7 @@ function GuildSubscriptionPanel({ guild, subData, onRefresh }) {
   function goneConfirm(providerId) {
     return `This removes it from the bot only: the bot does not have the payment provider '${providerId}', so the billing there does not stop. Cancel it at that provider as well.`;
   }
+  const DISCORD_SERVER_TEXT = "The bot no longer follows server subscriptions from Discord, so this record ends only when it is removed here or at an end date it already holds. Removing it does not stop Discord's billing; remove it once Discord no longer bills it.";
   function cancelText(providerId) {
     return capabilitiesOf(providerId)?.endsAtPaidEnd
       ? `Cancel your paid subscription? ${getProviderName(providerId)} stops billing it now. You keep access until the current period ends; it cannot be restarted, so to continue after that you buy again.`
@@ -398,7 +399,7 @@ function GuildSubscriptionPanel({ guild, subData, onRefresh }) {
     const remainingMsg = paid && paid.endDate
       ? ` You'll lose any remaining time on it.`
       : '';
-    if (!confirm(
+    if (!confirm(paid?.providerId === 'discord' ? DISCORD_SERVER_TEXT :
       `Cancel '${tierName}' immediately?${remainingMsg} ` +
       `If you have a queued subscription it will resume in this slot. ` +
       `This cannot be undone.` +
@@ -498,11 +499,13 @@ function GuildSubscriptionPanel({ guild, subData, onRefresh }) {
     const tierName = getTierName(ps.tierId);
     const isPaid = ps.source === 'paid';
     if (!confirm(
-      isPaid && providerGone(ps.providerId)
-        ? `Cancel your queued '${tierName}' subscription? It will not resume when your current plan ends. ${goneConfirm(ps.providerId)}`
-        : isPaid
-          ? `Cancel your queued '${tierName}' subscription? It will not resume when your current plan ends, and the provider will stop billing for it.`
-          : `Cancel your queued '${tierName}' grant? It will not resume when your current plan ends.`,
+      isPaid && ps.providerId === 'discord'
+        ? DISCORD_SERVER_TEXT
+        : isPaid && providerGone(ps.providerId)
+          ? `Cancel your queued '${tierName}' subscription? It will not resume when your current plan ends. ${goneConfirm(ps.providerId)}`
+          : isPaid
+            ? `Cancel your queued '${tierName}' subscription? It will not resume when your current plan ends, and the provider will stop billing for it.`
+            : `Cancel your queued '${tierName}' grant? It will not resume when your current plan ends.`,
     )) return;
     setProcessing(true); setError(null);
     try {
@@ -755,8 +758,11 @@ function GuildSubscriptionPanel({ guild, subData, onRefresh }) {
                     This bot does not have the payment provider '{paid.providerId}', so it cannot change this subscription there. Manage or cancel it at that provider.
                   </div>
                 )}
+                {paid.providerId === 'discord' && (
+                  <div style={{ color: '#e67e22', fontSize: '0.78rem', marginTop: '4px' }}>{DISCORD_SERVER_TEXT}</div>
+                )}
                 <div style={{ display: 'flex', gap: '6px', marginTop: '10px', flexWrap: 'wrap' }}>
-                  {providerGone(paid.providerId) ? null : paid.autoRenew === true ? (
+                  {providerGone(paid.providerId) || paid.providerId === 'discord' ? null : paid.autoRenew === true ? (
                     <button onClick={handleCancel} disabled={processing} style={{
                       background: 'transparent', color: '#ed4245', border: '1px solid #ed4245',
                       padding: '5px 12px', borderRadius: '5px', cursor: 'pointer', fontSize: '0.78rem',
@@ -781,7 +787,7 @@ function GuildSubscriptionPanel({ guild, subData, onRefresh }) {
                   title="End this subscription right now and free the slot. Loses remaining time. If you have a queued sub, it resumes here.">
                     {processing ? 'Cancelling…' : 'Cancel & remove now'}
                   </button>
-                  {!providerGone(paid.providerId) && (!paidCaps || paidCaps.supportsCustomerPortal) && (
+                  {!providerGone(paid.providerId) && paid.providerId !== 'discord' && (!paidCaps || paidCaps.supportsCustomerPortal) && (
                   <button onClick={handleOpenBillingPortal} disabled={processing} style={{
                     background: 'transparent', color: '#aaa', border: '1px solid #555',
                     padding: '5px 12px', borderRadius: '5px',
@@ -831,6 +837,9 @@ function GuildSubscriptionPanel({ guild, subData, onRefresh }) {
                     <div style={{ color: '#888', fontSize: '0.78rem', marginTop: '4px' }}>
                       via <strong style={{ color: '#ccc' }}>{getProviderName(ps.providerId)}</strong>
                     </div>
+                  )}
+                  {isPaid && ps.providerId === 'discord' && (
+                    <div style={{ color: '#e67e22', fontSize: '0.78rem', marginTop: '4px' }}>{DISCORD_SERVER_TEXT}</div>
                   )}
                   <div style={{ display: 'flex', gap: '6px', marginTop: '10px' }}>
                     <button onClick={() => handleCancelPaused(ps)} disabled={processing} style={{
