@@ -8,6 +8,8 @@ import { dataPath } from '../../../utils/dataRoot';
 import { atomicWriteFileSync } from './atomicWrite';
 import { FolderSyncError, logFolderSyncError } from './folderChain';
 import { recordLoadFailure } from './loadFailures';
+import { isMaintenanceGateClosed } from './maintenanceGate';
+import { stoppedServing } from './servingGate';
 import { readStoreRecord, writeStoreRecord } from './sharedRecords';
 
 /** One start of one module version: opened before its code runs, ended once. Compared by identity. */
@@ -23,7 +25,8 @@ export interface ModuleStart {
   late: boolean;
 }
 
-export type StartResult = 'ok' | 'bound' | 'replaced' | { rejected: unknown } | { failed: unknown };
+/** 'unserved': a boot start of a process granted no shard, ended at its boot's end with none of its start-up code run. */
+export type StartResult = 'ok' | 'bound' | 'replaced' | 'unserved' | { rejected: unknown } | { failed: unknown };
 
 export type StartAnswer = ModuleStart | 'held' | 'starting';
 
@@ -330,7 +333,7 @@ export async function endStart(start: ModuleStart, result: StartResult): Promise
     startFailures.set(start.module, failure);
     failuresByStart.set(start, failure);
   }
-  if (start.sha !== null) {
+  if (start.sha !== null && result !== 'unserved') {
     try {
       const lines = readCrashLines();
       if (lines[start.module]?.sha === start.sha) {
@@ -355,6 +358,17 @@ export async function endStart(start: ModuleStart, result: StartResult): Promise
     }
   } finally {
     if (startEnds.get(start.module) === 'running') startEnds.delete(start.module);
+  }
+}
+
+/**
+ * NB46: a process granted no shard never logs in, so no turn ends its handed boot starts; they end here. One that
+ * stopped serving or whose maintenance gate is closed keeps them, and its restart recovers the applies.
+ */
+export async function endUnservedBootStarts(granted: number): Promise<void> {
+  if (granted > 0 || stoppedServing() || isMaintenanceGateClosed()) return;
+  for (const [module, start] of [...bootStarts]) {
+    if (openStarts.get(module) === start) await endStart(start, 'unserved');
   }
 }
 

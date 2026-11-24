@@ -31,7 +31,7 @@ import { bootShards, getLeaseRuntime, getShardClaims } from './fleet/shardBoot';
 import { guildRequestsStopStep, requestGuildRequestPass, startGuildRequestSweep } from './fleet/guildRequests';
 import { bootShared, startSharedPass, stopSharedPass } from './utils/sharedMirror';
 import {
-  applyOfStart, applyTails, bootStartOf, closeWindow, endStart, INITIALIZER_LATE_MS, INITIALIZER_WAIT_MS, markLate, onModuleCode, openStarts, openWindow,
+  applyOfStart, applyTails, bootStartOf, closeWindow, endStart, endUnservedBootStarts, INITIALIZER_LATE_MS, INITIALIZER_WAIT_MS, markLate, onModuleCode, openStarts, openWindow,
   startEndFailed, type ModuleStart,
 } from './utils/moduleCrashes';
 import { stoppedServing } from './utils/servingGate';
@@ -949,5 +949,6 @@ export async function runBot(opts: RunBotOptions): Promise<void> {
     if (missing.length > 0) console.warn(l20Line(missing));
     client.emit('clientReady', client as Client<true>);
   }
+  if (backend instanceof PostgresBackend && dataRefusal === undefined) await endUnservedBootStarts(getLeaseRuntime()?.getCurrent()?.leases.length ?? 0);
   fleet.startIngest(process.env.DISCORD_TOKEN);
 }

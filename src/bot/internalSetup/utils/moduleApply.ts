@@ -1009,15 +1009,16 @@ function setBuilt(module: string, sha: string): void {
 // ============================================================================
 
 /**
- * An apply's start that ended at boot, or after its turn passed: 'ok' or 'bound' finish the apply; a rejection takes
- * 67's failure path holding the store mutex and the reload mark, both released in a `finally` (101). A start ended
- * inside its turn in a running bot is the apply's own run's, and `{ failed }` is the caller's own failure path.
+ * An apply's start that ended at boot, or after its turn passed: 'ok', 'bound' or 'unserved' finish the apply; a
+ * rejection takes 67's failure path holding the store mutex and the reload mark, both released in a `finally` (101). A
+ * start ended inside its turn in a running bot is the apply's own run's, and `{ failed }` is the caller's own failure
+ * path.
  */
 async function onApplyStartEnded(start: ModuleStart, result: StartResult): Promise<void> {
   if (result === 'replaced' || (typeof result === 'object' && 'failed' in result)) return;
   if (!applyOfStart(start)) return;
   if (!start.boot && !start.late) return;
-  if (result === 'ok' || result === 'bound') {
+  if (result === 'ok' || result === 'bound' || result === 'unserved') {
     await finishApply(start.module);
     return;
   }
