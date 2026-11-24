@@ -16,7 +16,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { execSync } from 'child_process';
 import { ModuleManifest } from '../../types/moduleTypes';
-import { ensureDir, getModulesDir, getSourceModulesDir, getBuildModulesDir, getModulesDevDir } from './pathHelpers';
+import { buildInfoPathOf, ensureDir, getModulesDir, getSourceModulesDir, getBuildModulesDir, getModulesDevDir } from './pathHelpers';
 import { dataPath } from '../../../utils/dataRoot';
 import { takeAutoSnapshot } from '@/utils/autoSnapshot';
 import { ProcessLock, processStart } from './processLock';
@@ -587,6 +587,13 @@ function fsyncTree(dir: string): void {
 function dropStaged(dir: string): void {
   stagedFolders.delete(path.resolve(dir));
   fs.rmSync(dir, { recursive: true, force: true });
+}
+
+/** A module's compiled folder deleted, tsc's incremental record first, so the next compile writes its files again (NB45). */
+function dropRuntimeDir(sourceDir: string, runtimeDir: string): void {
+  if (!fs.existsSync(runtimeDir)) return;
+  if (path.resolve(runtimeDir) !== path.resolve(sourceDir)) fs.rmSync(buildInfoPathOf(getModulesDir()), { force: true });
+  fs.rmSync(runtimeDir, { recursive: true, force: true });
 }
 
 /** Decision 42's texts for a publish or an uninstall that stored nothing, and 35's and T10's when that is unknown. */
@@ -1964,9 +1971,7 @@ export class AppStoreManager {
       if (sourceDir !== buildDir && fs.existsSync(buildDir)) {
         fs.rmSync(buildDir, { recursive: true, force: true });
       }
-      if (fs.existsSync(runtimeDir)) {
-        fs.rmSync(runtimeDir, { recursive: true, force: true });
-      }
+      dropRuntimeDir(sourceDir, runtimeDir);
 
       // Remove credentials if any
       this.deleteCredentials(moduleName);
@@ -2420,7 +2425,7 @@ export class AppStoreManager {
       try {
         if (fs.existsSync(sourceDir)) fs.rmSync(sourceDir, { recursive: true, force: true });
         if (sourceDir !== buildDir && fs.existsSync(buildDir)) fs.rmSync(buildDir, { recursive: true, force: true });
-        if (fs.existsSync(runtimeDir)) fs.rmSync(runtimeDir, { recursive: true, force: true });
+        dropRuntimeDir(sourceDir, runtimeDir);
       } catch (error) {
         console.error(`[AppStoreManager] Failed to remove old module:`, error);
         return { success: false, error: `Failed to remove the current version of ${moduleName}; its backup is at ${backupDir}` };

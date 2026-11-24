@@ -60,9 +60,9 @@ describe('row 138: a request while a compile runs', () => {
 
 describe('row 139: a reload route\'s compile overlaps an apply\'s', () => {
   it('the apply\'s result comes from a compile started after its call, run with the largest bound of its callers', async () => {
-    const reload = recompileTypeScript();
+    const reload = recompileTypeScript({ timeoutMs: 60_000 });
     const apply = recompileTypeScript({ timeoutMs: 600_000 });
-    const other = recompileTypeScript();
+    const other = recompileTypeScript({ timeoutMs: 60_000 });
     expect(h.runs.map(r => r.timeout)).toEqual([60_000]);
     h.runs[0].finish(failed('bot/modules/m/index.ts(1,1): error TS1005: the source before the swap.\n'));
     expect((await reload).diagnostics).toHaveLength(1);

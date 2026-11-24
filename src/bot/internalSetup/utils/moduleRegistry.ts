@@ -1,3 +1,4 @@
+import * as path from 'path';
 import { Client } from 'discord.js';
 import { LoadedModule, ModuleManifest, ModuleContext } from '../../types/moduleTypes';
 import { getModuleEventManager } from './moduleEventManager';
@@ -118,7 +119,11 @@ export class ModuleRegistry {
       }
     }
 
-    // 5. Clear require/import cache for all files this module imported
+    // 5. The require cache of every file under the module's folder (require.resolve throws for a file already deleted), then of each file it imported
+    const folder = path.resolve(module.path) + path.sep;
+    for (const key of Object.keys(require.cache)) {
+      if (key.startsWith(folder)) delete require.cache[key];
+    }
     for (const filePath of module.importedFiles) {
       const importPath = toImportPath(filePath);
       // Clear CommonJS require cache

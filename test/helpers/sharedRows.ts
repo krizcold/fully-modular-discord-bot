@@ -192,6 +192,12 @@ export function sharedRows() {
       const rows = [...modules].map(([module, row]) => ({ module, sha: row.sha, version: row.version, updated_by: row.updated_by }));
       return { rows, rowCount: rows.length };
     }
+    if (sql === 'SELECT module, sha, version, updated_by, NULL::bytea AS installed FROM smdb_data.shared_modules UNION ALL SELECT NULL, NULL, NULL, NULL, body FROM smdb_data.shared_docs WHERE key = $1') {
+      const rows: Array<Record<string, unknown>> = [...modules].map(([module, row]) => ({ module, sha: row.sha, version: row.version, updated_by: row.updated_by, installed: null }));
+      const doc = docs.get(String(p[0]));
+      if (doc) rows.push({ module: null, sha: null, version: null, updated_by: null, installed: Buffer.from(doc.body) });
+      return { rows, rowCount: rows.length };
+    }
     if (sql.startsWith('INSERT INTO smdb_data.shared_module_status ')) {
       txOf(client).upserts.push({
         module: String(p[0]),

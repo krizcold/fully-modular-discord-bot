@@ -47,14 +47,14 @@ import path from 'path';
 import { applyRig, fakeLoader } from '../helpers/nb6ApplyRig';
 import * as dm from '../../src/bot/internalSetup/utils/dataManager';
 import { readStoreRecord, storeRecordPath, writeStoreRecord, type ModuleEntry } from '../../src/bot/internalSetup/utils/sharedRecords';
-import { MODULE_STATUS_SQL, modulePassStep } from '../../src/bot/internalSetup/utils/moduleApply';
+import { LIST_SQL, MODULE_STATUS_SQL, modulePassStep } from '../../src/bot/internalSetup/utils/moduleApply';
+import { INSTALLED_KEY } from '../../src/bot/internalSetup/utils/sharedModules';
 import { crashFilePath, startEndFailed } from '../../src/bot/internalSetup/utils/moduleCrashes';
 
 const stepsAtLoad = [...h.steps];
 
 const rig = applyRig();
 const S_FILES = { 'module.json': '{"name":"m","version":"1.0.0"}', 'index.js': 'exports.v = 1;\n' };
-const LIST_SQL = 'SELECT module, sha, version, updated_by FROM smdb_data.shared_modules';
 const STALE_MS = 10 * 60_000;
 
 beforeEach(() => rig.setup());
@@ -108,14 +108,14 @@ describe('what the module step answers', () => {
     await expect(modulePassStep({ tag0: '1:ALPHA' })).resolves.toBe(false);
   });
 
-  it('rl8 listing binds: the listing sends no bind values, which Postgres would refuse for a query with no placeholder', async () => {
+  it("rl8 listing binds: the listing binds one value, installed.json's key, for its one placeholder, as Postgres requires", async () => {
     await rig.publish('m', S_FILES);
     await expect(rig.pass()).resolves.toBe(true);
     const lists = rig.state.pg.sent.filter(s => s.sql === LIST_SQL);
     expect(lists.length).toBeGreaterThan(0);
     for (const s of lists) {
       const values = s.params ?? (s.raw as { values?: unknown[] })?.values ?? [];
-      expect(values).toEqual([]);
+      expect(values).toEqual([INSTALLED_KEY]);
     }
     expect(rig.entry('m')?.sha).not.toBe('absent');
   });

@@ -15,9 +15,9 @@ import { _setListenClientFactory } from '../../src/bot/internalSetup/utils/share
 import { applyRig } from '../helpers/nb6ApplyRig';
 import { listenRig } from '../helpers/nb6Listen';
 import { lost } from '../helpers/sharedRows';
+import { LIST_SQL as MODULES_SQL } from '../../src/bot/internalSetup/utils/moduleApply';
 
 const rig = applyRig();
-const MODULES_SQL = 'SELECT module, sha, version, updated_by FROM smdb_data.shared_modules';
 const M_FILES = { 'module.json': '{"name":"m","version":"1.0.0"}', 'index.js': 'exports.v = 1;\n' };
 const N_FILES = { 'module.json': '{"name":"n","version":"1.0.0"}', 'index.js': 'exports.n = 1;\n' };
 

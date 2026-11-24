@@ -24,6 +24,8 @@ export const fakeLoader = {
   unloads: [] as string[],
   compiles: [] as CompileResult[],
   compileCalls: 0,
+  /** The bound each compile was asked for, in order (undefined: the reloader's default). */
+  compileBounds: [] as Array<number | undefined>,
   unloadFails: null as string | null,
   /** Runs inside a load before it answers: a test's probe of the state an apply holds then. */
   duringLoad: null as null | ((module: string) => void | Promise<void>),
@@ -33,6 +35,7 @@ export const fakeLoader = {
     this.unloads = [];
     this.compiles = [];
     this.compileCalls = 0;
+    this.compileBounds = [];
     this.unloadFails = null;
     this.duringLoad = null;
   },
@@ -43,8 +46,9 @@ export const reloaderFakes: {
   loadModuleUnmarked: (client: unknown, module: string) => Promise<UnmarkedLoad>;
   unloadModuleUnmarked: (client: unknown, module: string) => Promise<ReloadResult>;
 } = {
-  recompileTypeScript: async (): Promise<CompileResult> => {
+  recompileTypeScript: async (opts?: { timeoutMs?: number }): Promise<CompileResult> => {
     fakeLoader.compileCalls += 1;
+    fakeLoader.compileBounds.push(opts?.timeoutMs);
     return fakeLoader.compiles.shift() ?? { success: true, duration: 0, diagnostics: [] };
   },
   loadModuleUnmarked: async (_client: unknown, module: string) => {

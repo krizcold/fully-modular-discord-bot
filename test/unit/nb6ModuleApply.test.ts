@@ -17,7 +17,7 @@ import { applyRig, fakeLoader, moduleShaOfFiles, reloaderFakes } from '../helper
 import { moduleShaOf, readModuleFolder } from '../../src/bot/internalSetup/utils/sharedModules';
 import { shaOf } from '../../src/bot/internalSetup/utils/sharedStore';
 import { readStoreRecord, writeStoreRecord } from '../../src/bot/internalSetup/utils/sharedRecords';
-import { recoverModuleApplies } from '../../src/bot/internalSetup/utils/moduleApply';
+import { BOOT_COMPILE_MS, recoverModuleApplies } from '../../src/bot/internalSetup/utils/moduleApply';
 import { _resetModuleCrashes, closeWindow, countCrash, openWindow, startModule } from '../../src/bot/internalSetup/utils/moduleCrashes';
 import { setStoppedServingHook } from '../../src/bot/internalSetup/utils/servingGate';
 import { pgError } from '../helpers/sharedRows';
@@ -324,6 +324,51 @@ describe('row 356: an entry left with applying, then the boot recovery', () => {
     expect(rig.live('m')).toEqual(U_FILES);
     expect(rig.entry('m')).toMatchObject({ sha: u });
     expect(moduleShaOfFiles(U_FILES)).toBe(u);
+  });
+});
+
+describe("NB45: tsc's incremental record goes with a module's dist folder", () => {
+  const record = () => path.join(rig.state.root, 'dist', '.tsbuildinfo');
+  const compiled = (module: string) => {
+    rig.writeTree(path.join(rig.state.dist, module), { 'index.js': 'compiled' });
+    fs.writeFileSync(record(), '{}');
+  };
+
+  it('nb45 removal: an uninstall deletes the record with the dist folder', async () => {
+    await rig.inPlace('m', S_FILES);
+    compiled('m');
+    await rig.unpublish('m');
+    await rig.pass();
+    expect(rig.live('m')).toBeNull();
+    expect(rig.dist('m')).toBeNull();
+    expect(fs.existsSync(record())).toBe(false);
+  });
+
+  it("nb45 update: an update deletes the record with the dist folder, and its compile has a full compile's 600 s bound", async () => {
+    await rig.inPlace('m', S_FILES);
+    compiled('m');
+    const u = await rig.publish('m', U_FILES, '2.0.0');
+    fakeLoader.compileBounds = [];
+    expect(await rig.apply('m', u)).toMatchObject({ outcome: 'applied' });
+    expect(rig.dist('m')).toBeNull();
+    expect(fs.existsSync(record())).toBe(false);
+    expect(fakeLoader.compileBounds).toEqual([BOOT_COMPILE_MS]);
+  });
+
+  it('nb45 put back: the compile of the previous version after a failed load has the same bound', async () => {
+    await rig.inPlace('m', S_FILES);
+    const u = await rig.publish('m', FAILING, '2.0.0');
+    fakeLoader.compileBounds = [];
+    expect(await rig.apply('m', u)).toMatchObject({ outcome: 'failed', kept: 'previous' });
+    expect(fakeLoader.compileBounds).toEqual([BOOT_COMPILE_MS, BOOT_COMPILE_MS]);
+  });
+
+  it('nb45 no change: a pass that changes nothing keeps the record and the dist folder', async () => {
+    await rig.inPlace('m', S_FILES);
+    compiled('m');
+    await rig.pass();
+    expect(rig.dist('m')).toEqual({ 'index.js': 'compiled' });
+    expect(fs.existsSync(record())).toBe(true);
   });
 });
 

@@ -175,6 +175,60 @@ describe('the modules this boot swapped', () => {
   });
 });
 
+describe("NB45: tsc's incremental record at the boot", () => {
+  const TS_FILES = { 'module.json': '{"name":"m","version":"1.0.0"}', 'commands/ping.ts': 'export default { name: "ping" };\n', 'types.d.ts': 'export {};\n' };
+  const record = () => path.join(rig.state.root, 'dist', '.tsbuildinfo');
+
+  it("nb45 boot T2: a compile with no file deletes the record with the module's dist folder", async () => {
+    await rig.inPlace('m', S_FILES);
+    newBuild();
+    rig.writeTree(path.join(rig.state.dist, 'm'), { 'index.js': 'compiled' });
+    fs.writeFileSync(record(), '{}');
+    compileWith(() => noFile());
+    await bootCompileModules();
+    expect(rig.dist('m')).toBeNull();
+    expect(fs.existsSync(record())).toBe(false);
+  });
+
+  it("nb45 boot empty: an entry built in this image whose dist folder lacks a .js of its .ts files is compiled again, the record deleted first", async () => {
+    await rig.inPlace('m', TS_FILES);
+    expect(builtCurrent(rig.entry('m')!)).toBe(true);
+    fs.writeFileSync(record(), '{}');
+    let recordAtCompile: boolean | null = null;
+    compileWith(() => {
+      recordAtCompile = fs.existsSync(record());
+      rig.writeTree(path.join(rig.state.dist, 'm'), { 'commands/ping.js': 'compiled' });
+      return { success: true, duration: 0, diagnostics: [] };
+    });
+    const calls = fakeLoader.compileCalls;
+    await bootCompileModules();
+    expect(fakeLoader.compileCalls).toBe(calls + 1);
+    expect(recordAtCompile).toBe(false);
+    expect(builtCurrent(rig.entry('m')!)).toBe(true);
+  });
+
+  it('nb45 boot whole: an entry built in this image whose dist folder holds every .js is not compiled, and the record stays', async () => {
+    await rig.inPlace('m', TS_FILES);
+    rig.writeTree(path.join(rig.state.dist, 'm'), { 'commands/ping.js': 'compiled' });
+    fs.writeFileSync(record(), '{}');
+    const calls = fakeLoader.compileCalls;
+    await bootCompileModules();
+    expect(fakeLoader.compileCalls).toBe(calls);
+    expect(fs.existsSync(record())).toBe(true);
+  });
+
+  it("nb45 boot skipped: the .ts files tsc's ** skips (node_modules, dot-named) are not looked for in the dist folder", async () => {
+    await rig.inPlace('m', TS_FILES);
+    rig.writeTree(path.join(rig.state.source, 'm'), { 'node_modules/dep/index.ts': 'export {};\n', '.hidden.ts': 'export {};\n', '.cache/x.ts': 'export {};\n' });
+    rig.writeTree(path.join(rig.state.dist, 'm'), { 'commands/ping.js': 'compiled' });
+    fs.writeFileSync(record(), '{}');
+    const calls = fakeLoader.compileCalls;
+    await bootCompileModules();
+    expect(fakeLoader.compileCalls).toBe(calls);
+    expect(fs.existsSync(record())).toBe(true);
+  });
+});
+
 describe('a module of the store with no source folder', () => {
   it('rl8 no folder: it is not compiled and its entry is left as it was', async () => {
     await rig.inPlace('m', S_FILES);

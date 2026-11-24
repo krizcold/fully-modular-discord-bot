@@ -74,6 +74,11 @@ export function getBuildRoot(): string {
   return getBotRoot();
 }
 
+/** tsc's incremental record (tsconfigprod.json's `./dist/.tsbuildinfo`): the dist root, two levels above its modules folder. */
+export function buildInfoPathOf(modulesDir: string): string {
+  return path.resolve(modulesDir, '..', '..', '.tsbuildinfo');
+}
+
 /**
  * Get the path to a specific module (flat structure)
  * @param moduleName - Module name

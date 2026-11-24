@@ -223,7 +223,9 @@ export function parseDiagnostics(output: string, cwd: string = process.cwd()): C
   return out;
 }
 
-const COMPILE_TIMEOUT_MS = 60_000;
+// A compile with no incremental record (after any module's dist folder is deleted) is a full one: the boot's bound.
+const COMPILE_TIMEOUT_MS = 600_000;
+const SYNC_TIMEOUT_MS = 60_000;
 
 async function compileOnce(timeoutMs: number): Promise<CompileResult> {
   const start = Date.now();
@@ -234,7 +236,7 @@ async function compileOnce(timeoutMs: number): Promise<CompileResult> {
       timeout: timeoutMs
     });
     copyBuildAssetsToDist();
-    if (process.platform !== 'win32') await execAsync('sync', { timeout: COMPILE_TIMEOUT_MS });
+    if (process.platform !== 'win32') await execAsync('sync', { timeout: SYNC_TIMEOUT_MS });
     return { success: true, duration: Date.now() - start, diagnostics: [] };
   } catch (error: any) {
     const stderr = error.stderr?.toString() || error.message || 'Unknown compilation error';

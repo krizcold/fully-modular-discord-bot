@@ -29,7 +29,7 @@ import {
 import { findModuleManifests, getBuildModulesDir, getModulesDir, getSourceModulesDir } from './pathHelpers';
 import { stoppedServing } from './servingGate';
 import { setSharedModulePassStep } from './sharedMirror';
-import { fetchModule, moduleShaOf, readModuleFolder } from './sharedModules';
+import { fetchModule, INSTALLED_KEY, moduleShaOf, readModuleFolder } from './sharedModules';
 import { readStoreRecord, writeStoreRecord, type ApplyingIntent, type ModuleEntry, type PendingStatus, type StoreRecord } from './sharedRecords';
 import { nodeOf, rowBackend, shaOf } from './sharedStore';
 
@@ -261,13 +261,55 @@ function copyFolder(from: string, to: string): void {
 
 const sameDir = (a: string, b: string): boolean => path.resolve(a) === path.resolve(b);
 
+/** tsc's incremental record, tsconfigprod.json's `./dist/.tsbuildinfo`: in the dist root beside `.build-complete`. */
+const buildInfoOf = (d: ModuleDirs): string => path.join(path.dirname(d.buildFile), '.tsbuildinfo');
+
+/**
+ * A module's dist folder deleted where it is not its source folder, tsc's incremental record first: tsc does not emit
+ * again the files its record lists as compiled, so a folder deleted without it is not written again for the same sources.
+ */
+function dropDist(module: string): void {
+  const d = dirs();
+  const dist = path.join(d.dist, module);
+  if (sameDir(dist, path.join(d.source, module)) || !exists(dist)) return;
+  fs.rmSync(buildInfoOf(d), { force: true });
+  fs.rmSync(dist, { recursive: true, force: true });
+}
+
 /** The build and dist folders of a module deleted where they are not its source folder (43 step 3, 58 a). */
 function clearCompiled(module: string): void {
   const d = dirs();
+  const build = path.join(d.build, module);
+  if (!sameDir(build, path.join(d.source, module))) fs.rmSync(build, { recursive: true, force: true });
+  dropDist(module);
+}
+
+/** tsc's `**` wildcard skips these folders and every dot-named entry; tsconfigprod.json excludes the disabled ones. */
+const IMPLICIT_EXCLUDED = new Set(['node_modules', 'bower_components', 'jspm_packages']);
+const EXCLUDED_DIR = (name: string): boolean => IMPLICIT_EXCLUDED.has(name) || name === 'disabled' || name.endsWith('.disabled');
+
+/** Every .ts file of the module's source folder that tsconfigprod.json compiles has its .js in the dist folder. */
+function distWhole(module: string): boolean {
+  const d = dirs();
   const source = path.join(d.source, module);
-  for (const root of [d.build, d.dist]) {
-    const dir = path.join(root, module);
-    if (!sameDir(dir, source)) fs.rmSync(dir, { recursive: true, force: true });
+  const dist = path.join(d.dist, module);
+  if (sameDir(dist, source)) return true;
+  const walk = (rel: string): boolean => {
+    for (const e of fs.readdirSync(path.join(source, rel), { withFileTypes: true })) {
+      if (e.name.startsWith('.')) continue;
+      const r = path.join(rel, e.name);
+      if (e.isDirectory()) {
+        if (!EXCLUDED_DIR(e.name) && !walk(r)) return false;
+      } else if (e.name.endsWith('.ts') && !e.name.endsWith('.d.ts') && !exists(path.join(dist, `${r.slice(0, -3)}.js`))) {
+        return false;
+      }
+    }
+    return true;
+  };
+  try {
+    return walk('');
+  } catch {
+    return false;
   }
 }
 
@@ -625,13 +667,36 @@ async function reloadEnded(module: string): Promise<boolean> {
   return true;
 }
 
+/** Each module's first apply of this process still waiting for the store mutex or running, for a caller of the same change. */
+const applyCalls = new Map<string, { change: ModuleChange; result: Promise<ApplyResult> }>();
+
+const sameChange = (a: ModuleChange, b: ModuleChange): boolean =>
+  a.to === b.to && a.tag === b.tag && a.displaced === b.displaced && !a.keep && !b.keep;
+
 /**
  * Applies one module change. Given a hold of the store mutex it runs inside it; given none it takes the mutex, and a
- * wait over 60 s ends 'busy' with nothing touched (61). It never throws for a refusal: each ends in its result.
+ * wait over 60 s ends 'busy' with nothing touched (61). Given none while an apply of the same change waits or runs (the
+ * pass and the web UI's `module:apply` of one publish), it answers that apply's result. It never throws for a refusal:
+ * each ends in its result.
  */
 export async function applyModuleChange(change: ModuleChange, hold?: StoreMutexHold): Promise<ApplyResult> {
   const gate = gateOf(change);
   if (gate) return gate;
+  const open = applyCalls.get(change.module);
+  if (!hold && open && sameChange(open.change, change)) return open.result;
+  const own = !open;
+  const result = (async () => {
+    try {
+      return await applyHeld(change, hold);
+    } finally {
+      if (own) applyCalls.delete(change.module);
+    }
+  })();
+  if (own) applyCalls.set(change.module, { change, result });
+  return result;
+}
+
+async function applyHeld(change: ModuleChange, hold?: StoreMutexHold): Promise<ApplyResult> {
   let mine: StoreMutexHold | null = null;
   if (!hold) {
     mine = await storeMutex.acquire();
@@ -784,7 +849,7 @@ const ownFile = (file: string, module: string): boolean => `/${file}`.includes(`
 /** Steps 4 to 6, or the failure path. */
 async function load(change: ModuleChange, swapped: Swapped): Promise<ApplyResult> {
   const { module } = change;
-  const compile = await recompileTypeScript();
+  const compile = await recompileTypeScript({ timeoutMs: BOOT_COMPILE_MS });
   const own = compile.diagnostics.filter(diag => ownFile(diag.file, module));
   if (!compile.success && compile.diagnostics.length === 0) {
     return failurePath(module, swapped, 'retry', compile.error ?? 'the compile failed');
@@ -874,7 +939,7 @@ async function afterRestore(module: string, restored: Restored, why: 'failed' | 
     else logRetry(module, A, error, 'none', restored.retryAt ?? Date.now());
     return { kept: 'none' };
   }
-  const compile: CompileResult = await recompileTypeScript();
+  const compile: CompileResult = await recompileTypeScript({ timeoutMs: BOOT_COMPILE_MS });
   const own = compile.diagnostics.filter(diag => ownFile(diag.file, module));
   const compiled = compile.success || (compile.diagnostics.length > 0 && own.length === 0);
   const heldNow = (() => {
@@ -977,7 +1042,11 @@ onStartEnded(onApplyStartEnded);
 // THE PASS'S MODULE STEP (decision 49 for modules, with 58's step 0 and 80's step 7)
 // ============================================================================
 
-const LIST_SQL = 'SELECT module, sha, version, updated_by FROM smdb_data.shared_modules';
+/**
+ * The module rows and installed.json's row in one statement, so one snapshot: a publish or an unpublish writes both in
+ * one transaction, and the step sees both changes or neither. The doc's row is the one whose module is NULL.
+ */
+export const LIST_SQL = 'SELECT module, sha, version, updated_by, NULL::bytea AS installed FROM smdb_data.shared_modules UNION ALL SELECT NULL, NULL, NULL, NULL, body FROM smdb_data.shared_docs WHERE key = $1';
 const READ_BOUND_MS = 10_000;
 
 interface ModuleRowSeen {
@@ -988,9 +1057,9 @@ interface ModuleRowSeen {
 
 const listedOnce = new Set<string>();
 
-function installedModules(): Set<string> {
+function listedIn(body: Buffer | null): Set<string> {
   try {
-    const parsed = JSON.parse(fs.readFileSync(dataPath('global', 'appstore', 'installed.json'), 'utf8'));
+    const parsed = JSON.parse(String(body ?? ''));
     return new Set(Object.keys(parsed?.modules ?? {}));
   } catch {
     return new Set();
@@ -1161,9 +1230,13 @@ export async function modulePassStep(pass: { tag0: string | null; modules?: stri
   const backend = rowBackend();
   if (!backend?.sharedSelect) return false;
   const rows = new Map<string, ModuleRowSeen>();
+  let installed = new Set<string>();
   try {
-    const res = await backend.sharedSelect(LIST_SQL, [], READ_BOUND_MS);
-    for (const r of res.rows) rows.set(String(r.module), { sha: String(r.sha), version: r.version ?? null, updatedBy: r.updated_by ?? null });
+    const res = await backend.sharedSelect(LIST_SQL, [INSTALLED_KEY], READ_BOUND_MS);
+    for (const r of res.rows) {
+      if (r.module === null) installed = listedIn(r.installed);
+      else rows.set(String(r.module), { sha: String(r.sha), version: r.version ?? null, updatedBy: r.updated_by ?? null });
+    }
   } catch (error) {
     return { cause: messageOf(error) };
   }
@@ -1199,7 +1272,6 @@ export async function modulePassStep(pass: { tag0: string | null; modules?: stri
   for (const folder of sourceFolders()) {
     if (!development || rows.has(folder) || read.record.modules[folder]) names.add(folder);
   }
-  const installed = installedModules();
   for (const module of [...names].filter(name => !pass.modules || pass.modules.includes(name)).sort()) {
     if (passStopped()) return true;
     try {
@@ -1228,7 +1300,7 @@ setSharedModulePassStep(modulePassStep);
 // THE BOOT APPLY (decision 45 as 59, 67, 69, 78, 81, 89, 92, 99 and 105 amend it)
 // ============================================================================
 
-/** Every compile the boot runs (81): the bound of the web UI's module operations, 600 s. */
+/** Every compile the boot (81) and an apply run, as either may be a full one: the bound of the web UI's module operations, 600 s. */
 export const BOOT_COMPILE_MS = 600_000;
 const BOOT_BOUND_TEXT = 'it did not finish within 10 minutes';
 
@@ -1277,13 +1349,11 @@ function entryOf(module: string): ModuleEntry | undefined {
 
 /** 69: a module this boot did not apply, left uncompiled by a compile that names no file. */
 function notCompiledAtBoot(module: string, error: string): void {
-  const d = dirs();
   withStoreLock(() => {
     const record = readRecord();
     const entry = record.modules[module];
     if (!entry) return;
-    const dist = path.join(d.dist, module);
-    if (!sameDir(dist, path.join(d.source, module))) fs.rmSync(dist, { recursive: true, force: true });
+    dropDist(module);
     record.modules[module] = { ...entry, built: null, status: nextStatus(record, 'failed', entry.sha, error) };
     writeStoreRecord(record);
   });
@@ -1345,7 +1415,7 @@ export async function bootCompileModules(): Promise<void> {
   const d = dirs();
   const applied = new Map(takeBootApplied());
   const inPlace = Object.keys(read.record.modules).filter(module => exists(path.join(d.source, module)));
-  const judged = inPlace.filter(module => !applied.has(module) && !read.record.modules[module].applying && !builtCurrent(read.record.modules[module]));
+  const judged = inPlace.filter(module => !applied.has(module) && !read.record.modules[module].applying && !(builtCurrent(read.record.modules[module]) && distWhole(module)));
   const stale = judged.filter(module => !noCompileCurrent(read.record.modules[module]));
   if (applied.size === 0 && stale.length === 0) {
     for (const module of judged) {
@@ -1364,6 +1434,13 @@ export async function bootCompileModules(): Promise<void> {
       withStoreLock(() => copyToBuild(module));
     } catch (thrown) {
       copyFailed.set(module, messageOf(thrown));
+    }
+  }
+  if (judged.some(module => !distWhole(module))) {
+    try {
+      fs.rmSync(buildInfoOf(d), { force: true });
+    } catch (thrown) {
+      console.error(`[Shared] Could not delete the compiler's record ${buildInfoOf(d)} (${messageOf(thrown)}); a module whose compiled files are missing may load without them`);
     }
   }
   const compile = await bootCompile();
@@ -1406,10 +1483,8 @@ export async function bootCompileModules(): Promise<void> {
 /** 102's rule for a throw in a boot step of one module: T33, its dist folder deleted, the module left out of this boot. */
 function bootStepFailed(module: string, error: unknown): void {
   leaveOutAtBoot(module);
-  const d = dirs();
-  const dist = path.join(d.dist, module);
   try {
-    if (!sameDir(dist, path.join(d.source, module))) fs.rmSync(dist, { recursive: true, force: true });
+    dropDist(module);
   } catch {
     // Left out of the load all the same.
   }
@@ -1597,6 +1672,7 @@ export async function bootLoadCheck(client: Client, loaded: LoadedModule[]): Pro
 
 export function _resetModuleApply(): void {
   applyRuns.clear();
+  applyCalls.clear();
   listedOnce.clear();
   prunedAt = -Infinity;
   applyClient = null;

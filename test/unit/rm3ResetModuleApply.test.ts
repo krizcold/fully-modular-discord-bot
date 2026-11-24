@@ -14,7 +14,6 @@ import fs from 'fs';
 import path from 'path';
 import type { Client } from 'discord.js';
 import { applyRig, fakeLoader } from '../helpers/nb6ApplyRig';
-import { dataPath } from '../../src/utils/dataRoot';
 import { _resetModuleApply, beginBootApplies, bootCompileModules, setModuleApplyClient } from '../../src/bot/internalSetup/utils/moduleApply';
 
 const rig = applyRig();
@@ -39,8 +38,9 @@ describe('_resetModuleApply', () => {
   it('rm3 reset listed: a module listed as installed with no files is named again by the first pass of the next process', async () => {
     fs.mkdirSync(path.join(rig.state.source, 'x'), { recursive: true });
     fs.writeFileSync(path.join(rig.state.source, 'x', 'index.js'), 'exports.v = 1;\n');
-    fs.mkdirSync(dataPath('global', 'appstore'), { recursive: true });
-    fs.writeFileSync(dataPath('global', 'appstore', 'installed.json'), JSON.stringify({ modules: { x: { version: '1.0.0' } } }));
+    await rig.publish('x', { 'index.js': 'exports.v = 1;\n' });
+    rig.state.rows.modules.delete('x');
+    rig.state.rows.moduleFiles.delete('x');
     const line = '[Shared] x is listed as installed, but the database holds none of its files; uninstall it from the App Store tab, then install it again';
     const named = () => rig.state.lines.filter(l => l === line).length;
     await rig.pass();

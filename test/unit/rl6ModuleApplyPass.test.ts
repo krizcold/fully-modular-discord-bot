@@ -19,9 +19,10 @@ vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => {
 import fs from 'fs';
 import path from 'path';
 import { dataPath } from '../../src/utils/dataRoot';
-import { applyRig, fakeLoader } from '../helpers/nb6ApplyRig';
+import { applyRig, fakeLoader, reloaderFakes } from '../helpers/nb6ApplyRig';
 import { readStoreRecord, writeStoreRecord, type ModuleEntry } from '../../src/bot/internalSetup/utils/sharedRecords';
 import { startModule } from '../../src/bot/internalSetup/utils/moduleCrashes';
+import { INSTALLED_KEY } from '../../src/bot/internalSetup/utils/sharedModules';
 
 const rig = applyRig();
 const S_FILES = { 'module.json': '{"name":"m","version":"1.0.0"}', 'index.js': 'exports.v = 1;\n' };
@@ -93,6 +94,7 @@ describe('the pass on a module with no row', () => {
       sha: 'absent', stamp: null, files: {}, main: '1:ALPHA', built: null, failedSha: 'f'.repeat(64), retryAt: null, heldSha: null, status: null, applying: null,
     }));
     listInstalled('a', 'm');
+    rig.state.rows.put(INSTALLED_KEY, JSON.stringify({ modules: { a: { version: '2.0.0' }, m: { version: '1.0.0' } } }));
     fakeLoader.duringLoad = module => {
       if (module === 'a') editEntry('m', () => undefined);
     };
@@ -101,6 +103,47 @@ describe('the pass on a module with no row', () => {
     expect(rig.entry('a')?.applying ?? null).toBeNull();
     expect(rig.entry('m')).toBeUndefined();
     expect(shared()).toEqual([]);
+  });
+
+  it("whose uninstall this machine sees before its installed.json mirror lands is removed, with no T13", async () => {
+    await rig.inPlace('m', S_FILES);
+    listInstalled('m');
+    await rig.unpublish('m');
+    rig.state.lines.length = 0;
+    fakeLoader.unloads = [];
+    await rig.pass();
+    expect(shared()).toEqual([]);
+    expect(rig.live('m')).toBeNull();
+    expect(rig.entry('m')).toBeUndefined();
+    expect(fakeLoader.unloads).toEqual(['m']);
+  });
+
+  it("nb45 join: the web UI's apply of an uninstall the pass is removing answers the pass's result, with one unload", async () => {
+    await rig.inPlace('m', S_FILES);
+    listInstalled('m');
+    await rig.unpublish('m');
+    fakeLoader.unloads = [];
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const unload = reloaderFakes.unloadModuleUnmarked;
+    reloaderFakes.unloadModuleUnmarked = async (client, module) => {
+      const out = await unload(client, module);
+      await gate;
+      return out;
+    };
+    try {
+      const passing = rig.pass();
+      await vi.waitFor(() => { if (fakeLoader.unloads.length === 0) throw new Error('the unload did not start'); }, { timeout: 5_000, interval: 5 });
+      const webui = rig.apply('m', 'absent', { reason: 'uninstall' });
+      release();
+      expect(await webui).toMatchObject({ outcome: 'applied', reason: null });
+      await passing;
+    } finally {
+      release();
+      reloaderFakes.unloadModuleUnmarked = unload;
+    }
+    expect(fakeLoader.unloads).toEqual(['m']);
+    expect(rig.entry('m')).toBeUndefined();
   });
 });
 
