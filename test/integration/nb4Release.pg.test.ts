@@ -77,6 +77,19 @@ describe('the release', () => {
     expect(rows.filter(r => r.handedTo === null)).toHaveLength(1);
   });
 
+  it('a move of a shard homed at another node keeps that home; a move of a shard homed here makes the receiver its home (NB47)', async () => {
+    const [own, away] = (await aHolds()).map(p => p.shardId).sort((x, y) => x - y);
+    await rig.direct.query(`UPDATE smdb_data.shard_claims SET home_node = 'n-k' WHERE shard_id = $1`, [away]);
+    await renew(b, B, [], heartbeat({ capacity: 2 }));
+    await rig.direct.query(`UPDATE smdb_data.shard_nodes SET healthy_since = now() - interval '301 seconds' WHERE node_id = 'n-b'`);
+    const rows = await a.release({ me: A, reserved: [], handOvers: [own, away].map(shardId => ({ shardId, receiver: 'n-b', move: true })), ttlMs: TIMINGS.ttlMs });
+    expect(rows.map(r => [r.shardId, r.handedTo]).sort((x, y) => (x[0] as number) - (y[0] as number))).toEqual([[own, 'B'], [away, 'B']]);
+    const ownRow = await rig.row(own);
+    const awayRow = await rig.row(away);
+    expect([ownRow.holder_node, ownRow.home_node]).toEqual(['n-b', 'n-b']);
+    expect([awayRow.holder_node, awayRow.home_node]).toEqual(['n-b', 'n-k']);
+  });
+
   it('hands nothing to a receiver healthy for only 299 s', async () => {
     const pairs = await aHolds();
     await renew(b, B, [], heartbeat({ capacity: 2 }));

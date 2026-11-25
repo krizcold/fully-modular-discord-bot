@@ -1321,7 +1321,8 @@ function keptLines(kept: Array<{ shardId: number; node: NodeRow }>): SpreadResul
 }
 
 // Decision 12: every unreleased row naming this process and its reservations still listed, kept for this node with a
-// fresh expiry from u', or a held pair handed to a receiver that still qualifies at this statement.
+// fresh expiry from u', or a held pair handed to a receiver that still qualifies at this statement. A move makes the
+// receiver the home only of a shard homed on this node, so a shard passed on while its home was down still returns there.
 export const RELEASE_SQL = `
 WITH clk AS (
   SELECT ${U_PRIME} AS u FROM smdb_data.claim_clock WHERE id = 1
@@ -1344,7 +1345,7 @@ WITH clk AS (
 UPDATE smdb_data.shard_claims c
    SET released = true, reserved = false, extended = false,
        holder_node = COALESCE(t.node_id, $2), holder_name = COALESCE(t.node_name, $3),
-       home_node = CASE WHEN t.move IS TRUE THEN t.node_id ELSE c.home_node END,
+       home_node = CASE WHEN t.move IS TRUE AND c.home_node = $2 THEN t.node_id ELSE c.home_node END,
        ttl_ms = CASE WHEN t.node_id IS NULL THEN $4::bigint ELSE t.takeover_seconds::bigint * 1000 END,
        expires_up_ms = (SELECT u FROM clk) + CASE WHEN t.node_id IS NULL THEN $4::bigint ELSE t.takeover_seconds::bigint * 1000 END
   FROM target t
