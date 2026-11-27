@@ -24,8 +24,9 @@ import {
 import { ModuleLoader } from './moduleLoader';
 import { getModuleRegistry } from './moduleRegistry';
 import {
-  distDropped, heldBackText, isReloading, loadModuleUnmarked, markReloading, recompileTypeScript, unloadModuleUnmarked, unmarkReloading, type CompileResult,
+  heldBackText, isReloading, loadModuleUnmarked, markReloading, recompileTypeScript, unloadModuleUnmarked, unmarkReloading, type CompileResult,
 } from './moduleReloader';
+import { distDropped } from './compileRecord';
 import { findModuleManifests, getBuildModulesDir, getModulesDir, getSourceModulesDir } from './pathHelpers';
 import { stoppedServing } from './servingGate';
 import { setSharedModulePassStep } from './sharedMirror';

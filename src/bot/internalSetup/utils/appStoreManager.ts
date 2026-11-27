@@ -30,7 +30,7 @@ import {
 import { readStoreRecord } from './sharedRecords';
 import { credentialsKeyOf, INSTALLED_KEY, moduleRelRefusal, publishModule, unpublishModule, type ModuleSaveAnswer } from './sharedModules';
 import type { ApplyLater, PublisherAnswer } from './moduleApply';
-import { distDropped } from './moduleReloader';
+import { distDropped } from './compileRecord';
 import { FolderSyncError, logFolderSyncError, logSyncLine, syncFolderChainSync, syncFolderSync, syncStepError, writeErrorText } from './folderChain';
 
 /**
