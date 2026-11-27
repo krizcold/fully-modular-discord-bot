@@ -14,7 +14,9 @@ import {
   planRetake,
   planTake,
   qualifiesAsReceiver,
+  qualifiesForReturn,
   nodeRoom,
+  returnRoom,
   nodeSeen,
   type ClaimRow,
   type ClaimTimings,
@@ -1352,15 +1354,26 @@ UPDATE smdb_data.shard_claims c
  WHERE c.shard_count = t.shard_count AND c.shard_id = t.shard_id
 RETURNING c.shard_id, c.claim::text AS claim, t.was_released, t.node_name AS handed_to`;
 
-/** Counted under the take's lock: each receiver gets at most its room, counting what this release already gave it. */
+/** Counted under the take's lock: a return gets at most the home's return room, a move the receiver's room, each counting what this release already gave it. */
 function assignReceivers(handOvers: HandOver[], nodes: NodeRow[], rows: ClaimRow[], upMs: number): HandOver[] {
   const room = new Map<string, number>();
-  for (const node of nodes) if (qualifiesAsReceiver(node, rows, upMs)) room.set(node.nodeId, nodeRoom(node, rows, upMs));
+  const homeRoom = new Map<string, number>();
+  for (const node of nodes) {
+    if (qualifiesAsReceiver(node, rows, upMs)) room.set(node.nodeId, nodeRoom(node, rows, upMs));
+    if (qualifiesForReturn(node, rows, upMs)) homeRoom.set(node.nodeId, returnRoom(node, rows, upMs));
+  }
   const out: HandOver[] = [];
   for (const h of handOvers) {
-    const left = room.get(h.receiver) ?? 0;
-    if (left <= 0) continue;
-    room.set(h.receiver, left - 1);
+    const moveLeft = room.get(h.receiver);
+    if (h.move) {
+      if (moveLeft === undefined || moveLeft <= 0) continue;
+      room.set(h.receiver, moveLeft - 1);
+    } else {
+      const left = homeRoom.get(h.receiver) ?? 0;
+      if (left <= 0) continue;
+      homeRoom.set(h.receiver, left - 1);
+      if (moveLeft !== undefined) room.set(h.receiver, moveLeft - 1);
+    }
     out.push(h);
   }
   return out;

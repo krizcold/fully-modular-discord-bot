@@ -157,6 +157,17 @@ export function qualifiesAsReceiver(node: NodeRow, rows: ClaimRow[], upMs: numbe
     && nodeSeen(node) && nodeRoom(node, rows, upMs) > 0;
 }
 
+/** A return's room: rows the node holds for other homes leave by their own returns, so only its own homed rows count. */
+export function returnRoom(node: NodeRow, rows: ClaimRow[], upMs: number): number {
+  const own = rows.filter(r => r.holderNode === node.nodeId && !isExpired(r, upMs) && r.homeNode === node.nodeId).length;
+  return Math.max(node.capacity - own, 0);
+}
+
+export function qualifiesForReturn(node: NodeRow, rows: ClaimRow[], upMs: number): boolean {
+  return node.fit && node.restartable && node.healthyForMs !== null && node.healthyForMs >= HEALTHY_BEFORE_RETURN_MS
+    && nodeSeen(node) && returnRoom(node, rows, upMs) > 0;
+}
+
 export interface Me {
   processId: string;
   nodeId: string;
@@ -350,8 +361,11 @@ export function planReturns(input: {
 }): HandOver[] {
   const { me, rows, upMs } = input;
   const room = new Map<string, number>();
+  const homeRoom = new Map<string, number>();
   for (const node of input.nodes) {
-    if (node.nodeId !== me.nodeId && qualifiesAsReceiver(node, rows, upMs)) room.set(node.nodeId, nodeRoom(node, rows, upMs));
+    if (node.nodeId === me.nodeId) continue;
+    if (qualifiesAsReceiver(node, rows, upMs)) room.set(node.nodeId, nodeRoom(node, rows, upMs));
+    if (qualifiesForReturn(node, rows, upMs)) homeRoom.set(node.nodeId, returnRoom(node, rows, upMs));
   }
   const byShard = new Map(rows.map(r => [r.shardId, r]));
   const out: HandOver[] = [];
@@ -359,9 +373,11 @@ export function planReturns(input: {
   for (const pair of [...input.held].sort((a, b) => a.shardId - b.shardId)) {
     const home = byShard.get(pair.shardId)?.homeNode;
     if (!home || home === me.nodeId) continue;
-    const left = room.get(home) ?? 0;
+    const left = homeRoom.get(home) ?? 0;
     if (left <= 0) continue;
-    room.set(home, left - 1);
+    homeRoom.set(home, left - 1);
+    const moveLeft = room.get(home);
+    if (moveLeft !== undefined) room.set(home, moveLeft - 1);
     out.push({ shardId: pair.shardId, receiver: home, move: false });
     given.add(pair.shardId);
   }
