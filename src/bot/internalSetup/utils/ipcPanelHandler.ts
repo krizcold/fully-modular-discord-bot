@@ -113,17 +113,13 @@ export function setupPanelIPCHandlers(): void {
       return;
     }
 
-    // Validate message structure
+    if (message && typeof message === 'object' && typeof message.type === 'string' && !ownsType(message.type)) return;
+
     if (!validateMessage(message)) {
       return;
     }
 
     const { type, requestId, data } = message;
-
-    // Only handle panel/bot/guild/dev IPC messages; skip others (handled by reload/toggle handlers)
-    const ownedPrefixes = ['panel:', 'dev:', 'bot:', 'guild:'];
-    if (!ownedPrefixes.some(p => type.startsWith(p))) return;
-
     const response = await answerPanelMessage(type, data, 'ipc');
     process.send!({ requestId, data: toTransport(response).answer });
   });
@@ -197,6 +193,13 @@ async function channelRefusal(client: any, guildId: string, channelId: string): 
   }
 }
 
+const OWNED_PREFIXES = ['panel:', 'dev:', 'bot:', 'guild:'];
+
+/** The panel, list and guild requests are this handler's; every other type has its own listener. */
+export function ownsType(type: string): boolean {
+  return OWNED_PREFIXES.some(p => type.startsWith(p));
+}
+
 /**
  * Validate incoming IPC message structure
  */
@@ -206,9 +209,9 @@ function validateMessage(message: any): boolean {
     return false;
   }
 
-  if (!message.type || !message.requestId) {
+  if (typeof message.type !== 'string' || !message.type || !message.requestId) {
     console.warn('[IPCPanelHandler] Received malformed IPC message:', {
-      hasType: !!message.type,
+      hasType: typeof message.type === 'string' && !!message.type,
       hasRequestId: !!message.requestId
     });
     if (message.requestId) {

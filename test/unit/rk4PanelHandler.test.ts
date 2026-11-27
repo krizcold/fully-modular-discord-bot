@@ -291,4 +291,37 @@ describe('the IPC listener', () => {
       expect(sent).toEqual([]);
     });
   });
+
+  it("NB51: the web UI's 'memory:reading' push, which has no requestId, is left to its own listener without a warning", async () => {
+    await listening(async (listener, sent, warns) => {
+      const push = { type: 'memory:reading', data: { room: true, useMb: 100, freeMb: 900, ageMs: 0 } };
+      await expect(listener(push)).resolves.toBeUndefined();
+      await listener({ type: 'identify:slot', data: { nonce: 'n', waitMs: 0 } });
+      expect(warns).toEqual([]);
+      expect(sent).toEqual([]);
+    });
+  });
+
+  it('NB51: a panel request with no requestId still warns as malformed and gets no answer', async () => {
+    await listening(async (listener, sent, warns) => {
+      await listener({ type: 'panel:list', data: {} });
+      expect(warns).toContainEqual(['[IPCPanelHandler] Received malformed IPC message:', { hasType: true, hasRequestId: false }]);
+      expect(sent).toEqual([]);
+    });
+  });
+
+  it('NB51: a message whose type is missing or not a string warns as malformed and is answered with the refusal', async () => {
+    await listening(async (listener, sent, warns) => {
+      await listener({ requestId: 'r1', data: {} });
+      await listener({ type: 7, requestId: 'r2', data: {} });
+      expect(warns.filter(w => w[0] === '[IPCPanelHandler] Received malformed IPC message:')).toEqual([
+        ['[IPCPanelHandler] Received malformed IPC message:', { hasType: false, hasRequestId: true }],
+        ['[IPCPanelHandler] Received malformed IPC message:', { hasType: false, hasRequestId: true }],
+      ]);
+      expect(sent).toEqual([
+        { requestId: 'r1', data: { success: false, error: 'Malformed IPC message: missing type or requestId' } },
+        { requestId: 'r2', data: { success: false, error: 'Malformed IPC message: missing type or requestId' } },
+      ]);
+    });
+  });
 });
