@@ -227,7 +227,39 @@ export function parseDiagnostics(output: string, cwd: string = process.cwd()): C
 const COMPILE_TIMEOUT_MS = 600_000;
 const SYNC_TIMEOUT_MS = 60_000;
 
+let compileOpen = false;
+const droppedRecords = new Set<string>();
+
+/**
+ * A module's dist folder was deleted with tsc's incremental record `record`. A compile running then writes the record
+ * again when it ends, listing the deleted outputs as emitted, so that record is deleted once the compile has ended.
+ */
+export function distDropped(record: string): void {
+  if (compileOpen) droppedRecords.add(record);
+}
+
+function dropRecordsAfterCompile(): void {
+  compileOpen = false;
+  for (const record of droppedRecords) {
+    try {
+      fs.rmSync(record, { force: true });
+    } catch (error) {
+      console.error(`[Reloader] Could not delete the compiler's record ${record} (${error instanceof Error ? error.message : String(error)}); a module whose compiled files are missing may load without them`);
+    }
+  }
+  droppedRecords.clear();
+}
+
 async function compileOnce(timeoutMs: number): Promise<CompileResult> {
+  compileOpen = true;
+  try {
+    return await compileTsc(timeoutMs);
+  } finally {
+    dropRecordsAfterCompile();
+  }
+}
+
+async function compileTsc(timeoutMs: number): Promise<CompileResult> {
   const start = Date.now();
   try {
     const tscBin = path.join(process.cwd(), 'node_modules', '.bin', process.platform === 'win32' ? 'tsc.cmd' : 'tsc');

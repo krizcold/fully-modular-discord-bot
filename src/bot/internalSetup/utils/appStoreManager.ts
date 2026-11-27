@@ -30,6 +30,7 @@ import {
 import { readStoreRecord } from './sharedRecords';
 import { credentialsKeyOf, INSTALLED_KEY, moduleRelRefusal, publishModule, unpublishModule, type ModuleSaveAnswer } from './sharedModules';
 import type { ApplyLater, PublisherAnswer } from './moduleApply';
+import { distDropped } from './moduleReloader';
 import { FolderSyncError, logFolderSyncError, logSyncLine, syncFolderChainSync, syncFolderSync, syncStepError, writeErrorText } from './folderChain';
 
 /**
@@ -592,8 +593,13 @@ function dropStaged(dir: string): void {
 /** A module's compiled folder deleted, tsc's incremental record first, so the next compile writes its files again (NB45). */
 function dropRuntimeDir(sourceDir: string, runtimeDir: string): void {
   if (!fs.existsSync(runtimeDir)) return;
-  if (path.resolve(runtimeDir) !== path.resolve(sourceDir)) fs.rmSync(buildInfoPathOf(getModulesDir()), { force: true });
-  fs.rmSync(runtimeDir, { recursive: true, force: true });
+  const record = path.resolve(runtimeDir) !== path.resolve(sourceDir) ? buildInfoPathOf(getModulesDir()) : null;
+  if (record) fs.rmSync(record, { force: true });
+  try {
+    fs.rmSync(runtimeDir, { recursive: true, force: true });
+  } finally {
+    if (record) distDropped(record);
+  }
 }
 
 /** Decision 42's texts for a publish or an uninstall that stored nothing, and 35's and T10's when that is unknown. */

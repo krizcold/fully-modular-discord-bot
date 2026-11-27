@@ -24,7 +24,7 @@ import {
 import { ModuleLoader } from './moduleLoader';
 import { getModuleRegistry } from './moduleRegistry';
 import {
-  heldBackText, isReloading, loadModuleUnmarked, markReloading, recompileTypeScript, unloadModuleUnmarked, unmarkReloading, type CompileResult,
+  distDropped, heldBackText, isReloading, loadModuleUnmarked, markReloading, recompileTypeScript, unloadModuleUnmarked, unmarkReloading, type CompileResult,
 } from './moduleReloader';
 import { findModuleManifests, getBuildModulesDir, getModulesDir, getSourceModulesDir } from './pathHelpers';
 import { stoppedServing } from './servingGate';
@@ -273,7 +273,11 @@ function dropDist(module: string): void {
   const dist = path.join(d.dist, module);
   if (sameDir(dist, path.join(d.source, module)) || !exists(dist)) return;
   fs.rmSync(buildInfoOf(d), { force: true });
-  fs.rmSync(dist, { recursive: true, force: true });
+  try {
+    fs.rmSync(dist, { recursive: true, force: true });
+  } finally {
+    distDropped(buildInfoOf(d));
+  }
 }
 
 /** The build and dist folders of a module deleted where they are not its source folder (43 step 3, 58 a). */
