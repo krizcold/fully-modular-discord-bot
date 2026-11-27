@@ -105,9 +105,9 @@ describe('the reader\'s readDoc', () => {
     return { r, sent };
   }
 
-  it('reads the guild_data row only, under the canonical key, bounded at 5 s; no exists', async () => {
+  it('reads the guild_data row only, under the canonical key, bounded at 5 s; no hasDoc', async () => {
     const { r, sent } = reader();
-    const exists = vi.spyOn(r, 'exists');
+    const exists = vi.spyOn(r, 'hasDoc');
     expect(await r.readDoc(GUILD, 'm', 'sub/../a.json')).toBeNull();
     expect(sent).toHaveLength(1);
     expect(sent[0].text).toMatch(/smdb_data\.guild_data\b/);
