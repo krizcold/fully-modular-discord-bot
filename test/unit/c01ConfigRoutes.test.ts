@@ -284,7 +284,7 @@ describe('config and data reads come from the serving process, queue first (R34-
 
   it('reads a postgres-routed guild\'s data file through the child, not the database reader', async () => {
     setBackendKind('postgres');
-    reader.current = { exists: async () => true, readDoc: async () => JSON.stringify({ v: 'database-old' }) };
+    reader.current = { hasDoc: async () => true, readDoc: async () => JSON.stringify({ v: 'database-old' }) };
     child.guild = req => (req.module === 'mod' && req.filename === 'x.json' ? { ok: true, contentJson: JSON.stringify({ v: 'child-new' }) } : undefined);
     const got = await call(base, 'GET', `/api/config/data/get?file=${encodeURIComponent('mod/x.json')}&guildId=${G1}`);
     expect(got.status).toBe(200);
@@ -295,7 +295,7 @@ describe('config and data reads come from the serving process, queue first (R34-
   it('falls back to the database reader only while the bot is down, and says so', async () => {
     setBackendKind('postgres');
     child.running = false;
-    reader.current = { exists: async () => true, readDoc: async () => JSON.stringify({ v: 'database' }) };
+    reader.current = { hasDoc: async () => true, readDoc: async () => JSON.stringify({ v: 'database' }) };
     const got = await call(base, 'GET', `/api/config/data/get?file=${encodeURIComponent('mod/x.json')}&guildId=${G1}`);
     expect(got.status).toBe(200);
     expect(got.body.data).toEqual({ v: 'database' });
@@ -325,7 +325,7 @@ describe('config and data reads come from the serving process, queue first (R34-
   it('leaves underscore (internal) modules out of a postgres-routed guild\'s listing', async () => {
     setBackendKind('postgres');
     reader.current = {
-      exists: async () => false,
+      hasDoc: async () => false,
       listModules: async () => ['_hardLimits', 'mod'],
       listFiles: async (_g: string, module?: string) => (module === '_hardLimits' ? ['caps.json'] : module === 'mod' ? ['y.json'] : []),
     };

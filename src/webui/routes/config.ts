@@ -1192,10 +1192,6 @@ async function discoverGuildFilesPostgres(guildId: string): Promise<Array<Config
   const dataFiles = discoverGuildDataFiles(guildId).filter(file => file.schema);
   const schemaFiles: Array<ConfigFileMetadata | DataFileMetadata> = [...configFiles, ...dataFiles];
 
-  await Promise.all(schemaFiles.map(async file => {
-    file.exists = await reader.exists(guildId, file.moduleName || '', file.id);
-  }));
-
   const covered = new Set(schemaFiles.map(file => `${file.moduleName || ''}/${file.id}`));
   const schemaModules = schemaFiles.map(file => file.moduleName).filter((name): name is string => !!name);
   // Underscore modules (_guildConfig, _hardLimits, ...) are internal namespaces, never rows.
@@ -1235,6 +1231,10 @@ async function discoverGuildFilesPostgres(guildId: string): Promise<Array<Config
       default: {}
     });
   }
+
+  await Promise.all([...schemaFiles, ...orphans].map(async file => {
+    file.exists = await reader.hasDoc(guildId, file.moduleName || '', file.id);
+  }));
 
   // Same dedup-by-path as the file-routed branch: schema entries win.
   const pathMap = new Map<string, ConfigFileMetadata | DataFileMetadata>();

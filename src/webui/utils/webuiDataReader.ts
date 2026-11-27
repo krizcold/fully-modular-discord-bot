@@ -439,14 +439,11 @@ export class WebuiDataReader {
     return rows.map(row => row.module);
   }
 
-  async exists(guildId: string, module: string, filename: string): Promise<boolean> {
+  /** Whether a document is stored under the key (the guild_data row the editor opens); appended lines alone are none. */
+  async hasDoc(guildId: string, module: string, filename: string): Promise<boolean> {
     const rows = await this.query(
-      `SELECT (
-         EXISTS (SELECT 1 FROM smdb_data.guild_data
-                 WHERE guild_id = $1 AND module = $2 AND filename = $3)
-         OR EXISTS (SELECT 1 FROM smdb_data.guild_append
-                    WHERE guild_id = $1 AND module = $2 AND filename = $3)
-       ) AS present`,
+      `SELECT EXISTS (SELECT 1 FROM smdb_data.guild_data
+                      WHERE guild_id = $1 AND module = $2 AND filename = $3) AS present`,
       [guildId, module, filename]
     );
     return rows[0]?.present === true;
