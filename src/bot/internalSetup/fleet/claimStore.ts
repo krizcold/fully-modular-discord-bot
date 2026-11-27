@@ -1031,7 +1031,8 @@ export class ClaimStore implements ClaimStoreApi {
         const upMs = Number(clock.up_ms);
         const rows = (await client.query(`SELECT ${ROW_COLUMNS} FROM smdb_data.shard_claims`)).rows.map(toClaimRow);
         const nodes = (await client.query(`SELECT ${NODE_COLUMNS} FROM smdb_data.shard_nodes`)).rows.map(toNodeRow);
-        const hand = assignReceivers(request.handOvers, nodes, rows, upMs);
+        const counts = new Set(rows.filter(r => r.holderProcess === me.processId && !r.released).map(r => r.shardCount));
+        const hand = assignReceivers(request.handOvers, nodes, rows.filter(r => counts.has(r.shardCount)), upMs);
         const res = await client.query(RELEASE_SQL, [
           me.processId, me.nodeId, me.nodeName, request.ttlMs,
           request.reserved.map(p => p.shardCount), request.reserved.map(p => p.shardId), request.reserved.map(p => p.claim),
