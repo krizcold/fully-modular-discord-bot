@@ -308,6 +308,30 @@ describe("keptSessions: true only when the grant is exactly the standby's set an
     expect(ctx.keptSessions).toBeUndefined();
   });
 
+  it("a standby with no pairs keeps the standby's count in its claims", async () => {
+    const p = await promoted({ pairs: [] });
+    await p.mod.bootShards({ taken: p.taken });
+    expect(p.mod.getShardClaims()!.ownCount()).toBe(2);
+  });
+
+  it('a promoted standby with no pairs hands over at a meta change', async () => {
+    const { l8Reason } = await import('../../src/bot/internalSetup/fleet/reshard');
+    const p = await promoted({ pairs: [] });
+    await p.mod.bootShards({ taken: p.taken });
+    store.count = 3;
+    await vi.advanceTimersByTimeAsync(RENEW_MS);
+    expect(h.leaves).toContain(l8Reason(3));
+  });
+
+  it('a promoted standby with no pairs leaves for a stop-start from its count', async () => {
+    const { l26Reason } = await import('../../src/bot/internalSetup/fleet/reshard');
+    const p = await promoted({ pairs: [] });
+    await p.mod.bootShards({ taken: p.taken });
+    store.reshard = { attempt: AT, state: 'stopping', fromCount: 2, toCount: 3 };
+    await vi.advanceTimersByTimeAsync(RENEW_MS);
+    expect(h.leaves).toContain(l26Reason(3));
+  });
+
   it('the redraw returns another shard in place of one of the set: keptSessions unset', async () => {
     const p = await promoted({ count: 3 });
     onRedrawDone(pairs => pairs.map(x => (x.shardId === 1 ? { ...x, shardId: 2 } : x)));

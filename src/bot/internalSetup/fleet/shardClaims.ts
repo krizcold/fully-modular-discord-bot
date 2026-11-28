@@ -736,7 +736,10 @@ export class ShardClaims {
   async redraw(taken: RedrawTaken): Promise<{ shardCount: number; pairs: Pair[]; lost: Pair[] } | null> {
     if (taken.processId !== this.processId) throw new Error(`the redraw names process ${taken.processId}, not this process's ${this.processId}`);
     const shardCount = taken.count;
-    if (taken.pairs.length === 0) return { shardCount, pairs: [], lost: [] };
+    if (taken.pairs.length === 0) {
+      this.shardCount = shardCount;
+      return { shardCount, pairs: [], lost: [] };
+    }
     const store = this.deps.store;
     if (!store.redraw) throw new Error('this claims store has no redraw');
     const start = this.clocks();

@@ -116,6 +116,15 @@ describe('rd2 the redraw sends nothing once a stop began or the database stopped
   });
 });
 
+describe('rd2 a standby that took none', () => {
+  it('sends no redraw statement and keeps the count it served', async () => {
+    const rig = build();
+    expect(await rig.claims.redraw({ count: 4, processId: ME.processId, pairs: [] })).toEqual({ shardCount: 4, pairs: [], lost: [] });
+    expect(rig.redraws).toBe(0);
+    expect(rig.claims.ownCount()).toBe(4);
+  });
+});
+
 describe('rd2 a redraw counts as a take for the release at the stop', () => {
   it('the stop after a redraw sends the release', async () => {
     const rig = build({ redraw: [answerAt([P0, P1])] });
